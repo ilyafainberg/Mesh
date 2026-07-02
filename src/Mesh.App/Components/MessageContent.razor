@@ -1,0 +1,102 @@
+@inject AppState State
+@inject IJSRuntime JS
+
+@foreach (var seg in Markdown.Parse(Text))
+{
+    if (seg.IsFile)
+    {
+        @if (seg.FileMime is not null && seg.FileMime.StartsWith("image/"))
+        {
+            <img class="msg-img" src="data:@seg.FileMime;base64,@seg.Content"
+                 alt="@seg.FileName" title="@seg.FileName (click to save)"
+                 @onclick="() => Download(seg)" />
+        }
+        else
+        {
+            <button class="file-card" @onclick="() => Download(seg)" title="Save @seg.FileName">
+                <i class="bi bi-file-earmark-arrow-down"></i>
+                <div class="app-card-text">
+                    <b>@seg.FileName</b>
+                    <small>@SizeLabel(seg.Content) · click to save</small>
+                </div>
+            </button>
+        }
+    }
+    else if (!seg.IsApp)
+    {
+        @if (!string.IsNullOrWhiteSpace(seg.Content))
+        {
+            <div class="text md">@((MarkupString)Markdown.ToHtml(seg.Content))</div>
+        }
+    }
+    else if (!State.Profile.AllowInteractiveApps)
+    {
+        <div class="app-card disabled">
+            <i class="bi bi-window"></i>
+            <div class="app-card-text"><b>Interactive app hidden</b><small>enable in Settings</small></div>
+        </div>
+    }
+    else
+    {
+        var id = seg.Content.GetHashCode();
+        @if (running.Contains(id))
+        {
+            <div class="app-frame @(expanded.Contains(id) ? "expanded" : "")">
+                <iframe sandbox="allow-scripts allow-forms allow-modals"
+                        srcdoc="@seg.Content"
+                        referrerpolicy="no-referrer"></iframe>
+                <div class="app-toolbar">
+                    @if (OnPin.HasDelegate)
+                    {
+                        <button @onclick="() => OnPin.InvokeAsync(seg.Content)" title="Pin as widget"><i class="bi bi-pin-angle"></i></button>
+                    }
+                    <button @onclick="() => Toggle(expanded, id)" title="@(expanded.Contains(id) ? "Shrink" : "Expand")">
+                        <i class="bi @(expanded.Contains(id) ? "bi-arrows-angle-contract" : "bi-arrows-angle-expand")"></i>
+                    </button>
+                    <button @onclick="() => running.Remove(id)" title="Close app"><i class="bi bi-x-lg"></i></button>
+                </div>
+            </div>
+        }
+        else
+        {
+            <button class="app-card" @onclick="() => running.Add(id)">
+                <i class="bi bi-play-circle"></i>
+                <div class="app-card-text">
+                    <b>Interactive app@(string.IsNullOrEmpty(From) ? "" : $" from {From}")</b>
+                    <small>runs sandboxed · no access to your data · tap to run</small>
+                </div>
+            </button>
+        }
+    }
+}
+
+@code {
+    [Parameter] public string Text { get; set; } = "";
+    [Parameter] public string? From { get; set; }
+    [Parameter] public EventCallback<string> OnPin { get; set; }
+
+    private readonly HashSet<int> running = new();
+    private readonly HashSet<int> expanded = new();
+
+    private void Toggle(HashSet<int> set, int id)
+    {
+        if (!set.Remove(id)) set.Add(id);
+    }
+
+    private async Task Download(MessageSegment seg)
+    {
+        try { await JS.InvokeVoidAsync("meshUI.downloadFile", seg.FileName, seg.FileMime, seg.Content); }
+        catch { /* ignore download failures */ }
+    }
+
+    private static string SizeLabel(string base64)
+    {
+        // Approximate decoded byte count from base64 length.
+        long bytes = (long)(base64.Length * 3L / 4);
+        string[] units = { "B", "KB", "MB", "GB" };
+        double size = bytes;
+        int u = 0;
+        while (size >= 1024 && u < units.Length - 1) { size /= 1024; u++; }
+        return $"{size:0.#} {units[u]}";
+    }
+}

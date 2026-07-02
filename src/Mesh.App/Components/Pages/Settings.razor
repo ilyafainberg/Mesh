@@ -1,0 +1,492 @@
+@page "/settings"
+@inject AppState State
+@inject MeshClient Mesh
+@inject MsalAuthService Msal
+@inject FoundryLocalService Foundry
+@inject ModelSetupService Setup
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-gear"></i> Settings</h2>
+        </div>
+
+        <div class="card-panel">
+            <h3>Identity</h3>
+            <div class="field-row">
+                <div><div class="field-label">Handle</div><div class="field-sub">how others add you</div></div>
+                <b>@State.Profile.Handle</b>
+            </div>
+            <div class="field">
+                <label>Display name</label>
+                <input class="full" @bind="display" />
+                <div class="field-hint">Shown to your contacts instead of your handle.</div>
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Link a device</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Add your phone or another computer to the same handle. On the other device, choose
+                <b>Link an existing device</b> and enter this code. Single-use, expires in 5&nbsp;minutes.
+            </div>
+            @if (linkCode is null)
+            {
+                <button class="ghost" disabled="@linkWorking" @onclick="CreateInvite">
+                    @(linkWorking ? "Generating..." : "Generate link code")
+                </button>
+                @if (linkError is not null) { <p class="err">@linkError</p> }
+            }
+            else
+            {
+                <div class="link-invite">
+                    @if (qrDataUri is not null)
+                    {
+                        <img class="link-qr" src="@qrDataUri" alt="Link QR code" />
+                    }
+                    <div class="link-code-box">
+                        <code class="link-code">@linkCode</code>
+                        <div class="field-sub">Expires in @remaining s</div>
+                    </div>
+                </div>
+                <button class="ghost" @onclick="ClearInvite">Done</button>
+            }
+        </div>
+
+        <div class="card-panel">
+            <h3>Model</h3>
+            <div class="field">
+                <label>Provider</label>
+                <select class="full" value="@provider" @onchange="OnProviderChange">
+                    <option value="Anthropic">Anthropic (Claude)</option>
+                    <option value="OpenAI">OpenAI</option>
+                    <option value="Gemini">Google Gemini</option>
+                    <option value="Grok">Grok (xAI)</option>
+                    <option value="Groq">Groq (fast inference)</option>
+                    <option value="FoundryLocal">On Device</option>
+                </select>
+            </div>
+
+            @if (provider == "FoundryLocal")
+            {
+                    <div class="field">
+                        <label>Model</label>
+                        <div class="model-row">
+                            <select class="full" @bind="model">
+                                @if (!string.IsNullOrWhiteSpace(model) && !foundryModels.Any(m => m.Id == model))
+                                {
+                                    <option value="@model">@model (current)</option>
+                                }
+                                @foreach (var m in foundryModels)
+                                {
+                                    <option value="@m.Id">@m.Label</option>
+                                }
+                            </select>
+                            <button class="ghost icon-btn" title="Refresh model list" @onclick="RefreshModels" disabled="@loadingModels">
+                                <i class="bi @(loadingModels ? "bi-hourglass-split" : "bi-arrow-repeat")"></i>
+                            </button>
+                        </div>
+                    <div class="field-hint">
+                        Runs on this device, no key, no cost. Only tool-capable models are listed.
+                        Your pick is downloaded and started automatically when you Save (first time can take a while).
+                    </div>
+                    <div class="field-hint star-note">
+                        <span class="stars">★★★★★</span> = most capable. More stars mean a bigger, smarter model that needs better hardware (more RAM/CPU); fewer stars run faster on modest machines.
+                    </div>
+                    @if (loadingModels)
+                    {
+                        <div class="field-hint"><i class="bi bi-hourglass-split"></i> Finding on-device models…</div>
+                    }
+                    else if (foundryModels.Count == 0)
+                    {
+                        <div class="connector-note">
+                            <i class="bi bi-cpu"></i>
+                            <span>Couldn't list on-device models yet. Foundry Local will be installed and started when you Save; smaller models load fastest.</span>
+                        </div>
+                    }
+                </div>
+            }
+            else
+            {
+                <div class="field">
+                    <label>Model</label>
+                    <input class="full" @bind="model" placeholder="@ModelPlaceholder" />
+                </div>
+                @if (provider == "OpenAI")
+                {
+                    <div class="field">
+                        <label>Endpoint <span class="muted">(optional)</span></label>
+                        <input class="full" @bind="endpoint" placeholder="https://api.openai.com" />
+                    </div>
+                }
+                <div class="field">
+                    <label>API key</label>
+                    <input class="full" type="password" @bind="apiKey" placeholder="(unchanged)" />
+                </div>
+            }
+        </div>
+
+        <div class="card-panel">
+            <h3>Agent responses</h3>
+            <div class="field">
+                <label>Approval before replying</label>
+                <select class="full" @bind="approvalMode">
+                    <option value="Off">Auto-reply (no approval)</option>
+                    <option value="PerCircle">Approve per circle (uses circle settings)</option>
+                    <option value="All">Approve every reply</option>
+                </select>
+                <div class="field-hint">When on, your agent drafts a reply and waits for you on the Messages page before sending.</div>
+            </div>
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Interactive apps</div>
+                    <div class="field-sub">Let agents send interactive mini-apps in messages. They run sandboxed and never auto-run.</div>
+                </div>
+                <label class="switch"><input type="checkbox" checked="@allowApps" @onchange="e => allowApps = (bool)(e.Value ?? false)" /></label>
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Agent budget</h3>
+            <div class="field">
+                <label>Automatic replies per day</label>
+                <input class="full" type="number" min="0" @bind="replyBudget" />
+                <div class="field-hint">
+                    Cap how many automatic agent replies run per day. Each reply calls your model, so this protects
+                    your usage and cost. Set to 0 for unlimited.
+                </div>
+            </div>
+            <div class="field-row">
+                <div class="field-label">Used today</div>
+                <span>@BudgetUsageLabel</span>
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Relay</h3>
+            <div class="field">
+                <label>Relay URL</label>
+                <input class="full" @bind="relay" />
+            </div>
+            <div class="field-row">
+                <div class="field-label">Status</div>
+                <span class="@(Mesh.Connected ? "on" : "off")">
+                    <i class="bi @(Mesh.Connected ? "bi-check-circle-fill" : "bi-circle")"></i>
+                    @(Mesh.Connected ? "connected" : "offline")
+                </span>
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Identities on this device</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Keep several handles on this device and switch between them without signing out of any.
+            </div>
+            <div class="account-list">
+                @foreach (var a in State.Accounts)
+                {
+                    var isActive = a.Id == State.ActiveAccountId;
+                    <div class="account-row @(isActive ? "active" : "")">
+                        <div class="account-info">
+                            <i class="bi bi-person-circle"></i>
+                            <div class="account-text">
+                                <b>@("@")@a.Handle</b>
+                                @if (!string.IsNullOrWhiteSpace(a.DisplayName) && a.DisplayName != a.Handle)
+                                {
+                                    <small class="muted">@a.DisplayName</small>
+                                }
+                            </div>
+                        </div>
+                        <div class="account-actions">
+                            @if (isActive)
+                            {
+                                <span class="vis shared">current</span>
+                            }
+                            else
+                            {
+                                <button class="ghost" disabled="@switching" @onclick="() => Switch(a)">Switch</button>
+                            }
+                            @if (deleteId == a.Id)
+                            {
+                                <button class="danger" @onclick="() => DeleteAccount(a)">Delete</button>
+                                <button class="ghost icon-btn" @onclick="() => deleteId = null" title="Cancel"><i class="bi bi-x-lg"></i></button>
+                            }
+                            else
+                            {
+                                <button class="icon-btn" title="Remove from this device" @onclick="() => deleteId = a.Id"><i class="bi bi-trash"></i></button>
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Sign out</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Sign out of <b>@("@")@State.Profile.Handle</b> and return to the account picker. Your identity
+                stays saved on this device, you can switch back anytime, or add / link another handle.
+                Nothing is deleted.
+            </div>
+            @if (!confirmSignOut)
+            {
+                <button class="ghost" @onclick="() => confirmSignOut = true">
+                    <i class="bi bi-box-arrow-right"></i> Sign out / switch identity
+                </button>
+            }
+            else
+            {
+                <div class="confirm-row">
+                    <span class="muted">Sign out of @("@")@State.Profile.Handle? It stays saved on this device.</span>
+                    <button class="primary" disabled="@signingOut" @onclick="SignOut">
+                        @(signingOut ? "Signing out…" : "Sign out")
+                    </button>
+                    <button class="ghost" disabled="@signingOut" @onclick="() => confirmSignOut = false">Cancel</button>
+                </div>
+            }
+        </div>
+
+        <div class="actions">
+            <button class="primary" @onclick="SaveAll" disabled="@Setup.Running"><i class="bi bi-check-lg"></i> @(Setup.Running ? "Working…" : "Save")</button>
+            <button class="ghost" @onclick="Reconnect"><i class="bi bi-arrow-repeat"></i> Reconnect relay</button>
+        </div>
+        @if (Setup.Running)
+        {
+            <div class="setup-status running" style="margin-top:12px;">
+                <span class="spinner"></span>
+                <span>@(Setup.Status ?? "Working…")</span>
+            </div>
+        }
+        else if (Setup.Success is not null)
+        {
+            <div class="setup-status @(Setup.Success == true ? "ok" : "err")" style="margin-top:12px;">
+                <i class="bi @(Setup.Success == true ? "bi-check-circle" : "bi-exclamation-triangle")"></i>
+                <span>@Setup.Status</span>
+            </div>
+        }
+    </div>
+</div>
+
+@code {
+    string display = "";
+    string relay = "";
+    string provider = "Anthropic";
+    string model = "";
+    string endpoint = "";
+    string apiKey = "";
+    string approvalMode = "PerCircle";
+    bool allowApps = true;
+    int replyBudget = 100;
+
+    string BudgetUsageLabel => replyBudget <= 0
+        ? "Unlimited"
+        : $"{State.Profile.AgentRepliesUsedToday} of {replyBudget}";
+
+    List<FoundryModel> foundryModels = new();
+    bool loadingModels;
+
+    string? linkCode;
+    string? qrDataUri;
+    string? linkError;
+    bool linkWorking;
+    int remaining;
+    System.Threading.Timer? linkTimer;
+
+    bool confirmSignOut;
+    bool signingOut;
+    bool switching;
+    string? deleteId;
+
+    async Task SignOut()
+    {
+        signingOut = true;
+        try
+        {
+            await Mesh.DisconnectAsync();
+            State.SignOut(); // keeps the identity saved; returns app to the picker
+        }
+        finally { signingOut = false; }
+    }
+
+    async Task Switch(AccountRef a)
+    {
+        if (a.Id == State.ActiveAccountId || switching) return;
+        switching = true;
+        try
+        {
+            await Mesh.DisconnectAsync();
+            if (State.SwitchAccount(a.Id))
+            {
+                SyncFields();
+                await Mesh.RegisterAsync();
+                await Mesh.ConnectAsync();
+            }
+        }
+        finally { switching = false; }
+    }
+
+    async Task DeleteAccount(AccountRef a)
+    {
+        deleteId = null;
+        var wasActive = a.Id == State.ActiveAccountId;
+        if (wasActive) await Mesh.DisconnectAsync();
+        State.DeleteAccount(a.Id);
+        if (wasActive) SyncFields(); // active cleared → app shows the picker
+    }
+
+    void SyncFields()
+    {
+        var p = State.Profile;
+        display = p.DisplayName;
+        relay = p.RelayUrl;
+        provider = p.Model.Provider.ToString();
+        model = p.Model.Model;
+        endpoint = p.Model.Endpoint ?? "";
+        approvalMode = p.ApprovalMode.ToString();
+        allowApps = p.AllowInteractiveApps;
+        replyBudget = p.AgentDailyReplyBudget;
+    }
+
+    string ModelPlaceholder=> provider switch
+    {
+        "Anthropic" => "claude-sonnet-4-6",
+        "Gemini" => "gemini-1.5-flash",
+        "Grok" => "grok-2-latest",
+        "Groq" => "llama-3.3-70b-versatile",
+        _ => "gpt-4o-mini"
+    };
+
+    static bool IsFoundryId(string id) =>
+        id.Contains("generic-cpu", StringComparison.OrdinalIgnoreCase) || id.Contains("-instruct-", StringComparison.OrdinalIgnoreCase);
+
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+        Mesh.StateChanged += Refresh;
+        Setup.Changed += Refresh;
+        Foundry.ModelsChanged += Refresh;
+        var p = State.Profile;
+        display = p.DisplayName;
+        relay = p.RelayUrl;
+        provider = p.Model.Provider.ToString();
+        model = p.Model.Model;
+        endpoint = p.Model.Endpoint ?? "";
+        approvalMode = p.ApprovalMode.ToString();
+        allowApps = p.AllowInteractiveApps;
+        replyBudget = p.AgentDailyReplyBudget;
+        // Use the list cached at app startup, do NOT reload here (that would reset the selection).
+        foundryModels = Foundry.CachedModels.ToList();
+    }
+    void Refresh()
+    {
+        // Keep the dropdown in sync if the startup preload finishes while Settings is open.
+        if (foundryModels.Count == 0 && Foundry.CachedModels.Count > 0)
+            foundryModels = Foundry.CachedModels.ToList();
+        InvokeAsync(StateHasChanged);
+    }
+
+    void OnProviderChange(ChangeEventArgs e)
+    {
+        provider = e.Value?.ToString() ?? "Anthropic";
+        if (provider == "FoundryLocal")
+        {
+            foundryModels = Foundry.CachedModels.ToList();
+            // Only pick a default when the current selection isn't an on-device model.
+            if (!IsFoundryId(model))
+                model = foundryModels.FirstOrDefault(m => m.Id == FoundryLocalService.DefaultModel)?.Id
+                        ?? foundryModels.FirstOrDefault()?.Id
+                        ?? FoundryLocalService.DefaultModel;
+        }
+        else if (IsFoundryId(model))
+        {
+            model = ""; // let the provider's placeholder show
+        }
+    }
+
+    /// <summary>Manual refresh, the only place that re-queries the on-device catalog after startup.</summary>
+    async Task RefreshModels()
+    {
+        loadingModels = true;
+        await InvokeAsync(StateHasChanged);
+        try { await Foundry.PreloadModelsAsync(force: true); foundryModels = Foundry.CachedModels.ToList(); }
+        catch { /* leave existing list */ }
+        finally { loadingModels = false; await InvokeAsync(StateHasChanged); }
+    }
+
+    async Task SaveAll()
+    {
+        var apiKeyToSet = apiKey;
+        apiKey = "";
+
+        // The save + model test runs in a background singleton, so it keeps going
+        // (and stays observable) even if the user navigates away from Settings.
+        Setup.SaveAndTest(p =>
+        {
+            p.DisplayName = display.Trim();
+            p.RelayUrl = relay.Trim();
+            p.Model.Provider = Enum.Parse<ModelProvider>(provider);
+            p.Model.Model = model.Trim();
+            p.Model.Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim();
+            if (!string.IsNullOrWhiteSpace(apiKeyToSet)) p.Model.ApiKey = apiKeyToSet.Trim();
+            p.ApprovalMode = Enum.Parse<ApprovalMode>(approvalMode);
+            p.AllowInteractiveApps = allowApps;
+            p.AgentDailyReplyBudget = replyBudget < 0 ? 0 : replyBudget;
+        });
+
+        await Mesh.RegisterAsync();
+    }
+
+    async Task Reconnect() => await Mesh.ConnectAsync();
+
+    async Task CreateInvite()
+    {
+        linkError = null;
+        linkWorking = true;
+        try
+        {
+            var ttl = TimeSpan.FromMinutes(5);
+            var (ok, code, err) = await Mesh.CreateLinkInviteAsync(ttl);
+            if (!ok || code is null) { linkError = err ?? "Could not create invite."; return; }
+            linkCode = code;
+            qrDataUri = BuildQr(code);
+            remaining = (int)ttl.TotalSeconds;
+            linkTimer = new System.Threading.Timer(_ =>
+            {
+                remaining--;
+                if (remaining <= 0) { ClearInvite(); }
+                InvokeAsync(StateHasChanged);
+            }, null, 1000, 1000);
+        }
+        catch (Exception ex) { linkError = ex.Message; }
+        finally { linkWorking = false; }
+    }
+
+    void ClearInvite()
+    {
+        linkTimer?.Dispose();
+        linkTimer = null;
+        linkCode = null;
+        qrDataUri = null;
+    }
+
+    // The QR payload carries relay + handle + code so the other device can prefill everything.
+    string BuildQr(string code)
+    {
+        var payload = $"mesh://link?relay={Uri.EscapeDataString(State.Profile.RelayUrl)}"
+                    + $"&handle={Uri.EscapeDataString(State.Profile.Handle)}&code={Uri.EscapeDataString(code)}";
+        using var gen = new QRCoder.QRCodeGenerator();
+        using var data = gen.CreateQrCode(payload, QRCoder.QRCodeGenerator.ECCLevel.Q);
+        var png = new QRCoder.PngByteQRCode(data).GetGraphic(6);
+        return "data:image/png;base64," + Convert.ToBase64String(png);
+    }
+
+    public void Dispose()
+    {
+        linkTimer?.Dispose();
+        State.Changed -= Refresh;
+        Setup.Changed -= Refresh;
+        Mesh.StateChanged -= Refresh;
+        Foundry.ModelsChanged -= Refresh;
+    }
+}

@@ -1,0 +1,185 @@
+﻿@page "/contacts"
+@inject AppState State
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-people"></i> Contacts</h2>
+            <span class="muted">decide whose agent may talk to yours</span>
+        </div>
+
+        <div class="add-row">
+            <input @bind="handle" @onkeydown="OnAddKey" placeholder="Add someone by their handle…" aria-label="Contact handle" />
+            <button class="primary" @onclick="Add" disabled="@string.IsNullOrWhiteSpace(handle)"><i class="bi bi-person-plus"></i> Add</button>
+        </div>
+
+        <div class="card-panel">
+            @foreach (var c in State.Profile.Contacts)
+            {
+                <div class="list-row">
+                    <div class="row-main">
+                        <div class="row-title">@Name(c)</div>
+                        <div class="row-sub">@("@" + c.Handle)</div>
+                        <div class="chip-row" style="margin-top:6px;">
+                            <label class="chip @(c.Allowed ? "on" : "")">
+                                <input type="checkbox" checked="@c.Allowed" @onchange="e => ToggleAllowed(c, e)" />
+                                @(c.Allowed ? "Allowed" : "Blocked")
+                            </label>
+                            @foreach (var circle in State.Profile.Circles)
+                            {
+                                <label class="chip @(c.Circles.Contains(circle.Name) ? "on" : "")">
+                                    <input type="checkbox" checked="@c.Circles.Contains(circle.Name)" @onchange="e => ToggleCircle(c, circle.Name, e)" />
+                                    @circle.Name
+                                </label>
+                            }
+                        </div>
+                    </div>
+                    <div class="row-actions">
+                        <button class="icon-btn" title="Remove" @onclick="() => Remove(c)"><i class="bi bi-trash"></i></button>
+                    </div>
+                </div>
+            }
+            @if (State.Profile.Contacts.Count == 0)
+            {
+                <div class="empty">No contacts yet. Add someone by their handle above.</div>
+            }
+        </div>
+
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-diagram-3"></i> Circles</h2>
+            <span class="muted">group contacts &amp; control approval per group</span>
+        </div>
+
+        <div class="add-row">
+            <input @bind="newCircle" @onkeydown="OnCircleKey" placeholder="New circle name…" aria-label="New circle name" />
+            <button class="primary" @onclick="AddCircle" disabled="@string.IsNullOrWhiteSpace(newCircle)"><i class="bi bi-plus-lg"></i> Add circle</button>
+        </div>
+
+        <div class="card-panel">
+            @foreach (var circle in State.Profile.Circles)
+            {
+                <div class="list-row">
+                    <div class="row-main">
+                        @if (editingCircle == circle.Name)
+                        {
+                            <input @bind="editCircleName" style="max-width:220px;" aria-label="Circle name" />
+                        }
+                        else
+                        {
+                            <div class="row-title">@circle.Name</div>
+                            <div class="row-sub">@(circle.RequireApproval ? "you approve replies to this circle" : "auto-replies to this circle")</div>
+                        }
+                    </div>
+                    <label class="switch" title="Require approval"><input type="checkbox" checked="@circle.RequireApproval" @onchange="e => ToggleApproval(circle, e)" /></label>
+                    <div class="row-actions">
+                        @if (editingCircle == circle.Name)
+                        {
+                            <button class="icon-btn" title="Save" @onclick="() => SaveCircle(circle)"><i class="bi bi-check-lg"></i></button>
+                            <button class="icon-btn" title="Cancel" @onclick="() => editingCircle = null"><i class="bi bi-x-lg"></i></button>
+                        }
+                        else
+                        {
+                            <button class="icon-btn" title="Rename" @onclick="() => BeginEditCircle(circle)"><i class="bi bi-pencil"></i></button>
+                            <button class="icon-btn" title="Delete" @onclick="() => DeleteCircle(circle)"><i class="bi bi-trash"></i></button>
+                        }
+                    </div>
+                </div>
+            }
+            @if (State.Profile.Circles.Count == 0)
+            {
+                <div class="empty">No circles yet. Create one above to group contacts and set approval per group.</div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    string handle = "";
+    string newCircle = "";
+    string? editingCircle;
+    string editCircleName = "";
+
+    protected override void OnInitialized() => State.Changed += Refresh;
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    string Name(Contact c) => string.IsNullOrWhiteSpace(c.DisplayName) ? c.Handle : c.DisplayName!;
+
+    void OnAddKey(KeyboardEventArgs e) { if (e.Key == "Enter") Add(); }
+    void OnCircleKey(KeyboardEventArgs e) { if (e.Key == "Enter") AddCircle(); }
+
+    void Add()
+    {
+        if (string.IsNullOrWhiteSpace(handle)) return;
+        var norm = AppState.Norm(handle);
+        State.Mutate(p =>
+        {
+            if (!p.Contacts.Any(c => c.Handle == norm))
+                p.Contacts.Add(new Contact { Handle = norm });
+        });
+        handle = "";
+    }
+
+    void ToggleAllowed(Contact c, ChangeEventArgs e)
+        => State.Mutate(_ => c.Allowed = (bool)(e.Value ?? false));
+
+    void ToggleCircle(Contact c, string circle, ChangeEventArgs e)
+        => State.Mutate(_ =>
+        {
+            if ((bool)(e.Value ?? false)) { if (!c.Circles.Contains(circle)) c.Circles.Add(circle); }
+            else c.Circles.Remove(circle);
+        });
+
+    void Remove(Contact c) => State.Mutate(p => p.Contacts.Remove(c));
+
+    void AddCircle()
+    {
+        var n = newCircle.Trim();
+        if (string.IsNullOrWhiteSpace(n)) return;
+        State.Mutate(p => { if (!p.Circles.Any(x => x.Name.Equals(n, StringComparison.OrdinalIgnoreCase))) p.Circles.Add(new Circle { Name = n }); });
+        newCircle = "";
+    }
+
+    void ToggleApproval(Circle circle, ChangeEventArgs e)
+        => State.Mutate(_ => circle.RequireApproval = (bool)(e.Value ?? false));
+
+    void BeginEditCircle(Circle circle) { editingCircle = circle.Name; editCircleName = circle.Name; }
+
+    void SaveCircle(Circle circle)
+    {
+        var newName = editCircleName.Trim();
+        if (string.IsNullOrWhiteSpace(newName)) { editingCircle = null; return; }
+        var old = circle.Name;
+        State.Mutate(p =>
+        {
+            circle.Name = newName;
+            // cascade rename into contacts and visibility tags
+            foreach (var c in p.Contacts)
+            {
+                var i = c.Circles.IndexOf(old);
+                if (i >= 0) c.Circles[i] = newName;
+            }
+            foreach (var k in p.Knowledge)
+                if (k.Visibility == $"shared:{old}") k.Visibility = $"shared:{newName}";
+            foreach (var s in p.Skills)
+                if (s.Visibility == $"shared:{old}") s.Visibility = $"shared:{newName}";
+        });
+        editingCircle = null;
+    }
+
+    void DeleteCircle(Circle circle)
+    {
+        State.Mutate(p =>
+        {
+            p.Circles.Remove(circle);
+            // cascade cleanup: remove from contacts, downgrade shared items to private
+            foreach (var c in p.Contacts) c.Circles.Remove(circle.Name);
+            foreach (var k in p.Knowledge)
+                if (k.Visibility == $"shared:{circle.Name}") k.Visibility = "private";
+            foreach (var s in p.Skills)
+                if (s.Visibility == $"shared:{circle.Name}") s.Visibility = "private";
+        });
+    }
+
+    public void Dispose() => State.Changed -= Refresh;
+}

@@ -1,0 +1,98 @@
+﻿@inherits LayoutComponentBase
+@using Mesh.App.Domain
+@inject AppState State
+@inject MeshClient Mesh
+@inject MsalAuthService Msal
+@inject ModelSetupService Setup
+@inject FoundryLocalService Foundry
+@implements IDisposable
+
+@if (!State.IsOnboarded)
+{
+    <Onboarding OnDone="Refresh" />
+}
+else
+{
+    <div class="page">
+        <div class="scrim @(navOpen ? "show" : "")" @onclick="() => navOpen = false"></div>
+        <div class="sidebar @(navOpen ? "open" : "")">
+            <NavMenu OnNavigate="CloseNav" />
+            <div class="me">
+                <div class="me-name">@DisplayName</div>
+                <div class="me-status @(Mesh.Connected ? "on" : "off")">
+                    <i class="bi @(Mesh.Connected ? "bi-check-circle-fill" : "bi-circle")"></i>
+                    @(Mesh.Connected ? "connected" : "offline")
+                </div>
+            </div>
+        </div>
+        <main>
+            <div class="pane">
+                <div class="mobile-bar">
+                    <button class="hamburger" @onclick="() => navOpen = !navOpen" aria-label="Toggle navigation menu" title="Menu"><i class="bi bi-list"></i></button>
+                    <span class="mobile-title"><i class="bi bi-hexagon-fill" style="color:var(--brand)"></i> Mesh</span>
+                </div>
+                @if (Setup.HasBanner)
+                {
+                    <div class="global-banner @(Setup.Running ? "running" : Setup.Success == true ? "ok" : "err")">
+                        @if (Setup.Running)
+                        {
+                            <span class="spinner"></span>
+                            <span class="gb-text">Model setup: @(Setup.Status ?? "working…")</span>
+                        }
+                        else
+                        {
+                            <i class="bi @(Setup.Success == true ? "bi-check-circle" : "bi-exclamation-triangle")"></i>
+                            <span class="gb-text">@Setup.Status</span>
+                        }
+                        @if (!Setup.Running)
+                        {
+                            <button class="gb-close" @onclick="Setup.Dismiss" title="Dismiss"><i class="bi bi-x-lg"></i></button>
+                        }
+                        else
+                        {
+                            <a class="gb-link" href="settings">View</a>
+                        }
+                    </div>
+                }
+                <div class="content">
+                    @Body
+                </div>
+            </div>
+        </main>
+    </div>
+}
+
+@code {
+    bool navOpen;
+
+    string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
+        ? State.Profile.Handle : State.Profile.DisplayName;
+
+    void CloseNav() => navOpen = false;
+
+    protected override async Task OnInitializedAsync()
+    {
+        State.Changed += Refresh;
+        Mesh.StateChanged += Refresh;
+        Setup.Changed += Refresh;
+        if (State.IsOnboarded)
+        {
+            await Msal.InitializeAsync();
+            await Mesh.RegisterAsync();
+            await Mesh.ConnectAsync();
+        }
+        // Preload the on-device model catalog once, in the background, so Settings
+        // shows it instantly without reloading (and without resetting the selection).
+        if (State.Profile.Model.Provider == ModelProvider.FoundryLocal)
+            _ = Task.Run(() => Foundry.PreloadModelsAsync());
+    }
+
+    private void Refresh() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        Mesh.StateChanged -= Refresh;
+        Setup.Changed -= Refresh;
+    }
+}

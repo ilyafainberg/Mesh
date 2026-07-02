@@ -1,0 +1,130 @@
+﻿@page "/skills"
+@inject AppState State
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+    <div class="pane-head" style="padding-left:0;padding-right:0;">
+        <h2><i class="bi bi-lightning-charge"></i> Skills</h2>
+        <span class="muted">capabilities your agent can offer, exposed to circles just like knowledge</span>
+    </div>
+
+    <div class="card-panel">
+        <div class="field">
+            <label>Skill name</label>
+            <input class="full" @bind="name" placeholder="e.g. Book a 30-min intro call" />
+        </div>
+        <div class="field">
+            <label>Description</label>
+            <input class="full" @bind="description" placeholder="Short description of what it does" />
+        </div>
+        <div class="field">
+            <label>Instructions <span class="muted">(how the agent performs it)</span></label>
+            <textarea class="full" rows="3" @bind="instructions" placeholder="e.g. Offer two time slots and confirm the attendee's email…"></textarea>
+        </div>
+        <div class="field">
+            <label>Who can use it</label>
+            <select class="full" @bind="visibility">
+                <option value="private">Private (owner only)</option>
+                <option value="public">Public (any allowed contact)</option>
+                @foreach (var c in State.Profile.Circles)
+                {
+                    <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                }
+            </select>
+        </div>
+        <button class="primary" @onclick="Add" disabled="@string.IsNullOrWhiteSpace(name)">
+            <i class="bi bi-plus-lg"></i> Add skill
+        </button>
+    </div>
+
+    <div class="kn-list">
+        @foreach (var s in State.Profile.Skills)
+        {
+            <div class="kn-card">
+                @if (editingId == s.Id)
+                {
+                    <input class="full" @bind="editName" />
+                    <input class="full" @bind="editDescription" />
+                    <textarea class="full" rows="3" @bind="editInstructions"></textarea>
+                    <div class="kn-row">
+                        <select @bind="editVisibility">
+                            <option value="private">Private</option>
+                            <option value="public">Public</option>
+                            @foreach (var c in State.Profile.Circles)
+                            {
+                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                            }
+                        </select>
+                        <button class="primary" @onclick="() => SaveEdit(s)"><i class="bi bi-check-lg"></i> Save</button>
+                        <button class="ghost" @onclick="() => editingId = null"><i class="bi bi-x-lg"></i> Cancel</button>
+                    </div>
+                }
+                else
+                {
+                    <div class="kn-head">
+                        <label class="switch" title="Enabled">
+                            <input type="checkbox" checked="@s.Enabled" @onchange="e => Toggle(s, e)" />
+                        </label>
+                        <b>@s.Name</b>
+                        <span class="vis @VisClass(s.Visibility)">@s.Visibility</span>
+                        <span class="spacer"></span>
+                        <button class="icon-btn" title="Edit" @onclick="() => BeginEdit(s)"><i class="bi bi-pencil"></i></button>
+                        <button class="icon-btn" title="Delete" @onclick="() => Remove(s)"><i class="bi bi-trash"></i></button>
+                    </div>
+                    <div class="kn-body">
+                        @s.Description
+                        @if (!string.IsNullOrWhiteSpace(s.Instructions)) { <div class="muted small">How: @s.Instructions</div> }
+                    </div>
+                }
+            </div>
+        }
+        @if (State.Profile.Skills.Count == 0)
+        {
+            <div class="empty">No skills yet. Add one and share it with a circle so guest agents can request it.</div>
+        }
+    </div>
+    </div>
+</div>
+
+@code {
+    string name = "", description = "", instructions = "", visibility = "private";
+    string? editingId;
+    string editName = "", editDescription = "", editInstructions = "", editVisibility = "private";
+
+    protected override void OnInitialized() => State.Changed += Refresh;
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    void Add()
+    {
+        if (string.IsNullOrWhiteSpace(name)) return;
+        State.Mutate(p => p.Skills.Add(new Skill
+        {
+            Name = name.Trim(), Description = description.Trim(), Instructions = instructions.Trim(), Visibility = visibility
+        }));
+        name = ""; description = ""; instructions = ""; visibility = "private";
+    }
+
+    void BeginEdit(Skill s)
+    {
+        editingId = s.Id; editName = s.Name; editDescription = s.Description;
+        editInstructions = s.Instructions; editVisibility = s.Visibility;
+    }
+
+    void SaveEdit(Skill s)
+    {
+        State.Mutate(_ =>
+        {
+            s.Name = editName.Trim(); s.Description = editDescription.Trim();
+            s.Instructions = editInstructions.Trim(); s.Visibility = editVisibility;
+        });
+        editingId = null;
+    }
+
+    void Toggle(Skill s, ChangeEventArgs e) => State.Mutate(_ => s.Enabled = (bool)(e.Value ?? false));
+    void Remove(Skill s) => State.Mutate(p => p.Skills.Remove(s));
+
+    static string VisClass(string v) => v == "private" ? "priv" : v == "public" ? "pub" : "shared";
+
+    public void Dispose() => State.Changed -= Refresh;
+}

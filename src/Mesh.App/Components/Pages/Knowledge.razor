@@ -1,0 +1,702 @@
+﻿@page "/knowledge"
+@inject AppState State
+@inject FileImporter Files
+@inject MsalAuthService Msal
+@inject GoogleAuthService Google
+@inject ConnectorAuthService Connectors
+@inject SourceBrowser Browser
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+    <div class="pane-head" style="padding-left:0;padding-right:0;">
+        <h2><i class="bi bi-journal-text"></i> Knowledge</h2>
+        <span class="muted">private stays with you; shared/public is exposed to guest agents</span>
+    </div>
+
+    <div class="tabs">
+        <button class="tab @(tab == "sources" ? "on" : "")" @onclick='() => tab = "sources"'>Connect a source</button>
+        <button class="tab @(tab == "file" ? "on" : "")" @onclick='() => tab = "file"'>Add a document</button>
+        <button class="tab @(tab == "manual" ? "on" : "")" @onclick='() => tab = "manual"'>Write</button>
+    </div>
+
+    @if (tab == "manual")
+    {
+        <div class="card-panel">
+            <input class="full" @bind="title" placeholder="Title (e.g. My public bio)" />
+            <textarea class="full" rows="4" @bind="content" placeholder="Content the agent can use…"></textarea>
+            <div class="kn-row">
+                <select @bind="visibility">
+                    <option value="private">Private (owner only)</option>
+                    <option value="public">Public (any allowed handle)</option>
+                    @foreach (var c in State.Profile.Circles)
+                    {
+                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                    }
+                </select>
+                <button class="primary" @onclick="AddItem" disabled="@string.IsNullOrWhiteSpace(title)">
+                    <i class="bi bi-plus-lg"></i> Add
+                </button>
+            </div>
+        </div>
+    }
+    else if (tab == "file")
+    {
+        <div class="card-panel">
+            <p class="hint">Import a document as static knowledge. The text is extracted and stored so the agent can quote it. Supported: PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), and text files (txt, md, csv, json, html…).</p>
+            <div class="kn-row">
+                <input class="full" @bind="importRef" placeholder="Path to a PDF, Word, Excel, PowerPoint or text file" />
+                <button class="ghost" @onclick="Browse"><i class="bi bi-folder2-open"></i> Browse</button>
+            </div>
+            <div class="kn-row">
+                <select @bind="visibility">
+                    <option value="private">Private</option>
+                    <option value="public">Public</option>
+                    @foreach (var c in State.Profile.Circles)
+                    {
+                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                    }
+                </select>
+                <button class="primary" @onclick="Import" disabled="@(importing || string.IsNullOrWhiteSpace(importRef))">
+                    <i class="bi bi-download"></i> @(importing ? "Importing…" : "Import")
+                </button>
+            </div>
+            @if (importError is not null) { <p class="err">@importError</p> }
+        </div>
+    }
+    else
+    {
+        <div class="card-panel">
+            <p class="hint">
+                Connect an account to give your agent <b>live tools</b> instead of copying data. Nothing is
+                stored: the agent searches your email or Teams on demand, using your own credentials, only
+                when it needs to answer. You choose who else's agent may use each source.
+            </p>
+
+            <div class="add-source">
+                <div class="add-source-label">Add a source</div>
+                <div class="provider-grid">
+                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectMicrosoft(false)">
+                        <i class="bi bi-microsoft"></i>
+                        <span><b>Microsoft 365</b><small>Work Email + Teams + OneDrive</small></span>
+                    </button>
+                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectMicrosoft(true)">
+                        <i class="bi bi-envelope-at"></i>
+                        <span><b>Microsoft account</b><small>Outlook.com + OneDrive</small></span>
+                    </button>
+                    <button class="provider-btn" disabled="@busy" @onclick="ConnectGmail">
+                        <i class="bi bi-google"></i>
+                        <span><b>Google</b><small>Gmail + Drive</small></span>
+                    </button>
+                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectConnector(SourceProvider.Dropbox)">
+                        <i class="bi bi-dropbox"></i>
+                        <span><b>Dropbox</b><small>files</small></span>
+                    </button>
+                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectConnector(SourceProvider.Notion)">
+                        <i class="bi bi-journal-richtext"></i>
+                        <span><b>Notion</b><small>pages + databases</small></span>
+                    </button>
+                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectConnector(SourceProvider.Slack)">
+                        <i class="bi bi-slack"></i>
+                        <span><b>Slack</b><small>messages</small></span>
+                    </button>
+                </div>
+                @if (busy) { <p class="hint"><i class="bi bi-hourglass-split"></i> Opening sign-in…</p> }
+                @if (sourceError is not null) { <p class="err-text">@sourceError</p> }
+                @if (sourceNote is not null)
+                {
+                    <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> @sourceNote</div>
+                }
+            </div>
+
+            @if (State.Profile.Sources.Count > 0)
+            {
+                <div class="src-divider">
+                    <span>Connected sources</span>
+                </div>
+                <div class="src-list">
+                    @foreach (var s in State.Profile.Sources)
+                    {
+                        <div class="src-row">
+                            <div class="src-info">
+                                <i class="bi @ProviderIcon(s.Provider)"></i>
+                                <div class="src-text">
+                                    <b>@ToolRegistry.DisplayName(s.Provider)</b>
+                                    <small class="muted">@s.ConnectedAs</small>
+                                </div>
+                            </div>
+                            <div class="src-controls">
+                                <label class="switch" title="@(s.Enabled ? "Enabled" : "Disabled")">
+                                    <input type="checkbox" checked="@s.Enabled" @onchange="e => ToggleSource(s, e)" />
+                                </label>
+                                <select value="@s.Visibility" @onchange="e => SetVisibility(s, e)">
+                                    <option value="private">Only me</option>
+                                    <option value="public">Public</option>
+                                    @foreach (var c in State.Profile.Circles)
+                                    {
+                                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                                    }
+                                </select>
+                                <button class="icon-btn" title="Disconnect" @onclick="() => Disconnect(s)"><i class="bi bi-trash"></i></button>
+                            </div>
+                        </div>
+
+                        @if (ToolRegistry.SupportsFolders(s.Provider))
+                        {
+                            <div class="folder-grants">
+                                <button class="link-btn" @onclick="() => ToggleFolders(s)">
+                                    <i class="bi @(expandedSource == s.Id ? "bi-chevron-down" : "bi-chevron-right")"></i>
+                                    @(s.Folders.Count == 0
+                                        ? (s.Provider == SourceProvider.Google ? "Share specific labels with a circle" : "Share specific folders with a circle")
+                                        : $"{s.Folders.Count} folder grant{(s.Folders.Count == 1 ? "" : "s")}")
+                                </button>
+
+                                @if (expandedSource == s.Id)
+                                {
+                                    <div class="folder-panel">
+                                        <p class="hint">
+                                            When the whole source is <b>Only me</b>, you can still let a circle's agent search
+                                            just these folders. Each folder is exposed to the circle you pick.
+                                        </p>
+
+                                        @if (s.Folders.Count > 0)
+                                        {
+                                            <div class="grant-list">
+                                                @foreach (var g in s.Folders)
+                                                {
+                                                    <div class="grant-row">
+                                                        <span class="grant-name"><i class="bi bi-folder2"></i> @g.Name</span>
+                                                        <select value="@g.Visibility" @onchange="e => SetFolderVisibility(s, g, e)">
+                                                            <option value="public">Public</option>
+                                                            @foreach (var c in State.Profile.Circles)
+                                                            {
+                                                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                                                            }
+                                                        </select>
+                                                        <button class="icon-btn" title="Remove" @onclick="() => RemoveFolder(s, g)"><i class="bi bi-x-lg"></i></button>
+                                                    </div>
+                                                }
+                                            </div>
+                                        }
+
+                                        <div class="grant-add">
+                                            @if (loadingFolders)
+                                            {
+                                                <span class="hint"><i class="bi bi-hourglass-split"></i> Loading folders…</span>
+                                            }
+                                            else if (folderError is not null)
+                                            {
+                                                <span class="err-text">@folderError</span>
+                                                <button class="ghost" @onclick="() => LoadFolders(s)">Retry</button>
+                                            }
+                                            else
+                                            {
+                                                <select @bind="newFolderId">
+                                                    <option value="">Add a folder…</option>
+                                                    @foreach (var f in availableFolders.Where(f => !s.Folders.Any(g => g.Id == f.Id)))
+                                                    {
+                                                        <option value="@f.Id">@f.Name</option>
+                                                    }
+                                                </select>
+                                                <select @bind="newFolderVis">
+                                                    <option value="public">Public</option>
+                                                    @foreach (var c in State.Profile.Circles)
+                                                    {
+                                                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                                                    }
+                                                </select>
+                                                <button class="primary" @onclick="() => AddFolder(s)" disabled="@string.IsNullOrEmpty(newFolderId)">
+                                                    <i class="bi bi-plus-lg"></i> Add
+                                                </button>
+                                            }
+                                        </div>
+                                    </div>
+                                }
+                            </div>
+                        }
+
+                        @if (ToolRegistry.SupportsDrivePaths(s.Provider))
+                        {
+                            <div class="folder-grants">
+                                <button class="link-btn" @onclick="() => ToggleDrivePaths(s)">
+                                    <i class="bi @(expandedDrive == s.Id ? "bi-chevron-down" : "bi-chevron-right")"></i>
+                                    @(s.DrivePaths.Count == 0
+                                        ? (s.Provider == SourceProvider.Google ? "Share specific Drive folders with a circle" : "Share specific OneDrive folders with a circle")
+                                        : $"{s.DrivePaths.Count} folder grant{(s.DrivePaths.Count == 1 ? "" : "s")}")
+                                </button>
+
+                                @if (expandedDrive == s.Id)
+                                {
+                                    <div class="folder-panel">
+                                        <p class="hint">
+                                            Let a circle's agent search inside specific @(s.Provider == SourceProvider.Google ? "Drive" : "OneDrive") folders,
+                                            even when the whole drive stays <b>Only me</b>. Browse to a folder, then Add it for a circle.
+                                        </p>
+
+                                        @if (s.DrivePaths.Count > 0)
+                                        {
+                                            <div class="grant-list">
+                                                @foreach (var g in s.DrivePaths)
+                                                {
+                                                    <div class="grant-row">
+                                                        <span class="grant-name"><i class="bi bi-folder2"></i> @g.Name</span>
+                                                        <select value="@g.Visibility" @onchange="e => SetDrivePathVisibility(s, g, e)">
+                                                            <option value="public">Public</option>
+                                                            @foreach (var c in State.Profile.Circles)
+                                                            {
+                                                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                                                            }
+                                                        </select>
+                                                        <button class="icon-btn" title="Remove" @onclick="() => RemoveDrivePath(s, g)"><i class="bi bi-x-lg"></i></button>
+                                                    </div>
+                                                }
+                                            </div>
+                                        }
+
+                                        <div class="folder-nav">
+                                            @if (loadingDrive)
+                                            {
+                                                <span class="hint"><i class="bi bi-hourglass-split"></i> Loading folders…</span>
+                                            }
+                                            else if (driveError is not null)
+                                            {
+                                                <span class="err-text">@driveError</span>
+                                                <button class="ghost" @onclick="() => OpenDriveRoot(s)">Retry</button>
+                                            }
+                                            else
+                                            {
+                                                <div class="breadcrumbs">
+                                                    <button class="crumb" @onclick="() => OpenDriveRoot(s)"><i class="bi bi-hdd"></i> @(s.Provider == SourceProvider.Google ? "My Drive" : "OneDrive")</button>
+                                                    @foreach (var (crumb, i) in drivePath.Select((c, i) => (c, i)))
+                                                    {
+                                                        <span class="crumb-sep">/</span>
+                                                        <button class="crumb" @onclick="() => NavigateCrumb(s, i)">@crumb.Name</button>
+                                                    }
+                                                </div>
+                                                <div class="folder-browser">
+                                                    @if (driveFolders.Count == 0)
+                                                    {
+                                                        <div class="empty-mini">No sub-folders here.</div>
+                                                    }
+                                                    @foreach (var f in driveFolders)
+                                                    {
+                                                        <div class="browse-row">
+                                                            <button class="browse-open" @onclick="() => OpenDriveFolder(s, f)" title="Open">
+                                                                <i class="bi bi-folder2"></i> @f.Name
+                                                            </button>
+                                                            <button class="ghost add-here" @onclick="() => AddDrivePath(s, f)"
+                                                                    disabled="@(s.DrivePaths.Any(g => g.Id == f.Id))"
+                                                                    title="Grant this folder to a circle">
+                                                                <i class="bi bi-plus-lg"></i> Add
+                                                            </button>
+                                                        </div>
+                                                    }
+                                                </div>
+                                                @if (currentDriveFolder is not null)
+                                                {
+                                                    <button class="ghost add-current" @onclick="() => AddDrivePath(s, currentDriveFolder!)"
+                                                            disabled="@(s.DrivePaths.Any(g => g.Id == currentDriveFolder!.Id))">
+                                                        <i class="bi bi-plus-lg"></i> Add current folder (@currentDriveFolder.Name)
+                                                    </button>
+                                                }
+                                                <div class="grant-vis-row">
+                                                    <span class="muted">New grants go to:</span>
+                                                    <select @bind="newDriveVis">
+                                                        <option value="public">Public</option>
+                                                        @foreach (var c in State.Profile.Circles)
+                                                        {
+                                                            <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                                                        }
+                                                    </select>
+                                                </div>
+                                            }
+                                        </div>
+                                    </div>
+                                }
+                            </div>
+                        }
+                    }
+                </div>
+            }
+        </div>
+    }
+
+    <div class="kn-list">
+        @foreach (var k in State.Profile.Knowledge)
+        {
+            <div class="kn-card">
+                @if (editingId == k.Id)
+                {
+                    <input class="full" @bind="editTitle" />
+                    <textarea class="full" rows="4" @bind="editContent"></textarea>
+                    <div class="kn-row">
+                        <select @bind="editVisibility">
+                            <option value="private">Private</option>
+                            <option value="public">Public</option>
+                            @foreach (var c in State.Profile.Circles)
+                            {
+                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                            }
+                        </select>
+                        <button class="primary" @onclick="() => SaveEdit(k)"><i class="bi bi-check-lg"></i> Save</button>
+                        <button class="ghost" @onclick="() => editingId = null"><i class="bi bi-x-lg"></i> Cancel</button>
+                    </div>
+                }
+                else
+                {
+                    <div class="kn-head">
+                        <b>@k.Title</b>
+                        <span class="vis @VisClass(k.Visibility)">@k.Visibility</span>
+                        <span class="src"><i class="bi @SourceIcon(k.Source)"></i> @k.Source</span>
+                        <span class="spacer"></span>
+                        <button class="icon-btn" title="Edit" @onclick="() => BeginEdit(k)"><i class="bi bi-pencil"></i></button>
+                        <button class="icon-btn" title="Delete" @onclick="() => Remove(k)"><i class="bi bi-trash"></i></button>
+                    </div>
+                    <div class="kn-body @(expandedItems.Contains(k.Id) ? "expanded" : "")">@k.Content</div>
+                    @if (k.Content.Length > 240)
+                    {
+                        <button class="kn-more" @onclick="() => ToggleExpand(k.Id)">
+                            @(expandedItems.Contains(k.Id) ? "Show less" : "Show more")
+                        </button>
+                    }
+                }
+            </div>
+        }
+        @if (State.Profile.Knowledge.Count == 0)
+        {
+            <div class="empty">No knowledge yet. Add a public bio so guest agents have something to say.</div>
+        }
+    </div>
+    </div>
+</div>
+
+@code {
+    string tab = "sources";
+    string title = "", content = "", visibility = "private";
+
+    string importRef = "";
+    bool importing;
+    string? importError;
+
+    string? editingId;
+    string editTitle = "", editContent = "", editVisibility = "private";
+    bool busy;
+    string? sourceError;
+    string? sourceNote;
+    readonly HashSet<string> expandedItems = new();
+
+    // Folder-grant UI state.
+    string? expandedSource;
+    List<FolderRef> availableFolders = new();
+    bool loadingFolders;
+    string? folderError;
+    string newFolderId = "";
+    string newFolderVis = "public";
+
+    // Drive-path grant UI state (navigable folder browser).
+    string? expandedDrive;
+    List<FolderRef> driveFolders = new();
+    readonly List<FolderRef> drivePath = new(); // breadcrumb trail (each has Id ref + Name)
+    FolderRef? currentDriveFolder;              // the folder we're currently inside (null = root)
+    bool loadingDrive;
+    string? driveError;
+    string newDriveVis = "public";
+
+    void ToggleExpand(string id) { if (!expandedItems.Remove(id)) expandedItems.Add(id); }
+
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+        Msal.Changed += Refresh;
+    }
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    async Task ConnectMicrosoft(bool personal)
+    {
+        sourceError = null;
+        busy = true;
+        try
+        {
+            var scopes = personal ? MsalAuthService.PersonalScopes : MsalAuthService.WorkScopes;
+            var (ok, account, error) = await Msal.SignInInteractiveAsync(scopes);
+            if (!ok || account is null) { sourceError = "Sign-in failed: " + (error ?? "unknown error"); return; }
+
+            var accountId = account.HomeAccountId?.Identifier;
+            if (State.Profile.Sources.Any(s => s.AccountId == accountId && accountId is not null))
+            {
+                sourceError = "That account is already connected.";
+                return;
+            }
+            var provider = MsalAuthService.IsPersonal(account) ? SourceProvider.MicrosoftPersonal : SourceProvider.MicrosoftGraph;
+            State.Mutate(p => p.Sources.Add(new ConnectedSource
+            {
+                Provider = provider,
+                ConnectedAs = account.Username,
+                AccountId = accountId,
+                Visibility = "private"
+            }));
+        }
+        catch (Exception ex) { sourceError = "Sign-in error: " + ex.Message; }
+        finally { busy = false; }
+    }
+
+    async Task ConnectGmail()
+    {
+        sourceError = null;
+        sourceNote = null;
+        busy = true;
+        try
+        {
+            var (ok, email, scopes, error) = await Google.SignInInteractiveAsync();
+            if (!ok || email is null) { sourceError = "Google sign-in failed: " + (error ?? "unknown error"); return; }
+            if (State.Profile.Sources.Any(s => s.Provider == SourceProvider.Google && s.ConnectedAs == email))
+            {
+                sourceError = "That Google account is already connected.";
+                return;
+            }
+            State.Mutate(p => p.Sources.Add(new ConnectedSource
+            {
+                Provider = SourceProvider.Google,
+                ConnectedAs = email,
+                AccountId = email,
+                Visibility = "private"
+            }));
+
+            // Granular consent: the user can approve Gmail but skip Drive (or vice-versa).
+            // Warn now so it doesn't fail silently later when the agent tries to use the source.
+            var hasDrive = scopes.Any(s => s.Contains("drive", StringComparison.OrdinalIgnoreCase));
+            var hasGmail = scopes.Any(s => s.Contains("gmail", StringComparison.OrdinalIgnoreCase));
+            if (!hasDrive && !hasGmail)
+                sourceNote = "Connected, but neither Gmail nor Drive access was granted. Disconnect Google and reconnect, ticking both permissions.";
+            else if (!hasDrive)
+                sourceNote = "Connected, but you didn't grant Google Drive access. To let your agent search Drive, disconnect Google and reconnect, ticking the Drive permission.";
+            else if (!hasGmail)
+                sourceNote = "Connected, but you didn't grant Gmail access. To let your agent search email, disconnect Google and reconnect, ticking the Gmail permission.";
+        }
+        catch (Exception ex) { sourceError = "Google sign-in error: " + ex.Message; }
+        finally { busy = false; }
+    }
+
+    // ---- tier-2 connectors (Dropbox / Notion / Slack) ----
+    async Task ConnectConnector(SourceProvider provider)
+    {
+        sourceError = null;
+        busy = true;
+        try
+        {
+            var (ok, account, error) = await Connectors.SignInAsync(provider);
+            if (!ok || account is null) { sourceError = $"{ToolRegistry.DisplayName(provider)} sign-in failed: " + (error ?? "unknown error"); return; }
+            if (State.Profile.Sources.Any(s => s.Provider == provider && s.ConnectedAs == account))
+            {
+                sourceError = "That account is already connected.";
+                return;
+            }
+            State.Mutate(p => p.Sources.Add(new ConnectedSource
+            {
+                Provider = provider,
+                ConnectedAs = account,
+                AccountId = account,
+                Visibility = "private"
+            }));
+        }
+        catch (Exception ex) { sourceError = "Sign-in error: " + ex.Message; }
+        finally { busy = false; }
+    }
+
+    void ToggleSource(ConnectedSource s, ChangeEventArgs e)
+        => State.Mutate(_ => s.Enabled = e.Value is bool b && b);
+
+    void SetVisibility(ConnectedSource s, ChangeEventArgs e)
+        => State.Mutate(_ => s.Visibility = e.Value?.ToString() ?? "private");
+
+    async Task Disconnect(ConnectedSource s)
+    {
+        if (s.Provider is SourceProvider.MicrosoftGraph or SourceProvider.MicrosoftPersonal)
+            await Msal.RemoveAccountAsync(s.AccountId);
+        State.Mutate(p =>
+        {
+            p.Sources.Remove(s);
+            // Forget persisted tokens for this account.
+            if (s.Provider == SourceProvider.Google && s.ConnectedAs is not null)
+                p.GoogleRefreshTokens.Remove(s.ConnectedAs);
+            if (ConnectorAuthService.Configs.TryGetValue(s.Provider, out var cfg))
+                p.ConnectorTokens.Remove($"{cfg.Key}:{s.ConnectedAs}");
+        });
+    }
+
+    // ---- per-folder grants ----
+    async Task ToggleFolders(ConnectedSource s)
+    {
+        if (expandedSource == s.Id) { expandedSource = null; return; }
+        expandedSource = s.Id;
+        await LoadFolders(s);
+    }
+
+    async Task LoadFolders(ConnectedSource s)
+    {
+        folderError = null;
+        loadingFolders = true;
+        availableFolders = new();
+        newFolderId = "";
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            var (folders, error) = await Browser.ListFoldersAsync(s);
+            if (error is not null) folderError = error;
+            else availableFolders = folders.ToList();
+        }
+        catch (Exception ex) { folderError = ex.Message; }
+        finally { loadingFolders = false; }
+    }
+
+    void AddFolder(ConnectedSource s)
+    {
+        if (string.IsNullOrEmpty(newFolderId)) return;
+        var folder = availableFolders.FirstOrDefault(f => f.Id == newFolderId);
+        if (folder is null) return;
+        State.Mutate(_ => s.Folders.Add(new FolderGrant { Id = folder.Id, Name = folder.Name, Visibility = newFolderVis }));
+        newFolderId = "";
+    }
+
+    void SetFolderVisibility(ConnectedSource s, FolderGrant g, ChangeEventArgs e)
+        => State.Mutate(_ => g.Visibility = e.Value?.ToString() ?? "public");
+
+    void RemoveFolder(ConnectedSource s, FolderGrant g)
+        => State.Mutate(_ => s.Folders.Remove(g));
+
+    // ---- drive-path grants (navigable folder browser) ----
+    async Task ToggleDrivePaths(ConnectedSource s)
+    {
+        if (expandedDrive == s.Id) { expandedDrive = null; return; }
+        expandedDrive = s.Id;
+        await OpenDriveRoot(s);
+    }
+
+    async Task OpenDriveRoot(ConnectedSource s)
+    {
+        drivePath.Clear();
+        currentDriveFolder = null;
+        await LoadDriveChildren(s, null);
+    }
+
+    async Task OpenDriveFolder(ConnectedSource s, FolderRef folder)
+    {
+        drivePath.Add(folder);
+        currentDriveFolder = folder;
+        await LoadDriveChildren(s, folder.Id);
+    }
+
+    async Task NavigateCrumb(ConnectedSource s, int index)
+    {
+        // Navigate back to the crumb at `index` (trim the trail past it).
+        var target = drivePath[index];
+        while (drivePath.Count > index + 1) drivePath.RemoveAt(drivePath.Count - 1);
+        currentDriveFolder = target;
+        await LoadDriveChildren(s, target.Id);
+    }
+
+    async Task LoadDriveChildren(ConnectedSource s, string? parentRef)
+    {
+        driveError = null;
+        loadingDrive = true;
+        driveFolders = new();
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            var (folders, error) = await Browser.ListDriveFoldersAsync(s, parentRef);
+            if (error is not null) driveError = error;
+            else driveFolders = folders.ToList();
+        }
+        catch (Exception ex) { driveError = ex.Message; }
+        finally { loadingDrive = false; }
+    }
+
+    void AddDrivePath(ConnectedSource s, FolderRef folder)
+    {
+        if (s.DrivePaths.Any(g => g.Id == folder.Id)) return;
+        // Store a readable path (breadcrumb trail) as the grant name.
+        var trail = string.Join(" / ", drivePath.TakeWhile(c => c.Id != folder.Id).Select(c => c.Name).Append(folder.Name));
+        var name = drivePath.Any(c => c.Id == folder.Id) ? string.Join(" / ", drivePath.Select(c => c.Name)) : trail;
+        State.Mutate(_ => s.DrivePaths.Add(new FolderGrant { Id = folder.Id, Name = name, Visibility = newDriveVis }));
+    }
+
+    void SetDrivePathVisibility(ConnectedSource s, FolderGrant g, ChangeEventArgs e)
+        => State.Mutate(_ => g.Visibility = e.Value?.ToString() ?? "public");
+
+    void RemoveDrivePath(ConnectedSource s, FolderGrant g)
+        => State.Mutate(_ => s.DrivePaths.Remove(g));
+
+    void AddItem()
+    {
+        if (string.IsNullOrWhiteSpace(title)) return;
+        State.Mutate(p => p.Knowledge.Add(new KnowledgeItem
+        {
+            Title = title.Trim(), Content = content.Trim(), Visibility = visibility, Source = KnowledgeSource.Manual
+        }));
+        title = ""; content = ""; visibility = "private";
+    }
+
+    void BeginEdit(KnowledgeItem k)
+    {
+        editingId = k.Id; editTitle = k.Title; editContent = k.Content; editVisibility = k.Visibility;
+    }
+
+    void SaveEdit(KnowledgeItem k)
+    {
+        State.Mutate(_ =>
+        {
+            k.Title = editTitle.Trim(); k.Content = editContent.Trim(); k.Visibility = editVisibility;
+            k.UpdatedAt = DateTimeOffset.UtcNow;
+        });
+        editingId = null;
+    }
+
+    void Remove(KnowledgeItem k) => State.Mutate(p => p.Knowledge.Remove(k));
+
+    async Task Browse()
+    {
+        try
+        {
+            var result = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
+            if (result is not null) importRef = result.FullPath;
+        }
+        catch { /* picker unavailable */ }
+    }
+
+    async Task Import()
+    {
+        importError = null;
+        importing = true;
+        try
+        {
+            var result = await Files.ImportAsync(importRef, visibility);
+            if (!result.Ok) { importError = result.Error; return; }
+            State.Mutate(p => p.Knowledge.AddRange(result.Items));
+            importRef = "";
+        }
+        finally { importing = false; }
+    }
+
+    static string VisClass(string v) => v == "private" ? "priv" : v == "public" ? "pub" : "shared";
+    static string SourceIcon(KnowledgeSource s) => s switch
+    {
+        KnowledgeSource.File => "bi-file-earmark-text",
+        _ => "bi-pencil-square"
+    };
+    static string ProviderIcon(SourceProvider p) => p switch
+    {
+        SourceProvider.MicrosoftGraph => "bi-microsoft",
+        SourceProvider.MicrosoftPersonal => "bi-envelope-at",
+        SourceProvider.Google => "bi-google",
+        SourceProvider.Dropbox => "bi-dropbox",
+        SourceProvider.Notion => "bi-journal-richtext",
+        SourceProvider.Slack => "bi-slack",
+        _ => "bi-plug"
+    };
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        Msal.Changed -= Refresh;
+    }
+}

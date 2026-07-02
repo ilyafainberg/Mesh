@@ -1,0 +1,156 @@
+﻿@page "/"
+@inject AppState State
+@inject AgentService Agent
+@inject IJSRuntime JS
+@implements IDisposable
+
+<div class="pane">
+    <header class="pane-head">
+        <h2><i class="bi bi-person-badge"></i> Me</h2>
+        <span class="muted">your private space: your agent sees everything you know</span>
+    </header>
+
+    <div class="messages" @ref="scrollEl">
+        <div class="messages-wrap">
+            @if (State.Profile.OwnChat.Count == 0)
+            {
+                <div class="empty">
+                    This is your private assistant. It knows everything in your Knowledge and Skills,
+                    and helps you manage what your public agent shares with others. Ask it anything.
+                </div>
+            }
+            @foreach (var line in State.Profile.OwnChat)
+            {
+                <div class="bubble @(line.Role)">
+                    <MessageContent Text="@line.Text" OnPin="PinWidget" />
+                </div>
+            }
+            @if (busy) { <div class="bubble assistant"><div class="text muted">@(building ? "…building widget" : "…thinking")</div></div> }
+        </div>
+    </div>
+
+    <div class="composer-area">
+        <div class="composer-inner">
+            @if (pinHtml is not null)
+            {
+                <div class="pin-bar">
+                    <i class="bi bi-pin-angle"></i>
+                    <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" />
+                    <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
+                    <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel"><i class="bi bi-x-lg"></i></button>
+                </div>
+            }
+            @if (widgetMode)
+            {
+                <div class="mode-chip">
+                    <i class="bi bi-window-stack"></i> widget
+                    <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget"><i class="bi bi-x"></i></button>
+                    <span class="mode-hint">describe the mini-app you want</span>
+                </div>
+            }
+            else if (ShowPreview)
+            {
+                <div class="composer-preview">
+                    <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
+                    <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
+                </div>
+            }
+            <div class="composer">
+                <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@busy" title="Create a widget (mini-app)">
+                    <i class="bi bi-plus-lg"></i>
+                </button>
+                <input @bind="input" @bind:event="oninput" @onkeydown="OnKey" placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" />
+                <button class="primary send-btn" @onclick="Send" disabled="@(busy || string.IsNullOrWhiteSpace(input))" title="Send">
+                    <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
+                </button>
+            </div>
+            @if (!Agent.IsModelReady)
+            {
+                <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    string input = "";
+    bool busy;
+    bool building;
+    bool widgetMode;
+    string? pinHtml;
+    string pinName = "";
+    ElementReference scrollEl;
+    int lastCount = -1;
+
+    bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
+
+    protected override void OnInitialized() => State.Changed += Refresh;
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Scroll to the newest message whenever the count changes (or first paint).
+        var count = State.Profile.OwnChat.Count + (busy ? 1 : 0);
+        if (firstRender || count != lastCount)
+        {
+            lastCount = count;
+            try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
+        }
+    }
+
+    void ToggleWidget() { widgetMode = !widgetMode; }
+
+    async Task OnKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(input) && !busy) await Send();
+    }
+
+    async Task Send()
+    {
+        if (string.IsNullOrWhiteSpace(input) || busy) return;
+        var text = input;
+        input = "";
+        busy = true;
+        try
+        {
+            if (widgetMode)
+            {
+                building = true;
+                widgetMode = false;
+                var html = await Agent.BuildWidgetAsync(text);
+                State.Mutate(p =>
+                {
+                    p.OwnChat.Add(new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
+                    p.OwnChat.Add(new ChatLine { Role = "assistant", Text = html });
+                });
+            }
+            else
+            {
+                await Agent.AskAsOwnerAsync(text);
+            }
+        }
+        catch (Exception ex) { State.Mutate(p => p.OwnChat.Add(new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" })); }
+        finally { busy = false; building = false; }
+    }
+
+    void PinWidget(string html)
+    {
+        pinHtml = html;
+        pinName = "";
+    }
+
+    void OnPinKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(pinName)) ConfirmPin();
+    }
+
+    void ConfirmPin()
+    {
+        if (pinHtml is null || string.IsNullOrWhiteSpace(pinName)) return;
+        State.Mutate(p => p.Widgets.Add(new Widget { Name = pinName.Trim(), Html = pinHtml!, Visibility = "private" }));
+        pinHtml = null;
+        pinName = "";
+    }
+
+    public void Dispose() => State.Changed -= Refresh;
+}

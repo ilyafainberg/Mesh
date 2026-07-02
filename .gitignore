@@ -1,0 +1,21 @@
+## .NET build output
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+## Rider/VS
+.vs/
+.idea/
+*.user
+
+## MAUI / platform
+*.binlog
+
+## Local secrets and Azure name scratch
+_deploy/azure-names.txt
+appsettings.*.local.json
+
+## OS
+Thumbs.db
+.DS_Store

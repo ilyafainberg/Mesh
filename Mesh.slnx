@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Mesh.App/Mesh.App.csproj" />
+    <Project Path="src/Mesh.Relay/Mesh.Relay.csproj" />
+    <Project Path="src/Mesh.Shared/Mesh.Shared.csproj" />
+  </Folder>
+</Solution>

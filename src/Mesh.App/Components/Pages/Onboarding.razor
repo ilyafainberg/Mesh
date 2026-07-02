@@ -1,0 +1,276 @@
+@inject AppState State
+@inject MeshClient Mesh
+
+<div class="onboard">
+    <div class="card">
+        <h1><i class="bi bi-hexagon-fill"></i> Mesh</h1>
+        <p class="sub">Give your agent a handle. Other people's agents can talk to it, you decide who.</p>
+
+        @if (step == 0)
+        {
+            @if (State.HasSavedAccounts)
+            {
+                <div class="account-picker">
+                    <div class="picker-label">Switch to a saved identity</div>
+                    @foreach (var a in State.Accounts)
+                    {
+                        <button class="account-pick" disabled="@Working" @onclick="() => SwitchTo(a)">
+                            <i class="bi bi-person-circle"></i>
+                            <span class="pick-text">
+                                <b>@("@")@a.Handle</b>
+                                @if (!string.IsNullOrWhiteSpace(a.DisplayName) && a.DisplayName != a.Handle)
+                                {
+                                    <small>@a.DisplayName</small>
+                                }
+                            </span>
+                            <i class="bi bi-box-arrow-in-right"></i>
+                        </button>
+                    }
+                    <div class="picker-or">or add another</div>
+                </div>
+            }
+            <div class="onboard-choice">
+                <button class="choice-card" @onclick="ChooseNew">
+                    <i class="bi bi-person-plus"></i>
+                    <span class="ch-title">Create a new identity</span>
+                    <span class="ch-sub">Pick a fresh handle for your agent.</span>
+                </button>
+                <button class="choice-card" @onclick="ChooseLink">
+                    <i class="bi bi-qr-code-scan"></i>
+                    <span class="ch-title">Link an existing device</span>
+                    <span class="ch-sub">Already have Mesh elsewhere? Join the same handle with a code.</span>
+                </button>
+            </div>
+            @if (error is not null) { <p class="err">@error</p> }
+        }
+        else if (step == 1)
+        {
+            <label>Pick your handle</label>
+            <div class="handle-row">
+                <span>@@</span>
+                <input @bind="handle" @bind:event="oninput" placeholder="yourname" />
+            </div>
+            <label>Display name (optional)</label>
+            <input class="full" @bind="displayName" placeholder="Your Name" />
+            <button class="primary" disabled="@(!ValidHandle)" @onclick="NextFromHandle">Continue</button>
+            <button class="ghost" @onclick="() => step = 0">Back</button>
+            <p class="hint">A device identity key is generated locally and never leaves this device.</p>
+        }
+        else if (step == 3) // link an existing device
+        {
+            <label>Relay URL</label>
+            <input class="full" @bind="relayUrl" placeholder="https://mesh-relay...azurecontainerapps.io" />
+            <label>Handle to join</label>
+            <div class="handle-row">
+                <span>@@</span>
+                <input @bind="handle" @bind:event="oninput" placeholder="yourname" />
+            </div>
+            <label>Link code <span class="muted">(from your other device → Settings → Link a device)</span></label>
+            <input class="full" @bind="linkCode" placeholder="paste code" />
+            <button class="primary" disabled="@(Working || !ValidLink)" @onclick="RedeemLink">
+                @(Working ? "Linking..." : "Link this device")
+            </button>
+            <button class="ghost" @onclick="() => step = 0">Back</button>
+            @if (error is not null) { <p class="err">@error</p> }
+            <p class="hint">This device gets its own key, authorized under @("@")@handle. Nothing is copied off your other device.</p>
+        }
+        else if (step == 2)
+        {
+            <label>Connect a model</label>
+            <button class="primary full" disabled="@Working" @onclick="StartFree">@(Working && provider == "MeshHosted" ? "Setting up..." : "Start free")</button>
+            <p class="hint">Runs on a shared Mesh model, no API key needed. You can switch to your own model anytime in Settings.</p>
+            <p class="hint">Prefer to stay fully on your machine? Foundry Local runs a free model on-device (pick it under "Use my own model" below).</p>
+
+            <button class="ghost" @onclick="() => showAdvanced = !showAdvanced">@(showAdvanced ? "Hide advanced options" : "Use my own model key")</button>
+
+            @if (showAdvanced)
+            {
+                <div class="advanced">
+                    <label>Connect a model <span class="muted">(runs with your key, on your device)</span></label>
+                    <select class="full" @bind="provider">
+                        <option value="Anthropic">Anthropic (Claude)</option>
+                        <option value="OpenAI">OpenAI</option>
+                        <option value="Gemini">Google Gemini</option>
+                        <option value="Grok">Grok (xAI)</option>
+                        <option value="Groq">Groq (fast inference)</option>
+                        <option value="FoundryLocal">Foundry Local (free, on-device, desktop)</option>
+                    </select>
+
+                    @if (provider == "FoundryLocal")
+                    {
+                        <p class="hint" style="margin-top:12px;">Runs locally, no key, no cost. Mesh starts Foundry Local and picks up your installed model automatically. Make sure Foundry Local is installed with a model pulled.</p>
+                    }
+                    else
+                    {
+                        <label>Model</label>
+                        <input class="full" @bind="model" placeholder="@ModelPlaceholder" />
+
+                        @if (provider == "OpenAI")
+                        {
+                            <label>Endpoint <span class="muted">(optional)</span></label>
+                            <input class="full" @bind="endpoint" placeholder="https://api.openai.com" />
+                        }
+
+                        <label>API key</label>
+                        <input class="full" type="password" @bind="apiKey" placeholder="paste key" />
+                    }
+
+                    <button class="primary" disabled="@Working" @onclick="Finish">@(Working && provider != "MeshHosted" ? "Setting up..." : "Start using Mesh")</button>
+                </div>
+            }
+
+            <button class="ghost" @onclick="BackFromModel">Back</button>
+            @if (error is not null) { <p class="err">@error</p> }
+        }
+    </div>
+</div>
+
+@code {
+    [Parameter] public EventCallback OnDone { get; set; }
+
+    int step = 0;
+    bool linkMode;
+    string handle = "";
+    string displayName = "";
+    string relayUrl = "";
+    string linkCode = "";
+    string provider = "Anthropic";
+    string model = "claude-3-5-sonnet-20241022";
+    string endpoint = "";
+    string apiKey = "";
+    bool Working;
+    bool showAdvanced;
+    string? error;
+
+    protected override void OnInitialized()
+        => relayUrl = string.IsNullOrWhiteSpace(State.Profile.RelayUrl) ? "" : State.Profile.RelayUrl;
+
+    bool ValidHandle => handle.Trim().Length >= 2 && handle.Trim().All(c => char.IsLetterOrDigit(c) || c is '_' or '-');
+    bool ValidLink => ValidHandle && !string.IsNullOrWhiteSpace(relayUrl) && linkCode.Trim().Length >= 6;
+
+    string ModelPlaceholder => provider switch
+    {
+        "Anthropic" => "claude-sonnet-4-6",
+        "Gemini" => "gemini-1.5-flash",
+        "Grok" => "grok-2-latest",
+        "Groq" => "llama-3.3-70b-versatile",
+        _ => "gpt-4o-mini"
+    };
+
+    void ChooseNew() { linkMode = false; step = 1; }
+    void ChooseLink() { linkMode = true; step = 3; }
+
+    async Task SwitchTo(AccountRef a)
+    {
+        error = null;
+        Working = true;
+        try
+        {
+            await Mesh.DisconnectAsync();
+            if (State.SwitchAccount(a.Id))
+            {
+                await Mesh.RegisterAsync();
+                await Mesh.ConnectAsync();
+                await OnDone.InvokeAsync();
+            }
+            else { error = "That identity could not be loaded."; }
+        }
+        catch (Exception ex) { error = ex.Message; }
+        finally { Working = false; }
+    }
+
+    void NextFromHandle()
+    {
+        model = ModelPlaceholder;
+        step = 2;
+    }
+
+    void BackFromModel() => step = linkMode ? 3 : 1;
+
+    async Task StartFree()
+    {
+        provider = "MeshHosted";
+        model = State.Profile.HostedModelName;
+        apiKey = "";
+        endpoint = "";
+        await Finish();
+    }
+
+    async Task RedeemLink()
+    {
+        error = null;
+        Working = true;
+        try
+        {
+            TryParseLinkUri(); // allow pasting the whole mesh://link?... payload into any field
+            // This device needs its own keypair before it can prove key possession to the relay.
+            if (string.IsNullOrWhiteSpace(State.Profile.PrivateKey))
+            {
+                var (priv, pub) = IdentityService.GenerateKeyPair();
+                State.Mutate(p => { p.PrivateKey = priv; p.PublicKey = pub; });
+            }
+            var (ok, err) = await Mesh.RedeemLinkAsync(relayUrl.Trim(), handle.Trim(), linkCode.Trim());
+            if (!ok) { error = err ?? "Linking failed."; return; }
+            model = ModelPlaceholder;
+            step = 2; // now configure a model on this device
+        }
+        catch (Exception ex) { error = ex.Message; }
+        finally { Working = false; }
+    }
+
+    // If the user pasted the full QR payload (mesh://link?relay=...&handle=...&code=...) into
+    // the code box, split it out into the individual fields.
+    void TryParseLinkUri()
+    {
+        var candidate = linkCode.Trim();
+        if (!candidate.StartsWith("mesh://link", StringComparison.OrdinalIgnoreCase)) return;
+        var q = candidate.Contains('?') ? candidate[(candidate.IndexOf('?') + 1)..] : "";
+        foreach (var pair in q.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var i = pair.IndexOf('=');
+            if (i < 0) continue;
+            var key = pair[..i];
+            var val = Uri.UnescapeDataString(pair[(i + 1)..]);
+            if (string.IsNullOrWhiteSpace(val)) continue;
+            switch (key)
+            {
+                case "relay": relayUrl = val; break;
+                case "handle": handle = val; break;
+                case "code": linkCode = val; break;
+            }
+        }
+    }
+
+    async Task Finish()
+    {
+        error = null;
+        Working = true;
+        try
+        {
+            var mdl = string.IsNullOrWhiteSpace(model) ? ModelPlaceholder : model.Trim();
+            State.Mutate(p =>
+            {
+                if (!linkMode)
+                {
+                    var (priv, pub) = IdentityService.GenerateKeyPair();
+                    p.Handle = AppState.Norm(handle);
+                    p.DisplayName = string.IsNullOrWhiteSpace(displayName) ? handle.Trim() : displayName.Trim();
+                    p.PrivateKey = priv;
+                    p.PublicKey = pub;
+                }
+                p.Model = new ModelConfig
+                {
+                    Provider = Enum.Parse<ModelProvider>(provider),
+                    Model = mdl,
+                    ApiKey = apiKey.Trim(),
+                    Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim()
+                };
+            });
+            if (!linkMode) await Mesh.RegisterAsync(); // link mode already redeemed (registered) on the relay
+            await Mesh.ConnectAsync();
+            await OnDone.InvokeAsync();
+        }
+        catch (Exception ex) { error = ex.Message; }
+        finally { Working = false; }
+    }
+}

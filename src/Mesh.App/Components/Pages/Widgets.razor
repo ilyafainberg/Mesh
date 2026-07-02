@@ -1,0 +1,101 @@
+﻿@page "/widgets"
+@inject AppState State
+@inject AgentService Agent
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-window-stack"></i> Widgets</h2>
+            <span class="muted">reusable mini-apps · your agent can send shared ones to allowed contacts</span>
+        </div>
+
+        <div class="card-panel">
+            <div class="kn-row">
+                <input class="full" @bind="desc" @onkeydown="OnKey" placeholder="Describe a new widget (e.g. a tip calculator)…" disabled="@busy" />
+                <button class="primary" @onclick="Build" disabled="@(busy || string.IsNullOrWhiteSpace(desc))">
+                    <i class="bi bi-magic"></i> @(busy ? "Building…" : "Build")
+                </button>
+            </div>
+            @if (draftHtml is not null)
+            {
+                <div class="app-frame"><iframe sandbox="allow-scripts allow-forms allow-modals" srcdoc="@draftHtml" referrerpolicy="no-referrer"></iframe></div>
+                <div class="kn-row">
+                    <input class="full" @bind="draftName" placeholder="Name this widget…" />
+                    <button class="primary" @onclick="SaveDraft" disabled="@string.IsNullOrWhiteSpace(draftName)"><i class="bi bi-pin-angle"></i> Pin</button>
+                    <button class="ghost" @onclick="() => draftHtml = null"><i class="bi bi-x-lg"></i> Discard</button>
+                </div>
+            }
+            @if (error is not null) { <p class="err">@error</p> }
+        </div>
+
+        @foreach (var w in State.Profile.Widgets)
+        {
+            <div class="widget-card">
+                <div class="widget-head">
+                    <input class="widget-name" value="@w.Name" @onchange="e => Rename(w, e)" aria-label="Widget name" />
+                    <select value="@w.Visibility" @onchange="e => SetVisibility(w, e)" title="Who your agent may send this to">
+                        <option value="private">Only me</option>
+                        <option value="public">Public</option>
+                        @foreach (var c in State.Profile.Circles)
+                        {
+                            <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                        }
+                    </select>
+                    <button class="icon-btn" title="Delete" @onclick="() => Remove(w)"><i class="bi bi-trash"></i></button>
+                </div>
+                <div class="app-frame"><iframe sandbox="allow-scripts allow-forms allow-modals" srcdoc="@w.Html" referrerpolicy="no-referrer"></iframe></div>
+            </div>
+        }
+        @if (State.Profile.Widgets.Count == 0)
+        {
+            <div class="empty">No widgets yet. Build one above, or tap the + in Me / Messages and pin the result.</div>
+        }
+    </div>
+</div>
+
+@code {
+    string desc = "";
+    bool busy;
+    string? error;
+    string? draftHtml;
+    string draftName = "";
+
+    protected override void OnInitialized() => State.Changed += Refresh;
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    async Task OnKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(desc) && !busy) await Build();
+    }
+
+    async Task Build()
+    {
+        if (string.IsNullOrWhiteSpace(desc) || busy) return;
+        error = null;
+        busy = true;
+        try
+        {
+            var reply = await Agent.BuildWidgetAsync(desc);
+            var seg = Markdown.Parse(reply).FirstOrDefault(s => s.IsApp);
+            if (seg is null) { error = "The model didn't return a widget. Try rephrasing."; return; }
+            draftHtml = seg.Content;
+            draftName = desc.Length > 40 ? desc[..40] : desc;
+        }
+        catch (Exception ex) { error = ex.Message; }
+        finally { busy = false; }
+    }
+
+    void SaveDraft()
+    {
+        if (draftHtml is null || string.IsNullOrWhiteSpace(draftName)) return;
+        State.Mutate(p => p.Widgets.Add(new Widget { Name = draftName.Trim(), Prompt = desc, Html = draftHtml!, Visibility = "private" }));
+        draftHtml = null; draftName = ""; desc = "";
+    }
+
+    void Rename(Widget w, ChangeEventArgs e) => State.Mutate(_ => w.Name = e.Value?.ToString()?.Trim() ?? w.Name);
+    void SetVisibility(Widget w, ChangeEventArgs e) => State.Mutate(_ => w.Visibility = e.Value?.ToString() ?? "private");
+    void Remove(Widget w) => State.Mutate(p => p.Widgets.Remove(w));
+
+    public void Dispose() => State.Changed -= Refresh;
+}
