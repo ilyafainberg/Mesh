@@ -217,7 +217,10 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
 
     var apiKey = Config(app.Configuration, "MODEL_API_KEY", "Model:ApiKey");
     var endpoint = Config(app.Configuration, "MODEL_ENDPOINT", "Model:Endpoint");
-    if (string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(endpoint))
+    var kind = (Config(app.Configuration, "MODEL_KIND", "Model:Kind") ?? "azure").ToLowerInvariant();
+    // Every provider needs a key. Azure and OpenAI-compatible providers also need an endpoint;
+    // Gemini defaults to Google's public endpoint, so an endpoint is optional there.
+    if (string.IsNullOrWhiteSpace(apiKey) || (kind != "gemini" && string.IsNullOrWhiteSpace(endpoint)))
         return Results.Json(new { error = "hosted model not configured" }, statusCode: StatusCodes.Status503ServiceUnavailable);
 
     // Per-handle daily quota.
@@ -229,33 +232,57 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
     if (dailyLimit > 0 && usage.count > dailyLimit)
         return Results.Json(new { error = "daily free-model limit reached" }, statusCode: StatusCodes.Status429TooManyRequests);
 
-    // Build an OpenAI-style chat payload. Supports Azure OpenAI (api-key header + deployment URL)
-    // and OpenAI-compatible endpoints (Bearer + /v1/chat/completions), selected by Model:Kind.
-    var kind = (Config(app.Configuration, "MODEL_KIND", "Model:Kind") ?? "azure").ToLowerInvariant();
     var model = Config(app.Configuration, "MODEL_NAME", "Model:Deployment")
-                ?? Config(app.Configuration, "MODEL_NAME2", "Model:Model") ?? "gpt-4o-mini";
-
-    var messages = new List<object> { new { role = "system", content = req.SystemPrompt } };
-    messages.AddRange(req.Messages.Select(m => (object)new { role = m.Role == "assistant" ? "assistant" : "user", content = m.Content }));
-
-    string url;
-    using var upstream = new HttpRequestMessage(HttpMethod.Post, (Uri?)null);
-    if (kind == "azure")
-    {
-        var apiVersion = Config(app.Configuration, "MODEL_API_VERSION", "Model:ApiVersion") ?? "2024-08-01-preview";
-        url = $"{endpoint.TrimEnd('/')}/openai/deployments/{model}/chat/completions?api-version={apiVersion}";
-        upstream.Headers.TryAddWithoutValidation("api-key", apiKey);
-    }
-    else
-    {
-        url = $"{endpoint.TrimEnd('/')}/v1/chat/completions";
-        upstream.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-    }
-    upstream.RequestUri = new Uri(url);
-    upstream.Content = JsonContent.Create(new { model, messages, max_tokens = 1024 });
+                ?? Config(app.Configuration, "MODEL_NAME2", "Model:Model")
+                ?? (kind == "gemini" ? "gemini-2.0-flash" : "gpt-4o-mini");
 
     try
     {
+        // Google Gemini uses a different request/response shape (contents/parts, not OpenAI chat).
+        // The client's own GeminiModel uses the same native API, so this mirrors it server-side.
+        if (kind == "gemini")
+        {
+            var gBase = string.IsNullOrWhiteSpace(endpoint)
+                ? "https://generativelanguage.googleapis.com" : endpoint!.TrimEnd('/');
+            var gUrl = $"{gBase}/v1beta/models/{model}:generateContent?key={Uri.EscapeDataString(apiKey!)}";
+            var contents = req.Messages
+                .Where(m => m.Role is "user" or "assistant")
+                .Select(m => (object)new { role = m.Role == "assistant" ? "model" : "user", parts = new[] { new { text = m.Content } } })
+                .ToList();
+            if (contents.Count == 0) contents.Add(new { role = "user", parts = new[] { new { text = "Hello" } } });
+            var gPayload = new { system_instruction = new { parts = new[] { new { text = req.SystemPrompt } } }, contents };
+
+            using var gResp = await modelHttp.PostAsJsonAsync(gUrl, gPayload);
+            var gBody = await gResp.Content.ReadAsStringAsync();
+            if (!gResp.IsSuccessStatusCode)
+                return Results.Json(new { error = "upstream model error", detail = Trim(gBody) }, statusCode: StatusCodes.Status502BadGateway);
+            using var gDoc = JsonDocument.Parse(gBody);
+            var gText = gDoc.RootElement.GetProperty("candidates")[0].GetProperty("content")
+                .GetProperty("parts")[0].GetProperty("text").GetString() ?? "";
+            return Results.Ok(new HostedModelResponse(gText));
+        }
+
+        // OpenAI-style chat payload: Azure OpenAI (api-key header + deployment URL) or an
+        // OpenAI-compatible endpoint (Bearer + /v1/chat/completions).
+        var messages = new List<object> { new { role = "system", content = req.SystemPrompt } };
+        messages.AddRange(req.Messages.Select(m => (object)new { role = m.Role == "assistant" ? "assistant" : "user", content = m.Content }));
+
+        string url;
+        using var upstream = new HttpRequestMessage(HttpMethod.Post, (Uri?)null);
+        if (kind == "azure")
+        {
+            var apiVersion = Config(app.Configuration, "MODEL_API_VERSION", "Model:ApiVersion") ?? "2024-08-01-preview";
+            url = $"{endpoint!.TrimEnd('/')}/openai/deployments/{model}/chat/completions?api-version={apiVersion}";
+            upstream.Headers.TryAddWithoutValidation("api-key", apiKey);
+        }
+        else
+        {
+            url = $"{endpoint!.TrimEnd('/')}/v1/chat/completions";
+            upstream.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        }
+        upstream.RequestUri = new Uri(url);
+        upstream.Content = JsonContent.Create(new { model, messages, max_tokens = 1024 });
+
         using var resp = await modelHttp.SendAsync(upstream);
         var body = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode)
