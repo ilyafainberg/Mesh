@@ -64,6 +64,7 @@
                     <option value="Gemini">Google Gemini</option>
                     <option value="Grok">Grok (xAI)</option>
                     <option value="Groq">Groq (fast inference)</option>
+                    <option value="AzureOpenAI">Azure OpenAI</option>
                     <option value="FoundryLocal">On Device</option>
                 </select>
             </div>
@@ -110,7 +111,7 @@
             else
             {
                 <div class="field">
-                    <label>Model</label>
+                    <label>@(provider == "AzureOpenAI" ? "Deployment name" : "Model")</label>
                     <input class="full" @bind="model" placeholder="@ModelPlaceholder" />
                 </div>
                 @if (provider == "OpenAI")
@@ -118,6 +119,18 @@
                     <div class="field">
                         <label>Endpoint <span class="muted">(optional)</span></label>
                         <input class="full" @bind="endpoint" placeholder="https://api.openai.com" />
+                    </div>
+                }
+                @if (provider == "AzureOpenAI")
+                {
+                    <div class="field">
+                        <label>Endpoint</label>
+                        <input class="full" @bind="endpoint" placeholder="https://your-resource.openai.azure.com" />
+                        <div class="field-hint">Your Azure OpenAI resource URL. The Deployment name above is your model deployment, not the base model name.</div>
+                    </div>
+                    <div class="field">
+                        <label>API version <span class="muted">(optional)</span></label>
+                        <input class="full" @bind="apiVersion" placeholder="2024-08-01-preview" />
                     </div>
                 }
                 <div class="field">
@@ -275,6 +288,7 @@
     string model = "";
     string endpoint = "";
     string apiKey = "";
+    string apiVersion = "";
     string approvalMode = "PerCircle";
     bool allowApps = true;
     int replyBudget = 100;
@@ -343,6 +357,7 @@
         provider = p.Model.Provider.ToString();
         model = p.Model.Model;
         endpoint = p.Model.Endpoint ?? "";
+        apiVersion = p.Model.ApiVersion ?? "";
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
@@ -354,6 +369,7 @@
         "Gemini" => "gemini-1.5-flash",
         "Grok" => "grok-2-latest",
         "Groq" => "llama-3.3-70b-versatile",
+        "AzureOpenAI" => "my-gpt-4o-mini (deployment name)",
         _ => "gpt-4o-mini"
     };
 
@@ -372,6 +388,7 @@
         provider = p.Model.Provider.ToString();
         model = p.Model.Model;
         endpoint = p.Model.Endpoint ?? "";
+        apiVersion = p.Model.ApiVersion ?? "";
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
@@ -428,6 +445,7 @@
             p.Model.Provider = Enum.Parse<ModelProvider>(provider);
             p.Model.Model = model.Trim();
             p.Model.Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim();
+            p.Model.ApiVersion = string.IsNullOrWhiteSpace(apiVersion) ? null : apiVersion.Trim();
             if (!string.IsNullOrWhiteSpace(apiKeyToSet)) p.Model.ApiKey = apiKeyToSet.Trim();
             p.ApprovalMode = Enum.Parse<ApprovalMode>(approvalMode);
             p.AllowInteractiveApps = allowApps;

@@ -93,6 +93,7 @@
                         <option value="Gemini">Google Gemini</option>
                         <option value="Grok">Grok (xAI)</option>
                         <option value="Groq">Groq (fast inference)</option>
+                        <option value="AzureOpenAI">Azure OpenAI</option>
                         <option value="FoundryLocal">Foundry Local (free, on-device, desktop)</option>
                     </select>
 
@@ -102,13 +103,20 @@
                     }
                     else
                     {
-                        <label>Model</label>
+                        <label>@(provider == "AzureOpenAI" ? "Deployment name" : "Model")</label>
                         <input class="full" @bind="model" placeholder="@ModelPlaceholder" />
 
                         @if (provider == "OpenAI")
                         {
                             <label>Endpoint <span class="muted">(optional)</span></label>
                             <input class="full" @bind="endpoint" placeholder="https://api.openai.com" />
+                        }
+                        @if (provider == "AzureOpenAI")
+                        {
+                            <label>Endpoint</label>
+                            <input class="full" @bind="endpoint" placeholder="https://your-resource.openai.azure.com" />
+                            <label>API version <span class="muted">(optional)</span></label>
+                            <input class="full" @bind="apiVersion" placeholder="2024-08-01-preview" />
                         }
 
                         <label>API key</label>
@@ -138,6 +146,7 @@
     string model = "claude-3-5-sonnet-20241022";
     string endpoint = "";
     string apiKey = "";
+    string apiVersion = "";
     bool Working;
     bool showAdvanced;
     string? error;
@@ -154,6 +163,7 @@
         "Gemini" => "gemini-1.5-flash",
         "Grok" => "grok-2-latest",
         "Groq" => "llama-3.3-70b-versatile",
+        "AzureOpenAI" => "my-gpt-4o-mini (deployment name)",
         _ => "gpt-4o-mini"
     };
 
@@ -263,7 +273,8 @@
                     Provider = Enum.Parse<ModelProvider>(provider),
                     Model = mdl,
                     ApiKey = apiKey.Trim(),
-                    Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim()
+                    Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim(),
+                    ApiVersion = string.IsNullOrWhiteSpace(apiVersion) ? null : apiVersion.Trim()
                 };
             });
             if (!linkMode) await Mesh.RegisterAsync(); // link mode already redeemed (registered) on the relay

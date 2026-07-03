@@ -32,6 +32,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state)
         ModelProvider.Grok => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.x.ai")),
         ModelProvider.Groq => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.groq.com/openai")),
         ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg),
+        ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg),
         _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg),
     };
 
@@ -312,4 +313,98 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
     }
 
     private static string TrimBody(string s) => s.Length > 300 ? s[..300] : s;
+}
+
+/// <summary>
+/// Azure OpenAI (bring-your-own-resource). Uses the same chat-completions request/response
+/// shape as OpenAI, but targets an Azure deployment URL
+/// (<c>{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...</c>) and
+/// authenticates with the <c>api-key</c> header instead of a Bearer token. The user's
+/// <see cref="ModelConfig.Model"/> is the Azure deployment name and
+/// <see cref="ModelConfig.Endpoint"/> is the resource URL. Supports tool calls.
+/// </summary>
+public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg) : IChatModel
+{
+    private const string DefaultApiVersion = "2024-08-01-preview";
+
+    private string ChatUrl()
+    {
+        var baseUrl = (cfg.Endpoint ?? "").TrimEnd('/');
+        var version = string.IsNullOrWhiteSpace(cfg.ApiVersion) ? DefaultApiVersion : cfg.ApiVersion!.Trim();
+        return $"{baseUrl}/openai/deployments/{cfg.Model}/chat/completions?api-version={version}";
+    }
+
+    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(cfg.Endpoint)) return "[Azure OpenAI needs a resource endpoint in Settings]";
+        if (string.IsNullOrWhiteSpace(cfg.Model)) return "[Azure OpenAI needs a deployment name in Settings]";
+
+        var messages = new List<object> { new { role = "system", content = systemPrompt } };
+        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = l.Text }));
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
+        req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
+        req.Content = JsonContent.Create(new { messages, max_tokens = 1024 });
+
+        using var resp = await http.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+    }
+
+    public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        IReadOnlyList<IAgentTool> tools, CancellationToken ct = default)
+    {
+        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
+        if (string.IsNullOrWhiteSpace(cfg.Endpoint) || string.IsNullOrWhiteSpace(cfg.Model))
+            return await CompleteAsync(systemPrompt, history, ct);
+
+        var messages = new List<object> { new { role = "system", content = systemPrompt } };
+        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = l.Text }));
+
+        var toolDefs = tools.Select(t => (object)new
+        {
+            type = "function",
+            function = new { name = t.Name, description = t.Description, parameters = t.ParametersSchema }
+        }).ToArray();
+
+        for (var round = 0; round < 5; round++)
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
+            req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
+            req.Content = JsonContent.Create(new { messages, tools = toolDefs, max_tokens = 1024 });
+
+            using var resp = await http.SendAsync(req, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                if (round == 0) return await CompleteAsync(systemPrompt, history, ct);
+                return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
+            }
+
+            using var doc = JsonDocument.Parse(body);
+            var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+
+            if (!msg.TryGetProperty("tool_calls", out var toolCalls) || toolCalls.ValueKind != JsonValueKind.Array || toolCalls.GetArrayLength() == 0)
+                return msg.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
+
+            messages.Add(new { role = "assistant", content = (string?)null, tool_calls = CloneArray(toolCalls) });
+            foreach (var call in toolCalls.EnumerateArray())
+            {
+                var id = call.GetProperty("id").GetString();
+                var fn = call.GetProperty("function");
+                var name = fn.GetProperty("name").GetString() ?? "";
+                var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
+                var result = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct);
+                messages.Add(new { role = "tool", tool_call_id = id, content = result });
+            }
+        }
+        return "[stopped after too many tool calls]";
+    }
+
+    private static string MapRole(string r) => r is "assistant" ? "assistant" : r is "system" ? "system" : "user";
+    private static string Trim(string s) => s.Length > 300 ? s[..300] : s;
+    private static object[] CloneArray(JsonElement arr)
+        => arr.EnumerateArray().Select(e => (object)JsonSerializer.Deserialize<JsonElement>(e.GetRawText())).ToArray();
 }

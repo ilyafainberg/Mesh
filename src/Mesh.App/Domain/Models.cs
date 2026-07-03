@@ -2,7 +2,7 @@ using System.Text.Json.Serialization;
 
 namespace Mesh.App.Domain;
 
-public enum ModelProvider { Anthropic, OpenAI, Gemini, FoundryLocal, Grok, Groq, MeshHosted }
+public enum ModelProvider { Anthropic, OpenAI, Gemini, FoundryLocal, Grok, Groq, MeshHosted, AzureOpenAI }
 
 /// <summary>Where a knowledge item's content came from.</summary>
 public enum KnowledgeSource { Manual, File }
@@ -56,8 +56,10 @@ public sealed class ModelConfig
     public ModelProvider Provider { get; set; } = ModelProvider.Anthropic;
     public string ApiKey { get; set; } = "";
     public string Model { get; set; } = "claude-sonnet-4-6";
-    /// <summary>Optional base URL override for OpenAI-compatible endpoints.</summary>
+    /// <summary>Optional base URL override for OpenAI-compatible endpoints, or the Azure OpenAI resource URL.</summary>
     public string? Endpoint { get; set; }
+    /// <summary>Azure OpenAI REST api-version (Azure only). Falls back to a sane default when unset.</summary>
+    public string? ApiVersion { get; set; }
 
     /// <summary>
     /// Configured when there is a usable key, an on-device provider, a custom endpoint, or
