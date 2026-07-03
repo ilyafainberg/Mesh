@@ -1,27 +1,27 @@
 using System.Collections.Concurrent;
 using System.Net.Http;
 using System.Net.Http.Json;
-using System.Net.WebSockets;
-using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.SignalR.Client;
 using Mesh.App.Domain;
 using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
 /// <summary>
-/// Talks to the relay: registers the handle (REST) and maintains a WebSocket
-/// for sending/receiving <see cref="MeshEnvelope"/>s. Inbound messages are
-/// dispatched to the agent (guest auto-respond) and surfaced to the UI.
+/// Talks to the relay: registers the handle (REST) and maintains a SignalR hub connection
+/// for sending/receiving <see cref="MeshEnvelope"/>s. SignalR handles transport, framing,
+/// keepalive and automatic reconnection; this client adds the device-key auth handshake,
+/// end-to-end encryption, and dispatch of inbound messages to the agent and UI.
 /// </summary>
 public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFactory httpFactory)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
-    private ClientWebSocket? socket;
-    private CancellationTokenSource? cts;
+    private HubConnection? hub;
+    private volatile bool authenticated;
 
-    public bool Connected => socket?.State == WebSocketState.Open;
+    public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
     public event Action? StateChanged;
     public event Action<string>? Log;
 
@@ -104,95 +104,57 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     public async Task ConnectAsync()
     {
         await DisconnectAsync();
-        cts = new CancellationTokenSource();
-        _ = Task.Run(() => RunLoopAsync(cts.Token));
-        await Task.CompletedTask;
-    }
-
-    private async Task RunLoopAsync(CancellationToken ct)
-    {
         var p = state.Profile;
-        var wsUrl = ToWs(p.RelayUrl) + $"/ws?handle={Uri.EscapeDataString(p.Handle)}";
-        while (!ct.IsCancellationRequested)
+        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
+
+        var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}";
+        var connection = new HubConnectionBuilder()
+            .WithUrl(url)
+            .WithAutomaticReconnect(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10) })
+            .Build();
+
+        // The relay opens with a nonce challenge; sign it with the device key to authenticate.
+        connection.On<string>(MeshHubProtocol.Challenge, async nonce =>
         {
             try
             {
-                socket = new ClientWebSocket();
-                await socket.ConnectAsync(new Uri(wsUrl), ct);
-
-                if (!await AuthenticateAsync(socket, ct))
-                {
-                    Log?.Invoke("ws auth failed");
-                    try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", ct); } catch { }
-                    StateChanged?.Invoke();
-                    if (!ct.IsCancellationRequested) await Task.Delay(3000, ct).ContinueWith(_ => { });
-                    continue;
-                }
-
-                Log?.Invoke("ws connected + authenticated");
-                StateChanged?.Invoke();
-                await ReceiveLoopAsync(socket, ct);
+                var sig = IdentityService.Sign(state.Profile.PrivateKey, nonce);
+                await connection.InvokeAsync(MeshHubProtocol.Authenticate, state.Profile.PublicKey, sig);
             }
-            catch (Exception ex) when (!ct.IsCancellationRequested)
-            {
-                Log?.Invoke($"ws error: {ex.Message}; retrying in 3s");
-            }
+            catch (Exception ex) { Log?.Invoke($"auth failed: {ex.Message}"); }
+        });
+
+        connection.On(MeshHubProtocol.Ready, () =>
+        {
+            authenticated = true;
+            Log?.Invoke("hub connected + authenticated");
             StateChanged?.Invoke();
-            if (!ct.IsCancellationRequested) await Task.Delay(3000, ct).ContinueWith(_ => { });
-        }
-    }
+        });
 
-    /// <summary>Completes the relay's challenge/response handshake with the device key.</summary>
-    private async Task<bool> AuthenticateAsync(ClientWebSocket ws, CancellationToken ct)
-    {
-        var buffer = new byte[16 * 1024];
-        // 1. receive challenge
-        var raw = await ReceiveTextAsync(ws, buffer, ct);
-        var challenge = raw is null ? null : JsonSerializer.Deserialize<AuthChallenge>(raw, Json);
-        if (challenge is null || challenge.Type != "auth.challenge") return false;
-
-        // 2. sign nonce and reply
-        var sig = IdentityService.Sign(state.Profile.PrivateKey, challenge.Nonce);
-        var resp = new AuthResponse(state.Profile.PublicKey, sig);
-        await ws.SendAsync(JsonSerializer.SerializeToUtf8Bytes(resp, Json), WebSocketMessageType.Text, true, ct);
-
-        // 3. read result
-        var resultRaw = await ReceiveTextAsync(ws, buffer, ct);
-        var result = resultRaw is null ? null : JsonSerializer.Deserialize<AuthResult>(resultRaw, Json);
-        return result is { Type: "auth.result", Ok: true };
-    }
-
-    private static async Task<string?> ReceiveTextAsync(ClientWebSocket ws, byte[] buffer, CancellationToken ct)
-    {
-        using var ms = new MemoryStream();
-        WebSocketReceiveResult result;
-        do
+        connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
         {
-            result = await ws.ReceiveAsync(buffer, ct);
-            if (result.MessageType == WebSocketMessageType.Close) return null;
-            ms.Write(buffer, 0, result.Count);
-        } while (!result.EndOfMessage);
-        return Encoding.UTF8.GetString(ms.ToArray());
-    }
-
-    private async Task ReceiveLoopAsync(ClientWebSocket ws, CancellationToken ct)
-    {
-        var buffer = new byte[64 * 1024];
-        while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
-        {
-            using var ms = new MemoryStream();
-            WebSocketReceiveResult result;
-            do
-            {
-                result = await ws.ReceiveAsync(buffer, ct);
-                if (result.MessageType == WebSocketMessageType.Close) return;
-                ms.Write(buffer, 0, result.Count);
-            } while (!result.EndOfMessage);
-
-            var text = Encoding.UTF8.GetString(ms.ToArray());
             MeshEnvelope? env;
-            try { env = JsonSerializer.Deserialize<MeshEnvelope>(text, Json); } catch { continue; }
-            if (env is not null) await HandleInboundAsync(env, ct);
+            try { env = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, Json); }
+            catch { return; }
+            if (env is not null) await HandleInboundAsync(env, CancellationToken.None);
+        });
+
+        // A reconnect re-runs the server's challenge automatically (the handler stays registered),
+        // so we just reflect the transient unauthenticated state in the UI.
+        connection.Reconnecting += _ => { authenticated = false; StateChanged?.Invoke(); return Task.CompletedTask; };
+        connection.Reconnected += _ => { StateChanged?.Invoke(); return Task.CompletedTask; };
+        connection.Closed += _ => { authenticated = false; StateChanged?.Invoke(); return Task.CompletedTask; };
+
+        hub = connection;
+        try
+        {
+            await connection.StartAsync();
+            StateChanged?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"hub connect failed: {ex.Message}");
+            StateChanged?.Invoke();
         }
     }
 
@@ -329,7 +291,11 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
     public async Task SendAsync(string toHandle, string kind, string body)
     {
-        if (socket?.State != WebSocketState.Open) { Log?.Invoke("send failed: not connected"); return; }
+        if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
+        {
+            Log?.Invoke("send failed: not connected");
+            return;
+        }
         var p = state.Profile;
         var to = AppState.Norm(toHandle);
 
@@ -346,23 +312,21 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
         var sig = IdentityService.Sign(p.PrivateKey, wire);
         var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(env, Json);
-        await socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        try { await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env); }
+        catch (Exception ex) { Log?.Invoke($"send failed: {ex.Message}"); }
     }
 
     public async Task DisconnectAsync()
     {
-        try { cts?.Cancel(); } catch { }
+        authenticated = false;
         keyCache.Clear();
-        if (socket is { State: WebSocketState.Open })
+        var current = hub;
+        hub = null;
+        if (current is not null)
         {
-            try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
+            try { await current.StopAsync(); } catch { }
+            try { await current.DisposeAsync(); } catch { }
         }
-        socket?.Dispose();
-        socket = null;
         StateChanged?.Invoke();
     }
-
-    private static string ToWs(string httpUrl)
-        => httpUrl.TrimEnd('/').Replace("https://", "wss://").Replace("http://", "ws://");
 }

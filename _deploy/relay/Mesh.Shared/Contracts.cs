@@ -102,6 +102,38 @@ public record HandleInfo(
     DateTimeOffset RegisteredAt);
 
 /// <summary>
+/// A request to the relay-hosted free model. The relay holds the upstream model key
+/// server-side and proxies the completion, rate limited per handle, so first-launch users
+/// get a working model with no key of their own. The caller proves it owns a device key
+/// registered under its handle (same device-key auth as the connector broker).
+/// Signature is over <c>hosted-model|handle|promptHash</c> by the device key.
+/// </summary>
+public record HostedModelRequest(
+    string Handle,
+    string DevicePublicKey,
+    string Signature,
+    string SystemPrompt,
+    IReadOnlyList<HostedModelMessage> Messages);
+
+public record HostedModelMessage(string Role, string Content);
+
+public record HostedModelResponse(string Content);
+
+/// <summary>Canonical strings for the hosted-model proxy signature.</summary>
+public static class HostedModelProtocol
+{
+    public static string Message(string handle, string promptHash)
+        => $"hosted-model|{LinkProtocol.Normalize(handle)}|{promptHash}";
+
+    public static string PromptHash(string systemPrompt, IEnumerable<HostedModelMessage> messages)
+    {
+        var joined = systemPrompt + "\n" + string.Join("\n", messages.Select(m => m.Role + ":" + m.Content));
+        return Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(joined)));
+    }
+}
+
+/// <summary>
 /// An end-to-end message routed by the relay between two handles.
 /// The relay treats <see cref="Body"/> as opaque and never inspects it.
 /// </summary>
@@ -125,4 +157,34 @@ public static class MeshKinds
     public const string AgentRequest = "agent.request";
     public const string AgentResponse = "agent.response";
     public const string System = "system";
+
+    /// <summary>
+    /// A person-to-person message addressed to the human, not their agent. The
+    /// receiving client records it but does NOT auto-engage the guest agent.
+    /// </summary>
+    public const string DirectMessage = "direct";
+}
+
+/// <summary>
+/// Names shared by the SignalR hub and the client so both agree on the transport contract.
+/// The hub is used purely for the connection/transport; cross-node routing is done by the
+/// relay's directed backplane (presence lookup plus per-node forward), not a fan-out backplane.
+///
+/// Auth is a nonce challenge/response over the connection (replay resistant): the server
+/// issues a fresh nonce, the client signs it with its device private key, and the server
+/// verifies against the device public keys registered under the handle.
+/// </summary>
+public static class MeshHubProtocol
+{
+    /// <summary>Relative path the hub is mapped at on the relay.</summary>
+    public const string Route = "/hub/mesh";
+
+    // Client -> server invocations.
+    public const string Authenticate = "Authenticate";
+    public const string SendEnvelope = "SendEnvelope";
+
+    // Server -> client events.
+    public const string Challenge = "Challenge"; // payload: nonce (string)
+    public const string Ready = "Ready";         // payload: none (auth accepted)
+    public const string Receive = "Receive";     // payload: envelope JSON (string)
 }

@@ -16,6 +16,15 @@ obj/
 _deploy/azure-names.txt
 appsettings.*.local.json
 
+## Local relay run logs
+_deploy/relay-out.log
+_deploy/relay-err.log
+_deploy/_pubcheck/
+
+## Smoke test artifacts
+_smoke/bin/
+_smoke/obj/
+
 ## OS
 Thumbs.db
 .DS_Store

@@ -164,3 +164,27 @@ public static class MeshKinds
     /// </summary>
     public const string DirectMessage = "direct";
 }
+
+/// <summary>
+/// Names shared by the SignalR hub and the client so both agree on the transport contract.
+/// The hub is used purely for the connection/transport; cross-node routing is done by the
+/// relay's directed backplane (presence lookup plus per-node forward), not a fan-out backplane.
+///
+/// Auth is a nonce challenge/response over the connection (replay resistant): the server
+/// issues a fresh nonce, the client signs it with its device private key, and the server
+/// verifies against the device public keys registered under the handle.
+/// </summary>
+public static class MeshHubProtocol
+{
+    /// <summary>Relative path the hub is mapped at on the relay.</summary>
+    public const string Route = "/hub/mesh";
+
+    // Client -> server invocations.
+    public const string Authenticate = "Authenticate";
+    public const string SendEnvelope = "SendEnvelope";
+
+    // Server -> client events.
+    public const string Challenge = "Challenge"; // payload: nonce (string)
+    public const string Ready = "Ready";         // payload: none (auth accepted)
+    public const string Receive = "Receive";     // payload: envelope JSON (string)
+}
