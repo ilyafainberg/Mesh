@@ -278,13 +278,37 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg) : IChatModel
 /// </summary>
 public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig cfg) : IChatModel
 {
+    private static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
+
     public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
     {
-        var p = state.Profile;
-        if (string.IsNullOrWhiteSpace(p.RelayUrl))
-            return "[the free model needs a relay configured in Settings]";
-        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.PrivateKey) || string.IsNullOrWhiteSpace(p.PublicKey))
-            return "[set up your Mesh identity to use the free model]";
+        var messages = history
+            .Where(l => l.Role is "user" or "assistant")
+            .Select(l => new HostedModelMessage(l.Role, l.Text))
+            .ToList();
+        if (messages.Count == 0) messages.Add(new HostedModelMessage("user", "Hello"));
+
+        var (result, error) = await PostAsync(systemPrompt, messages, toolsJson: null, ct);
+        if (error is not null) return error;
+        return result?.Content ?? "";
+    }
+
+    /// <summary>
+    /// Runs the tool-calling loop for the hosted free model. Tools execute on THIS device (the
+    /// relay never runs them): each round the relay returns the model's tool_calls, we execute
+    /// the requested tools locally, append the results, and continue until the model answers.
+    /// </summary>
+    public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        IReadOnlyList<IAgentTool> tools, CancellationToken ct = default)
+    {
+        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
+
+        var toolDefs = tools.Select(t => new
+        {
+            type = "function",
+            function = new { name = t.Name, description = t.Description, parameters = t.ParametersSchema }
+        }).ToArray();
+        var toolsJson = JsonSerializer.Serialize(toolDefs, Web);
 
         var messages = history
             .Where(l => l.Role is "user" or "assistant")
@@ -292,9 +316,45 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
             .ToList();
         if (messages.Count == 0) messages.Add(new HostedModelMessage("user", "Hello"));
 
+        for (var round = 0; round < 5; round++)
+        {
+            var (result, error) = await PostAsync(systemPrompt, messages, toolsJson, ct);
+            if (error is not null)
+                // On the first round, degrade to a plain completion so chat still works even if
+                // the hosted model rejects tools; later rounds surface the error.
+                return round == 0 ? await CompleteAsync(systemPrompt, history, ct) : error;
+
+            if (string.IsNullOrWhiteSpace(result?.ToolCallsJson))
+                return result?.Content ?? "";
+
+            // Record the assistant's tool-call turn, then execute each tool locally and append results.
+            messages.Add(new HostedModelMessage("assistant", result!.Content ?? "", ToolCallsJson: result.ToolCallsJson));
+            using var calls = JsonDocument.Parse(result.ToolCallsJson!);
+            foreach (var call in calls.RootElement.EnumerateArray())
+            {
+                var id = call.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                var fn = call.GetProperty("function");
+                var name = fn.GetProperty("name").GetString() ?? "";
+                var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
+                var toolResult = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct);
+                messages.Add(new HostedModelMessage("tool", toolResult, ToolCallId: id));
+            }
+        }
+        return "[stopped after too many tool calls]";
+    }
+
+    private async Task<(HostedModelResponse? result, string? error)> PostAsync(
+        string systemPrompt, IReadOnlyList<HostedModelMessage> messages, string? toolsJson, CancellationToken ct)
+    {
+        var p = state.Profile;
+        if (string.IsNullOrWhiteSpace(p.RelayUrl))
+            return (null, "[the free model needs a relay configured in Settings]");
+        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.PrivateKey) || string.IsNullOrWhiteSpace(p.PublicKey))
+            return (null, "[set up your Mesh identity to use the free model]");
+
         var promptHash = HostedModelProtocol.PromptHash(systemPrompt, messages);
         var sig = IdentityService.Sign(p.PrivateKey, HostedModelProtocol.Message(p.Handle, promptHash));
-        var request = new HostedModelRequest(AppState.Norm(p.Handle), p.PublicKey, sig, systemPrompt, messages);
+        var request = new HostedModelRequest(AppState.Norm(p.Handle), p.PublicKey, sig, systemPrompt, messages, toolsJson);
         _ = cfg.Model; // the hosted model id is chosen server-side; cfg is kept for parity with other providers
 
         try
@@ -302,14 +362,13 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
             using var resp = await http.PostAsJsonAsync($"{p.RelayUrl.TrimEnd('/')}/model/chat", request, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
             if (resp.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
-                return "[free model daily limit reached. Add your own model key in Settings for unlimited use.]";
+                return (null, "[free model daily limit reached. Add your own model key in Settings for unlimited use.]");
             if (resp.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable)
-                return "[the free model is not available yet. Add your own model key in Settings, or pick an on-device model.]";
-            if (!resp.IsSuccessStatusCode) return $"[free model error {(int)resp.StatusCode}: {TrimBody(body)}]";
-            var result = JsonSerializer.Deserialize<HostedModelResponse>(body, new JsonSerializerOptions(JsonSerializerDefaults.Web));
-            return result?.Content ?? "";
+                return (null, "[the free model is not available yet. Add your own model key in Settings, or pick an on-device model.]");
+            if (!resp.IsSuccessStatusCode) return (null, $"[free model error {(int)resp.StatusCode}: {TrimBody(body)}]");
+            return (JsonSerializer.Deserialize<HostedModelResponse>(body, Web), null);
         }
-        catch (Exception ex) { return $"[free model error: {ex.Message}]"; }
+        catch (Exception ex) { return (null, $"[free model error: {ex.Message}]"); }
     }
 
     private static string TrimBody(string s) => s.Length > 300 ? s[..300] : s;

@@ -33,3 +33,7 @@ _deploy/*.log
 ## OS
 Thumbs.db
 .DS_Store
+
+## Hosted-model test
+_hostedtest/bin/
+_hostedtest/obj/

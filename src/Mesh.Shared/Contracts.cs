@@ -113,11 +113,22 @@ public record HostedModelRequest(
     string DevicePublicKey,
     string Signature,
     string SystemPrompt,
-    IReadOnlyList<HostedModelMessage> Messages);
+    IReadOnlyList<HostedModelMessage> Messages,
+    string? ToolsJson = null);
 
-public record HostedModelMessage(string Role, string Content);
+/// <summary>
+/// A single message in a hosted-model conversation. <see cref="ToolCallsJson"/> carries an
+/// assistant turn's raw OpenAI tool_calls array; a message with <see cref="ToolCallId"/> and
+/// Role "tool" carries a tool result. Both are null for ordinary user/assistant text.
+/// </summary>
+public record HostedModelMessage(string Role, string Content, string? ToolCallsJson = null, string? ToolCallId = null);
 
-public record HostedModelResponse(string Content);
+/// <summary>
+/// The hosted model reply. <see cref="Content"/> is the assistant text; when the model wants to
+/// call tools, <see cref="ToolCallsJson"/> holds the raw OpenAI tool_calls array so the CLIENT
+/// can execute the tools locally (the relay never runs them) and continue the conversation.
+/// </summary>
+public record HostedModelResponse(string Content, string? ToolCallsJson = null);
 
 /// <summary>Canonical strings for the hosted-model proxy signature.</summary>
 public static class HostedModelProtocol

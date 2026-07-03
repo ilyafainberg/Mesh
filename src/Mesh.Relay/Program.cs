@@ -264,8 +264,23 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
 
         // OpenAI-style chat payload: Azure OpenAI (api-key header + deployment URL) or an
         // OpenAI-compatible endpoint (Bearer + /v1/chat/completions).
+        // Build messages with tool support: an assistant turn may carry tool_calls, and a
+        // "tool" role message carries a tool result (tool_call_id + content). Tools themselves
+        // are executed on the CLIENT; the relay only forwards definitions and returns tool_calls.
         var messages = new List<object> { new { role = "system", content = req.SystemPrompt } };
-        messages.AddRange(req.Messages.Select(m => (object)new { role = m.Role == "assistant" ? "assistant" : "user", content = m.Content }));
+        foreach (var m in req.Messages)
+        {
+            if (m.Role == "tool" && m.ToolCallId is not null)
+                messages.Add(new { role = "tool", tool_call_id = m.ToolCallId, content = m.Content });
+            else if (m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.ToolCallsJson))
+                messages.Add(new { role = "assistant", content = (string?)m.Content, tool_calls = JsonDocument.Parse(m.ToolCallsJson!).RootElement.Clone() });
+            else
+                messages.Add(new { role = m.Role == "assistant" ? "assistant" : "user", content = m.Content });
+        }
+
+        object payload = new { model, messages, max_tokens = 1024 };
+        if (!string.IsNullOrWhiteSpace(req.ToolsJson))
+            payload = new { model, messages, max_tokens = 1024, tools = JsonDocument.Parse(req.ToolsJson!).RootElement.Clone() };
 
         string url;
         using var upstream = new HttpRequestMessage(HttpMethod.Post, (Uri?)null);
@@ -281,15 +296,19 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
             upstream.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         }
         upstream.RequestUri = new Uri(url);
-        upstream.Content = JsonContent.Create(new { model, messages, max_tokens = 1024 });
+        upstream.Content = JsonContent.Create(payload);
 
         using var resp = await modelHttp.SendAsync(upstream);
         var body = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode)
             return Results.Json(new { error = "upstream model error", detail = Trim(body) }, statusCode: StatusCodes.Status502BadGateway);
         using var doc = JsonDocument.Parse(body);
-        var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
-        return Results.Ok(new HostedModelResponse(content));
+        var respMsg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        var content = respMsg.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() ?? "" : "";
+        string? toolCallsJson = null;
+        if (respMsg.TryGetProperty("tool_calls", out var tcs) && tcs.ValueKind == JsonValueKind.Array && tcs.GetArrayLength() > 0)
+            toolCallsJson = tcs.GetRawText();
+        return Results.Ok(new HostedModelResponse(content, toolCallsJson));
     }
     catch (Exception ex)
     {
