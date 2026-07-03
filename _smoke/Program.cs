@@ -6,7 +6,8 @@ using System.Text.Json;
 using Microsoft.AspNetCore.SignalR.Client;
 using Mesh.Shared;
 
-var relay = "http://127.0.0.1:8790";
+var relay = args.Length > 0 ? args[0].TrimEnd('/') : "http://127.0.0.1:8790";
+Console.WriteLine($"Testing relay: {relay}");
 var web = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 var http = new HttpClient();
 int failures = 0;
