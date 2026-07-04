@@ -51,7 +51,10 @@ public sealed class SecretStore : ISecretStore
         var name = Prefix + identityId;
         try
         {
-            var b64 = Microsoft.Maui.Storage.SecureStorage.GetAsync(name).GetAwaiter().GetResult();
+            // Offload to the threadpool: SecureStorage is async and AppState is constructed on the
+            // UI thread during DI, so a direct .GetAwaiter().GetResult() would deadlock on the
+            // captured UI SynchronizationContext.
+            var b64 = Task.Run(() => Microsoft.Maui.Storage.SecureStorage.GetAsync(name)).GetAwaiter().GetResult();
             if (!string.IsNullOrEmpty(b64)) return Convert.FromBase64String(b64);
         }
         catch { /* secure storage unavailable, use fallback */ }
@@ -64,7 +67,7 @@ public sealed class SecretStore : ISecretStore
     {
         var name = Prefix + identityId;
         var b64 = Convert.ToBase64String(key);
-        try { Microsoft.Maui.Storage.SecureStorage.SetAsync(name, b64).GetAwaiter().GetResult(); }
+        try { Task.Run(() => Microsoft.Maui.Storage.SecureStorage.SetAsync(name, b64)).GetAwaiter().GetResult(); }
         catch { /* fall through to in-memory */ }
         lock (gate) fallback[identityId] = key;
     }

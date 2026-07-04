@@ -1,0 +1,96 @@
+using System.Windows.Input;
+using H.NotifyIcon;
+using Microsoft.UI.Windowing;
+using Microsoft.UI.Xaml.Media.Imaging;
+using Mesh.App.Services;
+using MenuFlyout = Microsoft.UI.Xaml.Controls.MenuFlyout;
+using MenuFlyoutItem = Microsoft.UI.Xaml.Controls.MenuFlyoutItem;
+using MenuFlyoutSeparator = Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator;
+
+namespace Mesh.App.Platforms.Windows;
+
+/// <summary>
+/// Windows desktop integration: a system tray icon, close-to-tray behavior, and a real quit.
+/// Closing the window hides it to the tray instead of exiting; the tray menu (and an in-app Quit
+/// button) exit for good. Backed by static state so the DI-resolved <see cref="IAppControl"/> and
+/// the window-created lifecycle hook share one tray.
+/// </summary>
+public sealed class WindowsAppControl : IAppControl
+{
+    private static Microsoft.UI.Xaml.Window? window;
+    private static AppWindow? appWindow;
+    private static TaskbarIcon? tray;
+    private static bool forceQuit;
+
+    public void ShowMainWindow() => Show();
+    public void Quit() => QuitApp();
+
+    /// <summary>Wires the tray + close-to-tray onto the app's main window. Called once at window creation.</summary>
+    public static void AttachTray(Microsoft.UI.Xaml.Window w)
+    {
+        if (tray is not null) return; // already attached
+        window = w;
+
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(w);
+        var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
+        appWindow = AppWindow.GetFromWindowId(windowId);
+
+        // Intercept the window close: hide to tray unless the user really chose Quit.
+        appWindow.Closing += (_, args) =>
+        {
+            if (forceQuit) return;
+            args.Cancel = true;
+            appWindow.Hide();
+        };
+
+        var menu = new MenuFlyout();
+        var open = new MenuFlyoutItem { Text = "Open Mesh" };
+        open.Click += (_, _) => Show();
+        var quit = new MenuFlyoutItem { Text = "Quit Mesh" };
+        quit.Click += (_, _) => QuitApp();
+        menu.Items.Add(open);
+        menu.Items.Add(new MenuFlyoutSeparator());
+        menu.Items.Add(quit);
+
+        tray = new TaskbarIcon
+        {
+            ToolTipText = "Mesh",
+            ContextMenuMode = ContextMenuMode.PopupMenu,
+            ContextFlyout = menu,
+            LeftClickCommand = new RelayCommand(Show),
+            NoLeftClickDelay = true
+        };
+
+        var icoPath = Path.Combine(AppContext.BaseDirectory, "mesh.ico");
+        if (File.Exists(icoPath))
+            tray.IconSource = new BitmapImage(new Uri(icoPath));
+
+        tray.ForceCreate(enablesEfficiencyMode: false);
+    }
+
+    private static void Show()
+    {
+        if (appWindow is null || window is null) return;
+        appWindow.Show();
+        window.Activate();
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(window);
+        Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd); // no-op keep-alive for interop
+        appWindow.MoveInZOrderAtTop();
+    }
+
+    private static void QuitApp()
+    {
+        forceQuit = true;
+        try { tray?.Dispose(); } catch { }
+        tray = null;
+        Microsoft.UI.Xaml.Application.Current.Exit();
+    }
+
+    /// <summary>Minimal ICommand for wiring tray clicks to an action.</summary>
+    private sealed class RelayCommand(Action execute) : ICommand
+    {
+        public event EventHandler? CanExecuteChanged { add { } remove { } }
+        public bool CanExecute(object? parameter) => true;
+        public void Execute(object? parameter) => execute();
+    }
+}

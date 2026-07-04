@@ -49,11 +49,11 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <!-- App Icon -->
-        <MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#512BD4" />
+        <!-- App Icon: the Mesh logo (single flattened image, already has its own background) -->
+        <MauiIcon Include="Resources\AppIcon\meshicon.png" />
 
         <!-- Splash Screen -->
-        <MauiSplashScreen Include="Resources\Splash\splash.svg" Color="#512BD4" BaseSize="128,128" />
+        <MauiSplashScreen Include="Resources\AppIcon\meshicon.png" Color="#131316" BaseSize="180,180" />
 
         <!-- Images -->
         <MauiImage Include="Resources\Images\*" />
@@ -86,6 +86,14 @@
 
     <ItemGroup>
       <ProjectReference Include="..\Mesh.Shared\Mesh.Shared.csproj" />
+    </ItemGroup>
+
+    <!-- Windows-only: system tray icon support + the tray icon asset next to the exe. -->
+    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
+        <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
+        <Content Include="Platforms\Windows\mesh.ico">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
     </ItemGroup>
 
 </Project>

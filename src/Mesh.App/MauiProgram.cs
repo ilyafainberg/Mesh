@@ -1,5 +1,8 @@
 using Microsoft.Extensions.Logging;
 using Mesh.App.Services;
+#if WINDOWS
+using Microsoft.Maui.LifecycleEvents;
+#endif
 
 namespace Mesh.App;
 
@@ -15,6 +18,17 @@ public static class MauiProgram
 				fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");
 			});
 
+#if WINDOWS
+		// Minimize/close to the system tray and expose a real quit.
+		builder.ConfigureLifecycleEvents(events =>
+		{
+			events.AddWindows(w => w.OnWindowCreated(window =>
+			{
+				Mesh.App.Platforms.Windows.WindowsAppControl.AttachTray(window);
+			}));
+		});
+#endif
+
 		builder.Services.AddMauiBlazorWebView();
 
 		builder.Services.AddHttpClient();
@@ -23,6 +37,11 @@ public static class MauiProgram
 		builder.Services.AddHttpClient("model", c => c.Timeout = TimeSpan.FromMinutes(10));
 		builder.Services.AddHttpClient("connector");
 		builder.Services.AddSingleton<ISecretStore, SecretStore>();
+#if WINDOWS
+		builder.Services.AddSingleton<IAppControl, Mesh.App.Platforms.Windows.WindowsAppControl>();
+#else
+		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
+#endif
 		builder.Services.AddSingleton<AppState>();
 		builder.Services.AddSingleton<TokenMeter>();
 		builder.Services.AddSingleton<ModelFactory>();

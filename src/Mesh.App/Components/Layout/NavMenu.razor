@@ -1,6 +1,6 @@
 ﻿<div class="mesh-nav">
     <div class="brand">
-        <i class="bi bi-hexagon-fill"></i> Mesh
+        <img src="logo.png" alt="Mesh" class="brand-logo" />
     </div>
     <nav class="nav flex-column">
         <NavLink class="nav-link" href="" Match="NavLinkMatch.All" @onclick="OnNavigate"><i class="bi bi-person-badge"></i> Me</NavLink>
@@ -12,8 +12,13 @@
         <NavLink class="nav-link" href="settings" @onclick="OnNavigate"><i class="bi bi-gear"></i> Settings</NavLink>
         <NavLink class="nav-link" href="backup" @onclick="OnNavigate"><i class="bi bi-shield-lock"></i> Backup</NavLink>
     </nav>
+    <button class="nav-quit" @onclick="Quit" title="Quit Mesh completely"><i class="bi bi-power"></i> Quit</button>
 </div>
 
 @code {
     [Parameter] public EventCallback OnNavigate { get; set; }
+
+    [Inject] private IAppControl AppControl { get; set; } = default!;
+
+    void Quit() => AppControl.Quit();
 }
