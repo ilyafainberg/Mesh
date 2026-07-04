@@ -199,6 +199,46 @@
         </div>
 
         <div class="card-panel">
+            <h3>Local tools</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Let your agent use this machine: run scripts, control the browser or desktop, and work with files.
+                These are powerful, so they are <b>off by default</b> and available only to you (in Me) unless you
+                share a tool with a circle. Shared tools let that circle's agents run them on your machine, only
+                enable sharing for people you fully trust.
+            </div>
+            @foreach (var lt in LocalToolRows)
+            {
+                var setting = GetLocalTool(lt.Kind);
+                <div class="local-tool-row">
+                    <div class="lt-main">
+                        <label class="switch">
+                            <input type="checkbox" checked="@setting.Enabled"
+                                   @onchange="e => SetLocalToolEnabled(lt.Kind, (bool)(e.Value ?? false))" />
+                        </label>
+                        <div class="lt-text">
+                            <div class="lt-name"><i class="bi @lt.Icon"></i> @lt.Name</div>
+                            <div class="lt-sub">@lt.Description</div>
+                        </div>
+                    </div>
+                    @if (setting.Enabled)
+                    {
+                        <div class="lt-share">
+                            <span class="lt-share-label">Who can use it</span>
+                            <select value="@setting.Visibility" @onchange="e => SetLocalToolVisibility(lt.Kind, e.Value?.ToString())">
+                                <option value="private">Only me (Me chat)</option>
+                                @foreach (var c in State.CircleNames)
+                                {
+                                    <option value="@($"shared:{c}")">Share with @c</option>
+                                }
+                                <option value="public">Anyone allowed</option>
+                            </select>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="card-panel">
             <h3>Relay</h3>
             <div class="field">
                 <label>Relay URL</label>
@@ -333,6 +373,44 @@
     bool signingOut;
     bool switching;
     string? deleteId;
+
+    // ---- local tools ----
+    sealed record LocalToolRow(LocalToolKind Kind, string Name, string Icon, string Description);
+
+    static readonly LocalToolRow[] LocalToolRows =
+    {
+        new(LocalToolKind.PowerShell, "PowerShell", "bi-terminal", "Run PowerShell scripts on this machine."),
+        new(LocalToolKind.Cmd, "Command Prompt", "bi-terminal-fill", "Run cmd.exe commands."),
+        new(LocalToolKind.Python, "Python", "bi-filetype-py", "Run Python 3 scripts (Python must be installed)."),
+        new(LocalToolKind.CSharpScript, "C# scripting", "bi-filetype-cs", "Run C# scripts (needs the dotnet-script tool)."),
+        new(LocalToolKind.Browser, "Browser", "bi-globe2", "Drive a real web browser (navigate, click, type, screenshot)."),
+        new(LocalToolKind.Desktop, "Desktop control", "bi-mouse", "Move the mouse, type keys, and capture the screen. Windows only."),
+        new(LocalToolKind.FileSystem, "Files", "bi-folder", "Read, write and convert files on this machine."),
+    };
+
+    LocalToolSetting GetLocalTool(LocalToolKind kind)
+    {
+        if (!State.Profile.LocalTools.TryGetValue(kind, out var s) || s is null)
+        {
+            s = new LocalToolSetting();
+            State.Profile.LocalTools[kind] = s;
+        }
+        return s;
+    }
+
+    void SetLocalToolEnabled(LocalToolKind kind, bool enabled)
+        => State.Mutate(p =>
+        {
+            if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
+            s.Enabled = enabled;
+        });
+
+    void SetLocalToolVisibility(LocalToolKind kind, string? visibility)
+        => State.Mutate(p =>
+        {
+            if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
+            s.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!;
+        });
 
     async Task SignOut()
     {

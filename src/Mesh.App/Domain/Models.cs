@@ -51,6 +51,30 @@ public sealed class FolderGrant
 /// <summary>How the agent handles inbound requests from allowed contacts.</summary>
 public enum ApprovalMode { Off, All, PerCircle }
 
+/// <summary>
+/// A powerful local-machine capability the owner's agent can be granted (run scripts, control the
+/// browser or desktop, work with files). These are OFF by default and, when enabled, are owner-only
+/// unless the owner explicitly shares them with a circle (same visibility model as knowledge/skills).
+/// </summary>
+public enum LocalToolKind
+{
+    PowerShell,
+    Cmd,
+    Python,
+    CSharpScript,
+    Browser,
+    Desktop,
+    FileSystem
+}
+
+/// <summary>Per-tool grant: whether the local tool is enabled and who (beyond the owner) may use it.</summary>
+public sealed class LocalToolSetting
+{
+    public bool Enabled { get; set; }
+    /// <summary>"private" (owner only) | "public" | "shared:&lt;circle&gt;".</summary>
+    public string Visibility { get; set; } = "private";
+}
+
 public sealed class ModelConfig
 {
     public ModelProvider Provider { get; set; } = ModelProvider.Anthropic;
@@ -264,6 +288,13 @@ public sealed class MeshProfile
 
     /// <summary>Allow interactive HTML mini-apps from agents to be run in message bubbles.</summary>
     public bool AllowInteractiveApps { get; set; } = true;
+
+    /// <summary>
+    /// Local-machine tool grants (run scripts, control browser/desktop, file access), keyed by tool.
+    /// All OFF by default. Enabled tools are always available to the owner in their private chat, and
+    /// only reach a guest agent when the owner has shared that tool with one of the guest's circles.
+    /// </summary>
+    public Dictionary<LocalToolKind, LocalToolSetting> LocalTools { get; set; } = new();
 
     /// <summary>The agent's own private chat (owner context).</summary>
     public List<ChatLine> OwnChat { get; set; } = new();

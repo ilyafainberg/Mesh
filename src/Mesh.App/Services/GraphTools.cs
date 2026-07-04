@@ -296,12 +296,16 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         return list;
     }
 
-    /// <summary>Owner path: every enabled source, full access, plus local-file reading.</summary>
-    public IReadOnlyList<IAgentTool> OwnerTools(IEnumerable<ConnectedSource> sources)
+    /// <summary>Owner path: every enabled source, full access, plus local-file reading and enabled local tools.</summary>
+    public IReadOnlyList<IAgentTool> OwnerTools(
+        IEnumerable<ConnectedSource> sources,
+        IReadOnlyDictionary<LocalToolKind, LocalToolSetting>? localTools = null)
     {
         var tools = new List<IAgentTool>();
         // The owner can attach local files in their private chat; let the agent open them by path.
         tools.Add(new ReadLocalFileTool(localFiles, extractor));
+        if (localTools is not null)
+            tools.AddRange(LocalTools(localTools, owner: true, circles: null));
         foreach (var src in sources)
             if (src.Enabled) tools.AddRange(ToolsFor(src));
         return tools;
@@ -312,12 +316,18 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
     /// itself is visible to the guest's circles, else scoped to just the folders
     /// shared with those circles. Teams + files are only offered when the whole source is visible.
     /// </summary>
-    public IReadOnlyList<IAgentTool> GuestTools(IEnumerable<ConnectedSource> sources, List<string> circles)
+    public IReadOnlyList<IAgentTool> GuestTools(
+        IEnumerable<ConnectedSource> sources,
+        List<string> circles,
+        IReadOnlyDictionary<LocalToolKind, LocalToolSetting>? localTools = null)
     {
         static bool Vis(string v, List<string> cs) =>
             v == "public" || (v.StartsWith("shared:") && cs.Contains(v["shared:".Length..]));
 
         var tools = new List<IAgentTool>();
+        // Local tools the owner has explicitly shared with one of this guest's circles.
+        if (localTools is not null)
+            tools.AddRange(LocalTools(localTools, owner: false, circles: circles));
         foreach (var src in sources)
         {
             if (!src.Enabled) continue;
@@ -358,6 +368,46 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
             : new SearchEmailTool(auth, httpFactory, src.AccountId,
                 src.Provider == SourceProvider.MicrosoftGraph ? MsalAuthService.WorkScopes : MsalAuthService.PersonalScopes,
                 label, suffix, folders);
+
+    /// <summary>
+    /// Builds the enabled local-machine tools (scripts, browser, desktop, files). For the OWNER,
+    /// every enabled tool is included. For a GUEST, only tools whose visibility is shared with one of
+    /// the guest's circles (or public) are included. Off-by-default: absent settings mean disabled.
+    /// </summary>
+    private IReadOnlyList<IAgentTool> LocalTools(
+        IReadOnlyDictionary<LocalToolKind, LocalToolSetting> settings,
+        bool owner,
+        List<string>? circles)
+    {
+        static bool Vis(string v, List<string> cs) =>
+            v == "public" || (v.StartsWith("shared:") && cs.Contains(v["shared:".Length..]));
+
+        var tools = new List<IAgentTool>();
+        foreach (var (kind, setting) in settings)
+        {
+            if (setting is null || !setting.Enabled) continue;
+            if (!owner)
+            {
+                // Guest: only if explicitly shared with one of their circles (or public).
+                if (circles is null || !Vis(setting.Visibility, circles)) continue;
+            }
+            var tool = MakeLocalTool(kind);
+            if (tool is not null) tools.Add(tool);
+        }
+        return tools;
+    }
+
+    private IAgentTool? MakeLocalTool(LocalToolKind kind) => kind switch
+    {
+        LocalToolKind.PowerShell => new RunPowerShellTool(),
+        LocalToolKind.Cmd => new RunCmdTool(),
+        LocalToolKind.Python => new RunPythonTool(),
+        LocalToolKind.CSharpScript => new RunCSharpScriptTool(),
+        LocalToolKind.Browser => new BrowserTool(),
+        LocalToolKind.Desktop => new DesktopTool(),
+        LocalToolKind.FileSystem => new FileSystemTool(extractor),
+        _ => null
+    };
 
     private static string LabelFor(ConnectedSource src)
         => string.IsNullOrWhiteSpace(src.ConnectedAs) ? DisplayName(src.Provider) : src.ConnectedAs!;

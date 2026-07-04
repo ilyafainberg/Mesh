@@ -150,6 +150,18 @@ main { flex: 1; min-width: 0; display: flex; overflow: hidden; }
 .pane-head h2 { font-size: 1.3rem; display: flex; align-items: center; gap: 10px; }
 .pane-head .contact-tokens { margin-left: auto; font-size: .8rem; color: var(--fg-3); display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .pane-head .contact-tokens i.bi { color: var(--brand); }
+
+/* local tools (settings) */
+.local-tool-row { padding: 10px 0; border-top: 1px solid var(--stroke-1); }
+.local-tool-row:first-of-type { border-top: none; }
+.local-tool-row .lt-main { display: flex; align-items: flex-start; gap: 12px; }
+.local-tool-row .lt-text { flex: 1; min-width: 0; }
+.local-tool-row .lt-name { font-weight: 600; font-size: .92rem; display: flex; align-items: center; gap: 8px; }
+.local-tool-row .lt-name i.bi { color: var(--brand); }
+.local-tool-row .lt-sub { font-size: .8rem; color: var(--fg-3); margin-top: 2px; }
+.local-tool-row .lt-share { display: flex; align-items: center; gap: 10px; margin: 8px 0 2px 46px; }
+.local-tool-row .lt-share-label { font-size: .78rem; color: var(--fg-3); white-space: nowrap; }
+.local-tool-row .lt-share select { flex: 1; max-width: 280px; }
 .pane-head h2 i.bi { color: var(--brand); font-size: 1.15rem; }
 .muted { color: var(--fg-3); font-size: .85rem; }
 .small { font-size: .8rem; }
