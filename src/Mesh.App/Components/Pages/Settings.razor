@@ -4,6 +4,7 @@
 @inject MsalAuthService Msal
 @inject FoundryLocalService Foundry
 @inject ModelSetupService Setup
+@inject McpHost McpHostSvc
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -239,6 +240,49 @@
         </div>
 
         <div class="card-panel">
+            <h3>Bundled tool servers</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Extra tool servers that ship with Mesh. Same rules as local tools: off by default, yours
+                to use in Me, and only reach a contact's agent if you share the server with their circle.
+            </div>
+            @foreach (var def in McpServerRegistry.All)
+            {
+                var setting = GetMcpServer(def.Id);
+                var available = McpHostSvc.IsAvailable(def);
+                <div class="local-tool-row">
+                    <div class="lt-main">
+                        <label class="switch">
+                            <input type="checkbox" checked="@setting.Enabled" disabled="@(!available)"
+                                   @onchange="e => SetMcpEnabled(def.Id, (bool)(e.Value ?? false))" />
+                        </label>
+                        <div class="lt-text">
+                            <div class="lt-name"><i class="bi @def.Icon"></i> @def.DisplayName</div>
+                            <div class="lt-sub">@def.Description</div>
+                            @if (!available)
+                            {
+                                <div class="lt-sub" style="color:var(--danger);">Not installed on this machine.</div>
+                            }
+                        </div>
+                    </div>
+                    @if (setting.Enabled && available)
+                    {
+                        <div class="lt-share">
+                            <span class="lt-share-label">Who can use it</span>
+                            <select value="@setting.Visibility" @onchange="e => SetMcpVisibility(def.Id, e.Value?.ToString())">
+                                <option value="private">Only me (Me chat)</option>
+                                @foreach (var c in State.CircleNames)
+                                {
+                                    <option value="@($"shared:{c}")">Share with @c</option>
+                                }
+                                <option value="public">Anyone allowed</option>
+                            </select>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="card-panel">
             <h3>Relay</h3>
             <div class="field">
                 <label>Relay URL</label>
@@ -384,7 +428,6 @@
         new(LocalToolKind.Python, "Python", "bi-filetype-py", "Run Python 3 scripts (Python must be installed)."),
         new(LocalToolKind.CSharpScript, "C# scripting", "bi-filetype-cs", "Run C# scripts (needs the dotnet-script tool)."),
         new(LocalToolKind.Browser, "Browser", "bi-globe2", "Drive a real web browser (navigate, click, type, screenshot)."),
-        new(LocalToolKind.Desktop, "Desktop control", "bi-mouse", "Move the mouse, type keys, and capture the screen. Windows only."),
         new(LocalToolKind.FileSystem, "Files", "bi-folder", "Read, write and convert files on this machine."),
     };
 
@@ -409,6 +452,31 @@
         => State.Mutate(p =>
         {
             if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
+            s.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!;
+        });
+
+    // ---- bundled MCP tool servers ----
+    LocalToolSetting GetMcpServer(string id)
+    {
+        if (!State.Profile.McpServers.TryGetValue(id, out var s) || s is null)
+        {
+            s = new LocalToolSetting();
+            State.Profile.McpServers[id] = s;
+        }
+        return s;
+    }
+
+    void SetMcpEnabled(string id, bool enabled)
+        => State.Mutate(p =>
+        {
+            if (!p.McpServers.TryGetValue(id, out var s) || s is null) { s = new LocalToolSetting(); p.McpServers[id] = s; }
+            s.Enabled = enabled;
+        });
+
+    void SetMcpVisibility(string id, string? visibility)
+        => State.Mutate(p =>
+        {
+            if (!p.McpServers.TryGetValue(id, out var s) || s is null) { s = new LocalToolSetting(); p.McpServers[id] = s; }
             s.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!;
         });
 

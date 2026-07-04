@@ -63,7 +63,6 @@ public enum LocalToolKind
     Python,
     CSharpScript,
     Browser,
-    Desktop,
     FileSystem
 }
 
@@ -290,11 +289,18 @@ public sealed class MeshProfile
     public bool AllowInteractiveApps { get; set; } = true;
 
     /// <summary>
-    /// Local-machine tool grants (run scripts, control browser/desktop, file access), keyed by tool.
+    /// Local-machine tool grants (run scripts, control browser, file access), keyed by tool.
     /// All OFF by default. Enabled tools are always available to the owner in their private chat, and
     /// only reach a guest agent when the owner has shared that tool with one of the guest's circles.
     /// </summary>
     public Dictionary<LocalToolKind, LocalToolSetting> LocalTools { get; set; } = new();
+
+    /// <summary>
+    /// Grants for bundled MCP tool servers (e.g. TotalControl desktop control), keyed by server id.
+    /// Same off-by-default, owner-first, optionally-circle-shared model as <see cref="LocalTools"/>.
+    /// Each server can expose several tools; the grant governs the whole server.
+    /// </summary>
+    public Dictionary<string, LocalToolSetting> McpServers { get; set; } = new();
 
     /// <summary>The agent's own private chat (owner context).</summary>
     public List<ChatLine> OwnChat { get; set; } = new();

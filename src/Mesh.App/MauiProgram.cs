@@ -52,6 +52,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ConnectorAuthService>();
 		builder.Services.AddSingleton<ToolRegistry>();
 		builder.Services.AddSingleton<LocalFileRegistry>();
+		builder.Services.AddSingleton<McpHost>();
 		builder.Services.AddSingleton<DocumentExtractor>();
 		builder.Services.AddSingleton<SourceBrowser>();
 		builder.Services.AddSingleton<FileImporter>();

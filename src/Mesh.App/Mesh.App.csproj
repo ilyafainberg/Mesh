@@ -75,6 +75,7 @@
         <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
         <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.9" />
         <PackageReference Include="Microsoft.Playwright" Version="1.61.0" />
+        <PackageReference Include="ModelContextProtocol" Version="1.4.0" />
         <PackageReference Include="Microsoft.Identity.Client" Version="4.85.2" />
         <PackageReference Include="Microsoft.Identity.Client.Broker" Version="4.85.2" />
         <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
@@ -97,5 +98,22 @@
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </Content>
     </ItemGroup>
+
+    <!--
+      Windows-only: ship the bundled TotalControl MCP server (desktop control) next to the app under
+      mcp/totalcontrol so McpServerRegistry can find and launch it. The server is published separately
+      into _deploy/totalcontrol (see _deploy/publish-totalcontrol.ps1); this target copies that output
+      into the build output. If the staged server is missing, the build still succeeds (the tool just
+      shows as "not installed" until the server is published).
+    -->
+    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
+        <TotalControlFiles Include="$(MSBuildProjectDirectory)\..\..\_deploy\totalcontrol\**\*.*" />
+    </ItemGroup>
+    <Target Name="CopyTotalControl" AfterTargets="Build;Publish"
+            Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows' And '@(TotalControlFiles)' != ''">
+        <Copy SourceFiles="@(TotalControlFiles)"
+              DestinationFiles="@(TotalControlFiles->'$(OutDir)mcp\totalcontrol\%(RecursiveDir)%(Filename)%(Extension)')"
+              SkipUnchangedFiles="true" />
+    </Target>
 
 </Project>

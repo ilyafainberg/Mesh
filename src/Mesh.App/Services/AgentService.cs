@@ -22,8 +22,9 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var p = state.Profile;
         state.AddOwnChatLine(new ChatLine { Role = "user", Text = userText });
 
-        // Owner may use every connected source's tools.
-        var agentTools = tools.OwnerTools(p.Sources, p.LocalTools);
+        // Owner may use every connected source's tools, plus local tools and bundled MCP servers.
+        var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
+        agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, owner: true, circles: null, ct));
         var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
@@ -96,7 +97,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         // Tools scoped to this contact's circles (whole-source or per-folder grants).
         static bool Visible(string vis, List<string> cs) =>
             vis == "public" || (vis.StartsWith("shared:") && cs.Contains(vis["shared:".Length..]));
-        var agentTools = tools.GuestTools(p.Sources, circles, p.LocalTools);
+        var agentTools = tools.GuestTools(p.Sources, circles, p.LocalTools).ToList();
+        agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, owner: false, circles: circles, ct));
         var widgets = p.Widgets.Where(w => Visible(w.Visibility, circles)).ToList();
 
         var sys = BuildGuestSystemPrompt(p, fromHandle, circles, agentTools, widgets);

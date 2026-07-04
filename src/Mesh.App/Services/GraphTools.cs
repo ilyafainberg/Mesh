@@ -240,7 +240,7 @@ public sealed class GmailSearchTool(GoogleAuthService auth, IHttpClientFactory h
 }
 
 /// <summary>Builds the set of tools available from the user's connected sources.</summary>
-public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles)
+public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost)
 {
     /// <summary>Whether a provider exposes an email/message search tool.</summary>
     private static bool HasEmail(SourceProvider p) => p is
@@ -404,10 +404,37 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         LocalToolKind.Python => new RunPythonTool(),
         LocalToolKind.CSharpScript => new RunCSharpScriptTool(),
         LocalToolKind.Browser => new BrowserTool(),
-        LocalToolKind.Desktop => new DesktopTool(),
         LocalToolKind.FileSystem => new FileSystemTool(extractor),
         _ => null
     };
+
+    /// <summary>
+    /// Tools from the bundled MCP servers (e.g. TotalControl), gated the same way as local tools:
+    /// the owner gets every enabled server's tools; a guest gets a server's tools only when the owner
+    /// shared that server with one of the guest's circles. Connects to enabled servers on demand.
+    /// </summary>
+    public async Task<IReadOnlyList<IAgentTool>> McpToolsAsync(
+        IReadOnlyDictionary<string, LocalToolSetting>? servers,
+        bool owner,
+        List<string>? circles,
+        CancellationToken ct = default)
+    {
+        if (servers is null || servers.Count == 0) return Array.Empty<IAgentTool>();
+
+        static bool Vis(string v, List<string> cs) =>
+            v == "public" || (v.StartsWith("shared:") && cs.Contains(v["shared:".Length..]));
+
+        var tools = new List<IAgentTool>();
+        foreach (var (id, setting) in servers)
+        {
+            if (setting is null || !setting.Enabled) continue;
+            if (!owner && (circles is null || !Vis(setting.Visibility, circles))) continue;
+            var def = McpServerRegistry.Find(id);
+            if (def is null || !mcpHost.IsAvailable(def)) continue;
+            tools.AddRange(await mcpHost.GetToolsAsync(def, ct));
+        }
+        return tools;
+    }
 
     private static string LabelFor(ConnectedSource src)
         => string.IsNullOrWhiteSpace(src.ConnectedAs) ? DisplayName(src.Provider) : src.ConnectedAs!;
