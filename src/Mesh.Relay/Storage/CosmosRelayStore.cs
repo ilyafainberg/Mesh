@@ -218,6 +218,48 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <inheritdoc />
+    public async Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            HandleDoc doc;
+            string etag;
+            try
+            {
+                var read = await handlesContainer
+                    .ReadItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return; // No-op if the handle does not exist.
+            }
+
+            // First writer wins: never overwrite an existing recovery key.
+            if (!string.IsNullOrEmpty(doc.RecoveryPublicKey))
+                return;
+
+            doc.RecoveryPublicKey = recoveryPublicKey;
+            try
+            {
+                await handlesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    /// <inheritdoc />
     public async Task AddInviteAsync(StoredInvite invite, CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
@@ -336,7 +378,8 @@ public sealed class CosmosRelayStore : IRelayStore
         Handle = doc.Handle,
         DisplayName = doc.DisplayName,
         RegisteredAt = doc.RegisteredAt,
-        DevicePublicKeys = doc.DevicePublicKeys is null ? new List<string>() : new List<string>(doc.DevicePublicKeys)
+        DevicePublicKeys = doc.DevicePublicKeys is null ? new List<string>() : new List<string>(doc.DevicePublicKeys),
+        RecoveryPublicKey = doc.RecoveryPublicKey
     };
 
     /// <summary>Cosmos document for a handle registration. Uses lowercase "handle" as the partition key.</summary>
@@ -356,6 +399,9 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("devicePublicKeys")]
         public List<string> DevicePublicKeys { get; set; } = new();
+
+        [JsonPropertyName("recoveryPublicKey")]
+        public string? RecoveryPublicKey { get; set; }
     }
 
     /// <summary>Cosmos document for a link invite, carrying a per-item "ttl" for native expiry.</summary>

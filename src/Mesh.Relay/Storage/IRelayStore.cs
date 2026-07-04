@@ -11,6 +11,14 @@ public sealed class StoredHandle
     public string? DisplayName { get; set; }
     public DateTimeOffset RegisteredAt { get; set; } = DateTimeOffset.UtcNow;
     public List<string> DevicePublicKeys { get; set; } = new();
+
+    /// <summary>
+    /// The handle's recovery public key, captured at registration. Used to authorize a brand-new
+    /// device via <c>POST /handles/{handle}/recover</c> when no existing device can issue a link
+    /// invite. Null when the handle was registered without recovery support. First writer wins:
+    /// once set it is never overwritten, so a later attacker cannot replace it.
+    /// </summary>
+    public string? RecoveryPublicKey { get; set; }
 }
 
 /// <summary>A pending device-link invite: single use, short lived, addressed to a handle.</summary>
@@ -53,6 +61,13 @@ public interface IRelayStore
 
     /// <summary>Updates only the display name of an existing handle. No-op if missing.</summary>
     Task SetDisplayNameAsync(string handle, string displayName, CancellationToken ct = default);
+
+    /// <summary>
+    /// Sets the handle's recovery public key, but only if one is not already stored (first writer
+    /// wins). This prevents a later attacker who has gained a device key from overwriting the
+    /// recovery key. No-op if the handle is missing or already has a recovery key.
+    /// </summary>
+    Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default);
 
     /// <summary>Stores a single-use invite. Expired invites are cleaned up opportunistically.</summary>
     Task AddInviteAsync(StoredInvite invite, CancellationToken ct = default);

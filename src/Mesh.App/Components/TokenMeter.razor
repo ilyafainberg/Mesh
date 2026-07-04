@@ -1,0 +1,47 @@
+@inject AppState State
+@implements IDisposable
+
+@{
+    var t = State.Profile.Tokens;
+    var modelKey = string.IsNullOrWhiteSpace(t.ModelKey) ? State.CurrentModelKey() : t.ModelKey;
+    var tip = $"{modelKey}\nPrompt {t.PromptTokens:N0} + Completion {t.CompletionTokens:N0} = {t.TotalTokens:N0} tokens";
+}
+
+@if (Compact)
+{
+    <span class="tm-pill" title="@tip">
+        <span class="tm-bar" aria-hidden="true">▮</span>
+        <span class="tm-pill-count">@t.TotalTokens.ToString("N0")</span>
+        <span class="tm-pill-unit">tokens</span>
+    </span>
+}
+else
+{
+    <div class="tm-card">
+        <div class="tm-head">
+            <span class="tm-title">Tokens this model</span>
+            <span class="tm-model" title="@modelKey">@modelKey</span>
+        </div>
+        <div class="tm-total">@t.TotalTokens.ToString("N0")</div>
+        <div class="tm-breakdown">
+            <span class="tm-chip"><span class="tm-chip-label">Prompt</span> @t.PromptTokens.ToString("N0")</span>
+            <span class="tm-chip"><span class="tm-chip-label">Completion</span> @t.CompletionTokens.ToString("N0")</span>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool Compact { get; set; }
+
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+    }
+
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+    }
+}

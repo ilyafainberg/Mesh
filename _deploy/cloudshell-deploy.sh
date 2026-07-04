@@ -48,7 +48,7 @@ az containerapp update -n "$APP" -g "$RG" \
     "ASPNETCORE_URLS=http://+:8080" \
     "COSMOS_CONNECTION=secretref:cosmos" \
     "REDIS_CONNECTION=secretref:redis" \
-    "MODEL_DAILY_LIMIT=50" \
+    "MODEL_DAILY_TOKEN_LIMIT=100000" \
   --min-replicas 1 --max-replicas 5 -o none
 
 echo "== sticky sessions =="

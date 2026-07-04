@@ -138,6 +138,18 @@
                     <input class="full" type="password" @bind="apiKey" placeholder="(unchanged)" />
                 </div>
             }
+
+            <div class="field" style="margin-top:4px;">
+                <label>Token usage</label>
+                <TokenMeter />
+                <div class="tm-actions" style="margin-top:8px;">
+                    <button class="ghost" @onclick="ResetCounter"><i class="bi bi-arrow-counterclockwise"></i> Reset counter</button>
+                </div>
+                <div class="field-hint">
+                    Counts reset automatically when you switch models. The free hosted model has a daily
+                    token budget, so it can pause once that budget is used up for the day.
+                </div>
+            </div>
         </div>
 
         <div class="card-panel">
@@ -452,8 +464,13 @@
             p.AgentDailyReplyBudget = replyBudget < 0 ? 0 : replyBudget;
         });
 
+        // Model may have changed; start the live counter fresh for the newly selected model.
+        State.ResetTokenCounter();
+
         await Mesh.RegisterAsync();
     }
+
+    void ResetCounter() => State.ResetTokenCounter();
 
     async Task Reconnect() => await Mesh.ConnectAsync();
 

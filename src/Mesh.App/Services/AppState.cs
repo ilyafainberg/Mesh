@@ -3,7 +3,7 @@ using Mesh.App.Domain;
 
 namespace Mesh.App.Services;
 
-/// <summary>A saved identity on this device (one Mesh handle + its own profile file).</summary>
+/// <summary>A saved identity on this device (one Mesh handle + its own encrypted database).</summary>
 public sealed class AccountRef
 {
     public string Id { get; set; } = "";
@@ -16,10 +16,12 @@ public sealed class AccountRef
 /// Central in-memory + on-disk store of the user's profile. Singleton.
 /// Raises <see cref="Changed"/> whenever state mutates so UI can refresh.
 ///
-/// Supports multiple identities on one device: each account has its own encrypted
-/// profile file (<c>profile-{id}.json</c>) and an index (<c>accounts.json</c>) tracks
-/// them plus the active one. Signing out just clears the active pointer, profiles
-/// are kept so the user can switch back.
+/// Each identity owns a single encrypted SQLCipher database (<c>identity-{id}.meshdb</c>) holding
+/// everything tied to that user: keys, config, contacts, and the full chat history (as scalable
+/// append-only rows). A small device-level index (<c>accounts.json</c>) tracks which identities
+/// live on this device and which one is active. Signing out just clears the active pointer; the
+/// databases are kept so the user can switch back. No data leaves the device except through an
+/// explicit passphrase-encrypted export (see <see cref="MeshExport"/>).
 /// </summary>
 public sealed class AppState
 {
@@ -34,27 +36,28 @@ public sealed class AppState
         public List<AccountRef> Accounts { get; set; } = new();
     }
 
+    private readonly ISecretStore secrets;
     private readonly string dir;
     private readonly string indexPath;
-    private readonly string legacyPath;
     private string? activeId;
     private List<AccountRef> accounts = new();
+    private MeshDb? activeDb;
 
     public MeshProfile Profile { get; private set; } = new();
 
     public event Action? Changed;
 
-    public AppState()
+    public AppState(ISecretStore secrets)
     {
-        // Allow an override directory so multiple instances (e.g. for testing two
-        // users on one machine) can run with isolated profiles.
+        this.secrets = secrets;
+        // Allow an override directory so multiple instances (e.g. two users on one machine for
+        // testing) run with isolated stores.
         var d = Environment.GetEnvironmentVariable("MESH_PROFILE_DIR");
         if (string.IsNullOrWhiteSpace(d))
             d = Microsoft.Maui.Storage.FileSystem.AppDataDirectory;
         Directory.CreateDirectory(d);
         dir = d;
         indexPath = Path.Combine(dir, "accounts.json");
-        legacyPath = Path.Combine(dir, "mesh-profile.json");
         Load();
     }
 
@@ -65,70 +68,44 @@ public sealed class AppState
     public string? ActiveAccountId => activeId;
     public bool HasSavedAccounts => accounts.Count > 0;
 
-    private string ProfilePath(string id) => Path.Combine(dir, $"profile-{id}.json");
+    private string DbPath(string id) => Path.Combine(dir, $"identity-{id}.meshdb");
+
+    private MeshDb OpenDb(string id)
+    {
+        var key = secrets.GetOrCreateDbKey(id);
+        return MeshDb.Open(DbPath(id), key);
+    }
 
     public void Load()
     {
         try
         {
-            if (File.Exists(indexPath))
+            if (!File.Exists(indexPath))
             {
-                var idx = JsonSerializer.Deserialize<AccountIndex>(File.ReadAllText(indexPath), JsonOpts) ?? new AccountIndex();
-                accounts = idx.Accounts ?? new();
-                activeId = idx.ActiveId;
-                if (activeId is not null)
-                {
-                    var loaded = LoadProfileFile(activeId);
-                    if (loaded is not null) { Profile = loaded; return; }
-                    activeId = null; // active profile file missing → land on the picker
-                }
                 Profile = new MeshProfile();
                 return;
             }
 
-            // First run after the single-profile version: migrate the legacy file into an account.
-            if (File.Exists(legacyPath))
+            var idx = JsonSerializer.Deserialize<AccountIndex>(File.ReadAllText(indexPath), JsonOpts) ?? new AccountIndex();
+            accounts = idx.Accounts ?? new();
+            activeId = idx.ActiveId;
+
+            if (activeId is not null)
             {
-                var stored = File.ReadAllText(legacyPath);
-                var json = ProfileProtector.Unprotect(stored);
-                Profile = JsonSerializer.Deserialize<MeshProfile>(json, JsonOpts) ?? new MeshProfile();
-                if (Profile.IsOnboarded)
+                var db = OpenDb(activeId);
+                var loaded = db.LoadProfile();
+                if (loaded is not null)
                 {
-                    activeId = NewId();
-                    accounts = new() { new AccountRef { Id = activeId, Handle = Profile.Handle, DisplayName = Profile.DisplayName } };
-                    WriteProfileFile(activeId, Profile);
-                    WriteIndex();
-                    try { File.Move(legacyPath, legacyPath + ".migrated", overwrite: true); } catch { }
+                    activeDb = db;
+                    Profile = loaded;
                     return;
                 }
+                db.Dispose();
+                activeId = null; // active database missing/empty, land on the picker
             }
-
-            // Fresh install: no accounts yet.
             Profile = new MeshProfile();
         }
-        catch { Profile = new MeshProfile(); activeId = null; }
-    }
-
-    private MeshProfile? LoadProfileFile(string id)
-    {
-        try
-        {
-            var p = ProfilePath(id);
-            if (!File.Exists(p)) return null;
-            var json = ProfileProtector.Unprotect(File.ReadAllText(p));
-            return JsonSerializer.Deserialize<MeshProfile>(json, JsonOpts);
-        }
-        catch { return null; }
-    }
-
-    private void WriteProfileFile(string id, MeshProfile profile)
-    {
-        try
-        {
-            var json = JsonSerializer.Serialize(profile, JsonOpts);
-            File.WriteAllText(ProfilePath(id), ProfileProtector.Protect(json));
-        }
-        catch { /* best-effort on prototype */ }
+        catch { Profile = new MeshProfile(); activeId = null; activeDb = null; }
     }
 
     private void WriteIndex()
@@ -148,8 +125,17 @@ public sealed class AppState
         // Adopt: onboarding/link just filled a fresh profile with no active id yet.
         if (activeId is null && Profile.IsOnboarded)
         {
+            EnsureRecoveryKeys();
             activeId = NewId();
+            activeDb = OpenDb(activeId);
             accounts.Add(new AccountRef { Id = activeId, Handle = Profile.Handle, DisplayName = Profile.DisplayName });
+            // Persist any history the fresh profile already carries (normally none at onboarding).
+            foreach (var conv in Profile.Conversations)
+            {
+                activeDb.EnsureConversation(conv.Handle);
+                foreach (var line in conv.Lines) activeDb.AppendChatLine(Norm(conv.Handle), line);
+            }
+            foreach (var line in Profile.OwnChat) activeDb.AppendOwnChat(line);
         }
 
         if (activeId is not null)
@@ -158,7 +144,7 @@ public sealed class AppState
             if (acc is null) { acc = new AccountRef { Id = activeId }; accounts.Add(acc); }
             acc.Handle = Profile.Handle;
             acc.DisplayName = Profile.DisplayName;
-            WriteProfileFile(activeId, Profile);
+            activeDb?.SaveProfile(Profile);
         }
         WriteIndex();
     }
@@ -172,16 +158,133 @@ public sealed class AppState
 
     public void NotifyChanged() => Changed?.Invoke();
 
+    // ---- chat history (append-only rows) ----------------------------------
+
+    /// <summary>
+    /// Appends a line to a conversation, persisting it as a single row (not a full re-serialize)
+    /// so history stays scalable. Updates the in-memory conversation and notifies the UI.
+    /// </summary>
+    public void AddChatLine(string handle, ChatLine line)
+    {
+        var conv = GetOrCreateConversation(handle);
+        conv.Lines.Add(line);
+        activeDb?.AppendChatLine(Norm(handle), line);
+        NotifyChanged();
+    }
+
+    /// <summary>Appends a line to the owner's own-agent chat as a single row.</summary>
+    public void AddOwnChatLine(ChatLine line)
+    {
+        Profile.OwnChat.Add(line);
+        activeDb?.AppendOwnChat(line);
+        NotifyChanged();
+    }
+
+    // ---- token counter ----------------------------------------------------
+
+    /// <summary>Stable key ("Provider/model") for the active model; the token counter resets when it changes.</summary>
+    public string CurrentModelKey()
+    {
+        var m = Profile.Model;
+        var name = m.Provider == ModelProvider.MeshHosted
+            ? (string.IsNullOrWhiteSpace(Profile.HostedModelName) ? "hosted" : Profile.HostedModelName)
+            : m.Model;
+        return $"{m.Provider}/{name}";
+    }
+
+    /// <summary>
+    /// Folds token usage into the running total for the current model, resetting first when the
+    /// model changed since the last record (the counter is only meaningful per model).
+    /// </summary>
+    public void AddTokens(string modelKey, long promptTokens, long completionTokens)
+    {
+        var t = Profile.Tokens;
+        if (t.ModelKey != modelKey)
+        {
+            t.ModelKey = modelKey;
+            t.PromptTokens = 0;
+            t.CompletionTokens = 0;
+        }
+        t.PromptTokens += promptTokens;
+        t.CompletionTokens += completionTokens;
+        Save();
+        NotifyChanged();
+    }
+
+    /// <summary>Resets the live token counter, e.g. when the user switches models in settings.</summary>
+    public void ResetTokenCounter()
+    {
+        Profile.Tokens = new TokenUsage { ModelKey = CurrentModelKey() };
+        Save();
+        NotifyChanged();
+    }
+
+    // ---- handle recovery keys --------------------------------------------
+
+    /// <summary>
+    /// Ensures the handle recovery keypair exists (generated once at onboarding). The public half
+    /// is registered with the relay; the private half travels only inside a passphrase-encrypted
+    /// export so a new device can re-authorize under the same handle when no device is available.
+    /// </summary>
+    public void EnsureRecoveryKeys()
+    {
+        if (!string.IsNullOrWhiteSpace(Profile.RecoveryPrivateKey)
+            && !string.IsNullOrWhiteSpace(Profile.RecoveryPublicKey)) return;
+        var (priv, pub) = IdentityService.GenerateKeyPair();
+        Profile.RecoveryPrivateKey = priv;
+        Profile.RecoveryPublicKey = pub;
+    }
+
+    // ---- export / import --------------------------------------------------
+
+    /// <summary>Produces a portable, passphrase-encrypted export of the active identity.</summary>
+    public byte[] ExportActiveProfile(string passphrase) => MeshExport.Create(Profile, passphrase);
+
+    /// <summary>
+    /// Imports a profile bundle as a NEW identity on this device: mints a fresh device keypair,
+    /// keeps the recovery keys and all data from the bundle, writes them to a new encrypted
+    /// database, and makes it the active identity. Returns the new local account id. The caller is
+    /// responsible for authorizing the new device key under the handle (link or recovery).
+    /// </summary>
+    public string ImportProfile(MeshProfile imported)
+    {
+        var (priv, pub) = IdentityService.GenerateKeyPair();
+        imported.PrivateKey = priv;
+        imported.PublicKey = pub;
+
+        if (activeId is not null && activeDb is not null) activeDb.SaveProfile(Profile);
+
+        var id = NewId();
+        var db = OpenDb(id);
+        foreach (var conv in imported.Conversations)
+        {
+            db.EnsureConversation(conv.Handle);
+            foreach (var line in conv.Lines) db.AppendChatLine(Norm(conv.Handle), line);
+        }
+        foreach (var line in imported.OwnChat) db.AppendOwnChat(line);
+        db.SaveProfile(imported);
+
+        activeDb?.Dispose();
+        activeDb = db;
+        activeId = id;
+        Profile = imported;
+        accounts.Add(new AccountRef { Id = id, Handle = imported.Handle, DisplayName = imported.DisplayName });
+        WriteIndex();
+        NotifyChanged();
+        return id;
+    }
+
     // ---- multi-account -----------------------------------------------------
 
     /// <summary>
-    /// Sign out of the active identity WITHOUT deleting it. The profile stays on
-    /// disk so it can be switched back to; the app returns to onboarding / the
-    /// account picker where the user can add or link another identity.
+    /// Sign out of the active identity WITHOUT deleting it. The database stays on disk so it can
+    /// be switched back to; the app returns to onboarding / the account picker.
     /// </summary>
     public void SignOut()
     {
-        if (activeId is not null) WriteProfileFile(activeId, Profile);
+        if (activeId is not null) activeDb?.SaveProfile(Profile);
+        activeDb?.Dispose();
+        activeDb = null;
         activeId = null;
         Profile = new MeshProfile();
         WriteIndex();
@@ -192,26 +295,38 @@ public sealed class AppState
     public bool SwitchAccount(string id)
     {
         if (id == activeId) return true;
-        var loaded = LoadProfileFile(id);
-        if (loaded is null) return false;
-        if (activeId is not null) WriteProfileFile(activeId, Profile); // persist the one we're leaving
-        activeId = id;
-        Profile = loaded;
-        WriteIndex();
-        NotifyChanged();
-        return true;
+        MeshDb? db = null;
+        try
+        {
+            db = OpenDb(id);
+            var loaded = db.LoadProfile();
+            if (loaded is null) { db.Dispose(); return false; }
+
+            if (activeId is not null) activeDb?.SaveProfile(Profile); // persist the one we're leaving
+            activeDb?.Dispose();
+            activeDb = db;
+            activeId = id;
+            Profile = loaded;
+            WriteIndex();
+            NotifyChanged();
+            return true;
+        }
+        catch { db?.Dispose(); return false; }
     }
 
-    /// <summary>Permanently remove a saved identity and its profile file from this device.</summary>
+    /// <summary>Permanently remove a saved identity: its database file and its master key.</summary>
     public void DeleteAccount(string id)
     {
         accounts.RemoveAll(a => a.Id == id);
-        try { var p = ProfilePath(id); if (File.Exists(p)) File.Delete(p); } catch { }
         if (id == activeId)
         {
+            activeDb?.Dispose();
+            activeDb = null;
             activeId = null;
             Profile = new MeshProfile();
         }
+        try { var p = DbPath(id); if (File.Exists(p)) File.Delete(p); } catch { }
+        secrets.DeleteDbKey(id);
         WriteIndex();
         NotifyChanged();
     }
@@ -228,6 +343,7 @@ public sealed class AppState
         {
             conv = new Conversation { Handle = handle };
             Profile.Conversations.Add(conv);
+            activeDb?.EnsureConversation(handle);
         }
         return conv;
     }
@@ -327,4 +443,3 @@ public sealed class AppState
         return contact.SigningKeys;
     }
 }
-

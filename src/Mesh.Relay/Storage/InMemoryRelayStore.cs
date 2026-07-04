@@ -50,6 +50,15 @@ public sealed class InMemoryRelayStore : IRelayStore
         return Task.CompletedTask;
     }
 
+    public Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
+    {
+        if (handles.TryGetValue(handle, out var rec))
+            lock (rec)
+                // First writer wins: never overwrite an existing recovery key.
+                rec.RecoveryPublicKey ??= recoveryPublicKey;
+        return Task.CompletedTask;
+    }
+
     public Task AddInviteAsync(StoredInvite invite, CancellationToken ct = default)
     {
         var map = invites.GetOrAdd(invite.Handle, _ => new(StringComparer.Ordinal));
@@ -95,7 +104,8 @@ public sealed class InMemoryRelayStore : IRelayStore
                 Handle = r.Handle,
                 DisplayName = r.DisplayName,
                 RegisteredAt = r.RegisteredAt,
-                DevicePublicKeys = r.DevicePublicKeys.ToList()
+                DevicePublicKeys = r.DevicePublicKeys.ToList(),
+                RecoveryPublicKey = r.RecoveryPublicKey
             };
     }
 }

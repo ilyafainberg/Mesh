@@ -3,16 +3,13 @@ using StackExchange.Redis;
 namespace Mesh.Relay.Quota;
 
 /// <summary>
-/// Redis-backed <see cref="IQuotaStore"/>. The daily counter is a Redis key
-/// <c>mesh:quota:{handle}:{yyyyMMdd}</c> incremented with INCR and given a 2-day TTL, so the
-/// per-user free-model limit is exact, shared across all relay replicas, and cleans itself up.
+/// Redis-backed <see cref="IQuotaStore"/>. The daily token counter is a Redis key
+/// <c>mesh:quota:{handle}:{yyyyMMdd}</c> incremented with INCRBY and given a 2-day TTL, so the
+/// per-user free-model token limit is exact, shared across all relay replicas, and cleans itself
+/// up.
 /// </summary>
 public sealed class RedisQuotaStore : IQuotaStore
 {
-    // Refund without underflow: only decrement when the counter is above zero.
-    private const string RefundScript =
-        "local v = tonumber(redis.call('get', KEYS[1]) or '0'); if v > 0 then return redis.call('decr', KEYS[1]) else return 0 end";
-
     private static readonly TimeSpan Ttl = TimeSpan.FromDays(2);
 
     private readonly string connectionString;
@@ -36,19 +33,21 @@ public sealed class RedisQuotaStore : IQuotaStore
         return mux.GetDatabase();
     }
 
-    public async Task<long> ReserveDailyAsync(string handle, CancellationToken ct = default)
+    public async Task<long> GetDailyAsync(string handle, CancellationToken ct = default)
+    {
+        var db = await DbAsync().ConfigureAwait(false);
+        var value = await db.StringGetAsync(Key(handle)).ConfigureAwait(false);
+        return value.HasValue && long.TryParse((string?)value, out var tokens) ? tokens : 0;
+    }
+
+    public async Task<long> AddDailyAsync(string handle, long tokens, CancellationToken ct = default)
     {
         var db = await DbAsync().ConfigureAwait(false);
         var key = Key(handle);
-        var value = await db.StringIncrementAsync(key).ConfigureAwait(false);
-        // Set the expiry once, when the counter is first created for the day.
-        if (value == 1) await db.KeyExpireAsync(key, Ttl).ConfigureAwait(false);
+        var value = await db.StringIncrementAsync(key, tokens).ConfigureAwait(false);
+        // Set the expiry once, when the counter is first created for the day (new total equals the
+        // tokens just added).
+        if (value == tokens) await db.KeyExpireAsync(key, Ttl).ConfigureAwait(false);
         return value;
-    }
-
-    public async Task RefundDailyAsync(string handle, CancellationToken ct = default)
-    {
-        var db = await DbAsync().ConfigureAwait(false);
-        await db.ScriptEvaluateAsync(RefundScript, new RedisKey[] { Key(handle) }).ConfigureAwait(false);
     }
 }

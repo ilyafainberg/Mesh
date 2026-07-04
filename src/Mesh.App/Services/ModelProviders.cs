@@ -43,19 +43,47 @@ public static class ModelReply
     }
 }
 
+/// <summary>Extracts token usage from the various provider response shapes and reports it to the meter.</summary>
+internal static class Usage
+{
+    private static long GetLong(JsonElement e, string name)
+        => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt64(out var n) ? n : 0;
+
+    /// <summary>OpenAI / Groq / Azure shape: <c>usage { prompt_tokens, completion_tokens }</c>.</summary>
+    public static void ReportOpenAi(TokenMeter? meter, JsonElement root)
+    {
+        if (meter is null || !root.TryGetProperty("usage", out var u) || u.ValueKind != JsonValueKind.Object) return;
+        meter.Record(GetLong(u, "prompt_tokens"), GetLong(u, "completion_tokens"));
+    }
+
+    /// <summary>Anthropic shape: <c>usage { input_tokens, output_tokens }</c>.</summary>
+    public static void ReportAnthropic(TokenMeter? meter, JsonElement root)
+    {
+        if (meter is null || !root.TryGetProperty("usage", out var u) || u.ValueKind != JsonValueKind.Object) return;
+        meter.Record(GetLong(u, "input_tokens"), GetLong(u, "output_tokens"));
+    }
+
+    /// <summary>Gemini shape: <c>usageMetadata { promptTokenCount, candidatesTokenCount }</c>.</summary>
+    public static void ReportGemini(TokenMeter? meter, JsonElement root)
+    {
+        if (meter is null || !root.TryGetProperty("usageMetadata", out var u) || u.ValueKind != JsonValueKind.Object) return;
+        meter.Record(GetLong(u, "promptTokenCount"), GetLong(u, "candidatesTokenCount"));
+    }
+}
+
 /// <summary>Builds an <see cref="IChatModel"/> for the configured provider.</summary>
-public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state)
+public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state, TokenMeter meter)
 {
     public IChatModel Create(ModelConfig cfg) => cfg.Provider switch
     {
-        ModelProvider.Anthropic => new AnthropicModel(httpFactory.CreateClient("model"), cfg),
-        ModelProvider.Gemini => new GeminiModel(httpFactory.CreateClient("model"), cfg),
-        ModelProvider.FoundryLocal => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithFoundryDefault(cfg)),
-        ModelProvider.Grok => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.x.ai")),
-        ModelProvider.Groq => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.groq.com/openai")),
-        ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg),
-        ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg),
-        _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg),
+        ModelProvider.Anthropic => new AnthropicModel(httpFactory.CreateClient("model"), cfg, meter),
+        ModelProvider.Gemini => new GeminiModel(httpFactory.CreateClient("model"), cfg, meter),
+        ModelProvider.FoundryLocal => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithFoundryDefault(cfg), meter),
+        ModelProvider.Grok => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.x.ai"), meter),
+        ModelProvider.Groq => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.groq.com/openai"), meter),
+        ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg, meter),
+        ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg, meter),
+        _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg, meter),
     };
 
     /// <summary>Applies a default endpoint for OpenAI-compatible hosts (Grok/Groq) when none set.</summary>
@@ -81,7 +109,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state)
 }
 
 /// <summary>Works for OpenAI, Groq, Mistral, Foundry Local, Ollama (OpenAI-compatible).</summary>
-public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg) : IChatModel
+public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
     public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
     {
@@ -98,6 +126,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg) : IC
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
+        Usage.ReportOpenAi(meter, doc.RootElement);
         return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
     }
 
@@ -137,6 +166,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg) : IC
             }
 
             using var doc = JsonDocument.Parse(body);
+            Usage.ReportOpenAi(meter, doc.RootElement);
             var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
 
             if (!msg.TryGetProperty("tool_calls", out var toolCalls) || toolCalls.ValueKind != JsonValueKind.Array || toolCalls.GetArrayLength() == 0)
@@ -173,7 +203,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg) : IC
         => arr.EnumerateArray().Select(e => (object)JsonSerializer.Deserialize<JsonElement>(e.GetRawText())).ToArray();
 }
 
-public sealed class AnthropicModel(HttpClient http, ModelConfig cfg) : IChatModel
+public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
     public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
     {
@@ -197,6 +227,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg) : IChatMode
         foreach (var block in content.EnumerateArray())
             if (block.GetProperty("type").GetString() == "text")
                 sb.Append(block.GetProperty("text").GetString());
+        Usage.ReportAnthropic(meter, doc.RootElement);
         return sb.ToString();
     }
 
@@ -232,6 +263,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg) : IChatMode
             using var doc = JsonDocument.Parse(body);
             var content = doc.RootElement.GetProperty("content");
             var stopReason = doc.RootElement.TryGetProperty("stop_reason", out var sr) ? sr.GetString() : null;
+            Usage.ReportAnthropic(meter, doc.RootElement);
 
             var text = new StringBuilder();
             var toolUses = new List<(string id, string name, string argsJson)>();
@@ -265,7 +297,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg) : IChatMode
         => arr.EnumerateArray().Select(e => (object)JsonSerializer.Deserialize<JsonElement>(e.GetRawText())).ToArray();
 }
 
-public sealed class GeminiModel(HttpClient http, ModelConfig cfg) : IChatModel
+public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
     public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
     {
@@ -285,6 +317,7 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg) : IChatModel
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
+        Usage.ReportGemini(meter, doc.RootElement);
         return doc.RootElement.GetProperty("candidates")[0].GetProperty("content")
             .GetProperty("parts")[0].GetProperty("text").GetString() ?? "";
     }
@@ -298,7 +331,7 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg) : IChatModel
 /// This powers the one-click "start free" onboarding: the user needs no key of their own.
 /// Tool calls are not supported on the free tier, so tool requests degrade to plain chat.
 /// </summary>
-public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig cfg) : IChatModel
+public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
     private static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
 
@@ -388,7 +421,10 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
             if (resp.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable)
                 return (null, "The free model is temporarily unavailable. You can add your own model key in Settings, or switch to an on-device model.");
             if (!resp.IsSuccessStatusCode) return (null, "The free model is temporarily unavailable. Please try again shortly, or add your own model key in Settings.");
-            return (JsonSerializer.Deserialize<HostedModelResponse>(body, Web), null);
+            var parsed = JsonSerializer.Deserialize<HostedModelResponse>(body, Web);
+            if (parsed is not null)
+                meter?.Record(parsed.PromptTokens, parsed.CompletionTokens);
+            return (parsed, null);
         }
         catch (Exception ex) { return (null, $"The free model could not be reached ({ex.Message}). Check your connection, or add your own model key in Settings."); }
     }
@@ -402,7 +438,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
 /// <see cref="ModelConfig.Model"/> is the Azure deployment name and
 /// <see cref="ModelConfig.Endpoint"/> is the resource URL. Supports tool calls.
 /// </summary>
-public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg) : IChatModel
+public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
     private const string DefaultApiVersion = "2024-08-01-preview";
 
@@ -429,6 +465,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg) : IChatMo
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
+        Usage.ReportOpenAi(meter, doc.RootElement);
         return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
     }
 
@@ -463,6 +500,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg) : IChatMo
             }
 
             using var doc = JsonDocument.Parse(body);
+            Usage.ReportOpenAi(meter, doc.RootElement);
             var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
 
             if (!msg.TryGetProperty("tool_calls", out var toolCalls) || toolCalls.ValueKind != JsonValueKind.Array || toolCalls.GetArrayLength() == 0)

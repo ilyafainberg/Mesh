@@ -150,6 +150,19 @@ public sealed class Conversation
     public List<ChatLine> Lines { get; set; } = new();
 }
 
+/// <summary>
+/// Cumulative token usage for the currently selected model. Tracks the model the counts belong
+/// to so the counter can auto-reset when the model changes.
+/// </summary>
+public sealed class TokenUsage
+{
+    /// <summary>Provider+model the counts apply to (e.g. "Groq/llama-3.3-70b-versatile"); reset trigger.</summary>
+    public string ModelKey { get; set; } = "";
+    public long PromptTokens { get; set; }
+    public long CompletionTokens { get; set; }
+    public long TotalTokens => PromptTokens + CompletionTokens;
+}
+
 /// <summary>An inbound request from a handle that is not yet allowed.</summary>
 public sealed class PendingRequest
 {
@@ -173,8 +186,18 @@ public sealed class MeshProfile
 {
     public string Handle { get; set; } = "";
     public string DisplayName { get; set; } = "";
-    public string PrivateKey { get; set; } = ""; // base64 PKCS#8
-    public string PublicKey { get; set; } = "";  // base64 SubjectPublicKeyInfo
+    public string PrivateKey { get; set; } = ""; // base64 PKCS#8 (device signing key, never exported)
+    public string PublicKey { get; set; } = "";  // base64 SubjectPublicKeyInfo (device signing key)
+
+    /// <summary>
+    /// Handle recovery keypair (ECDSA P-256). Generated once at onboarding. The PUBLIC half is
+    /// registered with the relay; the PRIVATE half is the only key that travels inside an
+    /// encrypted export, so a brand-new device can re-authorize itself under the same handle when
+    /// no existing device is available to link. Device signing keys are NEVER exported.
+    /// </summary>
+    public string RecoveryPrivateKey { get; set; } = ""; // base64 PKCS#8
+    public string RecoveryPublicKey { get; set; } = "";  // base64 SubjectPublicKeyInfo
+
     public string RelayUrl { get; set; } = "https://mesh-relay.whiteground-796c60f9.northeurope.azurecontainerapps.io";
     public ModelConfig Model { get; set; } = new();
 
@@ -224,6 +247,13 @@ public sealed class MeshProfile
 
     /// <summary>Model id used for the relay-hosted free model (first-launch, no key required).</summary>
     public string HostedModelName { get; set; } = "gpt-4o-mini";
+
+    /// <summary>
+    /// Running token usage for the CURRENTLY selected model, shown as a live counter in the UI.
+    /// Reset to zero whenever the user switches models (provider or model id changes), because a
+    /// counter is only meaningful per model. Persisted so it survives restarts.
+    /// </summary>
+    public TokenUsage Tokens { get; set; } = new();
 
     /// <summary>Allow interactive HTML mini-apps from agents to be run in message bubbles.</summary>
     public bool AllowInteractiveApps { get; set; } = true;

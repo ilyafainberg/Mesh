@@ -78,7 +78,7 @@ az containerapp create -n $appName -g $ResourceGroup --environment $env `
     "MODEL_ENDPOINT=$aoaiEndpoint" `
     "MODEL_API_KEY=secretref:modelkey" `
     "MODEL_NAME=gpt-4o-mini" `
-    "MODEL_DAILY_LIMIT=50" `
+    "MODEL_DAILY_TOKEN_LIMIT=100000" `
   -o none
 
 # Session affinity so a connection's negotiate + socket land on the same replica.

@@ -118,18 +118,15 @@
                 building = true;
                 widgetMode = false;
                 var html = await Agent.BuildWidgetAsync(text);
-                State.Mutate(p =>
-                {
-                    p.OwnChat.Add(new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
-                    p.OwnChat.Add(new ChatLine { Role = "assistant", Text = html });
-                });
+                State.AddOwnChatLine(new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
+                State.AddOwnChatLine(new ChatLine { Role = "assistant", Text = html });
             }
             else
             {
                 await Agent.AskAsOwnerAsync(text);
             }
         }
-        catch (Exception ex) { State.Mutate(p => p.OwnChat.Add(new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" })); }
+        catch (Exception ex) { State.AddOwnChatLine(new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
         finally { busy = false; building = false; }
     }
 

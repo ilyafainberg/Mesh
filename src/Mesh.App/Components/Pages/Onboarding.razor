@@ -40,6 +40,11 @@
                     <span class="ch-title">Link an existing device</span>
                     <span class="ch-sub">Already have Mesh elsewhere? Join the same handle with a code.</span>
                 </button>
+                <button class="choice-card" @onclick="ChooseRestore">
+                    <i class="bi bi-box-arrow-in-down"></i>
+                    <span class="ch-title">Restore from a backup</span>
+                    <span class="ch-sub">Moving to this device? Bring your identity from an encrypted backup file.</span>
+                </button>
             </div>
             @if (error is not null) { <p class="err">@error</p> }
         }
@@ -73,6 +78,33 @@
             <button class="ghost" @onclick="() => step = 0">Back</button>
             @if (error is not null) { <p class="err">@error</p> }
             <p class="hint">This device gets its own key, authorized under @("@")@handle. Nothing is copied off your other device.</p>
+        }
+        else if (step == 4) // restore from an encrypted backup
+        {
+            @if (!restoreImported)
+            {
+                <label>Relay URL</label>
+                <input class="full" @bind="relayUrl" placeholder="https://mesh-relay...azurecontainerapps.io" />
+                <label>Backup passphrase</label>
+                <input class="full" type="password" @bind="passphrase" placeholder="the passphrase you set when you made the backup" />
+                <button class="primary" disabled="@(Working || !ValidRestore)" @onclick="PickAndImport">
+                    @(Working ? "Restoring..." : "Choose backup file and restore")
+                </button>
+                <button class="ghost" @onclick="() => step = 0">Back</button>
+                @if (error is not null) { <p class="err">@error</p> }
+                <p class="hint">Your backup carries all your data plus the handle recovery key, but not device keys. This device gets its own fresh key.</p>
+            }
+            else
+            {
+                <p class="sub">Restored <b>@("@")@State.Profile.Handle</b>. Now authorize this device to talk under that handle.</p>
+                <button class="primary full" disabled="@Working" @onclick="RecoverThisDevice">
+                    @(Working ? "Recovering..." : "This is a new device, my old device is gone")
+                </button>
+                <p class="hint">Uses the recovery key from your backup to re-authorize this device. Pick this when the old device is no longer available.</p>
+                <button class="ghost full" disabled="@Working" @onclick="LinkAfterImport">My old device still works, I'll link with a code</button>
+                <p class="hint">Generate a link code on the old device (Settings, Link a device) and join from there instead.</p>
+                @if (error is not null) { <p class="err">@error</p> }
+            }
         }
         else if (step == 2)
         {
@@ -142,6 +174,8 @@
     string displayName = "";
     string relayUrl = "";
     string linkCode = "";
+    string passphrase = "";
+    bool restoreImported;
     string provider = "Anthropic";
     string model = "claude-3-5-sonnet-20241022";
     string endpoint = "";
@@ -156,6 +190,7 @@
 
     bool ValidHandle => handle.Trim().Length >= 2 && handle.Trim().All(c => char.IsLetterOrDigit(c) || c is '_' or '-');
     bool ValidLink => ValidHandle && !string.IsNullOrWhiteSpace(relayUrl) && linkCode.Trim().Length >= 6;
+    bool ValidRestore => !string.IsNullOrWhiteSpace(relayUrl) && !string.IsNullOrWhiteSpace(passphrase);
 
     string ModelPlaceholder => provider switch
     {
@@ -169,6 +204,72 @@
 
     void ChooseNew() { linkMode = false; step = 1; }
     void ChooseLink() { linkMode = true; step = 3; }
+    void ChooseRestore() { linkMode = false; restoreImported = false; error = null; step = 4; }
+
+    async Task PickAndImport()
+    {
+        error = null;
+        Working = true;
+        try
+        {
+            var res = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
+            if (res is null) { Working = false; return; }
+            byte[] bytes;
+            using (var stream = await res.OpenReadAsync())
+            using (var ms = new MemoryStream())
+            {
+                await stream.CopyToAsync(ms);
+                bytes = ms.ToArray();
+            }
+
+            MeshProfile profile;
+            try
+            {
+                profile = MeshExport.Open(bytes, passphrase);
+            }
+            catch (System.Security.Cryptography.CryptographicException)
+            {
+                error = "Wrong passphrase or corrupt backup.";
+                return;
+            }
+            catch (FormatException)
+            {
+                error = "That file is not a Mesh backup.";
+                return;
+            }
+
+            profile.RelayUrl = relayUrl.Trim();
+            State.ImportProfile(profile);
+            handle = State.Profile.Handle;
+            restoreImported = true;
+        }
+        catch (Exception ex) { error = ex.Message; }
+        finally { Working = false; }
+    }
+
+    async Task RecoverThisDevice()
+    {
+        error = null;
+        Working = true;
+        try
+        {
+            var (ok, err) = await Mesh.RecoverHandleAsync();
+            if (!ok) { error = err ?? "Recovery failed."; return; }
+            await Mesh.RegisterAsync();
+            await Mesh.ConnectAsync();
+            await OnDone.InvokeAsync();
+        }
+        catch (Exception ex) { error = ex.Message; }
+        finally { Working = false; }
+    }
+
+    void LinkAfterImport()
+    {
+        // The handle is already imported; reuse the existing link step to authorize this device.
+        linkMode = true;
+        error = null;
+        step = 3;
+    }
 
     async Task SwitchTo(AccountRef a)
     {

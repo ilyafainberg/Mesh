@@ -71,6 +71,7 @@
             <header class="pane-head">
                 <h2>@State.DisplayNameFor(active)</h2>
                 <span class="muted">@(IsAllowed(active) ? "their agent can talk to yours" : "you can message them")</span>
+                <span style="margin-left:auto;"><TokenMeter Compact="true" /></span>
             </header>
             <div class="messages" @ref="scrollEl">
                 <div class="messages-wrap">
@@ -327,16 +328,12 @@
 
             var kind = directMode ? MeshKinds.DirectMessage : MeshKinds.Chat;
             var via = directMode ? "person" : "agent";
-            State.Mutate(p =>
-            {
-                var conv = State.GetOrCreateConversation(active);
-                conv.Lines.Add(new ChatLine { Role = "assistant", Text = toSend, Via = via }); // "assistant" = me, rendered right
-            });
+            State.AddChatLine(active, new ChatLine { Role = "assistant", Text = toSend, Via = via }); // "assistant" = me, rendered right
             await Mesh.SendAsync(active, kind, toSend);
         }
         catch (Exception ex)
         {
-            State.Mutate(p => State.GetOrCreateConversation(active!).Lines.Add(new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }));
+            State.AddChatLine(active!, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" });
         }
         finally { busy = false; }
     }

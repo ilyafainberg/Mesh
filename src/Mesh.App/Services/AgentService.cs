@@ -20,7 +20,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     public async Task<string> AskAsOwnerAsync(string userText, CancellationToken ct = default)
     {
         var p = state.Profile;
-        state.Mutate(x => x.OwnChat.Add(new ChatLine { Role = "user", Text = userText }));
+        state.AddOwnChatLine(new ChatLine { Role = "user", Text = userText });
 
         // Owner may use every connected source's tools.
         var agentTools = tools.OwnerTools(p.Sources);
@@ -31,7 +31,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct);
         answer = ExpandWidgets(answer, p.Widgets);
 
-        state.Mutate(x => x.OwnChat.Add(new ChatLine { Role = "assistant", Text = answer }));
+        state.AddOwnChatLine(new ChatLine { Role = "assistant", Text = answer });
         return answer;
     }
 

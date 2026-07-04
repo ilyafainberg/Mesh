@@ -22,7 +22,9 @@ public static class MauiProgram
 		// well past the default 100s HttpClient timeout. Give model calls plenty of room.
 		builder.Services.AddHttpClient("model", c => c.Timeout = TimeSpan.FromMinutes(10));
 		builder.Services.AddHttpClient("connector");
+		builder.Services.AddSingleton<ISecretStore, SecretStore>();
 		builder.Services.AddSingleton<AppState>();
+		builder.Services.AddSingleton<TokenMeter>();
 		builder.Services.AddSingleton<ModelFactory>();
 		builder.Services.AddSingleton<FoundryLocalService>();
 		builder.Services.AddSingleton<MsalAuthService>();

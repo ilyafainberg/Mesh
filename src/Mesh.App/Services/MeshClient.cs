@@ -32,7 +32,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         try
         {
             var resp = await http.PostAsJsonAsync($"{p.RelayUrl.TrimEnd('/')}/handles",
-                new RegisterHandleRequest(p.Handle, p.PublicKey, p.DisplayName));
+                new RegisterHandleRequest(p.Handle, p.PublicKey, p.DisplayName, NullIfBlank(p.RecoveryPublicKey)));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
             if (resp.StatusCode == System.Net.HttpStatusCode.Conflict)
                 // Handle claimed by a different device set, this device isn't linked to it.
@@ -40,6 +40,37 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             return resp.IsSuccessStatusCode;
         }
         catch (Exception ex) { Log?.Invoke($"register failed: {ex.Message}"); return false; }
+    }
+
+    private static string? NullIfBlank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s;
+
+    /// <summary>
+    /// Re-authorizes THIS device under an existing handle using the handle's recovery key (carried
+    /// in an imported profile). Used when no other device is available to issue a link invite. The
+    /// device signs its own fresh public key with the recovery private key; the relay verifies it
+    /// against the recovery public key stored at registration and authorizes this device.
+    /// </summary>
+    public async Task<(bool ok, string? error)> RecoverHandleAsync()
+    {
+        var p = state.Profile;
+        if (string.IsNullOrWhiteSpace(p.RecoveryPrivateKey))
+            return (false, "This profile has no recovery key, so it can't recover a handle on a new device.");
+        var http = httpFactory.CreateClient("relay");
+        try
+        {
+            var h = AppState.Norm(p.Handle);
+            var sig = IdentityService.Sign(p.RecoveryPrivateKey, RecoveryProtocol.Message(h, p.PublicKey));
+            var resp = await http.PostAsJsonAsync(
+                $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/recover",
+                new RecoverHandleRequest(h, p.PublicKey, sig));
+            if (!resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                return (false, $"relay {(int)resp.StatusCode}: {body}");
+            }
+            return (true, null);
+        }
+        catch (Exception ex) { return (false, ex.Message); }
     }
 
     /// <summary>
@@ -188,11 +219,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         // Record the inbound line. Agent replies are tagged "agent"; anything a person typed
         // (chat or a direct message) is "person".
         var via = env.Kind == MeshKinds.AgentResponse ? "agent" : "person";
-        state.Mutate(x =>
-        {
-            var conv = state.GetOrCreateConversation(from);
-            conv.Lines.Add(new ChatLine { Role = "user", Text = text, Via = via });
-        });
+        state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = via });
 
         if (!allowed)
         {
@@ -247,11 +274,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             }
             else
             {
-                state.Mutate(x =>
-                {
-                    var c = state.GetOrCreateConversation(from);
-                    c.Lines.Add(new ChatLine { Role = "assistant", Text = reply });
-                });
+                state.AddChatLine(from, new ChatLine { Role = "assistant", Text = reply });
                 await SendAsync(from, MeshKinds.AgentResponse, reply);
             }
         }
@@ -288,12 +311,8 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var approval = state.Profile.Approvals.FirstOrDefault(a => a.Id == approvalId);
         if (approval is null) return;
         var text = string.IsNullOrWhiteSpace(editedReply) ? approval.DraftReply : editedReply!;
-        state.Mutate(x =>
-        {
-            var c = state.GetOrCreateConversation(approval.From);
-            c.Lines.Add(new ChatLine { Role = "assistant", Text = text });
-            x.Approvals.RemoveAll(a => a.Id == approvalId);
-        });
+        state.AddChatLine(approval.From, new ChatLine { Role = "assistant", Text = text });
+        state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
         await SendAsync(approval.From, MeshKinds.AgentResponse, text);
     }
 

@@ -1,0 +1,208 @@
+@page "/backup"
+@inject AppState State
+@inject MeshClient Mesh
+
+<div class="backup">
+    <header class="backup-head">
+        <h1><i class="bi bi-shield-lock"></i> Backup and move devices</h1>
+        <p class="lead">Move your identity to a new device with a passphrase-encrypted backup. The backup carries all your data plus the handle recovery key, but never your device signing keys. Each device keeps its own key.</p>
+    </header>
+
+    <section class="card">
+        <div class="card-head">
+            <i class="bi bi-box-arrow-up"></i>
+            <div>
+                <h2>Create a backup</h2>
+                <p class="muted">On this (working) device, make an encrypted file you can carry to a new device.</p>
+            </div>
+        </div>
+
+        <label>Passphrase</label>
+        <input class="full" type="password" @bind="createPass" placeholder="at least 8 characters" />
+        <label>Confirm passphrase</label>
+        <input class="full" type="password" @bind="confirmPass" placeholder="re-enter the passphrase" />
+
+        <button class="primary" disabled="@busyCreate" @onclick="CreateBackup">
+            @(busyCreate ? "Creating..." : "Create backup file")
+        </button>
+
+        @if (createError is not null) { <p class="err">@createError</p> }
+        @if (createMsg is not null)
+        {
+            <div class="ok">
+                <p>@createMsg</p>
+                @if (savedPath is not null)
+                {
+                    <code class="path">@savedPath</code>
+                }
+            </div>
+        }
+        <p class="hint">Keep the passphrase safe and separate from the file. Without it the backup cannot be opened.</p>
+    </section>
+
+    <section class="card">
+        <div class="card-head">
+            <i class="bi bi-box-arrow-in-down"></i>
+            <div>
+                <h2>Restore a backup onto this device</h2>
+                <p class="muted">Import your identity here, then authorize this device to talk under the same handle.</p>
+            </div>
+        </div>
+
+        @if (!restoreImported)
+        {
+            <label>Relay URL</label>
+            <input class="full" @bind="restoreRelay" placeholder="https://mesh-relay...azurecontainerapps.io" />
+            <label>Backup passphrase</label>
+            <input class="full" type="password" @bind="restorePass" placeholder="the passphrase you set when you made the backup" />
+
+            <button class="primary" disabled="@(busyRestore || !ValidRestore)" @onclick="PickAndImport">
+                @(busyRestore ? "Restoring..." : "Choose backup file and restore")
+            </button>
+            @if (restoreError is not null) { <p class="err">@restoreError</p> }
+        }
+        else
+        {
+            <p class="restored">Restored <b>@("@")@State.Profile.Handle</b>. Pick how to authorize this device.</p>
+
+            <div class="authorize">
+                <button class="primary full" disabled="@busyRestore" @onclick="RecoverThisDevice">
+                    @(busyRestore ? "Working..." : "This is a new device, my old device is gone")
+                </button>
+                <p class="hint">Uses the recovery key from your backup to re-authorize this device.</p>
+            </div>
+
+            <div class="authorize link-box">
+                <label>Link code <span class="muted">(from your old device: Settings, Link a device)</span></label>
+                <input class="full" @bind="linkCode" placeholder="paste code" />
+                <button class="ghost full" disabled="@(busyRestore || linkCode.Trim().Length < 6)" @onclick="LinkThisDevice">
+                    My old device still works, link with this code
+                </button>
+            </div>
+
+            @if (restoreError is not null) { <p class="err">@restoreError</p> }
+            @if (restoreMsg is not null) { <p class="ok-inline"><i class="bi bi-check-circle"></i> @restoreMsg</p> }
+        }
+    </section>
+</div>
+
+@code {
+    string createPass = "";
+    string confirmPass = "";
+    bool busyCreate;
+    string? createError;
+    string? createMsg;
+    string? savedPath;
+
+    string restoreRelay = "";
+    string restorePass = "";
+    string linkCode = "";
+    bool busyRestore;
+    bool restoreImported;
+    string? restoreError;
+    string? restoreMsg;
+
+    bool ValidRestore => !string.IsNullOrWhiteSpace(restoreRelay) && !string.IsNullOrWhiteSpace(restorePass);
+
+    protected override void OnInitialized()
+        => restoreRelay = string.IsNullOrWhiteSpace(State.Profile.RelayUrl) ? "" : State.Profile.RelayUrl;
+
+    async Task CreateBackup()
+    {
+        createError = null;
+        createMsg = null;
+        savedPath = null;
+
+        if (createPass.Length < 8) { createError = "Use a passphrase of at least 8 characters."; return; }
+        if (createPass != confirmPass) { createError = "The passphrases do not match."; return; }
+
+        busyCreate = true;
+        try
+        {
+            var bytes = State.ExportActiveProfile(createPass);
+            var fileName = $"mesh-backup-{State.Profile.Handle}-{DateTime.Now:yyyyMMdd-HHmmss}.meshbackup";
+            var path = System.IO.Path.Combine(Microsoft.Maui.Storage.FileSystem.CacheDirectory, fileName);
+            await System.IO.File.WriteAllBytesAsync(path, bytes);
+            savedPath = path;
+            createMsg = "Backup created. Copy this file somewhere safe (another device, a USB stick, or cloud storage), then keep the passphrase separately.";
+            createPass = "";
+            confirmPass = "";
+        }
+        catch (Exception ex) { createError = ex.Message; }
+        finally { busyCreate = false; }
+    }
+
+    async Task PickAndImport()
+    {
+        restoreError = null;
+        restoreMsg = null;
+        busyRestore = true;
+        try
+        {
+            var res = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
+            if (res is null) { busyRestore = false; return; }
+            byte[] bytes;
+            using (var stream = await res.OpenReadAsync())
+            using (var ms = new MemoryStream())
+            {
+                await stream.CopyToAsync(ms);
+                bytes = ms.ToArray();
+            }
+
+            MeshProfile profile;
+            try
+            {
+                profile = MeshExport.Open(bytes, restorePass);
+            }
+            catch (System.Security.Cryptography.CryptographicException)
+            {
+                restoreError = "Wrong passphrase or corrupt backup.";
+                return;
+            }
+            catch (FormatException)
+            {
+                restoreError = "That file is not a Mesh backup.";
+                return;
+            }
+
+            profile.RelayUrl = restoreRelay.Trim();
+            State.ImportProfile(profile);
+            restoreImported = true;
+        }
+        catch (Exception ex) { restoreError = ex.Message; }
+        finally { busyRestore = false; }
+    }
+
+    async Task RecoverThisDevice()
+    {
+        restoreError = null;
+        restoreMsg = null;
+        busyRestore = true;
+        try
+        {
+            var (ok, err) = await Mesh.RecoverHandleAsync();
+            if (!ok) { restoreError = err ?? "Recovery failed."; return; }
+            await Mesh.RegisterAsync();
+            await Mesh.ConnectAsync();
+            restoreMsg = $"This device is now authorized under @{State.Profile.Handle} and connected.";
+        }
+        catch (Exception ex) { restoreError = ex.Message; }
+        finally { busyRestore = false; }
+    }
+
+    async Task LinkThisDevice()
+    {
+        restoreError = null;
+        restoreMsg = null;
+        busyRestore = true;
+        try
+        {
+            var (ok, err) = await Mesh.RedeemLinkAsync(restoreRelay.Trim(), State.Profile.Handle, linkCode.Trim());
+            if (!ok) { restoreError = err ?? "Linking failed."; return; }
+            await Mesh.ConnectAsync();
+            restoreMsg = $"This device is now linked under @{State.Profile.Handle} and connected.";
+        }
+        catch (Exception ex) { restoreError = ex.Message; }
+        finally { busyRestore = false; }
+    }
+}

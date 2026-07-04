@@ -4,12 +4,33 @@ namespace Mesh.Shared;
 public record RegisterHandleRequest(
     string Handle,
     string DevicePublicKey,
-    string? DisplayName);
+    string? DisplayName,
+    string? RecoveryPublicKey = null);
 
 public record RegisterHandleResponse(
     string Handle,
     string DeviceId,
     DateTimeOffset RegisteredAt);
+
+/// <summary>
+/// Recover a handle onto a brand-new device when no existing device is available to issue a
+/// link invite. The new device presents its own fresh public key, signed by the handle's
+/// recovery private key (which travels only inside the user's passphrase-encrypted export).
+/// The relay verifies the signature against the recovery public key stored at registration and,
+/// on success, authorizes the new device key under the handle.
+/// Signature is over <c>handle-recover|handle|newPublicKey</c> by the recovery key.
+/// </summary>
+public record RecoverHandleRequest(
+    string Handle,
+    string NewPublicKey,
+    string RecoverySignature);
+
+/// <summary>Canonical strings for handle recovery.</summary>
+public static class RecoveryProtocol
+{
+    public static string Message(string handle, string newPublicKey)
+        => $"handle-recover|{LinkProtocol.Normalize(handle)}|{newPublicKey}";
+}
 
 /// <summary>
 /// Device-linking: an already-authorized device creates a short-lived, single-use
@@ -127,8 +148,15 @@ public record HostedModelMessage(string Role, string Content, string? ToolCallsJ
 /// The hosted model reply. <see cref="Content"/> is the assistant text; when the model wants to
 /// call tools, <see cref="ToolCallsJson"/> holds the raw OpenAI tool_calls array so the CLIENT
 /// can execute the tools locally (the relay never runs them) and continue the conversation.
+/// Token usage (as reported by the upstream model) is echoed back so the client can show a live
+/// token counter and so free-tier metering is done in tokens, the primary cost currency.
 /// </summary>
-public record HostedModelResponse(string Content, string? ToolCallsJson = null);
+public record HostedModelResponse(
+    string Content,
+    string? ToolCallsJson = null,
+    int PromptTokens = 0,
+    int CompletionTokens = 0,
+    int TotalTokens = 0);
 
 /// <summary>Canonical strings for the hosted-model proxy signature.</summary>
 public static class HostedModelProtocol

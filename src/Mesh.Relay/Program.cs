@@ -92,6 +92,9 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
     {
         // First registration CLAIMS the handle for this device key.
         var (created, _) = await store.UpsertHandleAsync(handle, req.DevicePublicKey, req.DisplayName, allowNewDevice: true);
+        // Capture the recovery public key at registration so a future device can recover the handle.
+        if (!string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
+            await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceIdOf(req.DevicePublicKey), created.RegisteredAt));
     }
 
@@ -99,6 +102,9 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
     {
         // Re-asserting an already authorized device is idempotent (normal launch).
         if (req.DisplayName is not null) await store.SetDisplayNameAsync(handle, req.DisplayName);
+        // First-writer-wins: adopt a recovery key on re-register only if none is stored yet.
+        if (existing.RecoveryPublicKey is null && !string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
+            await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceIdOf(req.DevicePublicKey), existing.RegisteredAt));
     }
 
@@ -146,6 +152,29 @@ app.MapPost("/handles/{handle}/link/redeem", async (string handle, LinkRedeemReq
 
     var (updated, _) = await store.UpsertHandleAsync(key, req.NewPublicKey, displayName: null, allowNewDevice: true);
     return Results.Ok(new LinkRedeemResponse(key, DeviceIdOf(req.NewPublicKey), updated.DisplayName));
+});
+
+// Handle recovery: a brand-new device authorizes itself under an existing handle by proving
+// possession of the handle's recovery private key. Used when no existing device is available to
+// issue a link invite. Covered by the per-IP rate limiter like every other REST endpoint.
+app.MapPost("/handles/{handle}/recover", async (string handle, RecoverHandleRequest req) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null) return Results.NotFound();
+
+    if (string.IsNullOrWhiteSpace(rec.RecoveryPublicKey))
+        return Results.BadRequest(new { error = "recovery not available for this handle" });
+
+    if (string.IsNullOrWhiteSpace(req.NewPublicKey))
+        return Results.BadRequest(new { error = "newPublicKey is required" });
+
+    var message = RecoveryProtocol.Message(key, req.NewPublicKey);
+    if (!MeshCrypto.Verify(rec.RecoveryPublicKey, message, req.RecoverySignature))
+        return Results.BadRequest(new { error = "invalid recovery signature" });
+
+    var (updated, _) = await store.UpsertHandleAsync(key, req.NewPublicKey, displayName: null, allowNewDevice: true);
+    return Results.Ok(new RegisterHandleResponse(key, DeviceIdOf(req.NewPublicKey), updated.RegisteredAt));
 });
 
 // ---- Connector token broker ----------------------------------------------
@@ -227,16 +256,13 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
     if (string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(endpoint))
         return Results.Json(new { error = "hosted model not configured" }, statusCode: StatusCodes.Status503ServiceUnavailable);
 
-    // Durable per-handle daily quota (Redis in prod). Reserve a unit up front, and refund it
-    // below if the request is rejected or the upstream fails for a server-side reason, so only
-    // successful completions consume a user's quota.
-    var dailyLimit = int.TryParse(Config(app.Configuration, "MODEL_DAILY_LIMIT", "Model:DailyLimit"), out var dl) ? dl : 50;
-    var used = await quota.ReserveDailyAsync(handleKey);
-    if (dailyLimit > 0 && used > dailyLimit)
-    {
-        await quota.RefundDailyAsync(handleKey); // rejected, do not consume
-        return Results.Json(new { error = "daily free-model limit reached" }, statusCode: StatusCodes.Status429TooManyRequests);
-    }
+    // Durable per-handle daily TOKEN quota (Redis in prod). Tokens are the primary cost currency,
+    // so metering counts the upstream-reported token usage, not the request count. Check the
+    // running daily total before serving; only successful completions add to it below.
+    var tokenLimit = long.TryParse(Config(app.Configuration, "MODEL_DAILY_TOKEN_LIMIT", "Model:DailyTokenLimit"), out var tl) ? tl : 100000L;
+    var usedTokens = await quota.GetDailyAsync(handleKey);
+    if (tokenLimit > 0 && usedTokens >= tokenLimit)
+        return Results.Json(new { error = "daily free-model token limit reached" }, statusCode: StatusCodes.Status429TooManyRequests);
 
     var model = Config(app.Configuration, "MODEL_NAME", "Model:Model") ?? "llama-3.3-70b-versatile";
 
@@ -268,9 +294,9 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
         if (!resp.IsSuccessStatusCode)
         {
             // Upstream failure (bad/expired shared key, upstream rate limit, provider outage) is
-            // a server-side problem, not the user's fault: refund the reserved quota and surface
-            // a single "temporarily unavailable" status (503), distinct from the per-user 429.
-            await quota.RefundDailyAsync(handleKey);
+            // a server-side problem, not the user's fault: there is nothing to meter on failure,
+            // so surface a single "temporarily unavailable" status (503), distinct from the
+            // per-user 429.
             app.Logger.LogWarning("hosted model upstream failed ({Status}): {Detail}", (int)resp.StatusCode, Trim(body));
             return Results.Json(new { error = "hosted model temporarily unavailable" }, statusCode: StatusCodes.Status503ServiceUnavailable);
         }
@@ -280,11 +306,17 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
         string? toolCallsJson = null;
         if (respMsg.TryGetProperty("tool_calls", out var tcs) && tcs.ValueKind == JsonValueKind.Array && tcs.GetArrayLength() > 0)
             toolCallsJson = tcs.GetRawText();
-        return Results.Ok(new HostedModelResponse(content, toolCallsJson));
+
+        // Meter the completion in tokens as reported by the upstream "usage" object. When
+        // total_tokens is absent, fall back to prompt + completion. Only successful completions
+        // are counted.
+        var (promptTokens, completionTokens, totalTokens) = ReadUsage(doc.RootElement);
+        await quota.AddDailyAsync(handleKey, totalTokens);
+        return Results.Ok(new HostedModelResponse(content, toolCallsJson, promptTokens, completionTokens, totalTokens));
     }
     catch (Exception ex)
     {
-        await quota.RefundDailyAsync(handleKey); // network/parse failure: do not burn the user's quota
+        // Network/parse failure: there is nothing to meter, so just surface a 503.
         app.Logger.LogWarning(ex, "hosted model proxy failed");
         return Results.Json(new { error = "hosted model temporarily unavailable" }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
@@ -313,6 +345,24 @@ static string DeviceIdOf(string publicKey)
     => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(publicKey)))[..12].ToLowerInvariant();
 
 static string Trim(string s) => s.Length > 300 ? s[..300] : s;
+
+// Reads the OpenAI-compatible "usage" object from an upstream chat completion. Returns prompt,
+// completion, and total token counts, defaulting each to 0 when absent. When total_tokens is
+// missing it falls back to prompt + completion.
+static (int prompt, int completion, int total) ReadUsage(JsonElement root)
+{
+    if (!root.TryGetProperty("usage", out var usage) || usage.ValueKind != JsonValueKind.Object)
+        return (0, 0, 0);
+
+    static int Read(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) ? n : 0;
+
+    var prompt = Read(usage, "prompt_tokens");
+    var completion = Read(usage, "completion_tokens");
+    var total = Read(usage, "total_tokens");
+    if (total == 0) total = prompt + completion;
+    return (prompt, completion, total);
+}
 
 // Config lookup: environment variable first, then configuration key.
 static string? Config(IConfiguration cfg, string envVar, string configKey)
