@@ -1,7 +1,7 @@
 ﻿@page "/"
 @inject AppState State
 @inject AgentService Agent
-@inject DocumentExtractor Extractor
+@inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
 @implements IDisposable
 
@@ -104,9 +104,8 @@
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
-    const long MaxAttachmentBytes = 6L * 1024 * 1024;
 
-    sealed record StagedFile(string Name, string Mime, string Base64, long Size, byte[] Bytes)
+    sealed record StagedFile(string Name, string Path, long Size)
     {
         public string SizeLabel => Human(Size);
     }
@@ -141,18 +140,18 @@
         {
             var file = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
             if (file is null) return;
-            using var stream = await file.OpenReadAsync();
-            using var ms = new MemoryStream();
-            await stream.CopyToAsync(ms);
-            var bytes = ms.ToArray();
-            if (bytes.LongLength == 0) { attachError = "That file is empty."; return; }
-            if (bytes.LongLength > MaxAttachmentBytes)
+            var path = file.FullPath;
+            if (string.IsNullOrWhiteSpace(path) || !System.IO.File.Exists(path))
             {
-                attachError = $"\"{file.FileName}\" is {Human(bytes.LongLength)}, over the {Human(MaxAttachmentBytes)} limit.";
+                attachError = "Could not resolve that file's path on disk.";
                 return;
             }
-            var mime = string.IsNullOrWhiteSpace(file.ContentType) ? GuessMime(file.FileName) : file.ContentType;
-            attachments.Add(new StagedFile(file.FileName, mime, Convert.ToBase64String(bytes), bytes.LongLength, bytes));
+            long size = 0;
+            try { size = new System.IO.FileInfo(path).Length; } catch { }
+            // No size cap on the owner's own machine: the file stays on disk and the agent reads it
+            // on demand via the read_local_file tool. Allow-list the path for this session.
+            LocalFiles.Allow(path);
+            attachments.Add(new StagedFile(file.FileName, path, size));
         }
         catch (Exception ex) { attachError = "Couldn't attach that file: " + ex.Message; }
     }
@@ -164,26 +163,6 @@
         int u = 0;
         while (size >= 1024 && u < units.Length - 1) { size /= 1024; u++; }
         return $"{size:0.#} {units[u]}";
-    }
-
-    static string GuessMime(string name)
-    {
-        var ext = Path.GetExtension(name).ToLowerInvariant();
-        return ext switch
-        {
-            ".png" => "image/png",
-            ".jpg" or ".jpeg" => "image/jpeg",
-            ".gif" => "image/gif",
-            ".webp" => "image/webp",
-            ".svg" => "image/svg+xml",
-            ".pdf" => "application/pdf",
-            ".txt" or ".md" or ".log" or ".csv" => "text/plain",
-            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            ".json" => "application/json",
-            _ => "application/octet-stream"
-        };
     }
 
     async Task Send()
@@ -206,26 +185,15 @@
             }
             else
             {
-                // Attached documents are extracted to text and appended so the owner agent can read them.
-                var prompt = text;
+                // Pass the file PATHS to the agent (not the bytes); it opens them on demand with the
+                // read_local_file tool, so there is no size limit here.
+                var prompt = text ?? "";
                 if (files.Count > 0)
                 {
-                    var sb = new System.Text.StringBuilder(text ?? "");
-                    foreach (var f in files)
-                    {
-                        sb.Append("\n\n");
-                        if (DocumentExtractor.IsSupported(f.Name))
-                        {
-                            string extracted;
-                            try { extracted = Extractor.Extract(f.Bytes, f.Name); }
-                            catch (Exception ex) { extracted = $"[could not read {f.Name}: {ex.Message}]"; }
-                            sb.Append($"Attached file \"{f.Name}\":\n{extracted}");
-                        }
-                        else
-                        {
-                            sb.Append($"[attached file \"{f.Name}\" ({f.SizeLabel}); its type cannot be read as text]");
-                        }
-                    }
+                    var sb = new System.Text.StringBuilder(prompt);
+                    if (sb.Length > 0) sb.Append("\n\n");
+                    sb.Append("Attached local files (use the read_local_file tool to open any you need):");
+                    foreach (var f in files) sb.Append($"\n- {f.Path}");
                     prompt = sb.ToString();
                 }
                 await Agent.AskAsOwnerAsync(prompt);

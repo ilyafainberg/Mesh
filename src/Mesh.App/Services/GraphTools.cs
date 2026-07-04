@@ -240,7 +240,7 @@ public sealed class GmailSearchTool(GoogleAuthService auth, IHttpClientFactory h
 }
 
 /// <summary>Builds the set of tools available from the user's connected sources.</summary>
-public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor)
+public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles)
 {
     /// <summary>Whether a provider exposes an email/message search tool.</summary>
     private static bool HasEmail(SourceProvider p) => p is
@@ -296,10 +296,12 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         return list;
     }
 
-    /// <summary>Owner path: every enabled source, full access.</summary>
+    /// <summary>Owner path: every enabled source, full access, plus local-file reading.</summary>
     public IReadOnlyList<IAgentTool> OwnerTools(IEnumerable<ConnectedSource> sources)
     {
         var tools = new List<IAgentTool>();
+        // The owner can attach local files in their private chat; let the agent open them by path.
+        tools.Add(new ReadLocalFileTool(localFiles, extractor));
         foreach (var src in sources)
             if (src.Enabled) tools.AddRange(ToolsFor(src));
         return tools;

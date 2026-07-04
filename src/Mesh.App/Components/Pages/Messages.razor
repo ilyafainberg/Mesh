@@ -177,7 +177,7 @@
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
-    const long MaxAttachmentBytes = 6L * 1024 * 1024;
+    const long MaxAttachmentBytes = 20L * 1024 * 1024;
 
     sealed record StagedFile(string Name, string Mime, string Base64, long Size)
     {
