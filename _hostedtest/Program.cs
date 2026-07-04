@@ -4,8 +4,9 @@ using System.Text;
 using System.Text.Json;
 using Mesh.Shared;
 
-// Verifies the relay-hosted free model end to end: registers a handle, signs a
-// HostedModelRequest, calls /model/chat, and confirms a real completion returns.
+// End-to-end tool-calling test for the relay-hosted free model. Simulates what
+// MeshHostedModel.CompleteWithToolsAsync does: sends tools, gets back tool_calls,
+// executes the tool locally, sends the result, and expects a grounded final answer.
 var relay = (args.Length > 0 ? args[0] : "https://mesh-relay.whiteground-796c60f9.northeurope.azurecontainerapps.io").TrimEnd('/');
 var web = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 var http = new HttpClient();
@@ -23,26 +24,60 @@ static string Sign(string privB64, string msg)
 }
 
 var (priv, pub) = Gen();
-var handle = "hm" + Random.Shared.Next(10000, 99999);
-var reg = await http.PostAsJsonAsync($"{relay}/handles", new RegisterHandleRequest(handle, pub, "HostedTest"));
-Console.WriteLine($"register: {(int)reg.StatusCode}");
+var handle = "tool" + Random.Shared.Next(10000, 99999);
+await http.PostAsJsonAsync($"{relay}/handles", new RegisterHandleRequest(handle, pub, "ToolTest"));
 
-var sys = "You are a helpful assistant. Answer in one short sentence.";
-var msgs = new List<HostedModelMessage> { new("user", "Say the single word: pong") };
-var promptHash = HostedModelProtocol.PromptHash(sys, msgs);
-var sig = Sign(priv, HostedModelProtocol.Message(handle, promptHash));
-var req = new HostedModelRequest(LinkProtocol.Normalize(handle), pub, sig, sys, msgs);
+// A tool the "agent" exposes. The model should call it, we return a secret number,
+// and the model must report that exact number back, proving the round-trip worked.
+var secret = "42931";
+var toolsJson = JsonSerializer.Serialize(new object[] { new {
+    type = "function",
+    function = new {
+        name = "get_account_balance",
+        description = "Returns the user's current account balance in euros.",
+        parameters = new { type = "object", properties = new { }, required = Array.Empty<string>() }
+    }
+}}, web);
 
-var resp = await http.PostAsJsonAsync($"{relay}/model/chat", req);
-var body = await resp.Content.ReadAsStringAsync();
-Console.WriteLine($"/model/chat: {(int)resp.StatusCode}");
-if (resp.IsSuccessStatusCode)
+var sys = "You are a helpful assistant. When asked about balance, you MUST call the get_account_balance tool, then state the number.";
+var msgs = new List<HostedModelMessage> { new("user", "What is my account balance? Use the tool, then tell me the exact number.") };
+
+async Task<HostedModelResponse?> Call(List<HostedModelMessage> messages)
 {
-    var r = JsonSerializer.Deserialize<HostedModelResponse>(body, web);
-    Console.WriteLine("REPLY: " + (r?.Content ?? "(empty)"));
-    Console.WriteLine(string.IsNullOrWhiteSpace(r?.Content) ? "FAIL: empty completion" : "PASS: hosted free model returned a completion");
+    var ph = HostedModelProtocol.PromptHash(sys, messages);
+    var sg = Sign(priv, HostedModelProtocol.Message(handle, ph));
+    var reqObj = new HostedModelRequest(LinkProtocol.Normalize(handle), pub, sg, sys, messages, toolsJson);
+    var r = await http.PostAsJsonAsync($"{relay}/model/chat", reqObj);
+    if (!r.IsSuccessStatusCode) { Console.WriteLine($"HTTP {(int)r.StatusCode}: {await r.Content.ReadAsStringAsync()}"); return null; }
+    return JsonSerializer.Deserialize<HostedModelResponse>(await r.Content.ReadAsStringAsync(), web);
 }
-else
+
+var toolWasCalled = false;
+for (var round = 0; round < 5; round++)
 {
-    Console.WriteLine("FAIL body: " + (body.Length > 300 ? body[..300] : body));
+    var res = await Call(msgs);
+    if (res is null) { Console.WriteLine("FAIL: no response"); return; }
+
+    if (string.IsNullOrWhiteSpace(res.ToolCallsJson))
+    {
+        Console.WriteLine("FINAL: " + res.Content);
+        var ok = toolWasCalled && res.Content.Contains(secret);
+        Console.WriteLine(ok ? "PASS: hosted free model called the tool and reported the tool's value"
+                             : $"FAIL: toolCalled={toolWasCalled}, containsSecret={res.Content.Contains(secret)}");
+        return;
+    }
+
+    // Model requested tools: record its turn, execute locally, append results.
+    toolWasCalled = true;
+    Console.WriteLine("MODEL requested tool_calls: " + res.ToolCallsJson);
+    msgs.Add(new HostedModelMessage("assistant", res.Content ?? "", ToolCallsJson: res.ToolCallsJson));
+    using var calls = JsonDocument.Parse(res.ToolCallsJson);
+    foreach (var call in calls.RootElement.EnumerateArray())
+    {
+        var id = call.GetProperty("id").GetString();
+        var name = call.GetProperty("function").GetProperty("name").GetString();
+        var result = name == "get_account_balance" ? $"{{\"balance_eur\": {secret}}}" : "unknown tool";
+        msgs.Add(new HostedModelMessage("tool", result, ToolCallId: id));
+    }
 }
+Console.WriteLine("FAIL: exceeded tool rounds");
