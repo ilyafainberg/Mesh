@@ -650,11 +650,12 @@ input[type=checkbox]:not(.switch input):checked::after {
     display:flex; flex-direction:column; align-items:flex-start; gap:4px;
     padding:16px; border:1px solid var(--stroke, #e0e0e0); border-radius:10px;
     background:#fff; cursor:pointer; text-align:left; transition:border-color .15s, box-shadow .15s;
+    width:100%; box-sizing:border-box;
 }
 .choice-card:hover { border-color:var(--brand, #0F6CBD); box-shadow:0 2px 8px rgba(15,108,189,.12); }
 .choice-card i { font-size:22px; color:var(--brand, #0F6CBD); }
-.choice-card .ch-title { font-weight:600; font-size:15px; }
-.choice-card .ch-sub { font-size:13px; color:#616161; }
+.choice-card .ch-title { font-weight:600; font-size:15px; width:100%; white-space:normal; overflow-wrap:anywhere; }
+.choice-card .ch-sub { font-size:13px; color:#616161; width:100%; white-space:normal; overflow-wrap:anywhere; }
 
 .link-invite { display:flex; align-items:center; gap:16px; margin:8px 0 12px; flex-wrap:wrap; }
 .link-qr { width:132px; height:132px; border:1px solid #eee; border-radius:8px; background:#fff; }
