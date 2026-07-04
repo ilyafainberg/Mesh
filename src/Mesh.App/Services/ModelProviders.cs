@@ -21,6 +21,28 @@ public interface IChatModel
         => CompleteAsync(systemPrompt, history, ct);
 }
 
+/// <summary>
+/// Recognizes model-layer failure replies (provider errors, the hosted model being unavailable,
+/// or the daily limit being hit). Used to avoid sending an error message to a peer as if it were
+/// the agent's real reply, and to refund budgets when no real answer was produced.
+/// </summary>
+public static class ModelReply
+{
+    private static readonly string[] FailureMarkers =
+    {
+        "The free model ", "You've reached today's free-model limit",
+        "[model error", "[free model", "[stopped after too many tool calls",
+        "[Azure OpenAI needs", "[set up your Mesh identity", "[the free model needs a relay"
+    };
+
+    public static bool IsFailure(string? reply)
+    {
+        if (string.IsNullOrWhiteSpace(reply)) return true;
+        var t = reply.TrimStart();
+        return FailureMarkers.Any(m => t.StartsWith(m, StringComparison.Ordinal));
+    }
+}
+
 /// <summary>Builds an <see cref="IChatModel"/> for the configured provider.</summary>
 public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state)
 {
@@ -362,16 +384,14 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
             using var resp = await http.PostAsJsonAsync($"{p.RelayUrl.TrimEnd('/')}/model/chat", request, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
             if (resp.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
-                return (null, "[free model daily limit reached. Add your own model key in Settings for unlimited use.]");
+                return (null, "You've reached today's free-model limit. Add your own model key in Settings for unlimited use, or switch to an on-device model.");
             if (resp.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable)
-                return (null, "[the free model is not available yet. Add your own model key in Settings, or pick an on-device model.]");
-            if (!resp.IsSuccessStatusCode) return (null, $"[free model error {(int)resp.StatusCode}: {TrimBody(body)}]");
+                return (null, "The free model is temporarily unavailable. You can add your own model key in Settings, or switch to an on-device model.");
+            if (!resp.IsSuccessStatusCode) return (null, "The free model is temporarily unavailable. Please try again shortly, or add your own model key in Settings.");
             return (JsonSerializer.Deserialize<HostedModelResponse>(body, Web), null);
         }
-        catch (Exception ex) { return (null, $"[free model error: {ex.Message}]"); }
+        catch (Exception ex) { return (null, $"The free model could not be reached ({ex.Message}). Check your connection, or add your own model key in Settings."); }
     }
-
-    private static string TrimBody(string s) => s.Length > 300 ? s[..300] : s;
 }
 
 /// <summary>

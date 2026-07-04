@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
@@ -6,6 +5,7 @@ using System.Text.Json;
 using System.Threading.RateLimiting;
 using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
+using Mesh.Relay.Quota;
 using Mesh.Relay.Storage;
 using Mesh.Shared;
 
@@ -29,8 +29,15 @@ IBackplane backplane = string.IsNullOrWhiteSpace(redisConn)
     ? new InMemoryBackplane()
     : new RedisBackplane(redisConn);
 
+// Durable per-handle free-model quota: Redis in production (exact + shared across replicas),
+// in-memory as the single-instance default.
+IQuotaStore quota = string.IsNullOrWhiteSpace(redisConn)
+    ? new InMemoryQuotaStore()
+    : new RedisQuotaStore(redisConn);
+
 builder.Services.AddSingleton(store);
 builder.Services.AddSingleton(backplane);
+builder.Services.AddSingleton(quota);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
 builder.Services.AddHostedService<PresenceRenewer>();
@@ -59,9 +66,6 @@ var app = builder.Build();
 var json = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 var brokerHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 var modelHttp = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
-
-// Per-handle daily counter for the hosted free model (cost control on the server side too).
-var modelUsage = new ConcurrentDictionary<string, (string day, int count)>(StringComparer.OrdinalIgnoreCase);
 
 app.UseRateLimiter();
 
@@ -223,14 +227,16 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
     if (string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(endpoint))
         return Results.Json(new { error = "hosted model not configured" }, statusCode: StatusCodes.Status503ServiceUnavailable);
 
-    // Per-handle daily quota.
+    // Durable per-handle daily quota (Redis in prod). Reserve a unit up front, and refund it
+    // below if the request is rejected or the upstream fails for a server-side reason, so only
+    // successful completions consume a user's quota.
     var dailyLimit = int.TryParse(Config(app.Configuration, "MODEL_DAILY_LIMIT", "Model:DailyLimit"), out var dl) ? dl : 50;
-    var today = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd");
-    var usage = modelUsage.AddOrUpdate(handleKey,
-        _ => (today, 1),
-        (_, cur) => cur.day == today ? (today, cur.count + 1) : (today, 1));
-    if (dailyLimit > 0 && usage.count > dailyLimit)
+    var used = await quota.ReserveDailyAsync(handleKey);
+    if (dailyLimit > 0 && used > dailyLimit)
+    {
+        await quota.RefundDailyAsync(handleKey); // rejected, do not consume
         return Results.Json(new { error = "daily free-model limit reached" }, statusCode: StatusCodes.Status429TooManyRequests);
+    }
 
     var model = Config(app.Configuration, "MODEL_NAME", "Model:Model") ?? "llama-3.3-70b-versatile";
 
@@ -260,7 +266,14 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
         using var resp = await modelHttp.SendAsync(upstream);
         var body = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode)
-            return Results.Json(new { error = "upstream model error", detail = Trim(body) }, statusCode: StatusCodes.Status502BadGateway);
+        {
+            // Upstream failure (bad/expired shared key, upstream rate limit, provider outage) is
+            // a server-side problem, not the user's fault: refund the reserved quota and surface
+            // a single "temporarily unavailable" status (503), distinct from the per-user 429.
+            await quota.RefundDailyAsync(handleKey);
+            app.Logger.LogWarning("hosted model upstream failed ({Status}): {Detail}", (int)resp.StatusCode, Trim(body));
+            return Results.Json(new { error = "hosted model temporarily unavailable" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
         using var doc = JsonDocument.Parse(body);
         var respMsg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
         var content = respMsg.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() ?? "" : "";
@@ -271,7 +284,9 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
     }
     catch (Exception ex)
     {
-        return Results.Json(new { error = "model proxy failed", detail = ex.Message }, statusCode: StatusCodes.Status502BadGateway);
+        await quota.RefundDailyAsync(handleKey); // network/parse failure: do not burn the user's quota
+        app.Logger.LogWarning(ex, "hosted model proxy failed");
+        return Results.Json(new { error = "hosted model temporarily unavailable" }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 });
 

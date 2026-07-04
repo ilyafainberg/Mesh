@@ -222,6 +222,18 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             var conv = state.GetOrCreateConversation(from);
             var reply = await agent.RespondAsGuestAsync(from, conv.Lines.ToList(), ct);
 
+            // If the model could not produce a real answer (unavailable, over limit, provider
+            // error), do NOT send the error text to the peer as if it were the agent's reply.
+            // Refund the consumed budget and leave the inbound message in the conversation for
+            // the owner to see and handle.
+            if (ModelReply.IsFailure(reply))
+            {
+                state.RefundAgentReply();
+                Log?.Invoke($"agent reply to @{from} skipped: model unavailable");
+                StateChanged?.Invoke();
+                return;
+            }
+
             if (state.RequiresApproval(from))
             {
                 // Human-in-the-loop: hold the draft for owner review, do NOT send yet.

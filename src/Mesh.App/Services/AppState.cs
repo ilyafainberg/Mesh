@@ -286,6 +286,18 @@ public sealed class AppState
         return true;
     }
 
+    /// <summary>
+    /// Gives back a unit consumed by <see cref="TryConsumeAgentReply"/> when the reply could not
+    /// actually be produced (for example the model was unavailable), so a failure does not burn
+    /// the user's daily agent budget.
+    /// </summary>
+    public void RefundAgentReply()
+    {
+        if (Profile.AgentDailyReplyBudget <= 0) return;
+        if (Profile.AgentRepliesUsedToday > 0)
+            Mutate(p => p.AgentRepliesUsedToday--);
+    }
+
     private void RollBudgetDay()
     {
         var today = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd");
