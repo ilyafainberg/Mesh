@@ -1,6 +1,7 @@
 ﻿@page "/"
 @inject AppState State
 @inject AgentService Agent
+@inject DocumentExtractor Extractor
 @inject IJSRuntime JS
 @implements IDisposable
 
@@ -8,6 +9,7 @@
     <header class="pane-head">
         <h2><i class="bi bi-person-badge"></i> Me</h2>
         <span class="muted">your private space: your agent sees everything you know</span>
+        <span style="margin-left:auto;"><TokenMeter Compact="true" /></span>
     </header>
 
     <div class="messages" @ref="scrollEl">
@@ -55,15 +57,33 @@
                     <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
                 </div>
             }
+            @if (attachments.Count > 0)
+            {
+                <div class="attach-bar">
+                    @foreach (var a in attachments)
+                    {
+                        <span class="attach-chip">
+                            <i class="bi bi-paperclip"></i>
+                            <span class="attach-name">@a.Name</span>
+                            <span class="attach-size">@a.SizeLabel</span>
+                            <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove"><i class="bi bi-x"></i></button>
+                        </span>
+                    }
+                </div>
+            }
             <div class="composer">
                 <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@busy" title="Create a widget (mini-app)">
                     <i class="bi bi-plus-lg"></i>
                 </button>
+                <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document">
+                    <i class="bi bi-paperclip"></i>
+                </button>
                 <input @bind="input" @bind:event="oninput" @onkeydown="OnKey" placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" />
-                <button class="primary send-btn" @onclick="Send" disabled="@(busy || string.IsNullOrWhiteSpace(input))" title="Send">
+                <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send">
                     <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
                 </button>
             </div>
+            @if (attachError is not null) { <p class="err-text">@attachError</p> }
             @if (!Agent.IsModelReady)
             {
                 <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
@@ -81,6 +101,15 @@
     string pinName = "";
     ElementReference scrollEl;
     int lastCount = -1;
+
+    readonly List<StagedFile> attachments = new();
+    string? attachError;
+    const long MaxAttachmentBytes = 6L * 1024 * 1024;
+
+    sealed record StagedFile(string Name, string Mime, string Base64, long Size, byte[] Bytes)
+    {
+        public string SizeLabel => Human(Size);
+    }
 
     bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
@@ -102,14 +131,68 @@
 
     async Task OnKey(KeyboardEventArgs e)
     {
-        if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(input) && !busy) await Send();
+        if (e.Key == "Enter" && !busy && (!string.IsNullOrWhiteSpace(input) || attachments.Count > 0)) await Send();
+    }
+
+    async Task PickFile()
+    {
+        attachError = null;
+        try
+        {
+            var file = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
+            if (file is null) return;
+            using var stream = await file.OpenReadAsync();
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+            var bytes = ms.ToArray();
+            if (bytes.LongLength == 0) { attachError = "That file is empty."; return; }
+            if (bytes.LongLength > MaxAttachmentBytes)
+            {
+                attachError = $"\"{file.FileName}\" is {Human(bytes.LongLength)}, over the {Human(MaxAttachmentBytes)} limit.";
+                return;
+            }
+            var mime = string.IsNullOrWhiteSpace(file.ContentType) ? GuessMime(file.FileName) : file.ContentType;
+            attachments.Add(new StagedFile(file.FileName, mime, Convert.ToBase64String(bytes), bytes.LongLength, bytes));
+        }
+        catch (Exception ex) { attachError = "Couldn't attach that file: " + ex.Message; }
+    }
+
+    static string Human(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB" };
+        double size = bytes;
+        int u = 0;
+        while (size >= 1024 && u < units.Length - 1) { size /= 1024; u++; }
+        return $"{size:0.#} {units[u]}";
+    }
+
+    static string GuessMime(string name)
+    {
+        var ext = Path.GetExtension(name).ToLowerInvariant();
+        return ext switch
+        {
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            ".pdf" => "application/pdf",
+            ".txt" or ".md" or ".log" or ".csv" => "text/plain",
+            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".json" => "application/json",
+            _ => "application/octet-stream"
+        };
     }
 
     async Task Send()
     {
-        if (string.IsNullOrWhiteSpace(input) || busy) return;
+        if ((string.IsNullOrWhiteSpace(input) && attachments.Count == 0) || busy) return;
         var text = input;
+        var files = attachments.ToList();
         input = "";
+        attachments.Clear();
         busy = true;
         try
         {
@@ -123,7 +206,29 @@
             }
             else
             {
-                await Agent.AskAsOwnerAsync(text);
+                // Attached documents are extracted to text and appended so the owner agent can read them.
+                var prompt = text;
+                if (files.Count > 0)
+                {
+                    var sb = new System.Text.StringBuilder(text ?? "");
+                    foreach (var f in files)
+                    {
+                        sb.Append("\n\n");
+                        if (DocumentExtractor.IsSupported(f.Name))
+                        {
+                            string extracted;
+                            try { extracted = Extractor.Extract(f.Bytes, f.Name); }
+                            catch (Exception ex) { extracted = $"[could not read {f.Name}: {ex.Message}]"; }
+                            sb.Append($"Attached file \"{f.Name}\":\n{extracted}");
+                        }
+                        else
+                        {
+                            sb.Append($"[attached file \"{f.Name}\" ({f.SizeLabel}); its type cannot be read as text]");
+                        }
+                    }
+                    prompt = sb.ToString();
+                }
+                await Agent.AskAsOwnerAsync(prompt);
             }
         }
         catch (Exception ex) { State.AddOwnChatLine(new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }

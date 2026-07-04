@@ -19,27 +19,27 @@
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            gap: 22px;
+            gap: 20px;
             height: 100vh;
-            background: #131316;
+            background: #f6f8fb;
             font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
         }
         .app-splash .splash-art {
-            width: 176px;
+            width: 320px;
+            max-width: 62vw;
             height: auto;
-            border-radius: 28px;
             animation: splash-breathe 2.2s ease-in-out infinite;
         }
         .app-splash .splash-caption {
             font-size: 0.9rem;
             letter-spacing: 0.06em;
             text-transform: uppercase;
-            color: #8ab4f8;
+            color: #5b6472;
             opacity: 0.85;
         }
         @keyframes splash-breathe {
-            0%, 100% { transform: scale(1); opacity: 0.92; }
-            50% { transform: scale(1.05); opacity: 1; }
+            0%, 100% { transform: scale(1); opacity: 0.94; }
+            50% { transform: scale(1.03); opacity: 1; }
         }
     </style>
 </head>
@@ -50,7 +50,7 @@
 
     <div id="app">
         <div class="app-splash">
-            <img src="logo.png" alt="Mesh" class="splash-art" onerror="this.style.display='none'" />
+            <img src="logo-text.png" alt="Mesh" class="splash-art" onerror="this.style.display='none'" />
             <div class="splash-caption">Connecting your mesh...</div>
         </div>
     </div>

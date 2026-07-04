@@ -71,7 +71,13 @@
             <header class="pane-head">
                 <h2>@State.DisplayNameFor(active)</h2>
                 <span class="muted">@(IsAllowed(active) ? "their agent can talk to yours" : "you can message them")</span>
-                <span style="margin-left:auto;"><TokenMeter Compact="true" /></span>
+                @{ var spent = State.FindContact(active)?.TokensSpent ?? 0; }
+                @if (spent > 0)
+                {
+                    <span class="contact-tokens" title="Tokens this contact's requests have cost your agent">
+                        <i class="bi bi-coin"></i> @spent.ToString("N0") tokens
+                    </span>
+                }
             </header>
             <div class="messages" @ref="scrollEl">
                 <div class="messages-wrap">

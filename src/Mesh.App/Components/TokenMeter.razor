@@ -3,7 +3,9 @@
 
 @{
     var t = State.Profile.Tokens;
-    var modelKey = string.IsNullOrWhiteSpace(t.ModelKey) ? State.CurrentModelKey() : t.ModelKey;
+    // Always label with the CURRENTLY selected model, not the stored key (which is only the
+    // reset trigger and can lag behind a model switch until the next token is recorded).
+    var modelKey = State.CurrentModelKey();
     var tip = $"{modelKey}\nPrompt {t.PromptTokens:N0} + Completion {t.CompletionTokens:N0} = {t.TotalTokens:N0} tokens";
 }
 

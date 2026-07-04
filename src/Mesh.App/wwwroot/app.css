@@ -110,7 +110,7 @@ main { flex: 1; min-width: 0; display: flex; overflow: hidden; }
   display: flex; align-items: center; gap: 10px; color: var(--fg-1);
 }
 .mesh-nav .brand i.bi { color: var(--brand); font-size: 1.1rem; }
-.mesh-nav .brand .brand-logo { height: 34px; width: auto; border-radius: 8px; display: block; }
+.mesh-nav .brand .brand-logo { width: 140px; max-width: 100%; height: auto; display: block; }
 .mesh-nav .nav-link {
   display: flex; align-items: center; gap: 12px; padding: 9px 12px;
   border-radius: var(--radius-s); color: var(--fg-1); margin-bottom: 2px;
@@ -148,6 +148,8 @@ main { flex: 1; min-width: 0; display: flex; overflow: hidden; }
   padding: 18px 24px 12px; border-bottom: 1px solid var(--stroke-1);
 }
 .pane-head h2 { font-size: 1.3rem; display: flex; align-items: center; gap: 10px; }
+.pane-head .contact-tokens { margin-left: auto; font-size: .8rem; color: var(--fg-3); display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.pane-head .contact-tokens i.bi { color: var(--brand); }
 .pane-head h2 i.bi { color: var(--brand); font-size: 1.15rem; }
 .muted { color: var(--fg-3); font-size: .85rem; }
 .small { font-size: .8rem; }
@@ -590,7 +592,7 @@ input[type=checkbox]:not(.switch input):checked::after {
   width: 100%; max-width: 440px; box-shadow: var(--shadow-16); }
 .onboard h1 { display: flex; align-items: center; gap: 10px; font-size: 1.6rem; }
 .onboard h1 i.bi { color: var(--brand); }
-.onboard .onboard-logo { display: block; width: 108px; height: auto; margin: 0 auto 4px; border-radius: 20px; }
+.onboard .onboard-logo { display: block; width: 200px; max-width: 80%; height: auto; margin: 0 auto 4px; }
 .onboard .sub { color: var(--fg-3); margin: 8px 0 20px; }
 .onboard label { display: block; font-size: .82rem; font-weight: 600; margin: 14px 0 4px; color: var(--fg-2); }
 .onboard .handle-row { display: flex; align-items: center; border: 1px solid var(--stroke-2);
@@ -621,7 +623,7 @@ input[type=checkbox]:not(.switch input):checked::after {
   }
   .mobile-bar .hamburger { background: transparent; border: none; font-size: 1.3rem; padding: 6px 10px; color: var(--fg-1); }
   .mobile-bar .mobile-title { font-weight: 600; font-size: 1.05rem; }
-  .mobile-bar .mobile-title .mobile-logo { height: 24px; width: auto; border-radius: 6px; vertical-align: middle; }
+  .mobile-bar .mobile-title .mobile-logo { height: 22px; width: auto; vertical-align: middle; }
 
   .app-shell { flex-direction: column; }
   .page { flex-direction: column; }

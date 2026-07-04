@@ -59,6 +59,7 @@
             <div class="field">
                 <label>Provider</label>
                 <select class="full" value="@provider" @onchange="OnProviderChange">
+                    <option value="MeshHosted">Mesh free model (no key)</option>
                     <option value="Anthropic">Anthropic (Claude)</option>
                     <option value="OpenAI">OpenAI</option>
                     <option value="Gemini">Google Gemini</option>
@@ -69,7 +70,16 @@
                 </select>
             </div>
 
-            @if (provider == "FoundryLocal")
+            @if (provider == "MeshHosted")
+            {
+                <div class="field">
+                    <div class="connector-note">
+                        <i class="bi bi-gift"></i>
+                        <span>The Mesh free model runs on a shared Mesh-hosted model, no API key needed. There is a daily token budget, so it can pause once that budget is used up for the day. Switch to your own key or an on-device model for unlimited use.</span>
+                    </div>
+                </div>
+            }
+            else if (provider == "FoundryLocal")
             {
                     <div class="field">
                         <label>Model</label>
@@ -418,7 +428,11 @@
     void OnProviderChange(ChangeEventArgs e)
     {
         provider = e.Value?.ToString() ?? "Anthropic";
-        if (provider == "FoundryLocal")
+        if (provider == "MeshHosted")
+        {
+            model = ""; // the free model's id is chosen server-side
+        }
+        else if (provider == "FoundryLocal")
         {
             foundryModels = Foundry.CachedModels.ToList();
             // Only pick a default when the current selection isn't an on-device model.

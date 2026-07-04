@@ -91,7 +91,7 @@
     <!-- Windows-only: system tray icon support + the tray icon asset next to the exe. -->
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
         <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
-        <Content Include="Platforms\Windows\mesh.ico">
+        <Content Include="Platforms\Windows\mesh-tray.png" Link="mesh-tray.png">
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </Content>
     </ItemGroup>

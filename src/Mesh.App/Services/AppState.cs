@@ -186,10 +186,11 @@ public sealed class AppState
     public string CurrentModelKey()
     {
         var m = Profile.Model;
-        var name = m.Provider == ModelProvider.MeshHosted
-            ? (string.IsNullOrWhiteSpace(Profile.HostedModelName) ? "hosted" : Profile.HostedModelName)
-            : m.Model;
-        return $"{m.Provider}/{name}";
+        // The hosted free model's actual id is chosen server-side (currently Groq llama-3.3), so the
+        // client does not claim a specific upstream name, it labels it generically.
+        if (m.Provider == ModelProvider.MeshHosted)
+            return "Mesh free model";
+        return $"{m.Provider}/{m.Model}";
     }
 
     /// <summary>
@@ -215,6 +216,26 @@ public sealed class AppState
     public void ResetTokenCounter()
     {
         Profile.Tokens = new TokenUsage { ModelKey = CurrentModelKey() };
+        Save();
+        NotifyChanged();
+    }
+
+    /// <summary>
+    /// Attributes tokens spent answering a contact's request to that contact's lifetime tally, so
+    /// the owner can see who is costing them tokens. Creates a lightweight contact record if needed.
+    /// </summary>
+    public void AddContactTokens(string handle, long promptTokens, long completionTokens)
+    {
+        var total = Math.Max(0, promptTokens) + Math.Max(0, completionTokens);
+        if (total <= 0) return;
+        var h = Norm(handle);
+        var contact = FindContact(h);
+        if (contact is null)
+        {
+            contact = new Domain.Contact { Handle = h, Allowed = false };
+            Profile.Contacts.Add(contact);
+        }
+        contact.TokensSpent += total;
         Save();
         NotifyChanged();
     }

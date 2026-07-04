@@ -1,9 +1,19 @@
 .backup {
-    max-width: 720px;
-    margin: 0 auto;
+    margin: 0;
     padding: 32px 28px 48px;
     font-family: "Segoe UI", system-ui, sans-serif;
     color: #1f2328;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.backup > * {
+    max-width: 720px;
+    margin-left: auto;
+    margin-right: auto;
 }
 
 .backup-head h1 {

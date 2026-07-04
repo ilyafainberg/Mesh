@@ -129,6 +129,13 @@ public sealed class Contact
     /// Inbound messages are verified against these to defend against a malicious relay.
     /// </summary>
     public List<string> SigningKeys { get; set; } = new();
+
+    /// <summary>
+    /// Cumulative tokens this contact's requests have cost the owner's model (guest replies your
+    /// agent generated for them). Shown per contact so the owner can see who is spending their
+    /// tokens. Not reset on model change, this is a lifetime cost-per-contact tally.
+    /// </summary>
+    public long TokensSpent { get; set; }
 }
 
 public sealed class ChatLine
@@ -246,7 +253,7 @@ public sealed class MeshProfile
     public string AgentBudgetDate { get; set; } = "";
 
     /// <summary>Model id used for the relay-hosted free model (first-launch, no key required).</summary>
-    public string HostedModelName { get; set; } = "gpt-4o-mini";
+    public string HostedModelName { get; set; } = "free model";
 
     /// <summary>
     /// Running token usage for the CURRENTLY selected model, shown as a live counter in the UI.

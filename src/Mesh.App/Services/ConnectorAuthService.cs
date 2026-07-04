@@ -89,6 +89,9 @@ public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppStat
                 "Close whatever is using it and try again.");
         }
 
+        // Abort the listener promptly on cancellation so the loopback port is freed for a retry.
+        using var cancelReg = ct.Register(() => { try { listener.Abort(); } catch { } });
+
         var ep = Endpoint(cfg.Key);
         var authUrl = $"{ep.AuthorizeUrl}?client_id={Uri.EscapeDataString(clientId)}" +
             $"&response_type=code&redirect_uri={Uri.EscapeDataString(redirect)}" +
@@ -101,8 +104,13 @@ public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppStat
         {
             browser = BrowserLauncher.Open(authUrl);
             var ctxTask = listener.GetContextAsync();
-            if (await Task.WhenAny(ctxTask, Task.Delay(TimeSpan.FromMinutes(3), ct)) != ctxTask)
+            var completed = await Task.WhenAny(ctxTask, Task.Delay(TimeSpan.FromMinutes(3), ct));
+            if (completed != ctxTask)
+            {
+                // Either the 3 minute timeout elapsed or the user cancelled. Either way, free the port.
+                ct.ThrowIfCancellationRequested();
                 return (false, null, "Sign-in timed out.");
+            }
             var context = await ctxTask;
             var code = context.Request.QueryString["code"];
             var err = context.Request.QueryString["error"];

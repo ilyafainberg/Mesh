@@ -1,7 +1,7 @@
 using System.Windows.Input;
+using System.Drawing;
 using H.NotifyIcon;
 using Microsoft.UI.Windowing;
-using Microsoft.UI.Xaml.Media.Imaging;
 using Mesh.App.Services;
 using MenuFlyout = Microsoft.UI.Xaml.Controls.MenuFlyout;
 using MenuFlyoutItem = Microsoft.UI.Xaml.Controls.MenuFlyoutItem;
@@ -61,9 +61,19 @@ public sealed class WindowsAppControl : IAppControl
             NoLeftClickDelay = true
         };
 
-        var icoPath = Path.Combine(AppContext.BaseDirectory, "mesh.ico");
-        if (File.Exists(icoPath))
-            tray.IconSource = new BitmapImage(new Uri(icoPath));
+        // Load the tray glyph as a System.Drawing.Icon (set synchronously via the icon handle),
+        // which is reliable at 16px, unlike an async BitmapImage that can render blank.
+        var pngPath = Path.Combine(AppContext.BaseDirectory, "mesh-tray.png");
+        if (File.Exists(pngPath))
+        {
+            try
+            {
+                using var bmp = new Bitmap(pngPath);
+                using var small = new Bitmap(bmp, new System.Drawing.Size(32, 32));
+                tray.Icon = Icon.FromHandle(small.GetHicon());
+            }
+            catch { /* fall back to no icon rather than crash */ }
+        }
 
         tray.ForceCreate(enablesEfficiencyMode: false);
     }

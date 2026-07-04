@@ -101,7 +101,13 @@
                         <span><b>Slack</b><small>messages</small></span>
                     </button>
                 </div>
-                @if (busy) { <p class="hint"><i class="bi bi-hourglass-split"></i> Opening sign-in…</p> }
+                @if (busy)
+                {
+                    <p class="hint">
+                        <i class="bi bi-hourglass-split"></i> Opening sign-in in your browser. Complete it there, or
+                        <button class="link-btn" @onclick="CancelConnect">cancel</button>.
+                    </p>
+                }
                 @if (sourceError is not null) { <p class="err-text">@sourceError</p> }
                 @if (sourceNote is not null)
                 {
@@ -381,6 +387,7 @@
     string? editingId;
     string editTitle = "", editContent = "", editVisibility = "private";
     bool busy;
+    CancellationTokenSource? connectCts;
     string? sourceError;
     string? sourceNote;
     readonly HashSet<string> expandedItems = new();
@@ -482,10 +489,18 @@
     {
         sourceError = null;
         busy = true;
+        connectCts?.Cancel();
+        connectCts = new CancellationTokenSource();
         try
         {
-            var (ok, account, error) = await Connectors.SignInAsync(provider);
-            if (!ok || account is null) { sourceError = $"{ToolRegistry.DisplayName(provider)} sign-in failed: " + (error ?? "unknown error"); return; }
+            var (ok, account, error) = await Connectors.SignInAsync(provider, connectCts.Token);
+            if (!ok || account is null)
+            {
+                // A user-initiated cancel is not an error.
+                if (!connectCts.IsCancellationRequested)
+                    sourceError = $"{ToolRegistry.DisplayName(provider)} sign-in failed: " + (error ?? "unknown error");
+                return;
+            }
             if (State.Profile.Sources.Any(s => s.Provider == provider && s.ConnectedAs == account))
             {
                 sourceError = "That account is already connected.";
@@ -499,9 +514,12 @@
                 Visibility = "private"
             }));
         }
+        catch (OperationCanceledException) { /* user cancelled */ }
         catch (Exception ex) { sourceError = "Sign-in error: " + ex.Message; }
-        finally { busy = false; }
+        finally { busy = false; connectCts?.Dispose(); connectCts = null; }
     }
+
+    void CancelConnect() => connectCts?.Cancel();
 
     void ToggleSource(ConnectedSource s, ChangeEventArgs e)
         => State.Mutate(_ => s.Enabled = e.Value is bool b && b);

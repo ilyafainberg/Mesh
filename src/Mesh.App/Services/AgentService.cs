@@ -10,7 +10,7 @@ namespace Mesh.App.Services;
 /// Private knowledge is never placed into a guest context, so it cannot be
 /// extracted by a hostile peer agent (privacy by binding, not by instruction).
 /// </summary>
-public sealed class AgentService(AppState state, ModelFactory factory, FoundryLocalService foundry, ToolRegistry tools)
+public sealed class AgentService(AppState state, ModelFactory factory, FoundryLocalService foundry, ToolRegistry tools, TokenMeter meter)
 {
     public bool IsModelReady => state.Profile.Model.IsConfigured
         || state.Profile.Model.Provider == ModelProvider.FoundryLocal
@@ -102,7 +102,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var sys = BuildGuestSystemPrompt(p, fromHandle, circles, agentTools, widgets);
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
-        var reply = await model.CompleteWithToolsAsync(sys, Window(history, p.Model.Provider), agentTools, ct);
+        // Attribute the tokens this reply costs to the requesting contact (in addition to the
+        // owner's global counter) so the owner can see per-contact spend in Messages.
+        string reply;
+        using (meter.BeginScope((pt, cc) => state.AddContactTokens(fromHandle, pt, cc)))
+            reply = await model.CompleteWithToolsAsync(sys, Window(history, p.Model.Provider), agentTools, ct);
         return ExpandWidgets(reply, widgets);
     }
 
