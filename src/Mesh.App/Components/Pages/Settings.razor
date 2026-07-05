@@ -6,6 +6,7 @@
 @inject ModelSetupService Setup
 @inject McpHost McpHostSvc
 @inject IHttpClientFactory HttpFactory
+@inject UpdateService Updater
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -403,6 +404,87 @@
                 </span>
             </div>
         </div>
+
+        @if (Updater.IsSupported)
+        {
+        <div class="card-panel">
+            <h3>Updates</h3>
+            <div class="field-row">
+                <div class="field-label">Current version</div>
+                <span>@Updater.CurrentVersion.ToString(3)</span>
+            </div>
+
+            @if (updatePhase == UpdatePhase.Downloading || updatePhase == UpdatePhase.Extracting
+                 || updatePhase == UpdatePhase.Preparing || updatePhase == UpdatePhase.Applying)
+            {
+                <div class="field">
+                    <div class="update-progress-head">
+                        <span>@updateStatus</span>
+                        @if (updatePercent >= 0) { <span>@updatePercent%</span> }
+                    </div>
+                    <div class="progress-track" role="progressbar"
+                         aria-valuenow="@(updatePercent < 0 ? 0 : updatePercent)" aria-valuemin="0" aria-valuemax="100">
+                        <div class="progress-fill @(updatePercent < 0 ? "indeterminate" : "")"
+                             style="@(updatePercent >= 0 ? $"width:{updatePercent}%" : "")"></div>
+                    </div>
+                    @if (updateBytesTotal > 0)
+                    {
+                        <div class="field-hint">@FormatMb(updateBytesReceived) of @FormatMb(updateBytesTotal) MB</div>
+                    }
+                </div>
+            }
+            else if (updateInfo is not null && updatePhase == UpdatePhase.ReadyToApply)
+            {
+                <div class="field">
+                    <div class="update-avail">Version @updateInfo.Version.ToString(3) is ready to install.</div>
+                    <div class="field-hint">Mesh will close and reopen to finish updating. Any unsaved work should be saved first.</div>
+                    <div class="model-row">
+                        <button class="primary" @onclick="ApplyUpdate">Restart and update</button>
+                        <button class="ghost" @onclick="DismissUpdate">Later</button>
+                    </div>
+                </div>
+            }
+            else if (updateInfo is not null && updateAvailable)
+            {
+                <div class="field">
+                    <div class="update-avail">
+                        <i class="bi bi-arrow-up-circle-fill"></i>
+                        Version @updateInfo.Version.ToString(3) is available.
+                    </div>
+                    @if (!string.IsNullOrWhiteSpace(updateInfo.ReleaseNotes))
+                    {
+                        <details class="update-notes">
+                            <summary>What's new</summary>
+                            <pre>@updateInfo.ReleaseNotes</pre>
+                        </details>
+                    }
+                    <div class="model-row">
+                        <button class="primary" @onclick="DownloadUpdate">
+                            Download @(updateInfo.Size > 0 ? $"({FormatMb(updateInfo.Size)} MB)" : "")
+                        </button>
+                        @if (updateInfo.HtmlUrl is not null)
+                        {
+                            <button class="ghost" @onclick="() => OpenUrl(updateInfo.HtmlUrl)">View release</button>
+                        }
+                    </div>
+                </div>
+            }
+            else
+            {
+                <div class="field">
+                    <div class="model-row">
+                        <button class="ghost" @onclick="CheckUpdate" disabled="@checkingUpdate">
+                            @(checkingUpdate ? "Checking…" : "Check for updates")
+                        </button>
+                    </div>
+                    @if (updateStatus is not null)
+                    {
+                        <div class="field-hint @(updateFailed ? "err-text" : "")">@updateStatus</div>
+                    }
+                </div>
+            }
+        </div>
+        }
 
         <div class="card-panel">
             <h3>Identities on this device</h3>
@@ -837,6 +919,115 @@
         }
         finally { testingRelay = false; }
     }
+
+    // ---- self-update ----
+    bool checkingUpdate;
+    bool updateAvailable;
+    bool updateFailed;
+    string? updateStatus;
+    UpdateInfo? updateInfo;
+    UpdatePhase updatePhase = UpdatePhase.Idle;
+    int updatePercent = -1;
+    long updateBytesReceived;
+    long updateBytesTotal;
+
+    static string FormatMb(long bytes) => (bytes / 1024.0 / 1024.0).ToString("N0");
+
+    async Task CheckUpdate()
+    {
+        checkingUpdate = true;
+        updateFailed = false;
+        updateStatus = null;
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var result = await Updater.CheckAsync(cts.Token);
+            if (result.Available && result.Info is not null)
+            {
+                updateAvailable = true;
+                updateInfo = result.Info;
+                updatePhase = UpdatePhase.Idle;
+            }
+            else if (result.Error is not null)
+            {
+                updateFailed = true;
+                updateStatus = result.Error;
+            }
+            else
+            {
+                updateStatus = $"You're on the latest version ({Updater.CurrentVersion.ToString(3)}).";
+            }
+        }
+        catch (Exception ex)
+        {
+            updateFailed = true;
+            updateStatus = $"Update check failed: {ex.Message}";
+        }
+        finally { checkingUpdate = false; }
+    }
+
+    async Task DownloadUpdate()
+    {
+        if (updateInfo is null) return;
+        updateFailed = false;
+        updatePhase = UpdatePhase.Downloading;
+        updateBytesReceived = 0;
+        updateBytesTotal = updateInfo.Size;
+        updatePercent = updateInfo.Size > 0 ? 0 : -1;
+
+        var progress = new Progress<UpdateProgress>(p =>
+        {
+            updatePhase = p.Phase;
+            updateBytesReceived = p.BytesReceived;
+            updateBytesTotal = p.TotalBytes;
+            updatePercent = p.Percent;
+            updateStatus = p.Phase switch
+            {
+                UpdatePhase.Downloading => "Downloading update…",
+                UpdatePhase.Extracting => "Extracting…",
+                UpdatePhase.Preparing => "Preparing…",
+                UpdatePhase.ReadyToApply => "Ready to install",
+                _ => updateStatus
+            };
+            InvokeAsync(StateHasChanged);
+        });
+
+        try
+        {
+            preparedUpdaterPath = await Updater.DownloadAndPrepareAsync(updateInfo, progress);
+            updatePhase = UpdatePhase.ReadyToApply;
+        }
+        catch (Exception ex)
+        {
+            updateFailed = true;
+            updatePhase = UpdatePhase.Idle;
+            updateStatus = $"Update download failed: {ex.Message}";
+        }
+    }
+
+    void ApplyUpdate()
+    {
+        if (preparedUpdaterPath is null) return;
+        updatePhase = UpdatePhase.Applying;
+        updateStatus = "Restarting to install…";
+        Updater.ApplyAndExit(preparedUpdaterPath);
+    }
+
+    void DismissUpdate()
+    {
+        updatePhase = UpdatePhase.Idle;
+        updateAvailable = false;
+        updateInfo = null;
+        preparedUpdaterPath = null;
+        updateStatus = null;
+    }
+
+    void OpenUrl(string url)
+    {
+        try { Microsoft.Maui.ApplicationModel.Launcher.OpenAsync(new Uri(url)); } catch { }
+    }
+
+    string? preparedUpdaterPath;
 
     void Toggle(Action<Mesh.App.Domain.MeshProfile> change) => State.Mutate(change);
 

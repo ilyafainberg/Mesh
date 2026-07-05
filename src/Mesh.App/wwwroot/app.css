@@ -729,3 +729,20 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
         transition-duration: 0.001ms !important;
     }
 }
+
+/* ============================================================
+   Self-update panel + progress bar
+   ============================================================ */
+.update-progress-head { display: flex; justify-content: space-between; align-items: baseline; font-size: .85rem; color: var(--fg-2); margin-bottom: 6px; }
+.progress-track { width: 100%; height: 8px; background: var(--bg-3); border-radius: 999px; overflow: hidden; }
+.progress-fill { height: 100%; background: var(--brand); border-radius: 999px; transition: width .15s ease; }
+.progress-fill.indeterminate { width: 40% !important; animation: mesh-indeterminate 1.1s ease-in-out infinite; }
+@keyframes mesh-indeterminate {
+  0%   { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+.update-avail { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--fg-1); margin-bottom: 6px; }
+.update-avail .bi { color: var(--brand); }
+.update-notes { margin: 6px 0; font-size: .82rem; }
+.update-notes summary { cursor: pointer; color: var(--fg-2); }
+.update-notes pre { white-space: pre-wrap; word-break: break-word; background: var(--bg-2); border: 1px solid var(--stroke-1); border-radius: var(--radius-m); padding: 8px 10px; margin-top: 6px; max-height: 180px; overflow: auto; font-size: .8rem; }

@@ -36,6 +36,14 @@ public static class MauiProgram
 		// well past the default 100s HttpClient timeout. Give model calls plenty of room.
 		builder.Services.AddHttpClient("model", c => c.Timeout = TimeSpan.FromMinutes(10));
 		builder.Services.AddHttpClient("connector");
+		builder.Services.AddHttpClient("relay");
+		// The self-updater downloads a large (hundreds of MB) client zip, so give it a generous
+		// timeout and the User-Agent the GitHub API requires.
+		builder.Services.AddHttpClient("updater", c =>
+		{
+			c.Timeout = TimeSpan.FromMinutes(30);
+			c.DefaultRequestHeaders.UserAgent.ParseAdd("Mesh-Updater");
+		});
 		builder.Services.AddSingleton<ISecretStore, SecretStore>();
 #if WINDOWS
 		builder.Services.AddSingleton<IAppControl, Mesh.App.Platforms.Windows.WindowsAppControl>();
@@ -71,6 +79,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<FileImporter>();
 		builder.Services.AddSingleton<AgentService>();
 		builder.Services.AddSingleton<ModelSetupService>();
+		builder.Services.AddSingleton<UpdateService>();
 		builder.Services.AddSingleton<MeshClient>();
 
 #if DEBUG
