@@ -14,6 +14,13 @@ relay, and any Mesh client can point at it. This document explains how.
 
 Running a relay does NOT give you access to anyone's messages. It is transport.
 
+## Version compatibility
+
+Relay and client share a registration protocol. Since v1.1.0 the relay requires a
+signed proof-of-possession on handle registration (collision avoidance), so run a
+client of v1.1.0 or newer against a v1.1.0 or newer relay. Older clients cannot
+register on a v1.1.0 relay.
+
 ## Quick start (Docker)
 
 ```bash
