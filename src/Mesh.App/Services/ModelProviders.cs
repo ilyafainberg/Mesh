@@ -43,6 +43,12 @@ public static class ModelReply
     }
 }
 
+/// <summary>Shared limit on how many rounds of tool calls a model may make before being forced to answer.</summary>
+internal static class ToolLoop
+{
+    public const int MaxRounds = 16;
+}
+
 /// <summary>Extracts token usage from the various provider response shapes and reports it to the meter.</summary>
 internal static class Usage
 {
@@ -149,7 +155,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
         }).ToArray();
 
         // Up to 4 rounds of tool calls before forcing an answer.
-        for (var round = 0; round < 5; round++)
+        for (var round = 0; round < ToolLoop.MaxRounds; round++)
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/v1/chat/completions");
             if (!string.IsNullOrWhiteSpace(cfg.ApiKey)) req.Headers.Authorization = new("Bearer", cfg.ApiKey);
@@ -249,7 +255,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             name = t.Name, description = t.Description, input_schema = t.ParametersSchema
         }).ToArray();
 
-        for (var round = 0; round < 5; round++)
+        for (var round = 0; round < ToolLoop.MaxRounds; round++)
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
             req.Headers.Add("x-api-key", cfg.ApiKey);
@@ -371,7 +377,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
             .ToList();
         if (messages.Count == 0) messages.Add(new HostedModelMessage("user", "Hello"));
 
-        for (var round = 0; round < 5; round++)
+        for (var round = 0; round < ToolLoop.MaxRounds; round++)
         {
             var (result, error) = await PostAsync(systemPrompt, messages, toolsJson, ct);
             if (error is not null)
@@ -485,7 +491,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
             function = new { name = t.Name, description = t.Description, parameters = t.ParametersSchema }
         }).ToArray();
 
-        for (var round = 0; round < 5; round++)
+        for (var round = 0; round < ToolLoop.MaxRounds; round++)
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
             req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
