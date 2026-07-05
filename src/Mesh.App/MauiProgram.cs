@@ -39,8 +39,10 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ISecretStore, SecretStore>();
 #if WINDOWS
 		builder.Services.AddSingleton<IAppControl, Mesh.App.Platforms.Windows.WindowsAppControl>();
+		builder.Services.AddSingleton<INotifier, Mesh.App.Platforms.Windows.WindowsNotifier>();
 #else
 		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
+		builder.Services.AddSingleton<INotifier, DefaultNotifier>();
 #endif
 		builder.Services.AddSingleton<AppState>();
 		builder.Services.AddSingleton<TokenMeter>();

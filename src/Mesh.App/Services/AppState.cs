@@ -47,6 +47,9 @@ public sealed class AppState
 
     public event Action? Changed;
 
+    // Handles with unread inbound person-messages (in-memory, cleared when the conversation is viewed).
+    private readonly HashSet<string> unread = new(StringComparer.OrdinalIgnoreCase);
+
     public AppState(ISecretStore secrets)
     {
         this.secrets = secrets;
@@ -218,6 +221,29 @@ public sealed class AppState
         Profile.Tokens = new TokenUsage { ModelKey = CurrentModelKey() };
         Save();
         NotifyChanged();
+    }
+
+    // ---- unread message tracking -----------------------------------------
+
+    /// <summary>Handles with at least one unread inbound person-message.</summary>
+    public IReadOnlyCollection<string> UnreadHandles => unread;
+
+    /// <summary>Total number of things needing the owner's attention: unread chats + requests + approvals.</summary>
+    public int AttentionCount => unread.Count + Profile.Requests.Count + Profile.Approvals.Count;
+
+    /// <summary>Marks a conversation as having an unread inbound message.</summary>
+    public void MarkUnread(string handle)
+    {
+        if (unread.Add(Norm(handle))) NotifyChanged();
+    }
+
+    /// <summary>True when the given conversation has an unread inbound message.</summary>
+    public bool IsUnread(string handle) => unread.Contains(Norm(handle));
+
+    /// <summary>Clears the unread flag for a conversation (called when the owner opens it).</summary>
+    public void MarkRead(string handle)
+    {
+        if (unread.Remove(Norm(handle))) NotifyChanged();
     }
 
     /// <summary>

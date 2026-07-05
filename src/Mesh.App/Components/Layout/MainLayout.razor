@@ -5,6 +5,8 @@
 @inject MsalAuthService Msal
 @inject ModelSetupService Setup
 @inject FoundryLocalService Foundry
+@inject NavigationManager Nav
+@inject IAppControl AppControl
 @implements IDisposable
 
 @if (!State.IsOnboarded)
@@ -75,6 +77,16 @@ else
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
         Setup.Changed += Refresh;
+
+        // When a toast is clicked, bring the window up and navigate to the relevant page.
+#if WINDOWS
+        global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = route => InvokeAsync(() =>
+        {
+            AppControl.ShowMainWindow();
+            if (!string.IsNullOrWhiteSpace(route)) Nav.NavigateTo(route);
+        });
+#endif
+
         if (State.IsOnboarded)
         {
             await Msal.InitializeAsync();
@@ -94,5 +106,8 @@ else
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
+#if WINDOWS
+        global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = null;
+#endif
     }
 }

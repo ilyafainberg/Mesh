@@ -120,6 +120,11 @@ main { flex: 1; min-width: 0; display: flex; overflow: hidden; }
 .mesh-nav .nav-link:hover { background: var(--bg-hover); text-decoration: none; }
 .mesh-nav .nav-link.active { background: var(--brand-tint); color: var(--brand); font-weight: 600; }
 .mesh-nav .nav-link.active i.bi { color: var(--brand); }
+.mesh-nav .nav-badge {
+  margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 9px; background: var(--danger, #d13438); color: #fff;
+  font-size: .7rem; font-weight: 700; line-height: 18px; text-align: center;
+}
 .mesh-nav .nav-link.active::before {
   content: ""; position: absolute; left: 0; top: 8px; bottom: 8px;
   width: 3px; border-radius: 2px; background: var(--brand);
@@ -457,6 +462,7 @@ input[type=checkbox]:not(.switch input):checked::after {
 .conv-item:hover { background: var(--bg-hover); }
 .conv-item.active { background: var(--brand-tint); color: var(--brand); font-weight: 600; }
 .conv-item .conv-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-item .conv-unread { width: 8px; height: 8px; border-radius: 50%; background: var(--danger, #d13438); flex: none; margin-left: 6px; }
 .conv-empty { text-align: left; margin: 6px 2px; max-width: none; font-size: .84rem; }
 
 .requests { margin-top: 16px; border-top: 1px solid var(--stroke-1); padding-top: 12px; }

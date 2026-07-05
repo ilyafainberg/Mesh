@@ -1,11 +1,18 @@
-﻿<div class="mesh-nav">
+﻿@implements IDisposable
+<div class="mesh-nav">
     <div class="brand">
         <img src="logo-text.png" alt="Mesh" class="brand-logo" />
     </div>
     <nav class="nav flex-column">
         <NavLink class="nav-link" href="" Match="NavLinkMatch.All" @onclick="OnNavigate"><i class="bi bi-person-badge"></i> Me</NavLink>
-        <NavLink class="nav-link" href="messages" @onclick="OnNavigate"><i class="bi bi-chat-dots"></i> Messages</NavLink>
-        <NavLink class="nav-link" href="contacts" @onclick="OnNavigate"><i class="bi bi-people"></i> Contacts</NavLink>
+        <NavLink class="nav-link" href="messages" @onclick="OnNavigate">
+            <i class="bi bi-chat-dots"></i> Messages
+            @if (MessagesBadge > 0) { <span class="nav-badge">@MessagesBadge</span> }
+        </NavLink>
+        <NavLink class="nav-link" href="contacts" @onclick="OnNavigate">
+            <i class="bi bi-people"></i> Contacts
+            @if (State.Profile.Requests.Count > 0) { <span class="nav-badge">@State.Profile.Requests.Count</span> }
+        </NavLink>
         <NavLink class="nav-link" href="knowledge" @onclick="OnNavigate"><i class="bi bi-journal-text"></i> Knowledge</NavLink>
         <NavLink class="nav-link" href="skills" @onclick="OnNavigate"><i class="bi bi-lightning-charge"></i> Skills</NavLink>
         <NavLink class="nav-link" href="widgets" @onclick="OnNavigate"><i class="bi bi-window-stack"></i> Widgets</NavLink>
@@ -19,6 +26,25 @@
     [Parameter] public EventCallback OnNavigate { get; set; }
 
     [Inject] private IAppControl AppControl { get; set; } = default!;
+    [Inject] private AppState State { get; set; } = default!;
+    [Inject] private MeshClient Mesh { get; set; } = default!;
+
+    // Messages badge: unread person-chats plus drafts awaiting approval.
+    int MessagesBadge => State.UnreadHandles.Count + State.Profile.Approvals.Count;
+
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+        Mesh.StateChanged += Refresh;
+    }
+
+    void Refresh() => InvokeAsync(StateHasChanged);
 
     void Quit() => AppControl.Quit();
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        Mesh.StateChanged -= Refresh;
+    }
 }

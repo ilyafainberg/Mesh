@@ -14,7 +14,7 @@ namespace Mesh.App.Services;
 /// keepalive and automatic reconnection; this client adds the device-key auth handshake,
 /// end-to-end encryption, and dispatch of inbound messages to the agent and UI.
 /// </summary>
-public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFactory httpFactory)
+public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFactory httpFactory, INotifier notifier)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
@@ -302,20 +302,34 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
         var contact = state.FindContact(from);
         var allowed = contact?.Allowed == true;
+        var display = state.DisplayNameFor(from);
 
         // Record the inbound line. Agent replies are tagged "agent"; anything a person typed
         // (chat or a direct message) is "person".
         var via = env.Kind == MeshKinds.AgentResponse ? "agent" : "person";
         state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = via });
 
+        // A person-to-person message to the human: mark unread and toast the owner.
+        if (env.Kind == MeshKinds.DirectMessage)
+        {
+            state.MarkUnread(from);
+            notifier.Notify($"Message from {display}", Preview(text), NotifyKind.Message, "messages");
+        }
+
         if (!allowed)
         {
             // Unknown/!allowed -> drop into request inbox, do NOT engage the agent.
+            var isNew = false;
             state.Mutate(x =>
             {
                 if (!x.Requests.Any(r => r.From == from))
+                {
                     x.Requests.Add(new PendingRequest { From = from, Body = text });
+                    isNew = true;
+                }
             });
+            if (isNew)
+                notifier.Notify($"Request from @{from}", Preview(text), NotifyKind.Request, "contacts");
             Log?.Invoke($"inbound from @{from} held for approval");
             StateChanged?.Invoke();
             return;
@@ -357,6 +371,8 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
                     RequestBody = text,
                     DraftReply = reply
                 }));
+                notifier.Notify("Reply needs your approval",
+                    $"Your agent drafted a reply to {display}.", NotifyKind.Approval, "messages");
                 Log?.Invoke($"draft reply to @{from} awaiting approval");
             }
             else
@@ -432,6 +448,13 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig);
         try { await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env); }
         catch (Exception ex) { Log?.Invoke($"send failed: {ex.Message}"); }
+    }
+
+    private static string Preview(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "(no content)";
+        var clean = text.Replace("\r", " ").Replace("\n", " ").Trim();
+        return clean.Length > 120 ? clean[..120] + "…" : clean;
     }
 
     public async Task DisconnectAsync()
