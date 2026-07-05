@@ -1,0 +1,74 @@
+@page "/search"
+@inject AppState State
+@inject NavigationManager Nav
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-search"></i> Search</h2>
+            <span class="muted">find anything across your conversations and your own chat</span>
+        </div>
+
+        <div class="add-row">
+            <input @bind="query" @bind:event="oninput" @onkeydown="OnKey" placeholder="Search messages…" aria-label="Search messages" autofocus />
+            <button class="primary" @onclick="Run" disabled="@string.IsNullOrWhiteSpace(query)"><i class="bi bi-search"></i> Search</button>
+        </div>
+
+        @if (ran)
+        {
+            @if (results.Count == 0)
+            {
+                <div class="empty">No matches for "@lastQuery".</div>
+            }
+            else
+            {
+                <div class="muted" style="margin:8px 0;">@results.Count result@(results.Count == 1 ? "" : "s") for "@lastQuery"</div>
+                <div class="card-panel">
+                    @foreach (var hit in results)
+                    {
+                        <button class="list-row search-hit" @onclick="() => Open(hit)">
+                            <div class="row-main">
+                                <div class="row-title">
+                                    @(hit.Handle == "(me)" ? "Me (your assistant)" : "@" + hit.Handle)
+                                    <span class="muted" style="font-weight:400;"> · @Who(hit)</span>
+                                </div>
+                                <div class="row-sub">@Snippet(hit.Text)</div>
+                            </div>
+                            <div class="row-sub" style="white-space:nowrap;">@hit.At.LocalDateTime.ToString("d MMM, HH:mm")</div>
+                        </button>
+                    }
+                </div>
+            }
+        }
+    </div>
+</div>
+
+@code {
+    string query = "";
+    string lastQuery = "";
+    bool ran;
+    IReadOnlyList<MeshDb.SearchHit> results = Array.Empty<MeshDb.SearchHit>();
+
+    void OnKey(KeyboardEventArgs e) { if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(query)) Run(); }
+
+    void Run()
+    {
+        lastQuery = query.Trim();
+        results = State.SearchHistory(lastQuery);
+        ran = true;
+    }
+
+    // Jump to the conversation for a hit (own-chat hits go to the Me page).
+    void Open(MeshDb.SearchHit hit)
+        => Nav.NavigateTo(hit.Handle == "(me)" ? "" : $"messages?to={Uri.EscapeDataString(hit.Handle)}");
+
+    string Who(MeshDb.SearchHit hit)
+        => hit.Role == "assistant" ? (hit.Handle == "(me)" ? "your agent" : "you") : (hit.Handle == "(me)" ? "you" : "them");
+
+    static string Snippet(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        var clean = text.Replace("\r", " ").Replace("\n", " ").Trim();
+        return clean.Length > 160 ? clean[..160] + "…" : clean;
+    }
+}

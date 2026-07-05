@@ -3,6 +3,7 @@
 @inject MeshClient Mesh
 @inject AgentService Agent
 @inject IJSRuntime JS
+@inject NavigationManager Nav
 @implements IDisposable
 
 <div class="split">
@@ -205,6 +206,30 @@
     {
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
+
+        // Deep-link: /messages?to=handle opens that conversation (used by Search).
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        var to = ParseQueryValue(uri.Query, "to");
+        if (!string.IsNullOrWhiteSpace(to))
+        {
+            var h = AppState.Norm(to!);
+            State.GetOrCreateConversation(h);
+            active = h;
+            State.MarkRead(h);
+        }
+    }
+
+    static string? ParseQueryValue(string queryString, string key)
+    {
+        var q = queryString.TrimStart('?');
+        foreach (var pair in q.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var i = pair.IndexOf('=');
+            if (i < 0) continue;
+            if (Uri.UnescapeDataString(pair[..i]) == key)
+                return Uri.UnescapeDataString(pair[(i + 1)..]);
+        }
+        return null;
     }
     void Refresh() => InvokeAsync(StateHasChanged);
 

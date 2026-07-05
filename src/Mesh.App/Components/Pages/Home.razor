@@ -88,6 +88,13 @@
             {
                 <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
             }
+            else if (QuotaExhausted)
+            {
+                <div class="warn-banner">
+                    <i class="bi bi-hourglass-bottom"></i>
+                    Today's free-model limit is reached. <a href="settings">Add your own model key</a> for unlimited use, or switch to an on-device model.
+                </div>
+            }
         </div>
     </div>
 </div>
@@ -111,6 +118,18 @@
     }
 
     bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
+
+    // The free model returns a friendly limit message when the daily token budget is spent.
+    // Surface it as a persistent, actionable banner (not just a chat line) so the fix is obvious.
+    bool QuotaExhausted
+    {
+        get
+        {
+            if (State.Profile.Model.Provider != Mesh.App.Domain.ModelProvider.MeshHosted) return false;
+            var last = State.Profile.OwnChat.LastOrDefault(l => l.Role == "assistant");
+            return last is not null && last.Text.StartsWith("You've reached today's free-model limit", StringComparison.Ordinal);
+        }
+    }
 
     protected override void OnInitialized() => State.Changed += Refresh;
     void Refresh() => InvokeAsync(StateHasChanged);

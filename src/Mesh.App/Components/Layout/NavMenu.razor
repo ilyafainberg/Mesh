@@ -13,6 +13,7 @@
             <i class="bi bi-people"></i> Contacts
             @if (State.Profile.Requests.Count > 0) { <span class="nav-badge">@State.Profile.Requests.Count</span> }
         </NavLink>
+        <NavLink class="nav-link" href="search" @onclick="OnNavigate"><i class="bi bi-search"></i> Search</NavLink>
         <NavLink class="nav-link" href="knowledge" @onclick="OnNavigate"><i class="bi bi-journal-text"></i> Knowledge</NavLink>
         <NavLink class="nav-link" href="skills" @onclick="OnNavigate"><i class="bi bi-lightning-charge"></i> Skills</NavLink>
         <NavLink class="nav-link" href="widgets" @onclick="OnNavigate"><i class="bi bi-window-stack"></i> Widgets</NavLink>

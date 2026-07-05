@@ -14,6 +14,30 @@
             <button class="primary" @onclick="Add" disabled="@string.IsNullOrWhiteSpace(handle)"><i class="bi bi-person-plus"></i> Add</button>
         </div>
 
+        @if (State.Profile.Requests.Count > 0)
+        {
+            <div class="pane-head" style="padding-left:0;padding-right:0;">
+                <h2><i class="bi bi-inbox"></i> Requests</h2>
+                <span class="muted">people who reached out but aren't approved yet</span>
+            </div>
+            <div class="card-panel">
+                @foreach (var r in State.Profile.Requests.ToList())
+                {
+                    <div class="list-row">
+                        <div class="row-main">
+                            <div class="row-title">@("@" + r.From)</div>
+                            <div class="row-sub">@Truncate(r.Body, 140)</div>
+                        </div>
+                        <div class="row-actions">
+                            <button class="primary" title="Allow this contact" @onclick="() => AllowRequest(r)"><i class="bi bi-check-lg"></i> Allow</button>
+                            <button class="ghost" title="Block this contact" @onclick="() => BlockRequest(r)"><i class="bi bi-slash-circle"></i> Block</button>
+                            <button class="icon-btn" title="Dismiss" @onclick="() => DismissRequest(r)"><i class="bi bi-x-lg"></i></button>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+
         <div class="card-panel">
             @foreach (var c in State.Profile.Contacts)
             {
@@ -25,6 +49,14 @@
                             <label class="chip @(c.Allowed ? "on" : "")">
                                 <input type="checkbox" checked="@c.Allowed" @onchange="e => ToggleAllowed(c, e)" />
                                 @(c.Allowed ? "Allowed" : "Blocked")
+                            </label>
+                            <label class="chip @(c.Muted ? "on" : "")" title="No popup notifications for this contact">
+                                <input type="checkbox" checked="@c.Muted" @onchange="e => ToggleMuted(c, e)" />
+                                <i class="bi bi-bell-slash"></i> Muted
+                            </label>
+                            <label class="chip @(c.Blocked ? "on" : "")" title="Drop this contact's messages entirely">
+                                <input type="checkbox" checked="@c.Blocked" @onchange="e => ToggleBlocked(c, e)" />
+                                <i class="bi bi-slash-circle"></i> Blocked
                             </label>
                             @foreach (var circle in State.Profile.Circles)
                             {
@@ -122,6 +154,40 @@
 
     void ToggleAllowed(Contact c, ChangeEventArgs e)
         => State.Mutate(_ => c.Allowed = (bool)(e.Value ?? false));
+
+    void ToggleMuted(Contact c, ChangeEventArgs e)
+        => State.Mutate(_ => c.Muted = (bool)(e.Value ?? false));
+
+    void ToggleBlocked(Contact c, ChangeEventArgs e)
+        => State.Mutate(_ => { c.Blocked = (bool)(e.Value ?? false); if (c.Blocked) c.Allowed = false; });
+
+    // ---- request inbox ----
+    Contact GetOrCreateContact(string fromHandle)
+    {
+        var norm = AppState.Norm(fromHandle);
+        var existing = State.FindContact(norm);
+        if (existing is not null) return existing;
+        var c = new Contact { Handle = norm };
+        State.Mutate(p => p.Contacts.Add(c));
+        return c;
+    }
+
+    void AllowRequest(PendingRequest r)
+    {
+        var c = GetOrCreateContact(r.From);
+        State.Mutate(p => { c.Allowed = true; c.Blocked = false; p.Requests.Remove(r); });
+    }
+
+    void BlockRequest(PendingRequest r)
+    {
+        var c = GetOrCreateContact(r.From);
+        State.Mutate(p => { c.Blocked = true; c.Allowed = false; p.Requests.Remove(r); });
+    }
+
+    void DismissRequest(PendingRequest r) => State.Mutate(p => p.Requests.Remove(r));
+
+    static string Truncate(string s, int max)
+        => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
 
     void ToggleCircle(Contact c, string circle, ChangeEventArgs e)
         => State.Mutate(_ =>
