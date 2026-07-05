@@ -41,3 +41,6 @@ _hostedtest/obj/
 # Bundled MCP server build output (reproduce via _deploy/publish-totalcontrol.ps1)
 _deploy/totalcontrol/
 
+
+_deploy/.lasttag
+
