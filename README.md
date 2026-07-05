@@ -71,4 +71,6 @@ dotnet run --project _hostedtest -- <relayUrl>   # hosted free-model tool call
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Mesh is free for personal and noncommercial use under the PolyForm Noncommercial
+License 1.0.0. See [LICENSE](LICENSE). Commercial use, including any use by or for
+a business, requires a separate commercial license: `licensing@quonkel.com`.
