@@ -74,6 +74,23 @@ public sealed class LocalToolSetting
     public string Visibility { get; set; } = "private";
 }
 
+/// <summary>
+/// A user-added MCP tool server: a local command Mesh launches over stdio to expose its tools to the
+/// agent. Same off-by-default, owner-first, optionally-circle-shared model as the bundled servers.
+/// </summary>
+public sealed class CustomMcpServer
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("n");
+    public string Name { get; set; } = "";
+    /// <summary>The executable or command to launch (e.g. a full path to an .exe, "npx", "python").</summary>
+    public string Command { get; set; } = "";
+    /// <summary>Command arguments, one per entry (e.g. ["-y", "@modelcontextprotocol/server-filesystem"]).</summary>
+    public List<string> Arguments { get; set; } = new();
+    public bool Enabled { get; set; }
+    /// <summary>"private" | "public" | "shared:&lt;circle&gt;".</summary>
+    public string Visibility { get; set; } = "private";
+}
+
 public sealed class ModelConfig
 {
     public ModelProvider Provider { get; set; } = ModelProvider.Anthropic;
@@ -301,6 +318,9 @@ public sealed class MeshProfile
     /// Each server can expose several tools; the grant governs the whole server.
     /// </summary>
     public Dictionary<string, LocalToolSetting> McpServers { get; set; } = new();
+
+    /// <summary>User-added MCP tool servers (local command launched over stdio). Off by default.</summary>
+    public List<CustomMcpServer> CustomMcpServers { get; set; } = new();
 
     /// <summary>The agent's own private chat (owner context).</summary>
     public List<ChatLine> OwnChat { get; set; } = new();

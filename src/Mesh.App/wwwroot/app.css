@@ -162,6 +162,10 @@ main { flex: 1; min-width: 0; display: flex; overflow: hidden; }
 .local-tool-row .lt-share { display: flex; align-items: center; gap: 10px; margin: 8px 0 2px 46px; }
 .local-tool-row .lt-share-label { font-size: .78rem; color: var(--fg-3); white-space: nowrap; }
 .local-tool-row .lt-share select { flex: 1; max-width: 280px; }
+.mcp-add { margin-top: 12px; padding: 12px; border: 1px dashed var(--stroke-2); border-radius: var(--radius-m); }
+.mcp-add label { display: block; font-size: .82rem; font-weight: 600; margin: 8px 0 4px; color: var(--fg-2); }
+.mcp-add textarea { font-family: "Cascadia Code", Consolas, monospace; font-size: .82rem; }
+.mcp-add-actions { display: flex; gap: 8px; margin-top: 12px; }
 .pane-head h2 i.bi { color: var(--brand); font-size: 1.15rem; }
 .muted { color: var(--fg-3); font-size: .85rem; }
 .small { font-size: .8rem; }

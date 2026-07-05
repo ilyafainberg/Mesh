@@ -37,3 +37,7 @@ Thumbs.db
 ## Hosted-model test
 _hostedtest/bin/
 _hostedtest/obj/
+
+# Bundled MCP server build output (reproduce via _deploy/publish-totalcontrol.ps1)
+_deploy/totalcontrol/
+

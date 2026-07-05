@@ -415,24 +415,38 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
     /// </summary>
     public async Task<IReadOnlyList<IAgentTool>> McpToolsAsync(
         IReadOnlyDictionary<string, LocalToolSetting>? servers,
+        IReadOnlyList<CustomMcpServer>? customServers,
         bool owner,
         List<string>? circles,
         CancellationToken ct = default)
     {
-        if (servers is null || servers.Count == 0) return Array.Empty<IAgentTool>();
-
         static bool Vis(string v, List<string> cs) =>
             v == "public" || (v.StartsWith("shared:") && cs.Contains(v["shared:".Length..]));
 
         var tools = new List<IAgentTool>();
-        foreach (var (id, setting) in servers)
-        {
-            if (setting is null || !setting.Enabled) continue;
-            if (!owner && (circles is null || !Vis(setting.Visibility, circles))) continue;
-            var def = McpServerRegistry.Find(id);
-            if (def is null || !mcpHost.IsAvailable(def)) continue;
-            tools.AddRange(await mcpHost.GetToolsAsync(def, ct));
-        }
+
+        // Bundled servers (e.g. TotalControl), governed by per-server grants.
+        if (servers is not null)
+            foreach (var (id, setting) in servers)
+            {
+                if (setting is null || !setting.Enabled) continue;
+                if (!owner && (circles is null || !Vis(setting.Visibility, circles))) continue;
+                var def = McpServerRegistry.Find(id);
+                if (def is null || !mcpHost.IsAvailable(def)) continue;
+                tools.AddRange(await mcpHost.GetToolsAsync(def, ct));
+            }
+
+        // User-added custom servers.
+        if (customServers is not null)
+            foreach (var c in customServers)
+            {
+                if (!c.Enabled) continue;
+                if (!owner && (circles is null || !Vis(c.Visibility, circles))) continue;
+                var def = McpServerRegistry.FromCustom(c);
+                if (!mcpHost.IsAvailable(def)) continue;
+                tools.AddRange(await mcpHost.GetToolsAsync(def, ct));
+            }
+
         return tools;
     }
 

@@ -35,6 +35,15 @@ public static class McpServerRegistry
 
     public static McpServerDef? Find(string id) => All.FirstOrDefault(s => s.Id == id);
 
+    /// <summary>Builds a launchable server definition from a user-added custom server.</summary>
+    public static McpServerDef FromCustom(Mesh.App.Domain.CustomMcpServer c) => new(
+        Id: "custom:" + c.Id,
+        DisplayName: string.IsNullOrWhiteSpace(c.Name) ? c.Command : c.Name,
+        Description: $"Custom MCP server: {c.Command} {string.Join(' ', c.Arguments)}".Trim(),
+        Icon: "bi-plugin",
+        ResolveCommand: () => string.IsNullOrWhiteSpace(c.Command) ? null : c.Command,
+        Arguments: c.Arguments.ToArray());
+
     /// <summary>Locates the bundled TotalControl.exe shipped under mcp/totalcontrol next to the app.</summary>
     private static string? ResolveTotalControl()
     {
