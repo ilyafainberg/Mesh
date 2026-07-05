@@ -60,19 +60,43 @@ public sealed class MeshDb : IDisposable
             CREATE TABLE IF NOT EXISTS conversations(handle TEXT PRIMARY KEY, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS chat_lines(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT,
                 handle TEXT NOT NULL,
                 role TEXT NOT NULL,
                 text TEXT NOT NULL,
                 via TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
                 at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS ix_chat_handle ON chat_lines(handle, id);
+            CREATE INDEX IF NOT EXISTS ix_chat_lineid ON chat_lines(line_id);
             CREATE TABLE IF NOT EXISTS own_chat(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT,
                 role TEXT NOT NULL,
                 text TEXT NOT NULL,
                 via TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
                 at TEXT NOT NULL);
             INSERT OR IGNORE INTO meta(k, v) VALUES('schema_version', '1');");
+
+        // Idempotent migration for databases created before line_id/status existed.
+        AddColumnIfMissing("chat_lines", "line_id", "TEXT");
+        AddColumnIfMissing("chat_lines", "status", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing("own_chat", "line_id", "TEXT");
+        AddColumnIfMissing("own_chat", "status", "TEXT NOT NULL DEFAULT ''");
+    }
+
+    private void AddColumnIfMissing(string table, string column, string decl)
+    {
+        bool exists = false;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = $"PRAGMA table_info({table});";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase)) { exists = true; break; }
+        }
+        if (!exists) Exec($"ALTER TABLE {table} ADD COLUMN {column} {decl};");
     }
 
     /// <summary>True when this database has never had a profile written to it.</summary>
@@ -127,7 +151,7 @@ public sealed class MeshDb : IDisposable
 
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT handle, role, text, via, at FROM chat_lines ORDER BY id;";
+            cmd.CommandText = "SELECT handle, role, text, via, at, line_id, status FROM chat_lines ORDER BY id;";
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -137,7 +161,9 @@ public sealed class MeshDb : IDisposable
                     Role = r.GetString(1),
                     Text = r.GetString(2),
                     Via = r.GetString(3),
-                    At = ParseAt(r.GetString(4))
+                    At = ParseAt(r.GetString(4)),
+                    Id = r.IsDBNull(5) ? Guid.NewGuid().ToString("n") : r.GetString(5),
+                    Status = r.IsDBNull(6) ? "" : r.GetString(6)
                 });
             }
         }
@@ -148,7 +174,7 @@ public sealed class MeshDb : IDisposable
     {
         var lines = new List<ChatLine>();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT role, text, via, at FROM own_chat ORDER BY id;";
+        cmd.CommandText = "SELECT role, text, via, at, line_id, status FROM own_chat ORDER BY id;";
         using var r = cmd.ExecuteReader();
         while (r.Read())
             lines.Add(new ChatLine
@@ -156,7 +182,9 @@ public sealed class MeshDb : IDisposable
                 Role = r.GetString(0),
                 Text = r.GetString(1),
                 Via = r.GetString(2),
-                At = ParseAt(r.GetString(3))
+                At = ParseAt(r.GetString(3)),
+                Id = r.IsDBNull(4) ? Guid.NewGuid().ToString("n") : r.GetString(4),
+                Status = r.IsDBNull(5) ? "" : r.GetString(5)
             });
         return lines;
     }
@@ -193,11 +221,13 @@ public sealed class MeshDb : IDisposable
     {
         EnsureConversation(handle);
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO chat_lines(handle, role, text, via, at) VALUES($h, $r, $x, $v, $a);";
+        cmd.CommandText = "INSERT INTO chat_lines(line_id, handle, role, text, via, status, at) VALUES($lid, $h, $r, $x, $v, $s, $a);";
+        cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$h", handle);
         cmd.Parameters.AddWithValue("$r", line.Role);
         cmd.Parameters.AddWithValue("$x", line.Text);
         cmd.Parameters.AddWithValue("$v", line.Via);
+        cmd.Parameters.AddWithValue("$s", line.Status);
         cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
         cmd.ExecuteNonQuery();
     }
@@ -206,12 +236,47 @@ public sealed class MeshDb : IDisposable
     public void AppendOwnChat(ChatLine line)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO own_chat(role, text, via, at) VALUES($r, $x, $v, $a);";
+        cmd.CommandText = "INSERT INTO own_chat(line_id, role, text, via, status, at) VALUES($lid, $r, $x, $v, $s, $a);";
+        cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$r", line.Role);
         cmd.Parameters.AddWithValue("$x", line.Text);
         cmd.Parameters.AddWithValue("$v", line.Via);
+        cmd.Parameters.AddWithValue("$s", line.Status);
         cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Updates the delivery status of an outgoing line by its stable id.</summary>
+    public void UpdateLineStatus(string lineId, string status)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE chat_lines SET status = $s WHERE line_id = $lid;";
+        cmd.Parameters.AddWithValue("$s", status);
+        cmd.Parameters.AddWithValue("$lid", lineId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>A single search hit across conversations and own-chat.</summary>
+    public sealed record SearchHit(string Handle, string Role, string Text, DateTimeOffset At);
+
+    /// <summary>Full-text-ish search over all chat history (case-insensitive LIKE). Newest first.</summary>
+    public List<SearchHit> Search(string query, int limit = 100)
+    {
+        var hits = new List<SearchHit>();
+        if (string.IsNullOrWhiteSpace(query)) return hits;
+        var like = "%" + query.Trim() + "%";
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            SELECT handle, role, text, at FROM chat_lines WHERE text LIKE $q COLLATE NOCASE
+            UNION ALL
+            SELECT '(me)' AS handle, role, text, at FROM own_chat WHERE text LIKE $q COLLATE NOCASE
+            ORDER BY at DESC LIMIT $lim;";
+        cmd.Parameters.AddWithValue("$q", like);
+        cmd.Parameters.AddWithValue("$lim", limit);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            hits.Add(new SearchHit(r.GetString(0), r.GetString(1), r.GetString(2), ParseAt(r.GetString(3))));
+        return hits;
     }
 
     // ---- helpers ------------------------------------------------------------

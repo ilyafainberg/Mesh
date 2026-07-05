@@ -202,6 +202,30 @@ public static class MeshKinds
     /// receiving client records it but does NOT auto-engage the guest agent.
     /// </summary>
     public const string DirectMessage = "direct";
+
+    /// <summary>
+    /// A delivery receipt: the recipient's client acknowledges it received a specific message.
+    /// The body carries the acknowledged message id (see <see cref="ReceiptProtocol"/>).
+    /// </summary>
+    public const string Receipt = "receipt";
+
+    /// <summary>
+    /// A request from one of the owner's OWN devices to another (e.g. phone to home desktop) asking
+    /// the remote device's agent to answer with its full local toolset. Only honored between devices
+    /// sharing the same handle when the target has opted in (ActAsRemoteAgent).
+    /// </summary>
+    public const string RemoteAgentRequest = "remote.request";
+
+    /// <summary>The remote device's answer to a <see cref="RemoteAgentRequest"/>.</summary>
+    public const string RemoteAgentResponse = "remote.response";
+}
+
+/// <summary>Canonical body format for a delivery receipt: just the acknowledged message id.</summary>
+public static class ReceiptProtocol
+{
+    public static string Body(string messageId) => "receipt:" + messageId;
+    public static string? MessageId(string body)
+        => body is not null && body.StartsWith("receipt:", StringComparison.Ordinal) ? body["receipt:".Length..] : null;
 }
 
 /// <summary>

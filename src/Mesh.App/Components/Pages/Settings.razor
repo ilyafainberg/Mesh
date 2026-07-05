@@ -121,10 +121,30 @@
             }
             else
             {
-                <div class="field">
-                    <label>@(provider == "AzureOpenAI" ? "Deployment name" : "Model")</label>
-                    <input class="full" @bind="model" placeholder="@ModelPlaceholder" />
-                </div>
+                @if (CatalogOptions.Count > 0)
+                {
+                    <div class="field">
+                        <label>Model</label>
+                        <select class="full" value="@ModelSelectValue" @onchange="OnModelSelect">
+                            @foreach (var opt in CatalogOptions)
+                            {
+                                <option value="@opt.Id">@opt.Label</option>
+                            }
+                            <option value="__custom__">Custom...</option>
+                        </select>
+                        @if (modelIsCustom)
+                        {
+                            <input class="full" style="margin-top:8px;" @bind="model" placeholder="@ModelPlaceholder" />
+                        }
+                    </div>
+                }
+                else
+                {
+                    <div class="field">
+                        <label>@(provider == "AzureOpenAI" ? "Deployment name" : "Model")</label>
+                        <input class="full" @bind="model" placeholder="@ModelPlaceholder" />
+                    </div>
+                }
                 @if (provider == "OpenAI")
                 {
                     <div class="field">
@@ -615,6 +635,7 @@
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
+        SyncModelCustomFlag();
     }
 
     string ModelPlaceholder=> provider switch
@@ -626,6 +647,27 @@
         "AzureOpenAI" => "my-gpt-4o-mini (deployment name)",
         _ => "gpt-4o-mini"
     };
+
+    // ---- model dropdown (curated catalog per provider) ----
+    bool modelIsCustom;
+
+    IReadOnlyList<ModelCatalog.ModelOption> CatalogOptions =>
+        Enum.TryParse<ModelProvider>(provider, out var pv) ? ModelCatalog.For(pv) : Array.Empty<ModelCatalog.ModelOption>();
+
+    // The <select> value: the current model id when it is in the catalog, else the Custom sentinel.
+    string ModelSelectValue =>
+        (!modelIsCustom && CatalogOptions.Any(o => o.Id == model)) ? model : "__custom__";
+
+    void OnModelSelect(ChangeEventArgs e)
+    {
+        var v = e.Value?.ToString() ?? "";
+        if (v == "__custom__") { modelIsCustom = true; }
+        else { modelIsCustom = false; model = v; }
+    }
+
+    // Keep the custom flag in sync when a provider/model is loaded or changed.
+    void SyncModelCustomFlag()
+        => modelIsCustom = CatalogOptions.Count > 0 && !string.IsNullOrWhiteSpace(model) && !CatalogOptions.Any(o => o.Id == model);
 
     static bool IsFoundryId(string id) =>
         id.Contains("generic-cpu", StringComparison.OrdinalIgnoreCase) || id.Contains("-instruct-", StringComparison.OrdinalIgnoreCase);
@@ -648,6 +690,7 @@
         replyBudget = p.AgentDailyReplyBudget;
         // Use the list cached at app startup, do NOT reload here (that would reset the selection).
         foundryModels = Foundry.CachedModels.ToList();
+        SyncModelCustomFlag();
     }
     void Refresh()
     {
@@ -677,6 +720,15 @@
         {
             model = ""; // let the provider's placeholder show
         }
+
+        // For providers with a curated catalog, default to the top model when the current id is not
+        // in the new provider's list, so the dropdown never lands on a stale/foreign model id.
+        if (ModelCatalog.HasCatalog(Enum.Parse<ModelProvider>(provider)))
+        {
+            var opts = CatalogOptions;
+            if (!opts.Any(o => o.Id == model)) model = opts[0].Id;
+        }
+        SyncModelCustomFlag();
     }
 
     /// <summary>Manual refresh, the only place that re-queries the on-device catalog after startup.</summary>

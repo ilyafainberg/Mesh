@@ -101,6 +101,7 @@ public sealed class AppState
                 {
                     activeDb = db;
                     Profile = loaded;
+                    RehydrateUnread();
                     return;
                 }
                 db.Dispose();
@@ -109,6 +110,13 @@ public sealed class AppState
             Profile = new MeshProfile();
         }
         catch { Profile = new MeshProfile(); activeId = null; activeDb = null; }
+    }
+
+    // Restore the in-memory unread set from the persisted profile (survives restarts).
+    private void RehydrateUnread()
+    {
+        unread.Clear();
+        foreach (var h in Profile.UnreadFrom) unread.Add(Norm(h));
     }
 
     private void WriteIndex()
@@ -234,7 +242,12 @@ public sealed class AppState
     /// <summary>Marks a conversation as having an unread inbound message.</summary>
     public void MarkUnread(string handle)
     {
-        if (unread.Add(Norm(handle))) NotifyChanged();
+        var h = Norm(handle);
+        if (unread.Add(h))
+        {
+            if (!Profile.UnreadFrom.Contains(h)) { Profile.UnreadFrom.Add(h); activeDb?.SaveProfile(Profile); }
+            NotifyChanged();
+        }
     }
 
     /// <summary>True when the given conversation has an unread inbound message.</summary>
@@ -243,8 +256,27 @@ public sealed class AppState
     /// <summary>Clears the unread flag for a conversation (called when the owner opens it).</summary>
     public void MarkRead(string handle)
     {
-        if (unread.Remove(Norm(handle))) NotifyChanged();
+        var h = Norm(handle);
+        var changed = unread.Remove(h);
+        if (Profile.UnreadFrom.Remove(h)) { activeDb?.SaveProfile(Profile); changed = true; }
+        if (changed) NotifyChanged();
     }
+
+    /// <summary>Updates an outgoing line's delivery status (persisted) and refreshes the UI.</summary>
+    public void SetLineStatus(string lineId, string status)
+    {
+        foreach (var conv in Profile.Conversations)
+        {
+            var line = conv.Lines.FirstOrDefault(l => l.Id == lineId);
+            if (line is not null) { line.Status = status; break; }
+        }
+        activeDb?.UpdateLineStatus(lineId, status);
+        NotifyChanged();
+    }
+
+    /// <summary>Searches all chat history for a query string. Empty when no active database.</summary>
+    public IReadOnlyList<MeshDb.SearchHit> SearchHistory(string query)
+        => activeDb is not null ? activeDb.Search(query) : new List<MeshDb.SearchHit>();
 
     /// <summary>
     /// Attributes tokens spent answering a contact's request to that contact's lifetime tally, so

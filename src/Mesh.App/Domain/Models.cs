@@ -177,10 +177,18 @@ public sealed class Contact
     /// tokens. Not reset on model change, this is a lifetime cost-per-contact tally.
     /// </summary>
     public long TokensSpent { get; set; }
+
+    /// <summary>When true, no OS notification fires for this contact's messages (in-app badge still updates).</summary>
+    public bool Muted { get; set; }
+
+    /// <summary>True when this contact is blocked: their messages are dropped and their agent gets nothing.</summary>
+    public bool Blocked { get; set; }
 }
 
 public sealed class ChatLine
 {
+    /// <summary>Stable id so delivery receipts can update the right outgoing line.</summary>
+    public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Role { get; set; } = "user"; // user | assistant | system
     public string Text { get; set; } = "";
     /// <summary>
@@ -189,6 +197,8 @@ public sealed class ChatLine
     /// can tell an agent exchange apart from a direct message.
     /// </summary>
     public string Via { get; set; } = "agent";
+    /// <summary>Delivery status for an outgoing line: "" | "sent" | "delivered" | "failed".</summary>
+    public string Status { get; set; } = "";
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -305,6 +315,22 @@ public sealed class MeshProfile
 
     /// <summary>Allow interactive HTML mini-apps from agents to be run in message bubbles.</summary>
     public bool AllowInteractiveApps { get; set; } = true;
+
+    /// <summary>Global do-not-disturb: suppress all OS notifications (in-app badges still update).</summary>
+    public bool DoNotDisturb { get; set; }
+
+    /// <summary>Play a sound with OS notifications.</summary>
+    public bool NotificationSound { get; set; } = true;
+
+    /// <summary>
+    /// When true, this device (a desktop) will answer remote requests from the owner's OTHER devices
+    /// (e.g. a phone) using its full local toolset, so the owner can "talk to my home agent" on the go.
+    /// Off by default; only the owner's own linked devices can ever reach it.
+    /// </summary>
+    public bool ActAsRemoteAgent { get; set; }
+
+    /// <summary>Handles this device has an unread inbound person-message from (persisted read-state).</summary>
+    public List<string> UnreadFrom { get; set; } = new();
 
     /// <summary>
     /// Local-machine tool grants (run scripts, control browser, file access), keyed by tool.

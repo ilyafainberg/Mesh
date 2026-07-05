@@ -5,7 +5,9 @@ using System.Text.Json;
 using System.Threading.RateLimiting;
 using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
+using Mesh.Relay.Observability;
 using Mesh.Relay.Quota;
+using Mesh.Relay.RateLimiting;
 using Mesh.Relay.Storage;
 using Mesh.Shared;
 
@@ -41,6 +43,17 @@ builder.Services.AddSingleton(quota);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
 builder.Services.AddHostedService<PresenceRenewer>();
+
+// Aggregate ops counters (no PII): scraped via GET /metrics.
+var metrics = new RelayMetrics();
+builder.Services.AddSingleton(metrics);
+
+// Per-handle message rate limiter for the hub (in-memory, no external service required).
+// MESH_MSG_RATE_PER_MIN: steady messages/minute per handle (default 120).
+// MESH_MSG_BURST:        back-to-back burst capacity per handle (default 30).
+var msgRatePerMin = int.TryParse(Config(builder.Configuration, "MESH_MSG_RATE_PER_MIN", "Mesh:MessageRatePerMinute"), out var rpm) ? rpm : 120;
+var msgBurst = int.TryParse(Config(builder.Configuration, "MESH_MSG_BURST", "Mesh:MessageBurst"), out var mb) ? mb : 30;
+builder.Services.AddSingleton(new PerHandleRateLimiter(msgRatePerMin, msgBurst));
 
 // SignalR provides the transport (connection, framing, keepalive, reconnection). Cross-node
 // routing is done by MeshRouter + the directed backplane, NOT by a SignalR fan-out backplane,
@@ -80,6 +93,22 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
 app.MapGet("/", () => Results.Ok(new { service = "Mesh.Relay", status = "ok", instance = backplane.InstanceId }));
 app.MapGet("/health", () => Results.Ok(new { status = "ok", time = DateTimeOffset.UtcNow }));
 
+// ---- Metrics (aggregate counts only, no handles/PII) ----------------------
+// Unauthenticated read so ops can scrape it; exposes only process-wide totals + a live gauge.
+app.MapGet("/metrics", () =>
+{
+    var s = metrics.Snapshot();
+    return Results.Ok(new
+    {
+        handlesRegistered = s.HandlesRegistered,
+        messagesRouted = s.MessagesRouted,
+        hostedModelCalls = s.HostedModelCalls,
+        rateLimitRejections = s.RateLimitRejections,
+        connected = s.Connected,
+        time = DateTimeOffset.UtcNow
+    });
+});
+
 // ---- Handle registry (REST) ----------------------------------------------
 app.MapPost("/handles", async (RegisterHandleRequest req) =>
 {
@@ -95,6 +124,8 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         // Capture the recovery public key at registration so a future device can recover the handle.
         if (!string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
+        metrics.HandleRegistered();
+        app.Logger.LogInformation("handle registered: {Handle}", handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceIdOf(req.DevicePublicKey), created.RegisteredAt));
     }
 
@@ -164,16 +195,26 @@ app.MapPost("/handles/{handle}/recover", async (string handle, RecoverHandleRequ
     if (rec is null) return Results.NotFound();
 
     if (string.IsNullOrWhiteSpace(rec.RecoveryPublicKey))
+    {
+        app.Logger.LogWarning("recover failed (not available): {Handle}", key);
         return Results.BadRequest(new { error = "recovery not available for this handle" });
+    }
 
     if (string.IsNullOrWhiteSpace(req.NewPublicKey))
+    {
+        app.Logger.LogWarning("recover failed (missing key): {Handle}", key);
         return Results.BadRequest(new { error = "newPublicKey is required" });
+    }
 
     var message = RecoveryProtocol.Message(key, req.NewPublicKey);
     if (!MeshCrypto.Verify(rec.RecoveryPublicKey, message, req.RecoverySignature))
+    {
+        app.Logger.LogWarning("recover failed (invalid signature): {Handle}", key);
         return Results.BadRequest(new { error = "invalid recovery signature" });
+    }
 
     var (updated, _) = await store.UpsertHandleAsync(key, req.NewPublicKey, displayName: null, allowNewDevice: true);
+    app.Logger.LogInformation("recover succeeded: {Handle}", key);
     return Results.Ok(new RegisterHandleResponse(key, DeviceIdOf(req.NewPublicKey), updated.RegisteredAt));
 });
 
@@ -312,6 +353,8 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
         // are counted.
         var (promptTokens, completionTokens, totalTokens) = ReadUsage(doc.RootElement);
         await quota.AddDailyAsync(handleKey, totalTokens);
+        metrics.HostedModelCall();
+        app.Logger.LogInformation("hosted model call: {Handle} tokens={Tokens}", handleKey, totalTokens);
         return Results.Ok(new HostedModelResponse(content, toolCallsJson, promptTokens, completionTokens, totalTokens));
     }
     catch (Exception ex)

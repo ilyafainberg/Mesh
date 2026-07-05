@@ -1,5 +1,8 @@
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging;
 using Mesh.Relay.Backplane;
+using Mesh.Relay.Observability;
+using Mesh.Relay.RateLimiting;
 using Mesh.Relay.Storage;
 using Mesh.Shared;
 
@@ -21,7 +24,10 @@ public sealed class MeshHub(
     ConnectionRegistry registry,
     MeshRouter router,
     IRelayStore store,
-    IBackplane backplane) : Microsoft.AspNetCore.SignalR.Hub
+    IBackplane backplane,
+    PerHandleRateLimiter rateLimiter,
+    RelayMetrics metrics,
+    ILogger<MeshHub> logger) : Microsoft.AspNetCore.SignalR.Hub
 {
     public override async Task OnConnectedAsync()
     {
@@ -43,6 +49,8 @@ public sealed class MeshHub(
 
         var nonce = MeshCrypto.NewNonce();
         registry.Add(Context.ConnectionId, handle, nonce);
+        metrics.ConnectionOpened();
+        logger.LogInformation("hub connection opened: {Handle}", handle);
         await Clients.Caller.SendAsync(MeshHubProtocol.Challenge, nonce);
         await base.OnConnectedAsync();
     }
@@ -82,13 +90,30 @@ public sealed class MeshHub(
         if (!MeshCrypto.Verify(state.PublicKey, env.Body, env.Signature ?? ""))
             return; // forged or tampered: drop
 
+        // Per-handle message rate limit: drop (do not route) when the sender is over its limit.
+        // A single over-limit message is dropped, not disconnected, so a bursty client recovers.
+        if (!rateLimiter.TryAcquire(state.Handle))
+        {
+            metrics.RateLimitRejected();
+            logger.LogWarning("message rate limited: {Handle}", state.Handle);
+            return;
+        }
+
         var stamped = env with { From = state.Handle }; // relay asserts the authenticated sender
         await router.RouteAsync(stamped);
+        metrics.MessageRouted();
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
+        // Only count a close for a connection we counted on open (present in the registry).
+        var counted = registry.Get(Context.ConnectionId) is not null;
         var handle = registry.Remove(Context.ConnectionId);
+        if (counted)
+        {
+            metrics.ConnectionClosed();
+            logger.LogInformation("hub connection closed: {Handle}", handle ?? "unknown");
+        }
         if (handle is not null)
             await backplane.ClearPresenceAsync(handle); // only when it was the last local connection
         await base.OnDisconnectedAsync(exception);
