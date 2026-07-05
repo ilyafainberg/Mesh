@@ -3,15 +3,15 @@
     <div class="brand">
         <img src="logo-text.png" alt="Mesh" class="brand-logo" />
     </div>
-    <nav class="nav flex-column">
+    <nav class="nav flex-column" role="navigation" aria-label="Main">
         <NavLink class="nav-link" href="" Match="NavLinkMatch.All" @onclick="OnNavigate"><i class="bi bi-person-badge"></i> Me</NavLink>
         <NavLink class="nav-link" href="messages" @onclick="OnNavigate">
             <i class="bi bi-chat-dots"></i> Messages
-            @if (MessagesBadge > 0) { <span class="nav-badge">@MessagesBadge</span> }
+            @if (MessagesBadge > 0) { <span class="nav-badge" aria-label="@($"{MessagesBadge} unread")">@MessagesBadge</span> }
         </NavLink>
         <NavLink class="nav-link" href="contacts" @onclick="OnNavigate">
             <i class="bi bi-people"></i> Contacts
-            @if (State.Profile.Requests.Count > 0) { <span class="nav-badge">@State.Profile.Requests.Count</span> }
+            @if (State.Profile.Requests.Count > 0) { <span class="nav-badge" aria-label="@($"{State.Profile.Requests.Count} pending requests")">@State.Profile.Requests.Count</span> }
         </NavLink>
         <NavLink class="nav-link" href="search" @onclick="OnNavigate"><i class="bi bi-search"></i> Search</NavLink>
         <NavLink class="nav-link" href="knowledge" @onclick="OnNavigate"><i class="bi bi-journal-text"></i> Knowledge</NavLink>
@@ -20,7 +20,7 @@
         <NavLink class="nav-link" href="settings" @onclick="OnNavigate"><i class="bi bi-gear"></i> Settings</NavLink>
         <NavLink class="nav-link" href="backup" @onclick="OnNavigate"><i class="bi bi-shield-lock"></i> Backup</NavLink>
     </nav>
-    <button class="nav-quit" @onclick="Quit" title="Quit Mesh completely"><i class="bi bi-power"></i> Quit</button>
+    <button class="nav-quit" @onclick="Quit" title="Quit Mesh completely" aria-label="Quit Mesh completely"><i class="bi bi-power"></i> Quit</button>
 </div>
 
 @code {

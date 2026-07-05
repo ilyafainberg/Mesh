@@ -11,7 +11,7 @@
         <h2>Messages</h2>
         <div class="new-conv">
             <input @bind="newHandle" @onkeydown="OnNewKey" placeholder="Add by handle…" aria-label="Add a conversation by handle" />
-            <button class="primary icon-primary" @onclick="StartConversation" title="Start conversation"><i class="bi bi-plus-lg"></i></button>
+            <button class="primary icon-primary" @onclick="StartConversation" title="Start conversation" aria-label="Start conversation"><i class="bi bi-plus-lg"></i></button>
         </div>
         @foreach (var c in State.Profile.Conversations)
         {
@@ -35,7 +35,7 @@
                         <div class="req-from"><b>@State.DisplayNameFor(a.From)</b> asked:</div>
                         <div class="req-body">@a.RequestBody</div>
                         <div class="req-draft-label">Your agent drafted:</div>
-                        <textarea class="req-draft" value="@GetDraft(a)" @onchange="e => SetDraft(a, e)" rows="3"></textarea>
+                        <textarea class="req-draft" value="@GetDraft(a)" @onchange="e => SetDraft(a, e)" rows="3" aria-label="Edit draft reply"></textarea>
                         <div class="req-actions">
                             <button class="primary" @onclick="() => Approve(a)"><i class="bi bi-send"></i> Approve &amp; send</button>
                             <button class="ghost" @onclick="() => Reject(a)"><i class="bi bi-x-lg"></i> Reject</button>
@@ -109,16 +109,16 @@
                     {
                         <div class="pin-bar">
                             <i class="bi bi-pin-angle"></i>
-                            <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" />
+                            <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" aria-label="Name this widget" />
                             <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
-                            <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel"><i class="bi bi-x-lg"></i></button>
+                            <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
                         </div>
                     }
                     @if (widgetMode)
                     {
                         <div class="mode-chip">
                             <i class="bi bi-window-stack"></i> widget
-                            <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget"><i class="bi bi-x"></i></button>
+                            <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
                             <span class="mode-hint">describe a mini-app to send</span>
                         </div>
                     }
@@ -138,20 +138,20 @@
                                     <i class="bi @(a.Mime.StartsWith("image/") ? "bi-image" : "bi-file-earmark")"></i>
                                     <span class="attach-name">@a.Name</span>
                                     <span class="attach-size">@a.SizeLabel</span>
-                                    <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove"><i class="bi bi-x"></i></button>
+                                    <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
                                 </span>
                             }
                         </div>
                     }
                     <div class="composer">
-                        <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="() => widgetMode = !widgetMode" disabled="@busy" title="Create a widget (mini-app)">
+                        <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="() => widgetMode = !widgetMode" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget (mini-app)">
                             <i class="bi bi-plus-lg"></i>
                         </button>
-                        <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document">
+                        <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
                             <i class="bi bi-paperclip"></i>
                         </button>
                         <input @bind="input" @bind:event="oninput" @onkeydown="OnKey"
-                               placeholder="@Placeholder" disabled="@busy" />
+                               placeholder="@Placeholder" disabled="@busy" aria-label="Message input" />
                         <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
                             <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
                                     title="Send to their agent (it may auto-reply)">
@@ -162,7 +162,7 @@
                                 <i class="bi bi-person"></i> Person
                             </button>
                         </div>
-                        <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send"><i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i></button>
+                        <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send" aria-label="Send"><i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i></button>
                     </div>
                     @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 </div>

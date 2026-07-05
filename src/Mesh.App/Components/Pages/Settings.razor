@@ -95,7 +95,7 @@
                                     <option value="@m.Id">@m.Label</option>
                                 }
                             </select>
-                            <button class="ghost icon-btn" title="Refresh model list" @onclick="RefreshModels" disabled="@loadingModels">
+                            <button class="ghost icon-btn" title="Refresh model list" @onclick="RefreshModels" disabled="@loadingModels" aria-label="Refresh model list">
                                 <i class="bi @(loadingModels ? "bi-hourglass-split" : "bi-arrow-repeat")"></i>
                             </button>
                         </div>
@@ -199,28 +199,28 @@
                     <div class="field-label">Interactive apps</div>
                     <div class="field-sub">Let agents send interactive mini-apps in messages. They run sandboxed and never auto-run.</div>
                 </div>
-                <label class="switch"><input type="checkbox" checked="@allowApps" @onchange="e => allowApps = (bool)(e.Value ?? false)" /></label>
+                <label class="switch"><input type="checkbox" checked="@allowApps" @onchange="e => allowApps = (bool)(e.Value ?? false)" aria-label="Interactive apps" /></label>
             </div>
             <div class="field-row">
                 <div>
                     <div class="field-label">Do not disturb</div>
                     <div class="field-sub">Suppress all popup notifications. In-app badges still update.</div>
                 </div>
-                <label class="switch"><input type="checkbox" checked="@State.Profile.DoNotDisturb" @onchange="e => Toggle(p => p.DoNotDisturb = (bool)(e.Value ?? false))" /></label>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.DoNotDisturb" @onchange="e => Toggle(p => p.DoNotDisturb = (bool)(e.Value ?? false))" aria-label="Do not disturb" /></label>
             </div>
             <div class="field-row">
                 <div>
                     <div class="field-label">Notification sound</div>
                     <div class="field-sub">Play a sound with popup notifications.</div>
                 </div>
-                <label class="switch"><input type="checkbox" checked="@State.Profile.NotificationSound" @onchange="e => Toggle(p => p.NotificationSound = (bool)(e.Value ?? false))" /></label>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.NotificationSound" @onchange="e => Toggle(p => p.NotificationSound = (bool)(e.Value ?? false))" aria-label="Notification sound" /></label>
             </div>
             <div class="field-row">
                 <div>
                     <div class="field-label">Answer my other devices (remote agent)</div>
                     <div class="field-sub">Let your phone or other linked devices ask this device's agent, so you can use its full local tools on the go. Only your own devices can reach it.</div>
                 </div>
-                <label class="switch"><input type="checkbox" checked="@State.Profile.ActAsRemoteAgent" @onchange="e => Toggle(p => p.ActAsRemoteAgent = (bool)(e.Value ?? false))" /></label>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.ActAsRemoteAgent" @onchange="e => Toggle(p => p.ActAsRemoteAgent = (bool)(e.Value ?? false))" aria-label="Answer my other devices (remote agent)" /></label>
             </div>
         </div>
 
@@ -255,7 +255,7 @@
                     <div class="lt-main">
                         <label class="switch">
                             <input type="checkbox" checked="@setting.Enabled"
-                                   @onchange="e => SetLocalToolEnabled(lt.Kind, (bool)(e.Value ?? false))" />
+                                   @onchange="e => SetLocalToolEnabled(lt.Kind, (bool)(e.Value ?? false))" aria-label="@($"Enable {lt.Name}")" />
                         </label>
                         <div class="lt-text">
                             <div class="lt-name"><i class="bi @lt.Icon"></i> @lt.Name</div>
@@ -266,7 +266,7 @@
                     {
                         <div class="lt-share">
                             <span class="lt-share-label">Who can use it</span>
-                            <select value="@setting.Visibility" @onchange="e => SetLocalToolVisibility(lt.Kind, e.Value?.ToString())">
+                            <select value="@setting.Visibility" @onchange="e => SetLocalToolVisibility(lt.Kind, e.Value?.ToString())" aria-label="Who can use it">
                                 <option value="private">Only me (Me chat)</option>
                                 @foreach (var c in State.CircleNames)
                                 {
@@ -295,7 +295,7 @@
                     <div class="lt-main">
                         <label class="switch">
                             <input type="checkbox" checked="@setting.Enabled" disabled="@(!available)"
-                                   @onchange="e => SetMcpEnabled(def.Id, (bool)(e.Value ?? false))" />
+                                   @onchange="e => SetMcpEnabled(def.Id, (bool)(e.Value ?? false))" aria-label="@($"Enable {def.DisplayName}")" />
                         </label>
                         <div class="lt-text">
                             <div class="lt-name"><i class="bi @def.Icon"></i> @def.DisplayName</div>
@@ -310,7 +310,7 @@
                     {
                         <div class="lt-share">
                             <span class="lt-share-label">Who can use it</span>
-                            <select value="@setting.Visibility" @onchange="e => SetMcpVisibility(def.Id, e.Value?.ToString())">
+                            <select value="@setting.Visibility" @onchange="e => SetMcpVisibility(def.Id, e.Value?.ToString())" aria-label="Who can use it">
                                 <option value="private">Only me (Me chat)</option>
                                 @foreach (var c in State.CircleNames)
                                 {
@@ -329,19 +329,19 @@
                     <div class="lt-main">
                         <label class="switch">
                             <input type="checkbox" checked="@c.Enabled"
-                                   @onchange="e => SetCustomEnabled(c, (bool)(e.Value ?? false))" />
+                                   @onchange="e => SetCustomEnabled(c, (bool)(e.Value ?? false))" aria-label="@($"Enable {(string.IsNullOrWhiteSpace(c.Name) ? c.Command : c.Name)}")" />
                         </label>
                         <div class="lt-text">
                             <div class="lt-name"><i class="bi bi-plugin"></i> @(string.IsNullOrWhiteSpace(c.Name) ? c.Command : c.Name)</div>
                             <div class="lt-sub">@c.Command @string.Join(' ', c.Arguments)</div>
                         </div>
-                        <button class="icon-btn" title="Remove server" @onclick="() => RemoveCustom(c)"><i class="bi bi-trash"></i></button>
+                        <button class="icon-btn" title="Remove server" @onclick="() => RemoveCustom(c)" aria-label="Remove server"><i class="bi bi-trash"></i></button>
                     </div>
                     @if (c.Enabled)
                     {
                         <div class="lt-share">
                             <span class="lt-share-label">Who can use it</span>
-                            <select value="@c.Visibility" @onchange="e => SetCustomVisibility(c, e.Value?.ToString())">
+                            <select value="@c.Visibility" @onchange="e => SetCustomVisibility(c, e.Value?.ToString())" aria-label="Who can use it">
                                 <option value="private">Only me (Me chat)</option>
                                 @foreach (var cir in State.CircleNames)
                                 {
@@ -424,11 +424,11 @@
                             @if (deleteId == a.Id)
                             {
                                 <button class="danger" @onclick="() => DeleteAccount(a)">Delete</button>
-                                <button class="ghost icon-btn" @onclick="() => deleteId = null" title="Cancel"><i class="bi bi-x-lg"></i></button>
+                                <button class="ghost icon-btn" @onclick="() => deleteId = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
                             }
                             else
                             {
-                                <button class="icon-btn" title="Remove from this device" @onclick="() => deleteId = a.Id"><i class="bi bi-trash"></i></button>
+                                <button class="icon-btn" title="Remove from this device" @onclick="() => deleteId = a.Id" aria-label="Remove from this device"><i class="bi bi-trash"></i></button>
                             }
                         </div>
                     </div>

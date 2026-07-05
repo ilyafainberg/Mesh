@@ -17,7 +17,7 @@ else
 {
     <div class="page">
         <div class="scrim @(navOpen ? "show" : "")" @onclick="() => navOpen = false"></div>
-        <div class="sidebar @(navOpen ? "open" : "")">
+        <div class="sidebar @(navOpen ? "open" : "")" aria-label="Sidebar">
             <NavMenu OnNavigate="CloseNav" />
             <div class="me">
                 <div class="me-name">@DisplayName</div>
@@ -27,7 +27,7 @@ else
                 </div>
             </div>
         </div>
-        <main>
+        <main role="main">
             <div class="pane">
                 <div class="mobile-bar">
                     <button class="hamburger" @onclick="() => navOpen = !navOpen" aria-label="Toggle navigation menu" title="Menu"><i class="bi bi-list"></i></button>
@@ -48,7 +48,7 @@ else
                         }
                         @if (!Setup.Running)
                         {
-                            <button class="gb-close" @onclick="Setup.Dismiss" title="Dismiss"><i class="bi bi-x-lg"></i></button>
+                            <button class="gb-close" @onclick="Setup.Dismiss" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
                         }
                         else
                         {

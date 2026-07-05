@@ -48,12 +48,12 @@
                 <div class="app-toolbar">
                     @if (OnPin.HasDelegate)
                     {
-                        <button @onclick="() => OnPin.InvokeAsync(seg.Content)" title="Pin as widget"><i class="bi bi-pin-angle"></i></button>
+                        <button @onclick="() => OnPin.InvokeAsync(seg.Content)" title="Pin as widget" aria-label="Pin as widget"><i class="bi bi-pin-angle"></i></button>
                     }
-                    <button @onclick="() => Toggle(expanded, id)" title="@(expanded.Contains(id) ? "Shrink" : "Expand")">
+                    <button @onclick="() => Toggle(expanded, id)" title="@(expanded.Contains(id) ? "Shrink" : "Expand")" aria-label="@(expanded.Contains(id) ? "Shrink" : "Expand")">
                         <i class="bi @(expanded.Contains(id) ? "bi-arrows-angle-contract" : "bi-arrows-angle-expand")"></i>
                     </button>
-                    <button @onclick="() => running.Remove(id)" title="Close app"><i class="bi bi-x-lg"></i></button>
+                    <button @onclick="() => running.Remove(id)" title="Close app" aria-label="Close app"><i class="bi bi-x-lg"></i></button>
                 </div>
             </div>
         }

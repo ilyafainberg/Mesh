@@ -693,3 +693,39 @@ input[type=checkbox]:not(.switch input):checked::after {
     background:#f5f5f5; border:1px solid #e0e0e0; border-radius:6px; padding:8px 10px;
     word-break:break-all; user-select:all;
 }
+
+/* ===== Accessibility (a11y) polish: additive, non-behavioral ===== */
+
+/* Visible keyboard focus for every focusable element. Kept as a :focus-visible
+   override so it does not suppress the existing input :focus underline style. */
+:focus-visible {
+    outline: 2px solid var(--brand, #0F6CBD);
+    outline-offset: 2px;
+}
+/* Inputs/textareas/selects set outline:none on :focus above; restore a clear
+   ring for keyboard users specifically (mouse focus stays quiet). */
+input:focus-visible, textarea:focus-visible, select:focus-visible {
+    outline: 2px solid var(--brand, #0F6CBD);
+    outline-offset: 2px;
+}
+
+/* Screen-reader-only helper: visually hidden text that remains announced. */
+.sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* Respect the user's reduced-motion preference (also calms the splash breathe
+   and spinner animations). */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+    }
+}
