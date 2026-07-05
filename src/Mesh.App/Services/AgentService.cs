@@ -10,7 +10,7 @@ namespace Mesh.App.Services;
 /// Private knowledge is never placed into a guest context, so it cannot be
 /// extracted by a hostile peer agent (privacy by binding, not by instruction).
 /// </summary>
-public sealed class AgentService(AppState state, ModelFactory factory, FoundryLocalService foundry, ToolRegistry tools, TokenMeter meter)
+public sealed class AgentService(AppState state, ModelFactory factory, FoundryLocalService foundry, ToolRegistry tools, TokenMeter meter, AgentMedia media)
 {
     public bool IsModelReady => state.Profile.Model.IsConfigured
         || state.Profile.Model.Provider == ModelProvider.FoundryLocal
@@ -29,11 +29,32 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
         var history = Window(p.OwnChat, p.Model.Provider);
-        var answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct);
-        answer = ExpandWidgets(answer, p.Widgets);
+
+        // Collect any images tools produce during the turn (screenshots, etc.) and append them so the
+        // chat displays them instead of the model narrating raw bytes it cannot see.
+        string answer;
+        using (media.BeginScope(out var images))
+        {
+            answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct);
+            answer = ExpandWidgets(answer, p.Widgets);
+            answer = AppendImages(answer, images);
+        }
 
         state.AddOwnChatLine(new ChatLine { Role = "assistant", Text = answer });
         return answer;
+    }
+
+    /// <summary>Appends any tool-produced images to a reply as renderable mesh-file blocks.</summary>
+    private static string AppendImages(string answer, IReadOnlyList<AgentImage> images)
+    {
+        if (images.Count == 0) return answer;
+        var sb = new StringBuilder(answer ?? "");
+        foreach (var img in images)
+        {
+            if (sb.Length > 0) sb.Append("\n\n");
+            sb.Append(Markdown.FileBlock(img.Name, img.Mime, img.Base64));
+        }
+        return sb.ToString();
     }
 
     /// <summary>Builds a single interactive widget (mini-app) from a description.</summary>

@@ -64,7 +64,7 @@ public static class McpServerRegistry
 /// agent can call them uniformly. Connection failures are surfaced as an empty tool list (the agent
 /// simply does not get those tools) rather than crashing the turn.
 /// </summary>
-public sealed class McpHost : IAsyncDisposable
+public sealed class McpHost(AgentMedia media) : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, Lazy<Task<Connection>>> connections = new();
 
@@ -90,7 +90,7 @@ public sealed class McpHost : IAsyncDisposable
         }
     }
 
-    private static async Task<Connection> ConnectAsync(McpServerDef def)
+    private async Task<Connection> ConnectAsync(McpServerDef def)
     {
         var command = def.ResolveCommand();
         if (command is null)
@@ -107,7 +107,7 @@ public sealed class McpHost : IAsyncDisposable
             var client = await McpClient.CreateAsync(transport);
             var mcpTools = await client.ListToolsAsync();
             var adapted = mcpTools
-                .Select(t => (IAgentTool)new McpToolAdapter(client, t))
+                .Select(t => (IAgentTool)new McpToolAdapter(client, t, media))
                 .ToList();
             return new Connection(client, adapted, null);
         }
@@ -136,7 +136,7 @@ public sealed class McpHost : IAsyncDisposable
 }
 
 /// <summary>Wraps a single MCP server tool as a Mesh <see cref="IAgentTool"/>, forwarding calls over MCP.</summary>
-public sealed class McpToolAdapter(McpClient client, McpClientTool tool) : IAgentTool
+public sealed class McpToolAdapter(McpClient client, McpClientTool tool, AgentMedia media) : IAgentTool
 {
     public string Name => tool.Name;
     public string Description => tool.Description ?? "";
@@ -167,18 +167,31 @@ public sealed class McpToolAdapter(McpClient client, McpClientTool tool) : IAgen
         _ => e.GetRawText()
     };
 
-    private static string Flatten(CallToolResult result)
+    private string Flatten(CallToolResult result)
     {
         var sb = new StringBuilder();
+        var images = 0;
         foreach (var block in result.Content)
         {
             if (block is TextContentBlock text)
                 sb.AppendLine(text.Text);
             else if (block is ImageContentBlock image)
-                sb.AppendLine($"[image {image.MimeType}, {image.Data.Length} base64 chars]");
+            {
+                // Surface the image to the chat rather than dumping base64 at the model, which cannot
+                // see it. Tell the model it was shown so it does not try to describe raw bytes.
+                var base64 = Convert.ToBase64String(image.Data.Span);
+                media.Report(image.MimeType ?? "image/png", base64, $"{tool.Name}.png");
+                images++;
+            }
         }
         var s = sb.ToString().Trim();
         if (result.IsError == true) return "ERROR: " + (s.Length == 0 ? "tool reported an error." : s);
+        if (images > 0)
+        {
+            var note = images == 1 ? "[image captured and shown to the user in the chat]"
+                                   : $"[{images} images captured and shown to the user in the chat]";
+            return s.Length == 0 ? note : s + "\n" + note;
+        }
         return s.Length == 0 ? "(no output)" : s;
     }
 }

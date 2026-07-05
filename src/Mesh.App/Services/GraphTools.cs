@@ -240,7 +240,7 @@ public sealed class GmailSearchTool(GoogleAuthService auth, IHttpClientFactory h
 }
 
 /// <summary>Builds the set of tools available from the user's connected sources.</summary>
-public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost)
+public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost, AgentMedia media)
 {
     /// <summary>Whether a provider exposes an email/message search tool.</summary>
     private static bool HasEmail(SourceProvider p) => p is
@@ -403,7 +403,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         LocalToolKind.Cmd => new RunCmdTool(),
         LocalToolKind.Python => new RunPythonTool(),
         LocalToolKind.CSharpScript => new RunCSharpScriptTool(),
-        LocalToolKind.Browser => new BrowserTool(),
+        LocalToolKind.Browser => new BrowserTool(media),
         LocalToolKind.FileSystem => new FileSystemTool(extractor),
         _ => null
     };

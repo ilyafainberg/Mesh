@@ -12,7 +12,7 @@ namespace Mesh.App.Services;
 /// calls: a single shared Chromium browser and page are created lazily on first use and reused for
 /// the whole app session, so the agent can navigate then act on the same page over multiple calls.
 /// </summary>
-public sealed class BrowserTool : IAgentTool
+public sealed class BrowserTool(AgentMedia media) : IAgentTool
 {
     public string Name => "browser";
     public string Description =>
@@ -166,7 +166,9 @@ public sealed class BrowserTool : IAgentTool
                         Path = path,
                         FullPage = false
                     }).ConfigureAwait(false);
-                    return $"OK screenshot saved: {path}";
+                    // Surface the shot into the chat so the user actually sees it.
+                    media.ReportFile(path);
+                    return $"OK screenshot captured and shown to the user in the chat ({path}).";
                 }
 
                 case "eval":
