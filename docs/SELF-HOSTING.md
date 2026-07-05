@@ -29,12 +29,21 @@ For anything public you should terminate TLS in front of it (a reverse proxy suc
 Caddy, nginx, or a cloud load balancer) and give clients the `https://` URL. The
 client uses secure WebSockets over the same URL.
 
-## Build without Docker
+## Run without Docker
+
+The package ships self-contained binaries that need no .NET install. Pick your
+platform folder under `bin/`:
 
 ```bash
-dotnet run --project src/Mesh.Relay -c Release
-# listens on http://localhost:5000 by default; set ASPNETCORE_URLS to change it
+# Linux
+bin/linux-x64/run.sh            # or: PORT=9000 bin/linux-x64/run.sh
+
+# Windows
+bin\win-x64\run.cmd             # or: set PORT=9000 & bin\win-x64\run.cmd
 ```
+
+Each folder holds a single self-contained executable; run it directly if you
+prefer (`ASPNETCORE_URLS` controls the listen address).
 
 ## Configuration
 

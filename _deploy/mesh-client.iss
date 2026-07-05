@@ -1,0 +1,66 @@
+; Inno Setup script for the Mesh Windows client.
+; Builds a per-user installer from the self-contained publish output.
+;
+;   "C:\Users\<you>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" mesh-client.iss
+;
+; Expects these to be passed in (or uses the defaults below):
+;   /DAppVersion=1.0.0
+;   /DSourceDir=..\client-release\Mesh-win-x64
+;   /DOutputDir=..\artifacts
+
+#ifndef AppVersion
+  #define AppVersion "1.0.0"
+#endif
+#ifndef SourceDir
+  #define SourceDir "client-release\Mesh-win-x64"
+#endif
+#ifndef OutputDir
+  #define OutputDir "artifacts"
+#endif
+
+#define AppName "Mesh"
+#define AppPublisher "Ilya Fainberg"
+#define AppExeName "Mesh.App.exe"
+#define AppId "{{7E2B9C64-4E1F-4C2A-9B3D-9A7F3D2E5A10}}"
+
+[Setup]
+AppId={#AppId}
+AppName={#AppName}
+AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
+AppPublisher={#AppPublisher}
+DefaultDirName={localappdata}\Programs\{#AppName}
+DefaultGroupName={#AppName}
+DisableProgramGroupPage=yes
+DisableDirPage=auto
+UninstallDisplayIcon={app}\{#AppExeName}
+UninstallDisplayName={#AppName}
+OutputDir={#OutputDir}
+OutputBaseFilename=Mesh-Setup-v{#AppVersion}
+SetupIconFile={#SourceDir}\meshicon.ico
+Compression=lzma2/max
+SolidCompression=yes
+WizardStyle=modern
+ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64compatible
+PrivilegesRequired=lowest
+LicenseFile={#SourceDir}\LICENSE.txt
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "startupicon"; Description: "Start Mesh when I sign in to Windows"; GroupDescription: "Startup:"; Flags: unchecked
+
+[Files]
+; The entire self-contained publish output.
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+
+[Icons]
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: startupicon
+
+[Run]
+Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
