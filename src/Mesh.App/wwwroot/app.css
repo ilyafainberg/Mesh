@@ -463,6 +463,10 @@ input[type=checkbox]:not(.switch input):checked::after {
 .conv-item.active { background: var(--brand-tint); color: var(--brand); font-weight: 600; }
 .conv-item .conv-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-item .conv-unread { width: 8px; height: 8px; border-radius: 50%; background: var(--danger, #d13438); flex: none; margin-left: 6px; }
+.msg-status { margin-left: 6px; }
+.msg-status.delivered i.bi { color: var(--brand); }
+.msg-status.sent i.bi { color: var(--fg-3); }
+.msg-status.failed i.bi { color: var(--danger, #d13438); }
 .conv-empty { text-align: left; margin: 6px 2px; max-width: none; font-size: .84rem; }
 
 .requests { margin-top: 16px; border-top: 1px solid var(--stroke-1); padding-top: 12px; }

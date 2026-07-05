@@ -201,6 +201,27 @@
                 </div>
                 <label class="switch"><input type="checkbox" checked="@allowApps" @onchange="e => allowApps = (bool)(e.Value ?? false)" /></label>
             </div>
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Do not disturb</div>
+                    <div class="field-sub">Suppress all popup notifications. In-app badges still update.</div>
+                </div>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.DoNotDisturb" @onchange="e => Toggle(p => p.DoNotDisturb = (bool)(e.Value ?? false))" /></label>
+            </div>
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Notification sound</div>
+                    <div class="field-sub">Play a sound with popup notifications.</div>
+                </div>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.NotificationSound" @onchange="e => Toggle(p => p.NotificationSound = (bool)(e.Value ?? false))" /></label>
+            </div>
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Answer my other devices (remote agent)</div>
+                    <div class="field-sub">Let your phone or other linked devices ask this device's agent, so you can use its full local tools on the go. Only your own devices can reach it.</div>
+                </div>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.ActAsRemoteAgent" @onchange="e => Toggle(p => p.ActAsRemoteAgent = (bool)(e.Value ?? false))" /></label>
+            </div>
         </div>
 
         <div class="card-panel">
@@ -769,6 +790,8 @@
     }
 
     void ResetCounter() => State.ResetTokenCounter();
+
+    void Toggle(Action<Mesh.App.Domain.MeshProfile> change) => State.Mutate(change);
 
     async Task Reconnect() => await Mesh.ConnectAsync();
 

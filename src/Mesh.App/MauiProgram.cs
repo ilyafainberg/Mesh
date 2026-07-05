@@ -40,9 +40,19 @@ public static class MauiProgram
 #if WINDOWS
 		builder.Services.AddSingleton<IAppControl, Mesh.App.Platforms.Windows.WindowsAppControl>();
 		builder.Services.AddSingleton<INotifier, Mesh.App.Platforms.Windows.WindowsNotifier>();
+		builder.Services.AddSingleton<IPushService, NoopPushService>();
+#elif IOS
+		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
+		builder.Services.AddSingleton<INotifier, DefaultNotifier>();
+		builder.Services.AddSingleton<IPushService, Mesh.App.Platforms.iOS.ApplePushService>();
+#elif ANDROID
+		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
+		builder.Services.AddSingleton<INotifier, DefaultNotifier>();
+		builder.Services.AddSingleton<IPushService, Mesh.App.Platforms.Android.FirebasePushService>();
 #else
 		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
 		builder.Services.AddSingleton<INotifier, DefaultNotifier>();
+		builder.Services.AddSingleton<IPushService, NoopPushService>();
 #endif
 		builder.Services.AddSingleton<AppState>();
 		builder.Services.AddSingleton<TokenMeter>();

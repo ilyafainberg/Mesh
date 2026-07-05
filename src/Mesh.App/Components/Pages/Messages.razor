@@ -89,6 +89,14 @@
                                             OnPin="PinWidget" />
                             <div class="msg-tag">
                                 <i class="bi @(line.Via == "person" ? "bi-person" : "bi-robot")"></i> @TagLabel(line)
+                                @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status))
+                                {
+                                    <span class="msg-status @line.Status" title="@line.Status">
+                                        @if (line.Status == "delivered") { <i class="bi bi-check2-all"></i> }
+                                        else if (line.Status == "sent") { <i class="bi bi-check2"></i> }
+                                        else if (line.Status == "failed") { <i class="bi bi-exclamation-circle"></i> }
+                                    </span>
+                                }
                             </div>
                         </div>
                     }
@@ -335,8 +343,9 @@
 
             var kind = directMode ? MeshKinds.DirectMessage : MeshKinds.Chat;
             var via = directMode ? "person" : "agent";
-            State.AddChatLine(active, new ChatLine { Role = "assistant", Text = toSend, Via = via }); // "assistant" = me, rendered right
-            await Mesh.SendAsync(active, kind, toSend);
+            var line = new ChatLine { Role = "assistant", Text = toSend, Via = via }; // "assistant" = me, rendered right
+            State.AddChatLine(active, line);
+            await Mesh.SendAsync(active, kind, toSend, line.Id);
         }
         catch (Exception ex)
         {

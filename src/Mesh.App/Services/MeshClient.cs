@@ -280,6 +280,18 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     {
         var from = AppState.Norm(env.From);
 
+        // A delivery receipt: mark our matching outgoing line as delivered. Receipts are plaintext
+        // (they carry only a message id, no content) and are verified below like any other envelope.
+        if (env.Kind == MeshKinds.Receipt)
+        {
+            var pinnedR = state.FindContact(from)?.SigningKeys.ToList() ?? new List<string>();
+            if (pinnedR.Count == 0) pinnedR = (await ResolveDeviceKeysAsync(from)).ToList();
+            if (pinnedR.Count > 0 && !MeshCrypto.VerifyAny(pinnedR, env.Body, env.Signature ?? "")) return;
+            var msgId = ReceiptProtocol.MessageId(env.Body);
+            if (!string.IsNullOrEmpty(msgId)) state.SetLineStatus(msgId!, "delivered");
+            return;
+        }
+
         // Client-side verification: check the sender's signature against their pinned signing
         // keys (trust on first use). This defends against a malicious or compromised relay
         // forging or tampering with messages. On first contact we fetch and pin the keys.
@@ -304,16 +316,28 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var allowed = contact?.Allowed == true;
         var display = state.DisplayNameFor(from);
 
+        // Blocked contact: drop entirely (no record, no agent, no toast).
+        if (contact?.Blocked == true)
+        {
+            Log?.Invoke($"dropped message from blocked @{from}");
+            return;
+        }
+
         // Record the inbound line. Agent replies are tagged "agent"; anything a person typed
         // (chat or a direct message) is "person".
         var via = env.Kind == MeshKinds.AgentResponse ? "agent" : "person";
         state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = via });
 
-        // A person-to-person message to the human: mark unread and toast the owner.
+        // Acknowledge receipt of any real message so the sender sees "delivered".
+        if (env.Kind is MeshKinds.DirectMessage or MeshKinds.Chat or MeshKinds.AgentRequest or MeshKinds.AgentResponse)
+            _ = SendReceiptAsync(from, env.Id);
+
+        // A person-to-person message to the human: mark unread and toast the owner (unless muted/DND).
         if (env.Kind == MeshKinds.DirectMessage)
         {
             state.MarkUnread(from);
-            notifier.Notify($"Message from {display}", Preview(text), NotifyKind.Message, "messages");
+            if (ShouldNotify(contact))
+                notifier.Notify($"Message from {display}", Preview(text), NotifyKind.Message, "messages", state.Profile.NotificationSound);
         }
 
         if (!allowed)
@@ -328,7 +352,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
                     isNew = true;
                 }
             });
-            if (isNew)
+            if (isNew && !state.Profile.DoNotDisturb)
                 notifier.Notify($"Request from @{from}", Preview(text), NotifyKind.Request, "contacts");
             Log?.Invoke($"inbound from @{from} held for approval");
             StateChanged?.Invoke();
@@ -371,8 +395,9 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
                     RequestBody = text,
                     DraftReply = reply
                 }));
-                notifier.Notify("Reply needs your approval",
-                    $"Your agent drafted a reply to {display}.", NotifyKind.Approval, "messages");
+                if (!state.Profile.DoNotDisturb)
+                    notifier.Notify("Reply needs your approval",
+                        $"Your agent drafted a reply to {display}.", NotifyKind.Approval, "messages");
                 Log?.Invoke($"draft reply to @{from} awaiting approval");
             }
             else
@@ -414,21 +439,23 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var approval = state.Profile.Approvals.FirstOrDefault(a => a.Id == approvalId);
         if (approval is null) return;
         var text = string.IsNullOrWhiteSpace(editedReply) ? approval.DraftReply : editedReply!;
-        state.AddChatLine(approval.From, new ChatLine { Role = "assistant", Text = text });
+        var line = new ChatLine { Role = "assistant", Text = text };
+        state.AddChatLine(approval.From, line);
         state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
-        await SendAsync(approval.From, MeshKinds.AgentResponse, text);
+        await SendAsync(approval.From, MeshKinds.AgentResponse, text, line.Id);
     }
 
     public void RejectDraft(string approvalId)
         => state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
 
 
-    public async Task SendAsync(string toHandle, string kind, string body)
+    public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null)
     {
         if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
         {
             Log?.Invoke("send failed: not connected");
-            return;
+            if (lineId is not null) state.SetLineStatus(lineId, "failed");
+            return false;
         }
         var p = state.Profile;
         var to = AppState.Norm(toHandle);
@@ -446,8 +473,36 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
         var sig = IdentityService.Sign(p.PrivateKey, wire);
         var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig);
-        try { await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env); }
-        catch (Exception ex) { Log?.Invoke($"send failed: {ex.Message}"); }
+        try
+        {
+            await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
+            if (lineId is not null) state.SetLineStatus(lineId, "sent");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"send failed: {ex.Message}");
+            if (lineId is not null) state.SetLineStatus(lineId, "failed");
+            return false;
+        }
+    }
+
+    private bool ShouldNotify(Domain.Contact? contact)
+        => !state.Profile.DoNotDisturb && contact?.Muted != true;
+
+    /// <summary>Sends a lightweight delivery receipt (message id only, signed, no content) to a sender.</summary>
+    private async Task SendReceiptAsync(string toHandle, string messageId)
+    {
+        try
+        {
+            if (hub is null || hub.State != HubConnectionState.Connected || !authenticated) return;
+            var p = state.Profile;
+            var body = ReceiptProtocol.Body(messageId);
+            var sig = IdentityService.Sign(p.PrivateKey, body);
+            var env = MeshEnvelope.Create(p.Handle, AppState.Norm(toHandle), MeshKinds.Receipt, body, sig);
+            await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
+        }
+        catch { /* receipts are best-effort */ }
     }
 
     private static string Preview(string text)
