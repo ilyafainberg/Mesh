@@ -20,10 +20,33 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
     private HubConnection? hub;
     private volatile bool authenticated;
+    private volatile bool wantConnected;   // the user intends to be connected; drives auto-recovery
+    private int reconnectScheduled;         // 0/1 guard so only one recovery loop runs at a time
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
     public event Action? StateChanged;
     public event Action<string>? Log;
+
+    /// <summary>
+    /// Retry policy that never gives up: SignalR's built-in reconnect stops after a fixed schedule,
+    /// which leaves the client permanently offline after a longer network drop (sleep, wifi switch).
+    /// This backs off up to 30s and keeps trying for as long as the user wants to be connected.
+    /// </summary>
+    private sealed class ForeverRetry : IRetryPolicy
+    {
+        public TimeSpan? NextRetryDelay(RetryContext context)
+        {
+            var seconds = context.PreviousRetryCount switch
+            {
+                0 => 0,
+                1 => 2,
+                2 => 5,
+                3 => 10,
+                _ => 30
+            };
+            return TimeSpan.FromSeconds(seconds);
+        }
+    }
 
     public async Task<bool> RegisterAsync()
     {
@@ -135,13 +158,14 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     public async Task ConnectAsync()
     {
         await DisconnectAsync();
+        wantConnected = true;
         var p = state.Profile;
         if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
 
         var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}";
         var connection = new HubConnectionBuilder()
             .WithUrl(url)
-            .WithAutomaticReconnect(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10) })
+            .WithAutomaticReconnect(new ForeverRetry())
             .Build();
 
         // The relay opens with a nonce challenge; sign it with the device key to authenticate.
@@ -174,19 +198,82 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         // so we just reflect the transient unauthenticated state in the UI.
         connection.Reconnecting += _ => { authenticated = false; StateChanged?.Invoke(); return Task.CompletedTask; };
         connection.Reconnected += _ => { StateChanged?.Invoke(); return Task.CompletedTask; };
-        connection.Closed += _ => { authenticated = false; StateChanged?.Invoke(); return Task.CompletedTask; };
+        connection.Closed += _ =>
+        {
+            authenticated = false;
+            StateChanged?.Invoke();
+            // SignalR's own auto-reconnect has given up by the time Closed fires. If the user still
+            // wants to be connected, keep trying ourselves so a long drop does not strand us offline.
+            ScheduleRecovery();
+            return Task.CompletedTask;
+        };
 
         hub = connection;
         try
         {
             await connection.StartAsync();
             StateChanged?.Invoke();
+            StartAuthWatchdog(connection);
         }
         catch (Exception ex)
         {
             Log?.Invoke($"hub connect failed: {ex.Message}");
             StateChanged?.Invoke();
+            ScheduleRecovery();
         }
+    }
+
+    /// <summary>
+    /// Guards the auth handshake: if the connection is up but the challenge/response never completes
+    /// (a mid-handshake hiccup leaves us connected-but-not-authenticated, with no Closed event to
+    /// trigger recovery), force a fresh reconnect so we do not sit silently offline.
+    /// </summary>
+    private void StartAuthWatchdog(HubConnection connection)
+    {
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(12));
+            if (!ReferenceEquals(hub, connection)) return; // superseded by a newer connection
+            if (wantConnected && !authenticated && connection.State == HubConnectionState.Connected)
+            {
+                Log?.Invoke("auth watchdog: connected but not authenticated, reconnecting");
+                ScheduleRecovery();
+                try { await connection.StopAsync(); } catch { } // triggers Closed -> recovery loop
+            }
+        });
+    }
+
+    /// <summary>
+    /// Background recovery: while the user wants to be connected but the hub is not connected, keep
+    /// reconnecting with backoff. Only one loop runs at a time. This covers the case where SignalR's
+    /// automatic reconnect has exhausted and fired Closed (e.g. after a long sleep or network loss).
+    /// </summary>
+    private void ScheduleRecovery()
+    {
+        if (!wantConnected) return;
+        if (Interlocked.Exchange(ref reconnectScheduled, 1) == 1) return; // already running
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var delay = TimeSpan.FromSeconds(3);
+                while (wantConnected && (hub is null || hub.State == HubConnectionState.Disconnected))
+                {
+                    await Task.Delay(delay);
+                    if (!wantConnected) break;
+                    if (hub is not null && hub.State != HubConnectionState.Disconnected) break;
+                    try
+                    {
+                        Log?.Invoke("recovery: reconnecting to relay");
+                        await ConnectAsync();
+                        break; // ConnectAsync rebuilds the hub + its own recovery hooks
+                    }
+                    catch (Exception ex) { Log?.Invoke($"recovery attempt failed: {ex.Message}"); }
+                    delay = TimeSpan.FromSeconds(Math.Min(30, delay.TotalSeconds * 2));
+                }
+            }
+            finally { Interlocked.Exchange(ref reconnectScheduled, 0); }
+        });
     }
 
     private async Task HandleInboundAsync(MeshEnvelope env, CancellationToken ct)
@@ -349,6 +436,9 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
     public async Task DisconnectAsync()
     {
+        // Clear intent first so the Closed handler from StopAsync does not trigger auto-recovery.
+        // ConnectAsync calls this then re-sets wantConnected, so a reconnect is unaffected.
+        wantConnected = false;
         authenticated = false;
         keyCache.Clear();
         var current = hub;
