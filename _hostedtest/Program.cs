@@ -61,7 +61,10 @@ for (var round = 0; round < 5; round++)
     if (string.IsNullOrWhiteSpace(res.ToolCallsJson))
     {
         Console.WriteLine("FINAL: " + res.Content);
-        var ok = toolWasCalled && res.Content.Contains(secret);
+        // Accept the number with or without thousands separators/currency (a smarter model may
+        // format it as "42,931" or "EUR 42,931").
+        var normalized = res.Content.Replace(",", "").Replace(".", "");
+        var ok = toolWasCalled && (res.Content.Contains(secret) || normalized.Contains(secret));
         Console.WriteLine(ok ? "PASS: hosted free model called the tool and reported the tool's value"
                              : $"FAIL: toolCalled={toolWasCalled}, containsSecret={res.Content.Contains(secret)}");
         return;
