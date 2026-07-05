@@ -1,11 +1,29 @@
 namespace Mesh.Shared;
 
-/// <summary>Register (or re-assert) a handle together with a device public key.</summary>
+/// <summary>
+/// Register (or re-assert) a handle together with a device public key.
+/// <para>
+/// Collision avoidance: <see cref="Signature"/> is a proof of possession over
+/// <c>ClaimProtocol.Message(handle, devicePublicKey)</c>, produced with the device PRIVATE key.
+/// The relay rejects any registration whose signature does not verify against the presented
+/// device public key, so a handle can only ever be claimed or re-asserted by someone who
+/// actually controls the key. Taking over an already-claimed handle with a different key still
+/// requires device linking or recovery (proof of the handle's recovery key).
+/// </para>
+/// </summary>
 public record RegisterHandleRequest(
     string Handle,
     string DevicePublicKey,
     string? DisplayName,
-    string? RecoveryPublicKey = null);
+    string? RecoveryPublicKey = null,
+    string? Signature = null);
+
+/// <summary>Canonical string a registrant signs with its device key to prove key possession.</summary>
+public static class ClaimProtocol
+{
+    public static string Message(string handle, string devicePublicKey)
+        => $"handle-claim|{LinkProtocol.Normalize(handle)}|{devicePublicKey}";
+}
 
 public record RegisterHandleResponse(
     string Handle,

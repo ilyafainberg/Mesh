@@ -81,6 +81,20 @@
                     </span>
                 }
             </header>
+            @if (State.FindContact(active)?.KeyChanged == true)
+            {
+                <div class="key-change-banner">
+                    <i class="bi bi-shield-exclamation"></i>
+                    <div class="kc-text">
+                        <strong>@State.DisplayNameFor(active)'s identity keys changed.</strong>
+                        Messages are held until you re-verify. Confirm out of band (in person, a call)
+                        that this is really them before trusting the new keys.
+                    </div>
+                    <button class="primary" @onclick="ReverifyActive" disabled="@reverifying">
+                        @(reverifying ? "Verifying…" : "Re-verify")
+                    </button>
+                </div>
+            }
             <div class="messages" @ref="scrollEl">
                 <div class="messages-wrap">
                     @foreach (var line in conv.Lines)
@@ -247,6 +261,16 @@
     }
 
     bool IsAllowed(string handle) => State.FindContact(handle)?.Allowed == true;
+
+    bool reverifying;
+
+    async Task ReverifyActive()
+    {
+        if (active is null || reverifying) return;
+        reverifying = true;
+        try { await Mesh.ReverifyContactAsync(active); }
+        finally { reverifying = false; }
+    }
 
     void Select(string handle) { active = handle; State.MarkRead(handle); }
 

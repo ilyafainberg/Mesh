@@ -521,4 +521,31 @@ public sealed class AppState
             Mutate(_ => contact.SigningKeys = observedKeys.ToList());
         return contact.SigningKeys;
     }
+
+    /// <summary>
+    /// Marks a contact as having presented keys that do not match what we pinned (possible identity
+    /// change or impostor). Surfaced in the UI so the user can re-verify before trusting new keys.
+    /// </summary>
+    public void FlagContactKeyChanged(string handle)
+    {
+        var contact = FindContact(Norm(handle));
+        if (contact is not null && !contact.KeyChanged)
+            Mutate(_ => contact.KeyChanged = true);
+    }
+
+    /// <summary>
+    /// Re-verifies a contact after an identity change: replaces the pinned signing keys with the
+    /// handle's current device keys from the relay and clears the key-changed flag. This is an
+    /// explicit user action (trust on re-verify), so it is never done automatically.
+    /// </summary>
+    public void ReverifyContact(string handle, IReadOnlyList<string> currentKeys)
+    {
+        var contact = FindContact(Norm(handle));
+        if (contact is null) return;
+        Mutate(_ =>
+        {
+            contact.SigningKeys = currentKeys.ToList();
+            contact.KeyChanged = false;
+        });
+    }
 }

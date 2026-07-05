@@ -746,3 +746,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .update-notes { margin: 6px 0; font-size: .82rem; }
 .update-notes summary { cursor: pointer; color: var(--fg-2); }
 .update-notes pre { white-space: pre-wrap; word-break: break-word; background: var(--bg-2); border: 1px solid var(--stroke-1); border-radius: var(--radius-m); padding: 8px 10px; margin-top: 6px; max-height: 180px; overflow: auto; font-size: .8rem; }
+
+/* Contact identity-change (key rotation / impostor) warning banner */
+.key-change-banner { display: flex; align-items: center; gap: 12px; margin: 10px 16px 0; padding: 10px 14px; background: var(--warn-bg); border: 1px solid var(--warn-stroke); border-radius: var(--radius-m); }
+.key-change-banner .bi { color: var(--warn); font-size: 1.2rem; flex: 0 0 auto; }
+.key-change-banner .kc-text { font-size: .85rem; color: var(--fg-2); flex: 1; }
+.key-change-banner .kc-text strong { color: var(--fg-1); }
+.key-change-banner button { flex: 0 0 auto; }

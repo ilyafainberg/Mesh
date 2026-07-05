@@ -34,10 +34,52 @@ var (bPriv, bPub) = Gen();
 var aliceHandle = "alice" + Random.Shared.Next(1000, 9999);
 var bobHandle = "bob" + Random.Shared.Next(1000, 9999);
 
-// 1. Register both handles.
-var r1 = await http.PostAsJsonAsync($"{relay}/handles", new RegisterHandleRequest(aliceHandle, aPub, "Alice"));
-var r2 = await http.PostAsJsonAsync($"{relay}/handles", new RegisterHandleRequest(bobHandle, bPub, "Bob"));
+// Proof-of-possession registration helper: sign the claim with the device private key.
+async Task<System.Net.Http.HttpResponseMessage> Register(string handle, string pub, string priv, string? display, string? recoveryPub = null)
+{
+    var sig = Sign(priv, ClaimProtocol.Message(handle, pub));
+    return await http.PostAsJsonAsync($"{relay}/handles",
+        new RegisterHandleRequest(handle, pub, display, recoveryPub, sig));
+}
+
+// 1. Register both handles (with proof of possession).
+var r1 = await Register(aliceHandle, aPub, aPriv, "Alice");
+var r2 = await Register(bobHandle, bPub, bPriv, "Bob");
 Check(r1.IsSuccessStatusCode && r2.IsSuccessStatusCode, "register alice + bob");
+
+// 1b. Collision avoidance: an unsigned registration is rejected.
+var rNoSig = await http.PostAsJsonAsync($"{relay}/handles",
+    new RegisterHandleRequest("nosig" + Random.Shared.Next(1000, 9999), aPub, "NoSig"));
+Check(rNoSig.StatusCode == System.Net.HttpStatusCode.BadRequest, "unsigned registration rejected");
+
+// 1c. Collision avoidance: a signature by the wrong key (does not match the device key) is rejected.
+var (xPriv, _) = Gen();
+var wrongHandle = "wrong" + Random.Shared.Next(1000, 9999);
+var wrongSig = Sign(xPriv, ClaimProtocol.Message(wrongHandle, aPub)); // signed by xPriv, but claims aPub
+var rWrong = await http.PostAsJsonAsync($"{relay}/handles",
+    new RegisterHandleRequest(wrongHandle, aPub, "Wrong", null, wrongSig));
+Check(rWrong.StatusCode == System.Net.HttpStatusCode.BadRequest, "wrong-key claim signature rejected");
+
+// 1d. Collision avoidance: a DIFFERENT key cannot take over alice's handle (409), even with a
+// valid proof of possession for that other key.
+var (cPriv, cPub) = Gen();
+var rTakeover = await Register(aliceHandle, cPub, cPriv, "Impostor");
+Check(rTakeover.StatusCode == System.Net.HttpStatusCode.Conflict, "different key cannot claim existing handle");
+
+// 1e. Recovery: register a handle WITH a recovery key, then authorize a brand-new device by
+// signing its key with the recovery key (the legitimate reinstall / takeover path).
+var (recPriv, recPub) = Gen();
+var recHandle = "rec" + Random.Shared.Next(1000, 9999);
+var (d1Priv, d1Pub) = Gen();
+var rRec1 = await Register(recHandle, d1Pub, d1Priv, "Recoverable", recPub);
+var (d2Priv, d2Pub) = Gen();
+var recSig = Sign(recPriv, RecoveryProtocol.Message(recHandle, d2Pub));
+var rRec2 = await http.PostAsJsonAsync($"{relay}/handles/{recHandle}/recover",
+    new RecoverHandleRequest(recHandle, d2Pub, recSig));
+var recInfo = await http.GetFromJsonAsync<HandleInfo>($"{relay}/handles/{recHandle}");
+Check(rRec1.IsSuccessStatusCode && rRec2.IsSuccessStatusCode
+    && recInfo is not null && recInfo.DevicePublicKeys.Contains(d2Pub),
+    "recovery authorizes a new device via recovery key");
 
 // Directory lookup exposes bob's device key.
 var info = await http.GetFromJsonAsync<HandleInfo>($"{relay}/handles/{bobHandle}");

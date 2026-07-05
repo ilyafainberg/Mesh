@@ -116,6 +116,17 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
     if (string.IsNullOrWhiteSpace(handle) || string.IsNullOrWhiteSpace(req.DevicePublicKey))
         return Results.BadRequest(new { error = "handle and devicePublicKey are required" });
 
+    // Collision avoidance / proof of possession: the registrant must sign the claim with the
+    // device PRIVATE key. This stops anyone claiming or re-asserting a handle with a key they do
+    // not control (for example pre-registering someone else's known key). Taking over a handle
+    // held by a DIFFERENT key still requires device linking or recovery, enforced below.
+    if (string.IsNullOrWhiteSpace(req.Signature)
+        || !MeshCrypto.Verify(req.DevicePublicKey, ClaimProtocol.Message(handle, req.DevicePublicKey), req.Signature))
+    {
+        app.Logger.LogWarning("register rejected (invalid claim signature): {Handle}", handle);
+        return Results.BadRequest(new { error = "invalid or missing claim signature" });
+    }
+
     var existing = await store.GetHandleAsync(handle);
     if (existing is null)
     {

@@ -54,13 +54,33 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var http = httpFactory.CreateClient("relay");
         try
         {
+            var h = AppState.Norm(p.Handle);
+            // Proof of possession: sign the claim with this device's private key so the relay can
+            // confirm we control the key we are registering (collision avoidance).
+            var sig = IdentityService.Sign(p.PrivateKey, ClaimProtocol.Message(h, p.PublicKey));
             var resp = await http.PostAsJsonAsync($"{p.RelayUrl.TrimEnd('/')}/handles",
-                new RegisterHandleRequest(p.Handle, p.PublicKey, p.DisplayName, NullIfBlank(p.RecoveryPublicKey)));
+                new RegisterHandleRequest(p.Handle, p.PublicKey, p.DisplayName, NullIfBlank(p.RecoveryPublicKey), sig));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
+            if (resp.IsSuccessStatusCode) return true;
+
             if (resp.StatusCode == System.Net.HttpStatusCode.Conflict)
-                // Handle claimed by a different device set, this device isn't linked to it.
-                Log?.Invoke($"'{p.Handle}' is claimed by another identity; link this device or pick a new handle.");
-            return resp.IsSuccessStatusCode;
+            {
+                // The handle is claimed by a different device key. If this profile carries the
+                // handle's recovery key (for example after a reinstall or profile import), prove
+                // ownership and re-authorize this device automatically instead of stranding it.
+                if (!string.IsNullOrWhiteSpace(p.RecoveryPrivateKey))
+                {
+                    Log?.Invoke($"'{p.Handle}' claimed by another device; attempting recovery with the recovery key.");
+                    var (ok, err) = await RecoverHandleAsync();
+                    if (ok) { Log?.Invoke($"recovered @{p.Handle}: this device is now authorized."); return true; }
+                    Log?.Invoke($"recovery failed for @{p.Handle}: {err}");
+                }
+                else
+                {
+                    Log?.Invoke($"'{p.Handle}' is claimed by another identity; link this device or restore your backup.");
+                }
+            }
+            return false;
         }
         catch (Exception ex) { Log?.Invoke($"register failed: {ex.Message}"); return false; }
     }
@@ -300,7 +320,11 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             pinned = (await ResolveDeviceKeysAsync(from)).ToList();
         if (pinned.Count > 0 && !MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? ""))
         {
-            Log?.Invoke($"dropped unverifiable message from @{from}");
+            // The sender's keys no longer match what we pinned: the contact's identity may have
+            // changed (rotation, reinstall, or an impostor). Surface it for re-verification instead
+            // of silently dropping, and do not auto-repin (that would defeat trust on first use).
+            state.FlagContactKeyChanged(from);
+            Log?.Invoke($"identity change: message from @{from} did not match pinned keys (re-verify)");
             return;
         }
 
@@ -453,6 +477,29 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             return keys;
         }
         catch { return Array.Empty<string>(); }
+    }
+
+    /// <summary>
+    /// Re-verifies a contact whose keys changed: fetches the handle's current device keys from the
+    /// relay directory (bypassing the cache) and re-pins them, clearing the key-changed flag. This
+    /// is an explicit, user-initiated trust decision.
+    /// </summary>
+    public async Task<bool> ReverifyContactAsync(string handle)
+    {
+        var h = AppState.Norm(handle);
+        try
+        {
+            var http = httpFactory.CreateClient("relay");
+            var info = await http.GetFromJsonAsync<HandleInfo>(
+                $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}");
+            var keys = info?.DevicePublicKeys?.ToList() ?? new List<string>();
+            if (keys.Count == 0) return false;
+            keyCache[h] = keys;
+            state.ReverifyContact(h, keys);
+            StateChanged?.Invoke();
+            return true;
+        }
+        catch { return false; }
     }
 
     /// <summary>Owner approves a held draft (optionally edited): record it and send.</summary>

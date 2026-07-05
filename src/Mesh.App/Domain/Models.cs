@@ -172,6 +172,14 @@ public sealed class Contact
     public List<string> SigningKeys { get; set; } = new();
 
     /// <summary>
+    /// Set when an inbound message from this contact fails verification against the pinned
+    /// <see cref="SigningKeys"/>, i.e. the contact's identity keys appear to have changed. Surfaced
+    /// in the UI so the user can re-verify out of band before trusting the new keys, rather than the
+    /// change being silently dropped. Cleared when the user re-verifies (re-pins) the contact.
+    /// </summary>
+    public bool KeyChanged { get; set; }
+
+    /// <summary>
     /// Cumulative tokens this contact's requests have cost the owner's model (guest replies your
     /// agent generated for them). Shown per contact so the owner can see who is spending their
     /// tokens. Not reset on model change, this is a lifetime cost-per-contact tally.
