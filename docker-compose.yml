@@ -1,0 +1,38 @@
+# Run your own Mesh relay.
+#
+#   Minimal (in-memory, single node, no free model):
+#     docker compose up mesh-relay
+#
+#   Durable + scalable (adds Redis for presence, quota and cross-node routing):
+#     docker compose --profile redis up
+#
+# Then point your Mesh client at http://your-host:8080 (or put it behind a TLS
+# reverse proxy and use https). See docs/SELF-HOSTING.md for the full reference.
+
+services:
+  mesh-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.relay
+    image: mesh-relay:local
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      # Optional: connect Redis for multi-replica presence, durable quota and directed routing.
+      # REDIS_CONNECTION: "redis:6379"
+      # Optional: offer a hosted free model to first-launch users on this relay.
+      # Any OpenAI-compatible endpoint works (OpenAI, Groq, together, a local server, ...).
+      # MODEL_ENDPOINT: "https://api.groq.com/openai"
+      # MODEL_API_KEY: "sk-..."
+      # MODEL_NAME: "openai/gpt-oss-120b"
+      # MODEL_DAILY_TOKEN_LIMIT: "100000"
+    restart: unless-stopped
+
+  # Optional Redis, enabled with:  docker compose --profile redis up
+  redis:
+    image: redis:7-alpine
+    profiles: ["redis"]
+    ports:
+      - "6379:6379"
+    restart: unless-stopped

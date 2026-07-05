@@ -1,0 +1,22 @@
+# Self-hosting Dockerfile for the Mesh relay.
+# Build from the repo root:  docker build -f Dockerfile.relay -t mesh-relay .
+# Run:                       docker run -p 8080:8080 mesh-relay
+#
+# The relay runs fully standalone with no external services: an in-memory handle
+# registry, presence and quota. Set COSMOS_CONNECTION / REDIS_CONNECTION to make it
+# durable and multi-replica, and MODEL_* to offer a hosted free model. See docs/SELF-HOSTING.md.
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+# Copy just the two projects the relay needs (relay references ..\Mesh.Shared).
+COPY src/Mesh.Shared/ Mesh.Shared/
+COPY src/Mesh.Relay/ Mesh.Relay/
+RUN dotnet restore Mesh.Relay/Mesh.Relay.csproj
+RUN dotnet publish Mesh.Relay/Mesh.Relay.csproj -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+WORKDIR /app
+COPY --from=build /app ./
+ENV ASPNETCORE_URLS=http://+:8080
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "Mesh.Relay.dll"]
