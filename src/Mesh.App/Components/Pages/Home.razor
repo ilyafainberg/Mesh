@@ -1,6 +1,7 @@
 ﻿@page "/"
 @inject AppState State
 @inject AgentService Agent
+@inject MeshClient Mesh
 @inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
 @implements IDisposable
@@ -37,16 +38,16 @@
             {
                 <div class="pin-bar">
                     <i class="bi bi-pin-angle"></i>
-                    <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" />
+                    <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" aria-label="Name this widget" />
                     <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
-                    <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel"><i class="bi bi-x-lg"></i></button>
+                    <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
                 </div>
             }
             @if (widgetMode)
             {
                 <div class="mode-chip">
                     <i class="bi bi-window-stack"></i> widget
-                    <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget"><i class="bi bi-x"></i></button>
+                    <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
                     <span class="mode-hint">describe the mini-app you want</span>
                 </div>
             }
@@ -66,20 +67,24 @@
                             <i class="bi bi-paperclip"></i>
                             <span class="attach-name">@a.Name</span>
                             <span class="attach-size">@a.SizeLabel</span>
-                            <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove"><i class="bi bi-x"></i></button>
+                            <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
                         </span>
                     }
                 </div>
             }
             <div class="composer">
-                <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@busy" title="Create a widget (mini-app)">
+                <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget">
                     <i class="bi bi-plus-lg"></i>
                 </button>
-                <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document">
+                <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
                     <i class="bi bi-paperclip"></i>
                 </button>
-                <input @bind="input" @bind:event="oninput" @onkeydown="OnKey" placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" />
-                <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send">
+                <button class="ghost icon-btn plus-btn @(homeMode ? "on" : "")" @onclick="() => homeMode = !homeMode" disabled="@busy"
+                        title="Ask my home agent (runs on my desktop with full tools)" aria-label="Ask my home agent">
+                    <i class="bi bi-house-gear"></i>
+                </button>
+                <input @bind="input" @bind:event="oninput" @onkeydown="OnKey" placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" aria-label="Message your assistant" />
+                <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send" aria-label="Send">
                     <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
                 </button>
             </div>
@@ -104,6 +109,7 @@
     bool busy;
     bool building;
     bool widgetMode;
+    bool homeMode;
     string? pinHtml;
     string pinName = "";
     ElementReference scrollEl;
@@ -125,7 +131,7 @@
     {
         get
         {
-            if (State.Profile.Model.Provider != Mesh.App.Domain.ModelProvider.MeshHosted) return false;
+            if (State.Profile.Model.Provider != global::Mesh.App.Domain.ModelProvider.MeshHosted) return false;
             var last = State.Profile.OwnChat.LastOrDefault(l => l.Role == "assistant");
             return last is not null && last.Text.StartsWith("You've reached today's free-model limit", StringComparison.Ordinal);
         }
@@ -201,6 +207,20 @@
                 var html = await Agent.BuildWidgetAsync(text);
                 State.AddOwnChatLine(new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
                 State.AddOwnChatLine(new ChatLine { Role = "assistant", Text = html });
+            }
+            else if (homeMode)
+            {
+                // Route to the owner's home desktop agent (full local tools). The answer arrives
+                // asynchronously and is recorded in the self-conversation + a notification.
+                State.AddOwnChatLine(new ChatLine { Role = "user", Text = text });
+                var ok = await Mesh.AskHomeAgentAsync(text);
+                State.AddOwnChatLine(new ChatLine
+                {
+                    Role = "assistant",
+                    Text = ok
+                        ? "Sent to your home agent. Its reply will arrive in Messages (from your own handle) and as a notification."
+                        : "[could not reach your home agent: not connected, or no device has 'Answer my other devices' enabled]"
+                });
             }
             else
             {
