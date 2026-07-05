@@ -312,6 +312,28 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             text = ok ? plain! : "[encrypted message this device can't read]";
         }
 
+        // Remote-to-desktop: a request from one of the owner's OWN devices (same handle) to run the
+        // full owner agent here and reply. Only honored when this device opted in and the sender is
+        // our own handle (the relay only routes same-handle envelopes between our linked devices).
+        if (env.Kind == MeshKinds.RemoteAgentRequest)
+        {
+            if (state.Profile.ActAsRemoteAgent && from == AppState.Norm(state.Profile.Handle))
+            {
+                var answer = await agent.AskAsRemoteAsync(text, ct);
+                await SendAsync(from, MeshKinds.RemoteAgentResponse, answer);
+            }
+            return;
+        }
+        if (env.Kind == MeshKinds.RemoteAgentResponse)
+        {
+            // The mobile side records the home agent's answer as an incoming assistant line.
+            state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = "agent" });
+            state.MarkUnread(from);
+            if (ShouldNotify(state.FindContact(from)))
+                notifier.Notify("Your home agent replied", Preview(text), NotifyKind.Message, "messages", state.Profile.NotificationSound);
+            return;
+        }
+
         var contact = state.FindContact(from);
         var allowed = contact?.Allowed == true;
         var display = state.DisplayNameFor(from);
@@ -447,6 +469,14 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
     public void RejectDraft(string approvalId)
         => state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
+
+    /// <summary>
+    /// Sends a request to the owner's OTHER devices asking a remote (home) agent to answer with its
+    /// full local toolset. Routed to the same handle; the relay excludes this device, so a linked
+    /// desktop that opted in (ActAsRemoteAgent) responds. Returns false when not connected.
+    /// </summary>
+    public async Task<bool> AskHomeAgentAsync(string prompt)
+        => await SendAsync(state.Profile.Handle, MeshKinds.RemoteAgentRequest, prompt);
 
 
     public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null)

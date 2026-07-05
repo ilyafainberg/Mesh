@@ -26,13 +26,17 @@ public sealed class MeshRouter(
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
     /// <summary>Routes a fully-formed envelope to its recipient.</summary>
-    public async Task RouteAsync(MeshEnvelope env)
+    /// <param name="excludeConnectionId">
+    /// A connection to skip on local delivery, used when a device sends to its OWN handle
+    /// (remote-to-desktop) so the message reaches the owner's OTHER devices, not an echo to itself.
+    /// </param>
+    public async Task RouteAsync(MeshEnvelope env, string? excludeConnectionId = null)
     {
         var to = Normalize(env.To);
         var envelopeJson = JsonSerializer.Serialize(env, Json);
 
         // 1. Local delivery to any of the recipient's connections on this instance.
-        if (await DeliverLocalAsync(to, envelopeJson)) return;
+        if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId)) return;
 
         // 2. Directed cross-instance forward to whichever instance holds the socket.
         var owner = await backplane.GetInstanceForAsync(to);
@@ -45,13 +49,15 @@ public sealed class MeshRouter(
     }
 
     /// <summary>
-    /// Delivers an envelope JSON to every local connection for a handle. Returns true if at
-    /// least one local connection received it. Used both by the local fast path and by the
-    /// backplane when another instance forwards a message to this one.
+    /// Delivers an envelope JSON to every local connection for a handle (optionally excluding one
+    /// connection). Returns true if at least one local connection received it. Used both by the
+    /// local fast path and by the backplane when another instance forwards a message to this one.
     /// </summary>
-    public async Task<bool> DeliverLocalAsync(string handle, string envelopeJson)
+    public async Task<bool> DeliverLocalAsync(string handle, string envelopeJson, string? excludeConnectionId = null)
     {
         var conns = registry.ConnectionsFor(Normalize(handle));
+        if (excludeConnectionId is not null)
+            conns = conns.Where(c => c != excludeConnectionId).ToList();
         if (conns.Count == 0) return false;
         await hub.Clients.Clients(conns).SendAsync(MeshHubProtocol.Receive, envelopeJson);
         return true;

@@ -100,7 +100,10 @@ public sealed class MeshHub(
         }
 
         var stamped = env with { From = state.Handle }; // relay asserts the authenticated sender
-        await router.RouteAsync(stamped);
+        // When a device sends to its own handle (remote-to-desktop), exclude the sender's own
+        // connection so the message reaches the owner's OTHER devices rather than echoing back.
+        var exclude = Normalize(stamped.To) == state.Handle ? Context.ConnectionId : null;
+        await router.RouteAsync(stamped, exclude);
         metrics.MessageRouted();
     }
 

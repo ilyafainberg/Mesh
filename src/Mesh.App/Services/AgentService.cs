@@ -57,6 +57,32 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Answers a request coming from one of the owner's OWN other devices (e.g. their phone) with the
+    /// full owner toolset (local tools, MCP servers, connected sources) so they can "talk to my home
+    /// agent" on the go. Does NOT record into the owner's private chat: it is a one-shot remote call.
+    /// </summary>
+    public async Task<string> AskAsRemoteAsync(string userText, CancellationToken ct = default)
+    {
+        var p = state.Profile;
+        var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
+        agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
+        var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider))
+            + "\nYou are answering your owner remotely from another of their devices. Be concise.";
+        var cfg = await ResolveModelConfigAsync(p.Model, ct);
+        var model = factory.Create(cfg);
+        var history = new[] { new ChatLine { Role = "user", Text = userText } };
+
+        string answer;
+        using (media.BeginScope(out var images))
+        {
+            answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct);
+            answer = ExpandWidgets(answer, p.Widgets);
+            answer = AppendImages(answer, images);
+        }
+        return answer;
+    }
+
     /// <summary>Builds a single interactive widget (mini-app) from a description.</summary>
     public async Task<string> BuildWidgetAsync(string description, CancellationToken ct = default)
     {
