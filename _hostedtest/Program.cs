@@ -7,7 +7,7 @@ using Mesh.Shared;
 // End-to-end tool-calling test for the relay-hosted free model. Simulates what
 // MeshHostedModel.CompleteWithToolsAsync does: sends tools, gets back tool_calls,
 // executes the tool locally, sends the result, and expects a grounded final answer.
-var relay = (args.Length > 0 ? args[0] : "https://mesh-relay.whiteground-796c60f9.northeurope.azurecontainerapps.io").TrimEnd('/');
+var relay = (args.Length > 0 ? args[0] : "https://relay.quonkel.com").TrimEnd('/');
 var web = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 var http = new HttpClient();
 

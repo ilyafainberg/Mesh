@@ -5,6 +5,7 @@
 @inject FoundryLocalService Foundry
 @inject ModelSetupService Setup
 @inject McpHost McpHostSvc
+@inject IHttpClientFactory HttpFactory
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -381,7 +382,18 @@
             <h3>Relay</h3>
             <div class="field">
                 <label>Relay URL</label>
-                <input class="full" @bind="relay" />
+                <div class="model-row">
+                    <input class="full" @bind="relay" aria-label="Relay URL" />
+                    <button class="ghost" @onclick="TestRelay" disabled="@testingRelay" title="Check this relay is reachable">
+                        @(testingRelay ? "Testing…" : "Test")
+                    </button>
+                </div>
+                @if (relayTestMsg is not null) { <div class="field-hint @(relayTestOk ? "" : "err-text")">@relayTestMsg</div> }
+                <div class="field-hint">
+                    The default relay is run by Mesh. You can run your own, or use anyone's:
+                    see <b>docs/SELF-HOSTING.md</b>. A handle is registered per relay, so switching relays
+                    re-registers your handle there.
+                </div>
             </div>
             <div class="field-row">
                 <div class="field-label">Status</div>
@@ -790,6 +802,41 @@
     }
 
     void ResetCounter() => State.ResetTokenCounter();
+
+    // ---- relay test ----
+    bool testingRelay;
+    bool relayTestOk;
+    string? relayTestMsg;
+
+    async Task TestRelay()
+    {
+        relayTestMsg = null;
+        var url = relay?.Trim();
+        if (string.IsNullOrWhiteSpace(url)) { relayTestOk = false; relayTestMsg = "Enter a relay URL first."; return; }
+        testingRelay = true;
+        try
+        {
+            var http = HttpFactory.CreateClient("relay");
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var resp = await http.GetAsync($"{url.TrimEnd('/')}/health", cts.Token);
+            if (resp.IsSuccessStatusCode)
+            {
+                relayTestOk = true;
+                relayTestMsg = "Relay is reachable. Save to switch to it.";
+            }
+            else
+            {
+                relayTestOk = false;
+                relayTestMsg = $"Relay responded with {(int)resp.StatusCode}. Check the URL.";
+            }
+        }
+        catch (Exception ex)
+        {
+            relayTestOk = false;
+            relayTestMsg = $"Could not reach that relay: {ex.Message}";
+        }
+        finally { testingRelay = false; }
+    }
 
     void Toggle(Action<Mesh.App.Domain.MeshProfile> change) => State.Mutate(change);
 

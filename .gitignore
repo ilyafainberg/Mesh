@@ -44,3 +44,11 @@ _deploy/totalcontrol/
 
 _deploy/.lasttag
 
+
+# Release build artifacts (generated)
+_deploy/artifacts/
+_deploy/client-release/
+_deploy/relay-release/
+_deploy/relay-pkg/
+_deploy/meshai-repo/
+_deploy/pkg/

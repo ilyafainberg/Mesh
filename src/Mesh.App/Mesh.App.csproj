@@ -109,10 +109,19 @@
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
         <TotalControlFiles Include="$(MSBuildProjectDirectory)\..\..\_deploy\totalcontrol\**\*.*" />
     </ItemGroup>
-    <Target Name="CopyTotalControl" AfterTargets="Build;Publish"
+    <Target Name="CopyTotalControl" AfterTargets="Build"
             Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows' And '@(TotalControlFiles)' != ''">
         <Copy SourceFiles="@(TotalControlFiles)"
               DestinationFiles="@(TotalControlFiles->'$(OutDir)mcp\totalcontrol\%(RecursiveDir)%(Filename)%(Extension)')"
+              SkipUnchangedFiles="true" />
+    </Target>
+
+    <!-- Publish writes to $(PublishDir), not $(OutDir); copy the bundled server there too so
+         self-contained releases ship TotalControl. -->
+    <Target Name="CopyTotalControlPublish" AfterTargets="Publish"
+            Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows' And '@(TotalControlFiles)' != ''">
+        <Copy SourceFiles="@(TotalControlFiles)"
+              DestinationFiles="@(TotalControlFiles->'$(PublishDir)mcp\totalcontrol\%(RecursiveDir)%(Filename)%(Extension)')"
               SkipUnchangedFiles="true" />
     </Target>
 
