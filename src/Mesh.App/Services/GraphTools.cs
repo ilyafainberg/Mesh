@@ -405,6 +405,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         LocalToolKind.CSharpScript => new RunCSharpScriptTool(),
         LocalToolKind.Browser => new BrowserTool(media),
         LocalToolKind.FileSystem => new FileSystemTool(extractor),
+        LocalToolKind.WorkIq => new AskWorkIqTool(),
         _ => null
     };
 

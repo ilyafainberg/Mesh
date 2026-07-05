@@ -178,8 +178,9 @@ public sealed class McpToolAdapter(McpClient client, McpClientTool tool, AgentMe
             else if (block is ImageContentBlock image)
             {
                 // Surface the image to the chat rather than dumping base64 at the model, which cannot
-                // see it. Tell the model it was shown so it does not try to describe raw bytes.
-                var base64 = Convert.ToBase64String(image.Data.Span);
+                // see it. The MCP SDK exposes ImageContentBlock.Data as the base64 string stored as
+                // UTF-8 bytes, so decode it as text (do NOT Convert.ToBase64String, that double-encodes).
+                var base64 = System.Text.Encoding.UTF8.GetString(image.Data.Span);
                 media.Report(image.MimeType ?? "image/png", base64, $"{tool.Name}.png");
                 images++;
             }

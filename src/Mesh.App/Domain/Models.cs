@@ -63,7 +63,8 @@ public enum LocalToolKind
     Python,
     CSharpScript,
     Browser,
-    FileSystem
+    FileSystem,
+    WorkIq
 }
 
 /// <summary>Per-tool grant: whether the local tool is enabled and who (beyond the owner) may use it.</summary>
