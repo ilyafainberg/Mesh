@@ -24,7 +24,7 @@ public sealed record ConnectorConfig(
 /// exchanged directly. Users may optionally supply their own app (advanced) for a direct exchange.
 /// Tokens are persisted DPAPI-encrypted in the profile so connections survive restarts.
 /// </summary>
-public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppState state, ConnectorBroker broker)
+public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppState state, ConnectorBroker broker, ConnectorCatalogService catalog)
 {
     // Dropbox/Notion/Slack require an OAuth app to allow-list an EXACT redirect URI, so we use a
     // fixed loopback port (unlike Google/Entra which special-case loopback and accept any port).
@@ -44,16 +44,22 @@ public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppStat
             ExtraAuthorizeParams: "&user_scope=search:read"),
     };
 
-    // Built-in apps are always available, so every connector is one-click by default.
-    public bool IsConfigured(SourceProvider p) => Configs.ContainsKey(p);
+    // Built-in apps are one-click, but only once the relay's connector catalog is available (it
+    // provides the OAuth client id). If the catalog hasn't loaded yet (never been online), the
+    // provider is shown as temporarily unavailable rather than failing mid sign-in.
+    public bool IsConfigured(SourceProvider p)
+        => Configs.TryGetValue(p, out var cfg)
+           && (catalog.Get(cfg.Key) is not null
+               || !string.IsNullOrWhiteSpace(state.Profile.ConnectorClientIds.GetValueOrDefault(cfg.Key, "")));
 
-    private static ConnectorEndpoint Endpoint(string key) => ConnectorCatalog.Get(key)!;
+    private ConnectorEndpoint? Endpoint(string key) => catalog.Get(key);
 
-    /// <summary>User-supplied app id if present (advanced), otherwise Mesh's built-in app id.</summary>
+    /// <summary>User-supplied app id if present (advanced), otherwise Mesh's built-in app id from the relay catalog.</summary>
     private string ClientId(SourceProvider p)
     {
         var user = state.Profile.ConnectorClientIds.GetValueOrDefault(Configs[p].Key, "");
-        return string.IsNullOrWhiteSpace(user) ? Endpoint(Configs[p].Key).ClientId : user;
+        if (!string.IsNullOrWhiteSpace(user)) return user;
+        return Endpoint(Configs[p].Key)?.ClientId ?? "";
     }
 
     /// <summary>True when the user brought their own OAuth app (direct exchange with their secret).</summary>
@@ -74,6 +80,9 @@ public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppStat
     public async Task<(bool ok, string? account, string? error)> SignInAsync(SourceProvider provider, CancellationToken ct = default)
     {
         if (!Configs.TryGetValue(provider, out var cfg)) return (false, null, "Unsupported connector.");
+        var ep = Endpoint(cfg.Key);
+        if (ep is null)
+            return (false, null, "Connector setup isn't available yet. Connect to a relay (get online) and try again.");
         var clientId = ClientId(provider);
         if (string.IsNullOrWhiteSpace(clientId)) return (false, null, $"Add your {cfg.Key} OAuth client id first.");
 
@@ -92,7 +101,6 @@ public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppStat
         // Abort the listener promptly on cancellation so the loopback port is freed for a retry.
         using var cancelReg = ct.Register(() => { try { listener.Abort(); } catch { } });
 
-        var ep = Endpoint(cfg.Key);
         var authUrl = $"{ep.AuthorizeUrl}?client_id={Uri.EscapeDataString(clientId)}" +
             $"&response_type=code&redirect_uri={Uri.EscapeDataString(redirect)}" +
             (string.IsNullOrEmpty(cfg.Scope) ? "" : $"&scope={Uri.EscapeDataString(cfg.Scope)}") +
@@ -208,7 +216,9 @@ public sealed class ConnectorAuthService(IHttpClientFactory httpFactory, AppStat
         };
         if (UsesOwnApp(provider) && !string.IsNullOrWhiteSpace(UserSecret(provider)))
             form["client_secret"] = UserSecret(provider);
-        using var resp = await http.PostAsync(Endpoint(cfg.Key).TokenUrl, new FormUrlEncodedContent(form), ct);
+        var tokenUrl = Endpoint(cfg.Key)?.TokenUrl;
+        if (tokenUrl is null) return (false, null, "Connector setup isn't available (get online and try again).");
+        using var resp = await http.PostAsync(tokenUrl, new FormUrlEncodedContent(form), ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return (false, null, $"Token refresh failed: {Trim(body)}");
         using var doc = JsonDocument.Parse(body);

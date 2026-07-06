@@ -4,6 +4,7 @@
 @inject MsalAuthService Msal
 @inject GoogleAuthService Google
 @inject ConnectorAuthService Connectors
+@inject ConnectorCatalogService Catalog
 @inject SourceBrowser Browser
 @implements IDisposable
 
@@ -75,6 +76,16 @@
 
             <div class="add-source">
                 <div class="add-source-label">Add a source</div>
+                @if (!Catalog.IsLoaded)
+                {
+                    <div class="warn-banner">
+                        <i class="bi bi-cloud-slash"></i>
+                        Google, Dropbox, Notion and Slack need a connection to your relay to set up.
+                        <button class="link-btn" @onclick="RefreshCatalog" disabled="@catalogRefreshing">
+                            @(catalogRefreshing ? "Checking…" : "Retry")
+                        </button>
+                    </div>
+                }
                 <div class="provider-grid">
                     <button class="provider-btn" disabled="@busy" @onclick="() => ConnectMicrosoft(false)">
                         <i class="bi bi-microsoft"></i>
@@ -84,19 +95,19 @@
                         <i class="bi bi-envelope-at"></i>
                         <span><b>Microsoft account</b><small>Outlook.com + OneDrive</small></span>
                     </button>
-                    <button class="provider-btn" disabled="@busy" @onclick="ConnectGmail">
+                    <button class="provider-btn" disabled="@(busy || !Google.IsConfigured)" @onclick="ConnectGmail">
                         <i class="bi bi-google"></i>
                         <span><b>Google</b><small>Gmail + Drive</small></span>
                     </button>
-                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectConnector(SourceProvider.Dropbox)">
+                    <button class="provider-btn" disabled="@(busy || !Connectors.IsConfigured(SourceProvider.Dropbox))" @onclick="() => ConnectConnector(SourceProvider.Dropbox)">
                         <i class="bi bi-dropbox"></i>
                         <span><b>Dropbox</b><small>files</small></span>
                     </button>
-                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectConnector(SourceProvider.Notion)">
+                    <button class="provider-btn" disabled="@(busy || !Connectors.IsConfigured(SourceProvider.Notion))" @onclick="() => ConnectConnector(SourceProvider.Notion)">
                         <i class="bi bi-journal-richtext"></i>
                         <span><b>Notion</b><small>pages + databases</small></span>
                     </button>
-                    <button class="provider-btn" disabled="@busy" @onclick="() => ConnectConnector(SourceProvider.Slack)">
+                    <button class="provider-btn" disabled="@(busy || !Connectors.IsConfigured(SourceProvider.Slack))" @onclick="() => ConnectConnector(SourceProvider.Slack)">
                         <i class="bi bi-slack"></i>
                         <span><b>Slack</b><small>messages</small></span>
                     </button>
@@ -415,8 +426,21 @@
     {
         State.Changed += Refresh;
         Msal.Changed += Refresh;
+        Catalog.Changed += Refresh;
+        // If the catalog isn't loaded yet (for example first visit before the background load),
+        // try to fetch it so the connector buttons light up without waiting for a reconnect.
+        if (!Catalog.IsLoaded) _ = RefreshCatalog();
     }
     void Refresh() => InvokeAsync(StateHasChanged);
+
+    bool catalogRefreshing;
+    async Task RefreshCatalog()
+    {
+        if (catalogRefreshing) return;
+        catalogRefreshing = true;
+        try { await Catalog.RefreshAsync(); }
+        finally { catalogRefreshing = false; await InvokeAsync(StateHasChanged); }
+    }
 
     async Task ConnectMicrosoft(bool personal)
     {
@@ -716,5 +740,6 @@
     {
         State.Changed -= Refresh;
         Msal.Changed -= Refresh;
+        Catalog.Changed -= Refresh;
     }
 }

@@ -8,6 +8,7 @@
 @inject NavigationManager Nav
 @inject IAppControl AppControl
 @inject UpdateService Updater
+@inject ConnectorCatalogService Catalog
 @implements IDisposable
 
 @if (!State.IsOnboarded)
@@ -103,6 +104,9 @@ else
             await Msal.InitializeAsync();
             await Mesh.RegisterAsync();
             await Mesh.ConnectAsync();
+            // Pull the relay's connector catalog (public OAuth metadata) in the background so the
+            // Knowledge page can offer one-click connectors. Cached for brief offline periods.
+            _ = Task.Run(() => Catalog.RefreshAsync());
         }
         // Preload the on-device model catalog once, in the background, so Settings
         // shows it instantly without reloading (and without resetting the selection).

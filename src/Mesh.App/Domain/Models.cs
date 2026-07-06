@@ -283,6 +283,13 @@ public sealed class MeshProfile
     /// <summary>Persisted access/refresh tokens for tier-2 connectors, keyed "provider:account".</summary>
     public Dictionary<string, string> ConnectorTokens { get; set; } = new();
 
+    /// <summary>
+    /// Cached copy of the relay's public connector catalog (GET /connectors) as JSON. Non-sensitive
+    /// public metadata (authorize/token URLs + public client ids). Persisted so a user who has been
+    /// online before can still see and start connector sign-ins while briefly offline.
+    /// </summary>
+    public string? ConnectorCatalogCache { get; set; }
+
     public List<KnowledgeItem> Knowledge { get; set; } = new();
     public List<Skill> Skills { get; set; } = new();
     public List<Widget> Widgets { get; set; } = new();

@@ -14,7 +14,7 @@ namespace Mesh.App.Services;
 /// brokers both the initial code exchange and hourly refresh, so no secret ships in the client and
 /// the user pastes nothing. Refresh tokens are held DPAPI-encrypted in the profile.
 /// </summary>
-public sealed class GoogleAuthService(IHttpClientFactory httpFactory, AppState state, ConnectorBroker broker)
+public sealed class GoogleAuthService(IHttpClientFactory httpFactory, AppState state, ConnectorBroker broker, ConnectorCatalogService catalog)
 {
     private const string ProviderKey = "google";
     private const string Scope = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.readonly openid email";
@@ -22,15 +22,17 @@ public sealed class GoogleAuthService(IHttpClientFactory httpFactory, AppState s
     // Google's Web-application client requires an exact redirect URI; we register + use this one.
     public const string RedirectUri = ConnectorAuthService.RedirectUri;
 
-    private static string ClientId => ConnectorCatalog.Get(ProviderKey)!.ClientId;
+    private string? ClientId => catalog.Get(ProviderKey)?.ClientId;
 
-    // Built-in app is always available → Google is one-click.
-    public bool IsConfigured => true;
+    // Google is one-click once the relay's connector catalog is available (provides the client id).
+    public bool IsConfigured => catalog.Get(ProviderKey) is not null;
 
     /// <summary>Runs the interactive loopback flow and returns the signed-in email plus the scopes Google actually granted.</summary>
     public async Task<(bool ok, string? email, string[] scopes, string? error)> SignInInteractiveAsync(CancellationToken ct = default)
     {
         var clientId = ClientId;
+        if (string.IsNullOrWhiteSpace(clientId))
+            return (false, null, Array.Empty<string>(), "Google setup isn't available yet. Connect to a relay (get online) and try again.");
         var verifier = RandomUrl(64);
         var challenge = Base64Url(SHA256.HashData(Encoding.ASCII.GetBytes(verifier)));
 

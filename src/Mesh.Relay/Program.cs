@@ -42,6 +42,7 @@ builder.Services.AddSingleton(backplane);
 builder.Services.AddSingleton(quota);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
+builder.Services.AddSingleton<Mesh.Relay.RelayConnectorCatalog>();
 builder.Services.AddHostedService<PresenceRenewer>();
 
 // Aggregate ops counters (no PII): scraped via GET /metrics.
@@ -84,6 +85,7 @@ app.UseRateLimiter();
 
 // When another instance forwards a message to this one, deliver it to the local hub connections.
 var router = app.Services.GetRequiredService<MeshRouter>();
+var connectorCatalog = app.Services.GetRequiredService<Mesh.Relay.RelayConnectorCatalog>();
 await backplane.StartAsync(async (toHandle, envelopeJson) =>
 {
     await router.DeliverLocalAsync(toHandle, envelopeJson);
@@ -229,10 +231,14 @@ app.MapPost("/handles/{handle}/recover", async (string handle, RecoverHandleRequ
     return Results.Ok(new RegisterHandleResponse(key, DeviceIdOf(req.NewPublicKey), updated.RegisteredAt));
 });
 
-// ---- Connector token broker ----------------------------------------------
+// ---- Connectors: public catalog + token broker ---------------------------
+// Public connector metadata (authorize/token URLs + public client ids), so the client does not
+// ship any OAuth app ids itself. No secrets are exposed here.
+app.MapGet("/connectors", (Mesh.Relay.RelayConnectorCatalog catalog) => Results.Ok(catalog.All));
+
 app.MapPost("/connectors/{provider}/token", async (string provider, ConnectorTokenRequest req) =>
 {
-    var ep = ConnectorCatalog.Get(provider);
+    var ep = connectorCatalog.Get(provider);
     if (ep is null || !ep.Confidential)
         return Results.BadRequest(new { error = "unknown or non-brokered connector" });
     if (req.GrantType is not (ConnectorProtocol.GrantAuthCode or ConnectorProtocol.GrantRefresh))

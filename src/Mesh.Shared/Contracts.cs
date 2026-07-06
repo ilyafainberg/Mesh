@@ -138,6 +138,23 @@ public record ConnectorTokenRequest(
 /// <summary>The provider's raw token response, passed back verbatim as JSON.</summary>
 public record ConnectorTokenResponse(string TokenJson);
 
+/// <summary>
+/// Public OAuth metadata for a built-in connector, served by the relay's <c>GET /connectors</c>
+/// endpoint and consumed by the client to build authorize requests. This is a data shape only:
+/// it carries public identifiers (authorize/token URLs and the OAuth <b>client id</b>, which is
+/// public and appears in every authorize URL). Client <b>secrets</b> are never part of this type,
+/// for confidential providers the relay injects the secret server-side during the token exchange.
+/// The concrete values (which client ids to use) live in the relay's configuration, not in the
+/// open shared library, so the shared code carries no app-specific credentials.
+/// </summary>
+public sealed record ConnectorEndpoint(
+    string Key,
+    string AuthorizeUrl,
+    string TokenUrl,
+    string ClientId,
+    bool UseBasicAuth,
+    bool Confidential);
+
 /// <summary>Canonical strings used by both client and relay for the connector token broker.</summary>
 public static class ConnectorProtocol
 {
