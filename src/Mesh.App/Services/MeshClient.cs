@@ -88,6 +88,53 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     private static string? NullIfBlank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s;
 
     /// <summary>
+    /// Checks whether a handle is already claimed on a relay. Returns true if taken, false if free,
+    /// and null if the relay could not be reached (caller should treat null as "unknown" and not
+    /// let creation proceed blindly). Used at identity creation to prevent claiming a taken handle.
+    /// </summary>
+    public async Task<bool?> IsHandleTakenAsync(string handle, string? relayUrl = null)
+    {
+        var url = (relayUrl ?? state.Profile.RelayUrl).TrimEnd('/');
+        var h = AppState.Norm(handle);
+        var http = httpFactory.CreateClient("relay");
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var resp = await http.GetAsync($"{url}/handles/{Uri.EscapeDataString(h)}", cts.Token);
+            if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return false; // free
+            if (resp.IsSuccessStatusCode) return true;                                // claimed
+            return null;                                                              // unknown
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Releases a handle on the relay so its name is free to claim again, authenticated with a
+    /// device key registered under it. Best-effort: returns false if the relay rejects it (for
+    /// example this device's key was never the registered one) or is unreachable.
+    /// </summary>
+    public async Task<bool> DeleteHandleAsync(string handle, string privateKey, string publicKey, string? relayUrl = null)
+    {
+        var url = (relayUrl ?? state.Profile.RelayUrl).TrimEnd('/');
+        var h = AppState.Norm(handle);
+        if (string.IsNullOrWhiteSpace(privateKey) || string.IsNullOrWhiteSpace(publicKey)) return false;
+        var http = httpFactory.CreateClient("relay");
+        try
+        {
+            var sig = IdentityService.Sign(privateKey, DeleteProtocol.Message(h));
+            using var req = new HttpRequestMessage(HttpMethod.Delete, $"{url}/handles/{Uri.EscapeDataString(h)}")
+            {
+                Content = JsonContent.Create(new DeleteHandleRequest(h, publicKey, sig))
+            };
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var resp = await http.SendAsync(req, cts.Token);
+            Log?.Invoke($"delete handle {h}: {(int)resp.StatusCode}");
+            return resp.IsSuccessStatusCode;
+        }
+        catch (Exception ex) { Log?.Invoke($"delete handle failed: {ex.Message}"); return false; }
+    }
+
+    /// <summary>
     /// Re-authorizes THIS device under an existing handle using the handle's recovery key (carried
     /// in an imported profile). Used when no other device is available to issue a link invite. The
     /// device signs its own fresh public key with the recovery private key; the relay verifies it

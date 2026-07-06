@@ -385,6 +385,30 @@ app.MapGet("/handles/{handle}", async (string handle) =>
     return Results.Ok(new HandleInfo(rec.Handle, rec.DisplayName, rec.DevicePublicKeys, online, rec.RegisteredAt));
 });
 
+app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.Mvc.FromBody] DeleteHandleRequest req) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null) return Results.NotFound();
+
+    // Only a device currently authorized under the handle can release it. Verify the presented key
+    // is registered AND that it signed the delete request (proof of possession), so nobody else can
+    // free someone's name.
+    if (string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey)
+        || string.IsNullOrWhiteSpace(req.Signature)
+        || !MeshCrypto.Verify(req.DevicePublicKey, DeleteProtocol.Message(key), req.Signature))
+    {
+        app.Logger.LogWarning("delete rejected (unauthorized): {Handle}", key);
+        return Results.BadRequest(new { error = "not authorized to delete this handle" });
+    }
+
+    var removed = await store.DeleteHandleAsync(key);
+    await backplane.ClearPresenceAsync(key);
+    app.Logger.LogInformation("handle deleted: {Handle}", key);
+    return removed ? Results.Ok(new { deleted = key }) : Results.NotFound();
+});
+
 // ---- SignalR transport hub ------------------------------------------------
 app.MapHub<MeshHub>(MeshHubProtocol.Route);
 

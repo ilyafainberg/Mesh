@@ -51,6 +51,26 @@ public static class RecoveryProtocol
 }
 
 /// <summary>
+/// Delete (release) a handle so its name becomes free to claim again. Authenticated: the caller
+/// signs with a device key currently registered under the handle, proving ownership. The relay
+/// verifies the key is registered and the signature is valid, then removes the handle registration
+/// (and its pending invites and offline inbox). This is what makes handle names truly reusable and
+/// prevents stale registrations from blocking a legitimate re-creation.
+/// Signature is over <c>handle-delete|handle</c> by a registered device key.
+/// </summary>
+public record DeleteHandleRequest(
+    string Handle,
+    string DevicePublicKey,
+    string Signature);
+
+/// <summary>Canonical string a device signs to delete (release) its handle.</summary>
+public static class DeleteProtocol
+{
+    public static string Message(string handle)
+        => $"handle-delete|{LinkProtocol.Normalize(handle)}";
+}
+
+/// <summary>
 /// Device-linking: an already-authorized device creates a short-lived, single-use
 /// invite so another device can join the same handle. The relay only stores the
 /// hash of the code; the raw code travels out-of-band (QR) to the new device.

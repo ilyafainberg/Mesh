@@ -59,6 +59,13 @@ public interface IRelayStore
     Task<(StoredHandle record, bool deviceAuthorized)> UpsertHandleAsync(
         string handle, string devicePublicKey, string? displayName, bool allowNewDevice, CancellationToken ct = default);
 
+    /// <summary>
+    /// Removes a handle registration entirely, freeing the name to be claimed again. Also drops the
+    /// handle's pending invites and offline inbox. Returns false if the handle did not exist.
+    /// Callers must authenticate the request before calling this.
+    /// </summary>
+    Task<bool> DeleteHandleAsync(string handle, CancellationToken ct = default);
+
     /// <summary>Updates only the display name of an existing handle. No-op if missing.</summary>
     Task SetDisplayNameAsync(string handle, string displayName, CancellationToken ct = default);
 

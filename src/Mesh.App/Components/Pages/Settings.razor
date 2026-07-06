@@ -748,6 +748,15 @@
     {
         deleteId = null;
         var wasActive = a.Id == State.ActiveAccountId;
+
+        // Release the handle on the relay first, so the name is freed and can be re-created. Signed
+        // with this identity's own key: the relay only honors it if this device's key is the one
+        // registered under the handle (a stranded duplicate simply won't be authorized, which is
+        // correct, it never owned the name). Best-effort: a relay error still deletes locally.
+        var keys = State.PeekIdentityKeys(a.Id);
+        if (keys is { } k && !string.IsNullOrWhiteSpace(k.handle))
+            await Mesh.DeleteHandleAsync(k.handle, k.privateKey, k.publicKey);
+
         if (wasActive) await Mesh.DisconnectAsync();
         State.DeleteAccount(a.Id);
         if (wasActive) SyncFields(); // active cleared → app shows the picker

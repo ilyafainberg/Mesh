@@ -359,6 +359,25 @@
         try
         {
             var mdl = string.IsNullOrWhiteSpace(model) ? ModelPlaceholder : model.Trim();
+
+            if (!linkMode)
+            {
+                var h = AppState.Norm(handle);
+
+                // Guard 1: don't allow two local identities with the same handle on this device.
+                if (State.HasLocalHandle(h))
+                {
+                    error = $"You already have an identity for @{h} on this device.";
+                    return;
+                }
+
+                // Guard 2: the handle must be free on the relay. Check BEFORE creating any local
+                // identity so a taken name can never produce a stranded, unusable account.
+                var taken = await Mesh.IsHandleTakenAsync(h);
+                if (taken == true) { error = $"@{h} is already taken. Please choose a different handle."; return; }
+                if (taken is null) { error = "Couldn't reach the relay to check that handle. Check your connection and try again."; return; }
+            }
+
             State.Mutate(p =>
             {
                 if (!linkMode)
@@ -378,7 +397,21 @@
                     ApiVersion = string.IsNullOrWhiteSpace(apiVersion) ? null : apiVersion.Trim()
                 };
             });
-            if (!linkMode) await Mesh.RegisterAsync(); // link mode already redeemed (registered) on the relay
+
+            if (!linkMode)
+            {
+                // Register the fresh handle. If the relay rejects it (for example someone claimed the
+                // name in the moment between the check and now), roll the local identity back so we
+                // never leave a stranded account behind.
+                var ok = await Mesh.RegisterAsync();
+                if (!ok)
+                {
+                    var strandedId = State.ActiveAccountId;
+                    if (strandedId is not null) State.DeleteAccount(strandedId);
+                    error = $"@{AppState.Norm(handle)} could not be registered (it may have just been taken). Please try another handle.";
+                    return;
+                }
+            }
             await Mesh.ConnectAsync();
             await OnDone.InvokeAsync();
         }

@@ -43,6 +43,14 @@ public sealed class InMemoryRelayStore : IRelayStore
         return Task.FromResult((Clone(rec), authorized));
     }
 
+    public Task<bool> DeleteHandleAsync(string handle, CancellationToken ct = default)
+    {
+        var removed = handles.TryRemove(handle, out _);
+        invites.TryRemove(handle, out _);
+        inboxes.TryRemove(handle, out _);
+        return Task.FromResult(removed);
+    }
+
     public Task SetDisplayNameAsync(string handle, string displayName, CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))

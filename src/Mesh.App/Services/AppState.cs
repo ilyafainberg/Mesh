@@ -410,6 +410,35 @@ public sealed class AppState
         NotifyChanged();
     }
 
+    /// <summary>True if any saved identity on this device already uses the given handle.</summary>
+    public bool HasLocalHandle(string handle)
+    {
+        var h = Norm(handle);
+        return accounts.Any(a => Norm(a.Handle ?? "") == h);
+    }
+
+    /// <summary>
+    /// Reads a saved identity's handle and keypair without switching to it, by opening its encrypted
+    /// database read-only. Used so deleting a non-active identity can still authenticate the relay
+    /// handle release. Returns null if the identity can't be opened. The active identity is read from
+    /// the in-memory profile directly.
+    /// </summary>
+    public (string handle, string privateKey, string publicKey)? PeekIdentityKeys(string id)
+    {
+        if (id == activeId)
+            return (Profile.Handle, Profile.PrivateKey, Profile.PublicKey);
+        MeshDb? db = null;
+        try
+        {
+            db = OpenDb(id);
+            var p = db.LoadProfile();
+            if (p is null || string.IsNullOrWhiteSpace(p.PublicKey)) return null;
+            return (p.Handle, p.PrivateKey, p.PublicKey);
+        }
+        catch { return null; }
+        finally { db?.Dispose(); }
+    }
+
     // ---- helpers ----------------------------------------------------------
     public Domain.Contact? FindContact(string handle)
         => Profile.Contacts.FirstOrDefault(c => c.Handle.Equals(Norm(handle), StringComparison.OrdinalIgnoreCase));

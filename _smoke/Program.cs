@@ -81,6 +81,38 @@ Check(rRec1.IsSuccessStatusCode && rRec2.IsSuccessStatusCode
     && recInfo is not null && recInfo.DevicePublicKeys.Contains(d2Pub),
     "recovery authorizes a new device via recovery key");
 
+// 1f. Handle uniqueness + delete: a fresh handle is free (404); after registering it is taken
+// (200); deleting it with a registered key frees the name; then it can be claimed again.
+var uHandle = "uniq" + Random.Shared.Next(1000, 9999);
+var (uPriv, uPub) = Gen();
+var free1 = await http.GetAsync($"{relay}/handles/{uHandle}");
+await Register(uHandle, uPub, uPriv, "Uniq");
+var taken = await http.GetAsync($"{relay}/handles/{uHandle}");
+Check(free1.StatusCode == System.Net.HttpStatusCode.NotFound && taken.IsSuccessStatusCode,
+    "handle is free before registration, taken after");
+
+// A different key cannot delete someone else's handle.
+var (evilPriv, evilPub) = Gen();
+var evilDelSig = Sign(evilPriv, DeleteProtocol.Message(uHandle));
+using var evilDelReq = new HttpRequestMessage(HttpMethod.Delete, $"{relay}/handles/{uHandle}")
+{ Content = JsonContent.Create(new DeleteHandleRequest(uHandle, evilPub, evilDelSig)) };
+var evilDel = await http.SendAsync(evilDelReq);
+Check(evilDel.StatusCode == System.Net.HttpStatusCode.BadRequest, "unauthorized key cannot delete a handle");
+
+// The owner deletes it, freeing the name.
+var delSig = Sign(uPriv, DeleteProtocol.Message(uHandle));
+using var delReq = new HttpRequestMessage(HttpMethod.Delete, $"{relay}/handles/{uHandle}")
+{ Content = JsonContent.Create(new DeleteHandleRequest(uHandle, uPub, delSig)) };
+var del = await http.SendAsync(delReq);
+var afterDel = await http.GetAsync($"{relay}/handles/{uHandle}");
+Check(del.IsSuccessStatusCode && afterDel.StatusCode == System.Net.HttpStatusCode.NotFound,
+    "owner deletes handle and the name is freed");
+
+// The freed name can be claimed by a brand-new key.
+var (newPriv, newPub) = Gen();
+var reclaim = await Register(uHandle, newPub, newPriv, "Reclaimer");
+Check(reclaim.IsSuccessStatusCode, "freed handle can be re-created by a new identity");
+
 // Directory lookup exposes bob's device key.
 var info = await http.GetFromJsonAsync<HandleInfo>($"{relay}/handles/{bobHandle}");
 Check(info is not null && info.DevicePublicKeys.Contains(bPub), "directory returns bob device key");

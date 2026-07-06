@@ -180,6 +180,23 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <inheritdoc />
+    public async Task<bool> DeleteHandleAsync(string handle, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await handlesContainer
+                .DeleteItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return false;
+        }
+    }
+
+    /// <inheritdoc />
     public async Task SetDisplayNameAsync(string handle, string displayName, CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
