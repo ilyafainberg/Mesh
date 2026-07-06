@@ -278,55 +278,93 @@ public sealed class UpdateService
     {
         if (!IsSupported) throw new PlatformNotSupportedException("Updates are only supported on Windows.");
 
+        // Show a small console window so the user sees the update happening (the swap + relaunch can
+        // take 10-30s while WebView2 child processes release their file locks). A silent window made
+        // it look like "nothing happened".
         var psi = new ProcessStartInfo
         {
             FileName = "cmd.exe",
             Arguments = $"/c \"{batPath}\"",
-            UseShellExecute = false,
-            CreateNoWindow = true,
+            UseShellExecute = true,
+            CreateNoWindow = false,
+            WindowStyle = ProcessWindowStyle.Minimized,
             WorkingDirectory = Path.GetTempPath()
         };
         Process.Start(psi);
 
-        // Give the child a moment to start waiting, then exit for real (bypassing close-to-tray).
-        MainThread.BeginInvokeOnMainThread(() => appControl.Quit());
+        // Quit gracefully on the UI thread, then guarantee the process actually exits shortly after so
+        // the updater's wait loop can proceed even if the graceful quit hangs (close-to-tray, a stuck
+        // WebView, and so on). Without this the app could linger, the swap would never run, and it
+        // would look like nothing happened.
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            try { appControl.Quit(); } catch { }
+        });
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3));
+            Environment.Exit(0);
+        });
     }
 
     // ---- helpers ----
 
     private static string BuildUpdaterScript(int pid, string source, string dest, string exeName, string stagingRoot)
     {
-        // A self-deleting batch: wait for the app (by PID) to exit, mirror the new files over the
-        // install directory with robocopy, relaunch, then clean up the staging folder and itself.
+        // A self-deleting batch: wait for the app (by PID) to exit, then mirror the new files over the
+        // install directory and relaunch. Uses `ping` for delays instead of `timeout`, because
+        // `timeout` fails ("Input redirection is not supported") when launched from a GUI app that has
+        // no console. After the main process exits, WebView2 child processes can briefly keep files
+        // locked, so robocopy is retried in a loop until the locks clear. All output is logged.
         return
 $@"@echo off
 setlocal enableextensions
+title Updating Mesh...
 set ""PID={pid}""
 set ""SRC={source}""
 set ""DST={dest}""
 set ""EXE={exeName}""
 set ""ROOT={stagingRoot}""
+set ""LOG=%TEMP%\mesh-update.log""
+
+echo Updating Mesh, please wait...
+echo [%date% %time%] update start pid=%PID% > ""%LOG%""
 
 REM Wait for the running Mesh process to exit so its files are no longer locked.
 :waitloop
 tasklist /fi ""PID eq %PID%"" 2>nul | find ""%PID%"" >nul
 if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
+    ping 127.0.0.1 -n 2 >nul
     goto waitloop
 )
+echo [%time%] main process exited >> ""%LOG%""
 
-REM Copy the new build over the install directory. Robocopy returns 0-7 on success.
-robocopy ""%SRC%"" ""%DST%"" /E /R:5 /W:2 /NFL /NDL /NJH /NJS /NP >nul
-if %errorlevel% geq 8 (
-    REM Copy failed; relaunch the existing build so the user is not left without an app.
-    start """" ""%DST%\%EXE%""
-    goto cleanup
-)
+REM Grace period so WebView2 child processes can shut down and release their file locks.
+ping 127.0.0.1 -n 5 >nul
 
+REM Copy the new build over the install directory, retrying while files are still locked.
+REM Robocopy exit codes below 8 are success (files copied / nothing to do); 8+ means a failure.
+set /a TRIES=0
+:copyloop
+robocopy ""%SRC%"" ""%DST%"" /E /R:1 /W:2 /NFL /NDL /NJH /NJS /NP >> ""%LOG%""
+if %errorlevel% lss 8 goto copied
+set /a TRIES+=1
+echo [%time%] robocopy blocked by a lock (attempt %TRIES%), retrying >> ""%LOG%""
+if %TRIES% geq 20 goto copyfail
+ping 127.0.0.1 -n 3 >nul
+goto copyloop
+
+:copyfail
+echo [%time%] robocopy FAILED after retries, relaunching existing build >> ""%LOG%""
+start """" ""%DST%\%EXE%""
+goto cleanup
+
+:copied
+echo [%time%] copy complete, relaunching >> ""%LOG%""
 start """" ""%DST%\%EXE%""
 
 :cleanup
-timeout /t 2 /nobreak >nul
+ping 127.0.0.1 -n 3 >nul
 rmdir /s /q ""%ROOT%"" 2>nul
 (goto) 2>nul & del ""%~f0""
 ";
