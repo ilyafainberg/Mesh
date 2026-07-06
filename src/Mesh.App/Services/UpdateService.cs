@@ -78,6 +78,59 @@ public sealed class UpdateService
     public bool IsSupported => OperatingSystem.IsWindows();
 
     /// <summary>
+    /// The newest available update found by a background check, or null when none is known. Shared
+    /// state so the app-wide banner and the Settings panel react to the same result.
+    /// </summary>
+    public UpdateInfo? Available { get; private set; }
+
+    /// <summary>True when the user dismissed the update banner this session (still shown in Settings).</summary>
+    public bool BannerDismissed { get; private set; }
+
+    /// <summary>Raised when <see cref="Available"/> or <see cref="BannerDismissed"/> changes.</summary>
+    public event Action? Changed;
+
+    private Timer? autoTimer;
+
+    /// <summary>
+    /// Starts automatic update checks: one immediately, then every 6 hours. Safe to call more than
+    /// once (later calls are no-ops). No-op on unsupported platforms.
+    /// </summary>
+    public void StartAutoChecks()
+    {
+        if (!IsSupported || autoTimer is not null) return;
+        autoTimer = new Timer(_ => _ = CheckInBackgroundAsync(), null, TimeSpan.Zero, TimeSpan.FromHours(6));
+    }
+
+    /// <summary>
+    /// Checks for an update in the background and, if a newer version exists, records it in
+    /// <see cref="Available"/> and raises <see cref="Changed"/>. Never throws.
+    /// </summary>
+    public async Task CheckInBackgroundAsync()
+    {
+        if (!IsSupported) return;
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var result = await CheckAsync(cts.Token);
+            if (result.Available && result.Info is not null && result.Info.Version > CurrentVersion)
+            {
+                var isNew = Available?.Version != result.Info.Version;
+                Available = result.Info;
+                if (isNew) { BannerDismissed = false; Changed?.Invoke(); }
+            }
+        }
+        catch { /* background check: ignore transient errors */ }
+    }
+
+    /// <summary>Hides the update banner for this session. The update stays available in Settings.</summary>
+    public void DismissBanner()
+    {
+        if (BannerDismissed) return;
+        BannerDismissed = true;
+        Changed?.Invoke();
+    }
+
+    /// <summary>
     /// Query the GitHub API for the latest release and decide whether it is newer than the running build.
     /// </summary>
     public async Task<UpdateCheckResult> CheckAsync(CancellationToken ct = default)

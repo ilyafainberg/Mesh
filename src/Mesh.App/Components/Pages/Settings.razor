@@ -7,6 +7,7 @@
 @inject McpHost McpHostSvc
 @inject IHttpClientFactory HttpFactory
 @inject UpdateService Updater
+@inject IAppControl AppControl
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -455,7 +456,7 @@
                     {
                         <details class="update-notes">
                             <summary>What's new</summary>
-                            <pre>@updateInfo.ReleaseNotes</pre>
+                            <div class="notes-md">@((MarkupString)global::Mesh.App.Services.Markdown.ToHtml(updateInfo.ReleaseNotes))</div>
                         </details>
                     }
                     <div class="model-row">
@@ -483,6 +484,20 @@
                     }
                 </div>
             }
+        </div>
+        }
+
+        @if (AppControl.IsLaunchAtStartupEnabled() || OperatingSystem.IsWindows())
+        {
+        <div class="card-panel">
+            <h3>Application</h3>
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Launch at startup</div>
+                    <div class="field-sub">Start Mesh automatically when you sign in to Windows. It opens minimized to the system tray.</div>
+                </div>
+                <label class="switch"><input type="checkbox" checked="@launchAtStartup" @onchange="OnToggleStartup" aria-label="Launch at startup" /></label>
+            </div>
         </div>
         }
 
@@ -806,6 +821,25 @@
         // Use the list cached at app startup, do NOT reload here (that would reset the selection).
         foundryModels = Foundry.CachedModels.ToList();
         SyncModelCustomFlag();
+
+        // Adopt any update already discovered by the background auto-check so the panel shows it
+        // immediately (for example when the user arrives here via the update banner).
+        if (Updater.Available is not null)
+        {
+            updateAvailable = true;
+            updateInfo = Updater.Available;
+        }
+        Updater.Changed += Refresh;
+
+        launchAtStartup = AppControl.IsLaunchAtStartupEnabled();
+    }
+
+    bool launchAtStartup;
+
+    void OnToggleStartup(ChangeEventArgs e)
+    {
+        launchAtStartup = (bool)(e.Value ?? false);
+        AppControl.SetLaunchAtStartup(launchAtStartup);
     }
     void Refresh()
     {
@@ -1082,5 +1116,6 @@
         Setup.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Foundry.ModelsChanged -= Refresh;
+        Updater.Changed -= Refresh;
     }
 }

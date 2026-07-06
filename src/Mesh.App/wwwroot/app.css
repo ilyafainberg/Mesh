@@ -753,3 +753,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .key-change-banner .kc-text { font-size: .85rem; color: var(--fg-2); flex: 1; }
 .key-change-banner .kc-text strong { color: var(--fg-1); }
 .key-change-banner button { flex: 0 0 auto; }
+
+/* Update available: global banner variant + markdown release notes */
+.global-banner.update { background: var(--brand-tint); border-color: var(--brand-tint-2); color: var(--fg-1); }
+.global-banner.update .bi { color: var(--brand); }
+.update-notes .notes-md { font-size: .82rem; color: var(--fg-2); background: var(--bg-2); border: 1px solid var(--stroke-1); border-radius: var(--radius-m); padding: 8px 12px; margin-top: 6px; max-height: 220px; overflow: auto; }
+.update-notes .notes-md h1, .update-notes .notes-md h2, .update-notes .notes-md h3 { font-size: .9rem; margin: 8px 0 4px; color: var(--fg-1); }
+.update-notes .notes-md ul { margin: 4px 0 4px 18px; }
+.update-notes .notes-md p { margin: 4px 0; }
+.update-notes .notes-md code { background: var(--bg-3); padding: 1px 4px; border-radius: 3px; }

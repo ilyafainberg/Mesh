@@ -7,6 +7,7 @@
 @inject FoundryLocalService Foundry
 @inject NavigationManager Nav
 @inject IAppControl AppControl
+@inject UpdateService Updater
 @implements IDisposable
 
 @if (!State.IsOnboarded)
@@ -56,6 +57,15 @@ else
                         }
                     </div>
                 }
+                @if (Updater.Available is not null && !Updater.BannerDismissed)
+                {
+                    <div class="global-banner update">
+                        <i class="bi bi-arrow-up-circle-fill"></i>
+                        <span class="gb-text">Mesh @Updater.Available.Version.ToString(3) is available.</span>
+                        <a class="gb-link" href="settings">Update</a>
+                        <button class="gb-close" @onclick="Updater.DismissBanner" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
+                    </div>
+                }
                 <div class="content">
                     @Body
                 </div>
@@ -77,6 +87,7 @@ else
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
         Setup.Changed += Refresh;
+        Updater.Changed += Refresh;
 
         // When a toast is clicked, bring the window up and navigate to the relevant page.
 #if WINDOWS
@@ -97,6 +108,9 @@ else
         // shows it instantly without reloading (and without resetting the selection).
         if (State.Profile.Model.Provider == ModelProvider.FoundryLocal)
             _ = Task.Run(() => Foundry.PreloadModelsAsync());
+
+        // Automatic update checks: one now, then periodically. Surfaces the update banner.
+        Updater.StartAutoChecks();
     }
 
     private void Refresh() => InvokeAsync(StateHasChanged);
@@ -106,6 +120,7 @@ else
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
+        Updater.Changed -= Refresh;
 #if WINDOWS
         global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = null;
 #endif

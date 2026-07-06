@@ -25,6 +25,41 @@ public sealed class WindowsAppControl : IAppControl
     public void ShowMainWindow() => Show();
     public void Quit() => QuitApp();
 
+    // "Launch at startup" is stored in the per-user Run key so it works for both the installer and
+    // the portable build, and points at the actual running executable.
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string RunValueName = "Mesh";
+
+    public bool IsLaunchAtStartupEnabled()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
+            var value = key?.GetValue(RunValueName) as string;
+            return !string.IsNullOrWhiteSpace(value);
+        }
+        catch { return false; }
+    }
+
+    public void SetLaunchAtStartup(bool enabled)
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKeyPath, writable: true);
+            if (key is null) return;
+            if (enabled)
+            {
+                var exe = Environment.ProcessPath;
+                if (!string.IsNullOrWhiteSpace(exe)) key.SetValue(RunValueName, $"\"{exe}\"");
+            }
+            else if (key.GetValue(RunValueName) is not null)
+            {
+                key.DeleteValue(RunValueName, throwOnMissingValue: false);
+            }
+        }
+        catch { /* best-effort: a registry failure should not crash the app */ }
+    }
+
     /// <summary>Wires the tray + close-to-tray onto the app's main window. Called once at window creation.</summary>
     public static void AttachTray(Microsoft.UI.Xaml.Window w)
     {

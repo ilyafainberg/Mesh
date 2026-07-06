@@ -13,6 +13,12 @@ public interface IAppControl
 
     /// <summary>Quit the application for good (bypasses close-to-tray).</summary>
     void Quit();
+
+    /// <summary>Whether "launch at Windows startup" is currently enabled for this user.</summary>
+    bool IsLaunchAtStartupEnabled();
+
+    /// <summary>Enables or disables launching this app when the user signs in to Windows.</summary>
+    void SetLaunchAtStartup(bool enabled);
 }
 
 /// <summary>Default no-frills implementation for platforms without a system tray.</summary>
@@ -21,4 +27,8 @@ public sealed class DefaultAppControl : IAppControl
     public void ShowMainWindow() { }
 
     public void Quit() => Microsoft.Maui.Controls.Application.Current?.Quit();
+
+    public bool IsLaunchAtStartupEnabled() => false;
+
+    public void SetLaunchAtStartup(bool enabled) { }
 }
