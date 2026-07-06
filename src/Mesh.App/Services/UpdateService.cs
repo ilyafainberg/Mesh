@@ -55,9 +55,8 @@ public sealed record UpdateCheckResult(bool Available, Version Current, Version?
 public sealed class UpdateService
 {
     // Public releases repo (binaries only). Source lives in the private repo.
-    // Note: the old ilyafainberg/MeshAI path still redirects here, so pre-1.2.3 clients keep updating.
     private const string Owner = "MeshRelayAI";
-    private const string Repo = "MeshAI";
+    private const string Repo = "Mesh";
     private const string AssetPrefix = "Mesh-Client-win-x64";
 
     private readonly IHttpClientFactory httpFactory;
