@@ -264,7 +264,7 @@ public sealed class MeshProfile
     public string RecoveryPrivateKey { get; set; } = ""; // base64 PKCS#8
     public string RecoveryPublicKey { get; set; } = "";  // base64 SubjectPublicKeyInfo
 
-    public string RelayUrl { get; set; } = "https://relay.quonkel.com";
+    public string RelayUrl { get; set; } = "https://meshrelay.net";
     public ModelConfig Model { get; set; } = new();
 
     /// <summary>Optional Google OAuth client id (Desktop app) for connecting Gmail.</summary>
