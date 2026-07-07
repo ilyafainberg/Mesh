@@ -54,10 +54,14 @@ public sealed record UpdateCheckResult(bool Available, Version Current, Version?
 /// </remarks>
 public sealed class UpdateService
 {
-    // Public releases repo (binaries only). Source lives in the private repo.
+    // Public releases repo. Source lives in the private repo. The updater downloads the Windows
+    // installer asset and runs it, so the install/upgrade is a transparent, branded wizard that
+    // uses the Windows Restart Manager to swap files reliably (no manual copy/relaunch dance).
     private const string Owner = "MeshRelayAI";
     private const string Repo = "Mesh";
-    private const string AssetPrefix = "Mesh-Client-win-x64";
+    // The installer asset. Preferred as a raw ".exe"; a ".zip" wrapping the installer is also
+    // accepted (older releases) and unpacked before running.
+    private const string InstallerPrefix = "Mesh-Setup";
 
     private readonly IHttpClientFactory httpFactory;
     private readonly IAppControl appControl;
@@ -163,18 +167,23 @@ public sealed class UpdateService
             long assetSize = 0;
             if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
             {
-                foreach (var a in assets.EnumerateArray())
+                // Prefer a raw installer (.exe); fall back to a zipped installer (.zip).
+                foreach (var wantExe in new[] { true, false })
                 {
-                    var name = a.TryGetProperty("name", out var n) ? n.GetString() : null;
-                    if (name is null) continue;
-                    if (name.StartsWith(AssetPrefix, StringComparison.OrdinalIgnoreCase)
-                        && name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                    foreach (var a in assets.EnumerateArray())
                     {
+                        var name = a.TryGetProperty("name", out var n) ? n.GetString() : null;
+                        if (name is null) continue;
+                        var isExe = name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+                        var isZip = name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
+                        if (!name.StartsWith(InstallerPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (wantExe ? !isExe : !isZip) continue;
                         assetName = name;
                         assetUrl = a.TryGetProperty("browser_download_url", out var u) ? u.GetString() : null;
                         assetSize = a.TryGetProperty("size", out var s) && s.TryGetInt64(out var sv) ? sv : 0;
                         break;
                     }
+                    if (assetUrl is not null) break;
                 }
             }
 
@@ -184,7 +193,7 @@ public sealed class UpdateService
             var newer = latest > CurrentVersion;
             if (!newer || assetUrl is null || assetName is null)
                 return new UpdateCheckResult(false, CurrentVersion, latest, null,
-                    assetUrl is null && newer ? "The latest release has no Windows client asset." : null);
+                    assetUrl is null && newer ? "The latest release has no Windows installer asset." : null);
 
             var info = new UpdateInfo(latest, tag!, assetName, assetUrl, assetSize, notes, htmlUrl);
             return new UpdateCheckResult(true, CurrentVersion, latest, info, null);
@@ -201,8 +210,9 @@ public sealed class UpdateService
     }
 
     /// <summary>
-    /// Download the update asset (reporting byte progress), extract it, and stage a .cmd updater.
-    /// Returns the path to the updater script; call <see cref="ApplyAndExit"/> to run it.
+    /// Download the installer asset (reporting byte progress). If the asset is a zip wrapping the
+    /// installer, it is unpacked. Returns the path to the installer executable; call
+    /// <see cref="ApplyAndExit"/> to run it.
     /// </summary>
     public async Task<string> DownloadAndPrepareAsync(UpdateInfo info, IProgress<UpdateProgress> progress,
         CancellationToken ct = default)
@@ -210,8 +220,8 @@ public sealed class UpdateService
         if (!IsSupported) throw new PlatformNotSupportedException("Updates are only supported on Windows.");
 
         var root = Path.Combine(Path.GetTempPath(), "MeshUpdate", SanitizeTag(info.TagName));
-        var extractDir = Path.Combine(root, "extracted");
-        var zipPath = Path.Combine(root, "client.zip");
+        var isZip = info.AssetName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
+        var downloadPath = Path.Combine(root, isZip ? "installer.zip" : info.AssetName);
 
         // Start clean so a half-finished previous attempt cannot poison this one.
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
@@ -226,7 +236,7 @@ public sealed class UpdateService
             var total = resp.Content.Headers.ContentLength ?? (info.Size > 0 ? info.Size : 0);
 
             await using var src = await resp.Content.ReadAsStreamAsync(ct);
-            await using var dst = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None,
+            await using var dst = new FileStream(downloadPath, FileMode.Create, FileAccess.Write, FileShare.None,
                 bufferSize: 1 << 20, useAsync: true);
 
             var buffer = new byte[1 << 20];
@@ -248,54 +258,43 @@ public sealed class UpdateService
             progress.Report(new UpdateProgress(UpdatePhase.Downloading, received, total, "Download complete"));
         }
 
-        // --- extract ---
-        progress.Report(new UpdateProgress(UpdatePhase.Extracting, 0, 0, "Extracting"));
-        Directory.CreateDirectory(extractDir);
-        await Task.Run(() => ZipFile.ExtractToDirectory(zipPath, extractDir, overwriteFiles: true), ct);
-
-        // The zip contains a single top-level "Mesh-win-x64" folder holding the app. Find the folder
-        // that actually contains the executable so we are robust to packaging changes.
-        var exeName = Path.GetFileName(Environment.ProcessPath) ?? "Mesh.App.exe";
-        var sourceDir = FindAppRoot(extractDir, exeName)
-            ?? throw new InvalidOperationException("Downloaded update did not contain the application.");
-
-        // --- write the updater script ---
-        progress.Report(new UpdateProgress(UpdatePhase.Preparing, 0, 0, "Preparing"));
-        var installDir = AppContext.BaseDirectory.TrimEnd('\\', '/');
-        var batPath = Path.Combine(Path.GetTempPath(), $"mesh-apply-{SanitizeTag(info.TagName)}.cmd");
-        await File.WriteAllTextAsync(batPath,
-            BuildUpdaterScript(Environment.ProcessId, sourceDir, installDir, exeName, root), ct);
+        // --- if the installer came zipped, unpack it and find the .exe ---
+        string installerPath = downloadPath;
+        if (isZip)
+        {
+            progress.Report(new UpdateProgress(UpdatePhase.Extracting, 0, 0, "Extracting"));
+            var extractDir = Path.Combine(root, "installer");
+            Directory.CreateDirectory(extractDir);
+            await Task.Run(() => ZipFile.ExtractToDirectory(downloadPath, extractDir, overwriteFiles: true), ct);
+            installerPath = FindInstaller(extractDir)
+                ?? throw new InvalidOperationException("Downloaded update did not contain an installer.");
+        }
 
         progress.Report(new UpdateProgress(UpdatePhase.ReadyToApply, 0, 0, "Ready to install"));
-        return batPath;
+        return installerPath;
     }
 
     /// <summary>
-    /// Launch the staged updater script (detached) and quit the app so its files can be replaced.
-    /// The script waits for this process to exit, copies the new files in, and relaunches.
+    /// Launch the downloaded installer (a visible, branded wizard) and quit the app so the installer
+    /// can replace files and relaunch. The installer uses the Windows Restart Manager to close any
+    /// lingering instance, so the swap is reliable even if a WebView child is slow to exit.
     /// </summary>
-    public void ApplyAndExit(string batPath)
+    public void ApplyAndExit(string installerPath)
     {
         if (!IsSupported) throw new PlatformNotSupportedException("Updates are only supported on Windows.");
 
-        // Show a small console window so the user sees the update happening (the swap + relaunch can
-        // take 10-30s while WebView2 child processes release their file locks). A silent window made
-        // it look like "nothing happened".
+        // Run the installer visibly (no silent flags) so the user sees exactly what is happening.
         var psi = new ProcessStartInfo
         {
-            FileName = "cmd.exe",
-            Arguments = $"/c \"{batPath}\"",
+            FileName = installerPath,
             UseShellExecute = true,
-            CreateNoWindow = false,
-            WindowStyle = ProcessWindowStyle.Minimized,
-            WorkingDirectory = Path.GetTempPath()
+            WorkingDirectory = Path.GetDirectoryName(installerPath) ?? Path.GetTempPath()
         };
         Process.Start(psi);
 
-        // Quit gracefully on the UI thread, then guarantee the process actually exits shortly after so
-        // the updater's wait loop can proceed even if the graceful quit hangs (close-to-tray, a stuck
-        // WebView, and so on). Without this the app could linger, the swap would never run, and it
-        // would look like nothing happened.
+        // Quit gracefully on the UI thread, then guarantee the process exits shortly after so the
+        // installer never has to fight this process for file locks (the installer's Restart Manager
+        // handling is a backstop, but exiting first keeps the update fast and clean).
         MainThread.BeginInvokeOnMainThread(() =>
         {
             try { appControl.Quit(); } catch { }
@@ -309,75 +308,17 @@ public sealed class UpdateService
 
     // ---- helpers ----
 
-    private static string BuildUpdaterScript(int pid, string source, string dest, string exeName, string stagingRoot)
+    /// <summary>Finds the installer executable inside an extracted zip (top level first, then nested).</summary>
+    private static string? FindInstaller(string extractDir)
     {
-        // A self-deleting batch: wait for the app (by PID) to exit, then mirror the new files over the
-        // install directory and relaunch. Uses `ping` for delays instead of `timeout`, because
-        // `timeout` fails ("Input redirection is not supported") when launched from a GUI app that has
-        // no console. After the main process exits, WebView2 child processes can briefly keep files
-        // locked, so robocopy is retried in a loop until the locks clear. All output is logged.
-        return
-$@"@echo off
-setlocal enableextensions
-title Updating Mesh...
-set ""PID={pid}""
-set ""SRC={source}""
-set ""DST={dest}""
-set ""EXE={exeName}""
-set ""ROOT={stagingRoot}""
-set ""LOG=%TEMP%\mesh-update.log""
+        bool IsInstaller(string p) =>
+            Path.GetFileName(p).StartsWith(InstallerPrefix, StringComparison.OrdinalIgnoreCase)
+            && p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
 
-echo Updating Mesh, please wait...
-echo [%date% %time%] update start pid=%PID% > ""%LOG%""
-
-REM Wait for the running Mesh process to exit so its files are no longer locked.
-:waitloop
-tasklist /fi ""PID eq %PID%"" 2>nul | find ""%PID%"" >nul
-if not errorlevel 1 (
-    ping 127.0.0.1 -n 2 >nul
-    goto waitloop
-)
-echo [%time%] main process exited >> ""%LOG%""
-
-REM Grace period so WebView2 child processes can shut down and release their file locks.
-ping 127.0.0.1 -n 5 >nul
-
-REM Copy the new build over the install directory, retrying while files are still locked.
-REM Robocopy exit codes below 8 are success (files copied / nothing to do); 8+ means a failure.
-set /a TRIES=0
-:copyloop
-robocopy ""%SRC%"" ""%DST%"" /E /R:1 /W:2 /NFL /NDL /NJH /NJS /NP >> ""%LOG%""
-if %errorlevel% lss 8 goto copied
-set /a TRIES+=1
-echo [%time%] robocopy blocked by a lock (attempt %TRIES%), retrying >> ""%LOG%""
-if %TRIES% geq 20 goto copyfail
-ping 127.0.0.1 -n 3 >nul
-goto copyloop
-
-:copyfail
-echo [%time%] robocopy FAILED after retries, relaunching existing build >> ""%LOG%""
-start """" ""%DST%\%EXE%""
-goto cleanup
-
-:copied
-echo [%time%] copy complete, relaunching >> ""%LOG%""
-start """" ""%DST%\%EXE%""
-
-:cleanup
-ping 127.0.0.1 -n 3 >nul
-rmdir /s /q ""%ROOT%"" 2>nul
-(goto) 2>nul & del ""%~f0""
-";
-    }
-
-    private static string? FindAppRoot(string extractDir, string exeName)
-    {
-        if (File.Exists(Path.Combine(extractDir, exeName))) return extractDir;
-        // Look one or two levels down for the folder that holds the executable.
-        foreach (var dir in Directory.EnumerateDirectories(extractDir, "*", SearchOption.AllDirectories))
-        {
-            if (File.Exists(Path.Combine(dir, exeName))) return dir;
-        }
+        foreach (var f in Directory.EnumerateFiles(extractDir, "*.exe", SearchOption.TopDirectoryOnly))
+            if (IsInstaller(f)) return f;
+        foreach (var f in Directory.EnumerateFiles(extractDir, "*.exe", SearchOption.AllDirectories))
+            if (IsInstaller(f)) return f;
         return null;
     }
 

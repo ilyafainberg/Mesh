@@ -461,9 +461,9 @@
             {
                 <div class="field">
                     <div class="update-avail">Version @updateInfo.Version.ToString(3) is ready to install.</div>
-                    <div class="field-hint">Mesh will close and reopen to finish updating. Any unsaved work should be saved first.</div>
+                    <div class="field-hint">Mesh will close and the installer will open to finish updating, then reopen Mesh. Save any unsaved work first.</div>
                     <div class="model-row">
-                        <button class="primary" @onclick="ApplyUpdate">Restart and update</button>
+                        <button class="primary" @onclick="ApplyUpdate">Install update</button>
                         <button class="ghost" @onclick="DismissUpdate">Later</button>
                     </div>
                 </div>
@@ -1075,7 +1075,7 @@
     {
         if (preparedUpdaterPath is null) return;
         updatePhase = UpdatePhase.Applying;
-        updateStatus = "Restarting to install…";
+        updateStatus = "Opening the installer…";
         Updater.ApplyAndExit(preparedUpdaterPath);
     }
 
