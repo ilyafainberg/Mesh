@@ -46,9 +46,9 @@
                         <div class="row-title">@Name(c)</div>
                         <div class="row-sub">@("@" + c.Handle)</div>
                         <div class="chip-row" style="margin-top:6px;">
-                            <label class="chip @(c.Allowed ? "on" : "")">
+                            <label class="chip @(c.Allowed ? "on" : "")" title="Allow this contact's agent to talk to yours">
                                 <input type="checkbox" checked="@c.Allowed" @onchange="e => ToggleAllowed(c, e)" />
-                                @(c.Allowed ? "Allowed" : "Blocked")
+                                <i class="bi bi-check-circle"></i> Allowed
                             </label>
                             <label class="chip @(c.Muted ? "on" : "")" title="No popup notifications for this contact">
                                 <input type="checkbox" checked="@c.Muted" @onchange="e => ToggleMuted(c, e)" />
