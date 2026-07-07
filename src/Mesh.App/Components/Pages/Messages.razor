@@ -177,8 +177,8 @@
                         <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
                             <i class="bi bi-paperclip"></i>
                         </button>
-                        <input @bind="input" @bind:event="oninput" @onkeydown="OnKey"
-                               placeholder="@Placeholder" disabled="@busy" aria-label="Message input" />
+                        <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
+                               placeholder="@Placeholder" disabled="@busy" aria-label="Message input"></textarea>
                         <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
                             <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
                                     title="Send to their agent (it may auto-reply)">
@@ -209,6 +209,9 @@
     string? pinHtml;
     string pinName = "";
     ElementReference scrollEl;
+    ElementReference composerEl;
+    Microsoft.JSInterop.DotNetObjectReference<Messages>? selfRef;
+    bool composerWired;
     int lastCount = -1;
     string? lastActive;
     Dictionary<string, string> editedDrafts = new();
@@ -264,6 +267,14 @@
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (active is null) return;
+
+        if (!composerWired)
+        {
+            composerWired = true;
+            selfRef ??= Microsoft.JSInterop.DotNetObjectReference.Create(this);
+            try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
+        }
+
         var count = State.GetOrCreateConversation(active).Lines.Count;
         // Scroll on new messages or when switching into a conversation.
         if (count != lastCount || active != lastActive)
@@ -273,6 +284,10 @@
             try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
         }
     }
+
+    /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
+    [Microsoft.JSInterop.JSInvokable]
+    public Task SendFromComposer() => Send();
 
     bool IsAllowed(string handle) => State.FindContact(handle)?.Allowed == true;
 
@@ -286,7 +301,7 @@
         finally { reverifying = false; }
     }
 
-    void Select(string handle) { active = handle; confirmDelete = null; State.MarkRead(handle); }
+    void Select(string handle) { active = handle; confirmDelete = null; composerWired = false; State.MarkRead(handle); }
 
     void ClearActive()
     {
@@ -301,6 +316,7 @@
         var h = active;
         active = null;
         confirmDelete = null;
+        composerWired = false;
         State.DeleteConversation(h);
     }
 
@@ -314,14 +330,15 @@
     {
         if (string.IsNullOrWhiteSpace(newHandle)) return;
         active = AppState.Norm(newHandle);
+        composerWired = false;
         State.GetOrCreateConversation(active);
         newHandle = "";
         State.Save();
     }
 
-    async Task OnKey(KeyboardEventArgs e)
+    async Task ResetComposer()
     {
-        if (e.Key == "Enter" && !busy && (!string.IsNullOrWhiteSpace(input) || attachments.Count > 0)) await Send();
+        try { await JS.InvokeVoidAsync("meshUI.resetComposer", composerEl); } catch { }
     }
 
     // Bubble tag: whether a line was addressed to / came from an agent or a person.
@@ -398,6 +415,7 @@
         var files = attachments.ToList();
         input = "";
         attachments.Clear();
+        _ = ResetComposer();
         busy = true;
         try
         {
@@ -479,5 +497,6 @@
     {
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
+        selfRef?.Dispose();
     }
 }

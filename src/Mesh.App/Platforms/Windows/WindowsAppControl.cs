@@ -70,6 +70,19 @@ public sealed class WindowsAppControl : IAppControl
         var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
         appWindow = AppWindow.GetFromWindowId(windowId);
 
+        // Restore the maximized state from the last run, and persist it whenever it changes, so the
+        // window reopens the way the user left it (size/position are handled by WindowGeometry).
+        if (appWindow.Presenter is OverlappedPresenter presenter)
+        {
+            if (Microsoft.Maui.Storage.Preferences.Get("win.maximized", false))
+                presenter.Maximize();
+        }
+        appWindow.Changed += (sender, args) =>
+        {
+            if (sender.Presenter is OverlappedPresenter p)
+                Microsoft.Maui.Storage.Preferences.Set("win.maximized", p.State == OverlappedPresenterState.Maximized);
+        };
+
         // Intercept the window close: hide to tray unless the user really chose Quit.
         appWindow.Closing += (_, args) =>
         {

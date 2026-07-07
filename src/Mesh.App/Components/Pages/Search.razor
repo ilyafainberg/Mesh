@@ -58,9 +58,20 @@
         ran = true;
     }
 
-    // Jump to the conversation for a hit (own-chat hits go to the Me page).
+    // Jump to the conversation for a hit. Own-chat hits open the Me page at the matching topic thread;
+    // contact hits open the Messages page at that conversation.
     void Open(MeshDb.SearchHit hit)
-        => Nav.NavigateTo(hit.Handle == "(me)" ? "" : $"messages?to={Uri.EscapeDataString(hit.Handle)}");
+    {
+        if (hit.Handle == "(me)")
+        {
+            var url = string.IsNullOrEmpty(hit.ThreadId) ? "/" : $"/?thread={Uri.EscapeDataString(hit.ThreadId)}";
+            Nav.NavigateTo(url, forceLoad: false);
+        }
+        else
+        {
+            Nav.NavigateTo($"messages?to={Uri.EscapeDataString(hit.Handle)}");
+        }
+    }
 
     string Who(MeshDb.SearchHit hit)
         => hit.Role == "assistant" ? "your agent" : (hit.Handle == "(me)" ? "you" : "them");

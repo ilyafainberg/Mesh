@@ -66,7 +66,8 @@ public enum LocalToolKind
     FileSystem,
     WorkIq,
     HeadlessBrowser,
-    WebSearch
+    WebSearch,
+    Geolocation
 }
 
 /// <summary>Per-tool grant: whether the local tool is enabled and who (beyond the owner) may use it.</summary>

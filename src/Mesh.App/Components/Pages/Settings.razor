@@ -24,8 +24,8 @@
             </div>
             <div class="field">
                 <label>Display name</label>
-                <input class="full" @bind="display" />
-                <div class="field-hint">Shown to your contacts instead of your handle.</div>
+                <input class="full" value="@display" @onchange="OnDisplayChanged" />
+                <div class="field-hint">Shown to your contacts instead of your handle. Saved automatically.</div>
             </div>
         </div>
 
@@ -184,13 +184,41 @@
                     token budget, so it can pause once that budget is used up for the day.
                 </div>
             </div>
+
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Estimated spend</div>
+                    <div class="field-sub">Approximate cost of your usage, based on the model's published prices. Actual billing comes from your provider.</div>
+                </div>
+                <span>@SpendLabel</span>
+            </div>
+
+            <div class="field" style="margin-top:8px;">
+                <button class="primary" @onclick="ChangeModel" disabled="@Setup.Running">
+                    <i class="bi bi-check-lg"></i> @(Setup.Running ? "Working…" : "Change model")
+                </button>
+                @if (Setup.Running)
+                {
+                    <div class="setup-status running" style="margin-top:12px;">
+                        <span class="spinner"></span>
+                        <span>@(Setup.Status ?? "Working…")</span>
+                    </div>
+                }
+                else if (Setup.Success is not null)
+                {
+                    <div class="setup-status @(Setup.Success == true ? "ok" : "err")" style="margin-top:12px;">
+                        <i class="bi @(Setup.Success == true ? "bi-check-circle" : "bi-exclamation-triangle")"></i>
+                        <span>@Setup.Status</span>
+                    </div>
+                }
+            </div>
         </div>
 
         <div class="card-panel">
             <h3>Agent responses</h3>
             <div class="field">
                 <label>Approval before replying</label>
-                <select class="full" @bind="approvalMode">
+                <select class="full" value="@approvalMode" @onchange="OnApprovalChanged">
                     <option value="Off">Auto-reply (no approval)</option>
                     <option value="PerCircle">Approve per circle (uses circle settings)</option>
                     <option value="All">Approve every reply</option>
@@ -202,7 +230,7 @@
                     <div class="field-label">Interactive apps</div>
                     <div class="field-sub">Let agents send interactive mini-apps in messages. They run sandboxed and never auto-run.</div>
                 </div>
-                <label class="switch"><input type="checkbox" checked="@allowApps" @onchange="e => allowApps = (bool)(e.Value ?? false)" aria-label="Interactive apps" /></label>
+                <label class="switch"><input type="checkbox" checked="@allowApps" @onchange="OnAllowAppsChanged" aria-label="Interactive apps" /></label>
             </div>
             <div class="field-row">
                 <div>
@@ -231,7 +259,7 @@
             <h3>Agent budget</h3>
             <div class="field">
                 <label>Automatic replies per day</label>
-                <input class="full" type="number" min="0" @bind="replyBudget" />
+                <input class="full" type="number" min="0" value="@replyBudget" @onchange="OnBudgetChanged" />
                 <div class="field-hint">
                     Cap how many automatic agent replies run per day. Each reply calls your model, so this protects
                     your usage and cost. Set to 0 for unlimited.
@@ -385,7 +413,7 @@
             <div class="field">
                 <label>Relay URL</label>
                 <div class="model-row">
-                    <input class="full" @bind="relay" aria-label="Relay URL" />
+                    <input class="full" value="@relay" @onchange="OnRelayChanged" aria-label="Relay URL" />
                     <button class="ghost" @onclick="TestRelay" disabled="@testingRelay" title="Check this relay is reachable">
                         @(testingRelay ? "Testing…" : "Test")
                     </button>
@@ -393,9 +421,8 @@
                 @if (relayTestMsg is not null) { <div class="field-hint @(relayTestOk ? "" : "err-text")">@relayTestMsg</div> }
                 <div class="field-hint">
                     The default relay is run by Mesh. You can run your own, or use anyone's:
-                    the relay is open source, see <b>Open source &amp; security</b> below.
-                    A handle is registered per relay, so switching relays
-                    re-registers your handle there.
+                    the relay is open source (see the About page). A handle is registered per relay,
+                    so switching relays re-registers your handle there. Changes apply automatically.
                 </div>
             </div>
             <div class="field-row">
@@ -404,28 +431,6 @@
                     <i class="bi @(Mesh.Connected ? "bi-check-circle-fill" : "bi-circle")"></i>
                     @(Mesh.Connected ? "connected" : "offline")
                 </span>
-            </div>
-        </div>
-
-        <div class="card-panel">
-            <h3>Open source &amp; security</h3>
-            <div class="field-hint" style="margin-bottom:12px;">
-                Mesh is end-to-end encrypted: the relay only ever routes sealed messages and
-                never holds a key, so it cannot read what you send. You don't have to take our
-                word for it. The relay and the encryption library are open source, so anyone
-                can read exactly what they do and verify these claims.
-            </div>
-            <div class="model-row">
-                <button class="ghost" @onclick='() => OpenUrl("https://github.com/MeshRelayAI/Relay")' title="Open the relay source on GitHub">
-                    <i class="bi bi-hdd-network"></i> Relay source <span class="muted">(AGPL-3.0)</span>
-                </button>
-                <button class="ghost" @onclick='() => OpenUrl("https://github.com/MeshRelayAI/Shared")' title="Open the encryption library source on GitHub">
-                    <i class="bi bi-shield-lock"></i> Encryption library <span class="muted">(Apache-2.0)</span>
-                </button>
-            </div>
-            <div class="field-hint" style="margin-top:10px;">
-                For its message encryption and protocol, Mesh includes the Apache-2.0 licensed
-                <b>Mesh.Shared</b> library linked above.
             </div>
         </div>
 
@@ -593,24 +598,6 @@
             }
         </div>
 
-        <div class="actions">
-            <button class="primary" @onclick="SaveAll" disabled="@Setup.Running"><i class="bi bi-check-lg"></i> @(Setup.Running ? "Working…" : "Save")</button>
-            <button class="ghost" @onclick="Reconnect"><i class="bi bi-arrow-repeat"></i> Reconnect relay</button>
-        </div>
-        @if (Setup.Running)
-        {
-            <div class="setup-status running" style="margin-top:12px;">
-                <span class="spinner"></span>
-                <span>@(Setup.Status ?? "Working…")</span>
-            </div>
-        }
-        else if (Setup.Success is not null)
-        {
-            <div class="setup-status @(Setup.Success == true ? "ok" : "err")" style="margin-top:12px;">
-                <i class="bi @(Setup.Success == true ? "bi-check-circle" : "bi-exclamation-triangle")"></i>
-                <span>@Setup.Status</span>
-            </div>
-        }
     </div>
 </div>
 
@@ -657,6 +644,7 @@
         new(LocalToolKind.Browser, "Browser", "bi-globe2", "Drive a real web browser (navigate, click, type, screenshot)."),
         new(LocalToolKind.HeadlessBrowser, "Headless browser", "bi-window-dock", "Drive a background (invisible) web browser: navigate, read, click, type, screenshot."),
         new(LocalToolKind.WebSearch, "Web search", "bi-search", "Search the web (Bing, Google, or DuckDuckGo) and return top results."),
+        new(LocalToolKind.Geolocation, "Location", "bi-geo-alt", "Report this device's approximate location (uses the OS location service, falling back to IP)."),
         new(LocalToolKind.FileSystem, "Files", "bi-folder", "Read, write and convert files on this machine."),
         new(LocalToolKind.WorkIq, "WorkIQ", "bi-microsoft", "Ask about your Microsoft 365 world: email, Teams, meetings, files, people."),
     };
@@ -924,13 +912,15 @@
         finally { loadingModels = false; await InvokeAsync(StateHasChanged); }
     }
 
-    async Task SaveAll()
+    async Task ChangeModel()
     {
         var apiKeyToSet = apiKey;
         apiKey = "";
 
         // The save + model test runs in a background singleton, so it keeps going
-        // (and stays observable) even if the user navigates away from Settings.
+        // (and stays observable) even if the user navigates away from Settings. The non-model
+        // fields (display name, relay, approval, budget) auto-save on change; they are set here too
+        // so a single "Change model" also captures anything the user just edited.
         Setup.SaveAndTest(p =>
         {
             p.DisplayName = display.Trim();
@@ -949,6 +939,52 @@
         State.ResetTokenCounter();
 
         await Mesh.RegisterAsync();
+    }
+
+    // ---- auto-save for non-model settings (persist immediately on change) ----
+    void OnDisplayChanged(ChangeEventArgs e)
+    {
+        display = e.Value?.ToString() ?? "";
+        Toggle(p => p.DisplayName = display.Trim());
+    }
+
+    void OnApprovalChanged(ChangeEventArgs e)
+    {
+        approvalMode = e.Value?.ToString() ?? "PerCircle";
+        Toggle(p => p.ApprovalMode = Enum.Parse<ApprovalMode>(approvalMode));
+    }
+
+    void OnAllowAppsChanged(ChangeEventArgs e)
+    {
+        allowApps = (bool)(e.Value ?? false);
+        Toggle(p => p.AllowInteractiveApps = allowApps);
+    }
+
+    void OnBudgetChanged(ChangeEventArgs e)
+    {
+        replyBudget = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : 0;
+        Toggle(p => p.AgentDailyReplyBudget = replyBudget);
+    }
+
+    async Task OnRelayChanged(ChangeEventArgs e)
+    {
+        relay = e.Value?.ToString() ?? "";
+        var url = relay.Trim();
+        if (string.IsNullOrWhiteSpace(url)) return;
+        Toggle(p => p.RelayUrl = url);
+        // A handle is registered per relay, so switching relays re-registers there and reconnects.
+        try { await Mesh.RegisterAsync(); await Mesh.ConnectAsync(); } catch { }
+    }
+
+    // Estimated spend for the current model's live token counter (null when the model has no price).
+    string SpendLabel
+    {
+        get
+        {
+            var t = State.Profile.Tokens;
+            var cost = ModelCatalog.EstimateCost(State.Profile.Model.Model, t.PromptTokens, t.CompletionTokens);
+            return cost is null ? "not available for this model" : $"~${cost.Value:0.00}";
+        }
     }
 
     void ResetCounter() => State.ResetTokenCounter();
@@ -972,7 +1008,7 @@
             if (resp.IsSuccessStatusCode)
             {
                 relayTestOk = true;
-                relayTestMsg = "Relay is reachable. Save to switch to it.";
+                relayTestMsg = "Relay is reachable.";
             }
             else
             {
@@ -1098,8 +1134,6 @@
     string? preparedUpdaterPath;
 
     void Toggle(Action<Mesh.App.Domain.MeshProfile> change) => State.Mutate(change);
-
-    async Task Reconnect() => await Mesh.ConnectAsync();
 
     async Task CreateInvite()
     {

@@ -1,212 +1,32 @@
-.backup {
-    margin: 0;
-    padding: 32px 28px 48px;
-    font-family: "Segoe UI", system-ui, sans-serif;
-    color: #1f2328;
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow-y: auto;
-    width: 100%;
-    box-sizing: border-box;
-}
-
-.backup > * {
-    max-width: 720px;
-    margin-left: auto;
-    margin-right: auto;
-}
-
-.backup-head h1 {
-    font-size: 24px;
-    font-weight: 600;
-    margin: 0 0 8px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
-
-.backup-head h1 i {
-    color: #4f46e5;
-}
-
-.lead {
-    color: #57606a;
-    font-size: 14px;
-    line-height: 1.5;
-    margin: 0 0 24px;
-}
-
-.card {
-    background: #ffffff;
-    border: 1px solid #e6e8eb;
-    border-radius: 12px;
-    padding: 22px 22px 20px;
-    margin-bottom: 22px;
-    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
-}
-
-.card-head {
-    display: flex;
-    align-items: flex-start;
-    gap: 14px;
-    margin-bottom: 18px;
-}
-
-.card-head i {
-    font-size: 22px;
-    color: #4f46e5;
-    margin-top: 2px;
-}
-
-.card-head h2 {
-    font-size: 17px;
-    font-weight: 600;
-    margin: 0 0 3px;
-}
-
-.card-head .muted {
-    color: #6b7280;
-    font-size: 13px;
-    margin: 0;
-}
-
-label {
+.path {
     display: block;
-    font-size: 13px;
-    font-weight: 600;
-    color: #374151;
-    margin: 14px 0 6px;
+    margin-top: 8px;
+    word-break: break-all;
+    background: var(--bg-3);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-s);
+    padding: 6px 8px;
+    font-size: .8rem;
+    color: var(--fg-1);
+    font-family: "Cascadia Code", Consolas, monospace;
 }
 
-.muted {
-    font-weight: 400;
-    color: #9199a3;
-}
-
-input.full {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 10px 12px;
-    border: 1px solid #d5d9de;
-    border-radius: 8px;
-    font-size: 14px;
-    background: #fbfcfd;
-    color: #1f2328;
-    transition: border-color .15s, box-shadow .15s;
-}
-
-input.full:focus {
-    outline: none;
-    border-color: #4f46e5;
-    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.15);
-    background: #fff;
-}
-
-button {
-    font-family: inherit;
-    cursor: pointer;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    padding: 10px 18px;
-    margin-top: 16px;
-    transition: background .15s, border-color .15s, opacity .15s;
-}
-
-button:disabled {
-    opacity: .55;
-    cursor: default;
-}
-
-button.full {
-    width: 100%;
-    box-sizing: border-box;
-}
-
-.primary {
-    background: #4f46e5;
-    color: #fff;
-    border: 1px solid #4f46e5;
-}
-
-.primary:not(:disabled):hover {
-    background: #4338ca;
-}
-
-.ghost {
-    background: #fff;
-    color: #374151;
-    border: 1px solid #d5d9de;
-}
-
-.ghost:not(:disabled):hover {
-    background: #f4f5f7;
-}
-
-.hint {
-    color: #6b7280;
-    font-size: 12.5px;
-    line-height: 1.5;
-    margin: 12px 0 0;
-}
-
-.err {
-    color: #b42318;
-    background: #fef3f2;
-    border: 1px solid #fecdc9;
-    border-radius: 8px;
-    padding: 9px 12px;
-    font-size: 13px;
-    margin: 14px 0 0;
-}
-
-.ok {
-    background: #edfcf2;
-    border: 1px solid #b9ecc9;
-    border-radius: 8px;
-    padding: 12px 14px;
-    margin: 14px 0 0;
-}
-
-.ok p {
-    margin: 0 0 8px;
-    color: #17663a;
-    font-size: 13px;
-    line-height: 1.5;
-}
-
-.ok-inline {
-    color: #17663a;
-    font-size: 13px;
-    margin: 14px 0 0;
+.ok-note {
+    color: var(--ok);
+    font-size: .85rem;
+    margin: 0;
     display: flex;
     align-items: center;
     gap: 6px;
 }
 
-.path {
-    display: block;
-    word-break: break-all;
-    background: #fff;
-    border: 1px solid #cdeBD8;
-    border-radius: 6px;
-    padding: 8px 10px;
-    font-size: 12px;
-    color: #1f2328;
-    font-family: "Cascadia Code", Consolas, monospace;
-}
-
 .restored {
-    font-size: 14px;
-    margin: 0 0 6px;
-}
-
-.authorize {
-    margin-top: 6px;
+    font-size: .9rem;
+    margin: 0 0 12px;
 }
 
 .link-box {
     margin-top: 18px;
     padding-top: 18px;
-    border-top: 1px solid #eceef1;
+    border-top: 1px solid var(--stroke-1);
 }

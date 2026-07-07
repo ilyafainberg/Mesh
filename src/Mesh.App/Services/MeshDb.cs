@@ -381,8 +381,8 @@ public sealed class MeshDb : IDisposable
         tx.Commit();
     }
 
-    /// <summary>A single search hit across conversations and own-chat.</summary>
-    public sealed record SearchHit(string Handle, string Role, string Text, DateTimeOffset At);
+    /// <summary>A single search hit across conversations and own-chat. ThreadId is set for "Me" hits.</summary>
+    public sealed record SearchHit(string Handle, string Role, string Text, DateTimeOffset At, string? ThreadId);
 
     /// <summary>Full-text-ish search over all chat history (case-insensitive LIKE). Newest first.</summary>
     public List<SearchHit> Search(string query, int limit = 100)
@@ -392,15 +392,17 @@ public sealed class MeshDb : IDisposable
         var like = "%" + query.Trim() + "%";
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-            SELECT handle, role, text, at FROM chat_lines WHERE text LIKE $q COLLATE NOCASE
+            SELECT handle, role, text, at, NULL AS thread_id FROM chat_lines WHERE text LIKE $q COLLATE NOCASE
             UNION ALL
-            SELECT '(me)' AS handle, role, text, at FROM own_chat WHERE text LIKE $q COLLATE NOCASE
+            SELECT '(me)' AS handle, role, text, at, thread_id FROM own_chat
+                WHERE thread_id IS NOT NULL AND text LIKE $q COLLATE NOCASE
             ORDER BY at DESC LIMIT $lim;";
         cmd.Parameters.AddWithValue("$q", like);
         cmd.Parameters.AddWithValue("$lim", limit);
         using var r = cmd.ExecuteReader();
         while (r.Read())
-            hits.Add(new SearchHit(r.GetString(0), r.GetString(1), r.GetString(2), ParseAt(r.GetString(3))));
+            hits.Add(new SearchHit(r.GetString(0), r.GetString(1), r.GetString(2), ParseAt(r.GetString(3)),
+                r.IsDBNull(4) ? null : r.GetString(4)));
         return hits;
     }
 

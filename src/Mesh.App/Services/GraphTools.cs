@@ -406,6 +406,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         LocalToolKind.Browser => new BrowserTool(media),
         LocalToolKind.HeadlessBrowser => new HeadlessBrowserTool(media),
         LocalToolKind.WebSearch => new WebSearchTool(),
+        LocalToolKind.Geolocation => new GeoLocationTool(httpFactory),
         LocalToolKind.FileSystem => new FileSystemTool(extractor),
         LocalToolKind.WorkIq => new AskWorkIqTool(),
         _ => null

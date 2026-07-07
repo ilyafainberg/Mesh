@@ -4,6 +4,7 @@
 @inject MeshClient Mesh
 @inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
+@inject NavigationManager Nav
 @implements IDisposable
 
 <div class="split">
@@ -133,7 +134,8 @@
                             <i class="bi bi-house-gear"></i>
                         </button>
                     }
-                    <input @bind="input" @bind:event="oninput" @onkeydown="OnKey" placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" aria-label="Message your assistant" />
+                    <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
+                              placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" aria-label="Message your assistant"></textarea>
                     <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send" aria-label="Send">
                         <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
                     </button>
@@ -168,7 +170,11 @@
     string? pinHtml;
     string pinName = "";
     ElementReference scrollEl;
+    ElementReference composerEl;
+    Microsoft.JSInterop.DotNetObjectReference<Home>? selfRef;
+    bool composerWired;
     int lastCount = -1;
+    bool lastBusy;
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
@@ -200,22 +206,53 @@
     protected override void OnInitialized()
     {
         State.Changed += Refresh;
-        // Land in the most recent thread if one exists.
-        if (activeThread is null && State.Profile.OwnThreads.Count > 0)
+        // Deep-link: /?thread=id opens that topic (used by Search). Otherwise land in the most recent.
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        var wanted = ParseQueryValue(uri.Query, "thread");
+        if (!string.IsNullOrWhiteSpace(wanted) && State.Profile.OwnThreads.Any(t => t.Id == wanted))
+            activeThread = wanted;
+        else if (activeThread is null && State.Profile.OwnThreads.Count > 0)
             activeThread = State.Profile.OwnThreads[^1].Id;
+    }
+
+    static string? ParseQueryValue(string queryString, string key)
+    {
+        if (string.IsNullOrEmpty(queryString)) return null;
+        foreach (var pair in queryString.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var eq = pair.IndexOf('=');
+            if (eq <= 0) continue;
+            if (Uri.UnescapeDataString(pair[..eq]) == key) return Uri.UnescapeDataString(pair[(eq + 1)..]);
+        }
+        return null;
     }
 
     void Refresh() => InvokeAsync(StateHasChanged);
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        var count = (Active?.Lines.Count ?? 0) + (busy ? 1 : 0);
-        if (firstRender || count != lastCount)
+        if (firstRender && !composerWired)
+        {
+            composerWired = true;
+            selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
+            try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
+        }
+
+        // Scroll on first paint, when a line is added, AND when the agent finishes (busy true->false):
+        // the reply is added while busy is still true, so tracking busy transitions guarantees the
+        // final answer scrolls into view even if its line count collides with an earlier render.
+        var count = Active?.Lines.Count ?? 0;
+        if (firstRender || count != lastCount || busy != lastBusy)
         {
             lastCount = count;
+            lastBusy = busy;
             try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
         }
     }
+
+    /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
+    [Microsoft.JSInterop.JSInvokable]
+    public Task SendFromComposer() => Send();
 
     void Select(string id) { activeThread = id; confirmDelete = false; renaming = false; }
 
@@ -264,9 +301,9 @@
 
     void ToggleWidget() { widgetMode = !widgetMode; }
 
-    async Task OnKey(KeyboardEventArgs e)
+    async Task ResetComposer()
     {
-        if (e.Key == "Enter" && !busy && (!string.IsNullOrWhiteSpace(input) || attachments.Count > 0)) await Send();
+        try { await JS.InvokeVoidAsync("meshUI.resetComposer", composerEl); } catch { }
     }
 
     async Task PickFile()
@@ -313,6 +350,7 @@
         var files = attachments.ToList();
         input = "";
         attachments.Clear();
+        _ = ResetComposer();
         busy = true;
         try
         {
@@ -381,5 +419,9 @@
         pinName = "";
     }
 
-    public void Dispose() => State.Changed -= Refresh;
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        selfRef?.Dispose();
+    }
 }

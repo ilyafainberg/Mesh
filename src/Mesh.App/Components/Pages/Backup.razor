@@ -2,88 +2,88 @@
 @inject AppState State
 @inject MeshClient Mesh
 
-<div class="backup">
-    <header class="backup-head">
-        <h1><i class="bi bi-shield-lock"></i> Backup and move devices</h1>
-        <p class="lead">Move your identity to a new device with a passphrase-encrypted backup. The backup carries all your data plus the handle recovery key, but never your device signing keys. Each device keeps its own key.</p>
-    </header>
-
-    <section class="card">
-        <div class="card-head">
-            <i class="bi bi-box-arrow-up"></i>
-            <div>
-                <h2>Create a backup</h2>
-                <p class="muted">On this (working) device, make an encrypted file you can carry to a new device.</p>
-            </div>
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-shield-lock"></i> Backup and move devices</h2>
         </div>
+        <p class="muted">Move your identity to a new device with a passphrase-encrypted backup. The backup carries all your data plus the handle recovery key, but never your device signing keys. Each device keeps its own key.</p>
 
-        <label>Passphrase</label>
-        <input class="full" type="password" @bind="createPass" placeholder="at least 8 characters" />
-        <label>Confirm passphrase</label>
-        <input class="full" type="password" @bind="confirmPass" placeholder="re-enter the passphrase" />
+        <div class="card-panel">
+            <h3><i class="bi bi-box-arrow-up"></i> Create a backup</h3>
+            <div class="field-hint" style="margin-bottom:12px;">On this (working) device, make an encrypted file you can carry to a new device.</div>
 
-        <button class="primary" disabled="@busyCreate" @onclick="CreateBackup">
-            @(busyCreate ? "Creating..." : "Create backup file")
-        </button>
-
-        @if (createError is not null) { <p class="err">@createError</p> }
-        @if (createMsg is not null)
-        {
-            <div class="ok">
-                <p>@createMsg</p>
-                @if (savedPath is not null)
-                {
-                    <code class="path">@savedPath</code>
-                }
+            <div class="field">
+                <label>Passphrase</label>
+                <input class="full" type="password" @bind="createPass" placeholder="at least 8 characters" />
             </div>
-        }
-        <p class="hint">Keep the passphrase safe and separate from the file. Without it the backup cannot be opened.</p>
-    </section>
-
-    <section class="card">
-        <div class="card-head">
-            <i class="bi bi-box-arrow-in-down"></i>
-            <div>
-                <h2>Restore a backup onto this device</h2>
-                <p class="muted">Import your identity here, then authorize this device to talk under the same handle.</p>
+            <div class="field">
+                <label>Confirm passphrase</label>
+                <input class="full" type="password" @bind="confirmPass" placeholder="re-enter the passphrase" />
             </div>
-        </div>
 
-        @if (!restoreImported)
-        {
-            <label>Relay URL</label>
-            <input class="full" @bind="restoreRelay" placeholder="https://mesh-relay...azurecontainerapps.io" />
-            <label>Backup passphrase</label>
-            <input class="full" type="password" @bind="restorePass" placeholder="the passphrase you set when you made the backup" />
-
-            <button class="primary" disabled="@(busyRestore || !ValidRestore)" @onclick="PickAndImport">
-                @(busyRestore ? "Restoring..." : "Choose backup file and restore")
+            <button class="primary" disabled="@busyCreate" @onclick="CreateBackup">
+                @(busyCreate ? "Creating..." : "Create backup file")
             </button>
-            @if (restoreError is not null) { <p class="err">@restoreError</p> }
-        }
-        else
-        {
-            <p class="restored">Restored <b>@("@")@State.Profile.Handle</b>. Pick how to authorize this device.</p>
 
-            <div class="authorize">
-                <button class="primary full" disabled="@busyRestore" @onclick="RecoverThisDevice">
-                    @(busyRestore ? "Working..." : "This is a new device, my old device is gone")
+            @if (createError is not null) { <p class="err-text">@createError</p> }
+            @if (createMsg is not null)
+            {
+                <div class="field" style="margin-top:12px;">
+                    <p class="ok-note"><i class="bi bi-check-circle"></i> @createMsg</p>
+                    @if (savedPath is not null)
+                    {
+                        <code class="path">@savedPath</code>
+                    }
+                </div>
+            }
+            <div class="field-hint" style="margin-top:12px;">Keep the passphrase safe and separate from the file. Without it the backup cannot be opened.</div>
+        </div>
+
+        <div class="card-panel">
+            <h3><i class="bi bi-box-arrow-in-down"></i> Restore a backup onto this device</h3>
+            <div class="field-hint" style="margin-bottom:12px;">Import your identity here, then authorize this device to talk under the same handle.</div>
+
+            @if (!restoreImported)
+            {
+                <div class="field">
+                    <label>Relay URL</label>
+                    <input class="full" @bind="restoreRelay" placeholder="https://mesh-relay...azurecontainerapps.io" />
+                </div>
+                <div class="field">
+                    <label>Backup passphrase</label>
+                    <input class="full" type="password" @bind="restorePass" placeholder="the passphrase you set when you made the backup" />
+                </div>
+
+                <button class="primary" disabled="@(busyRestore || !ValidRestore)" @onclick="PickAndImport">
+                    @(busyRestore ? "Restoring..." : "Choose backup file and restore")
                 </button>
-                <p class="hint">Uses the recovery key from your backup to re-authorize this device.</p>
-            </div>
+                @if (restoreError is not null) { <p class="err-text">@restoreError</p> }
+            }
+            else
+            {
+                <p class="restored">Restored <b>@("@")@State.Profile.Handle</b>. Pick how to authorize this device.</p>
 
-            <div class="authorize link-box">
-                <label>Link code <span class="muted">(from your old device: Settings, Link a device)</span></label>
-                <input class="full" @bind="linkCode" placeholder="paste code" />
-                <button class="ghost full" disabled="@(busyRestore || linkCode.Trim().Length < 6)" @onclick="LinkThisDevice">
-                    My old device still works, link with this code
-                </button>
-            </div>
+                <div class="field">
+                    <button class="primary full" disabled="@busyRestore" @onclick="RecoverThisDevice">
+                        @(busyRestore ? "Working..." : "This is a new device, my old device is gone")
+                    </button>
+                    <div class="field-hint">Uses the recovery key from your backup to re-authorize this device.</div>
+                </div>
 
-            @if (restoreError is not null) { <p class="err">@restoreError</p> }
-            @if (restoreMsg is not null) { <p class="ok-inline"><i class="bi bi-check-circle"></i> @restoreMsg</p> }
-        }
-    </section>
+                <div class="field link-box">
+                    <label>Link code <span class="muted">(from your old device: Settings, Link a device)</span></label>
+                    <input class="full" @bind="linkCode" placeholder="paste code" />
+                    <button class="ghost full" style="margin-top:8px;" disabled="@(busyRestore || linkCode.Trim().Length < 6)" @onclick="LinkThisDevice">
+                        My old device still works, link with this code
+                    </button>
+                </div>
+
+                @if (restoreError is not null) { <p class="err-text">@restoreError</p> }
+                @if (restoreMsg is not null) { <p class="ok-note"><i class="bi bi-check-circle"></i> @restoreMsg</p> }
+            }
+        </div>
+    </div>
 </div>
 
 @code {

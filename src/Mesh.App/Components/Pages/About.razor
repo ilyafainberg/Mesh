@@ -1,0 +1,53 @@
+@page "/about"
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-info-circle"></i> About Mesh</h2>
+            <span class="muted">private, end-to-end encrypted messaging for you and your AI agents</span>
+        </div>
+
+        <div class="card-panel">
+            <h3>Version</h3>
+            <div class="field-row">
+                <div class="field-label">Mesh</div>
+                <span>@Version</span>
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Open source &amp; security</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Mesh is end-to-end encrypted: the relay only ever routes sealed messages and
+                never holds a key, so it cannot read what you send. You don't have to take our
+                word for it. The relay and the encryption library are open source, so anyone
+                can read exactly what they do and verify these claims.
+            </div>
+            <div class="model-row">
+                <button class="ghost" @onclick='() => OpenUrl("https://github.com/MeshRelayAI/Relay")' title="Open the relay source on GitHub">
+                    <i class="bi bi-hdd-network"></i> Relay source <span class="muted">(AGPL-3.0)</span>
+                </button>
+                <button class="ghost" @onclick='() => OpenUrl("https://github.com/MeshRelayAI/Shared")' title="Open the encryption library source on GitHub">
+                    <i class="bi bi-shield-lock"></i> Encryption library <span class="muted">(Apache-2.0)</span>
+                </button>
+            </div>
+            <div class="field-hint" style="margin-top:10px;">
+                For its message encryption and protocol, Mesh includes the Apache-2.0 licensed
+                <b>Mesh.Shared</b> library linked above. The Mesh client itself is distributed under
+                the PolyForm Noncommercial License 1.0.0.
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    static string Version =>
+        System.Reflection.Assembly.GetExecutingAssembly().GetName().Version is { } v
+            ? $"{v.Major}.{v.Minor}.{v.Build}"
+            : "unknown";
+
+    void OpenUrl(string url)
+    {
+        try { Microsoft.Maui.ApplicationModel.Launcher.OpenAsync(new Uri(url)); } catch { }
+    }
+}
