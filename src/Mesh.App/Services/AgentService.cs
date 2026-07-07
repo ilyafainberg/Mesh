@@ -141,6 +141,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var contact = state.FindContact(fromHandle);
         var circles = contact?.Circles ?? new List<string>();
 
+        // The agent only sees the agent-to-agent exchange, never person-to-person messages the
+        // contact addressed directly to the human owner (Via == "person"). Those are private to
+        // the owner and must not steer or leak into the agent's replies.
+        var agentHistory = history.Where(l => l.Via != "person").ToList();
+
         // Tools scoped to this contact's circles (whole-source or per-folder grants).
         static bool Visible(string vis, List<string> cs) =>
             vis == "public" || (vis.StartsWith("shared:") && cs.Contains(vis["shared:".Length..]));
@@ -155,7 +160,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         // owner's global counter) so the owner can see per-contact spend in Messages.
         string reply;
         using (meter.BeginScope((pt, cc) => state.AddContactTokens(fromHandle, pt, cc)))
-            reply = await model.CompleteWithToolsAsync(sys, Window(history, p.Model.Provider), agentTools, ct);
+            reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct);
         return ExpandWidgets(reply, widgets);
     }
 

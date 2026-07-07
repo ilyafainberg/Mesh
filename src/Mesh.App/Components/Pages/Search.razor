@@ -63,7 +63,7 @@
         => Nav.NavigateTo(hit.Handle == "(me)" ? "" : $"messages?to={Uri.EscapeDataString(hit.Handle)}");
 
     string Who(MeshDb.SearchHit hit)
-        => hit.Role == "assistant" ? (hit.Handle == "(me)" ? "your agent" : "you") : (hit.Handle == "(me)" ? "you" : "them");
+        => hit.Role == "assistant" ? "your agent" : (hit.Handle == "(me)" ? "you" : "them");
 
     static string Snippet(string text)
     {
