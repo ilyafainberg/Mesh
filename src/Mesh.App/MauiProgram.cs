@@ -82,6 +82,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<SourceBrowser>();
 		builder.Services.AddSingleton<FileImporter>();
 		builder.Services.AddSingleton<AgentService>();
+		builder.Services.AddSingleton<SkillMarketplaceService>();
 		builder.Services.AddSingleton<ModelSetupService>();
 		builder.Services.AddSingleton<UpdateService>();
 		builder.Services.AddSingleton<MeshClient>();
@@ -91,6 +92,13 @@ public static class MauiProgram
 		builder.Logging.AddDebug();
 #endif
 
-		return builder.Build();
+		var app = builder.Build();
+		// Auto-update marketplace-imported skills in the background at startup (never blocks launch).
+		_ = Task.Run(async () =>
+		{
+			try { await app.Services.GetRequiredService<SkillMarketplaceService>().SyncAllAsync(); }
+			catch { /* startup sync is best-effort */ }
+		});
+		return app;
 	}
 }

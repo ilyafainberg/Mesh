@@ -139,6 +139,25 @@ public sealed class Skill
     public string Instructions { get; set; } = "";
     public string Visibility { get; set; } = "private";
     public bool Enabled { get; set; } = true;
+
+    /// <summary>Marketplace this skill was imported from. Null means a local, user-authored skill.</summary>
+    public string? SourceMarketplaceId { get; set; }
+    /// <summary>The skill's id within its source marketplace (used to match on auto-update).</summary>
+    public string? SourceSkillId { get; set; }
+    /// <summary>Version string reported by the marketplace, if any.</summary>
+    public string? Version { get; set; }
+}
+
+/// <summary>A remote catalog of importable skills, addressed by a JSON index URL.</summary>
+public sealed class SkillMarketplace
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("n");
+    /// <summary>Display name (from the index, else the URL host).</summary>
+    public string Name { get; set; } = "";
+    /// <summary>URL of the JSON index.</summary>
+    public string Url { get; set; } = "";
+    public DateTimeOffset AddedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? LastSyncedAt { get; set; }
 }
 
 /// <summary>A saved interactive mini-app (self-contained HTML) the user can reuse and share.</summary>
@@ -308,6 +327,7 @@ public sealed class MeshProfile
 
     public List<KnowledgeItem> Knowledge { get; set; } = new();
     public List<Skill> Skills { get; set; } = new();
+    public List<SkillMarketplace> SkillMarketplaces { get; set; } = new();
     public List<Widget> Widgets { get; set; } = new();
     public List<ConnectedSource> Sources { get; set; } = new();
     public List<Contact> Contacts { get; set; } = new();

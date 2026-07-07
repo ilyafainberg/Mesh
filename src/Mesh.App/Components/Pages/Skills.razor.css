@@ -1,0 +1,136 @@
+.mp-title {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 12px;
+}
+
+.mp-title h3 {
+    margin: 0;
+    font-size: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.mp-add-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.mp-add-row input {
+    flex: 1;
+}
+
+.mp-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.mp-row {
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-m);
+    background: var(--bg-1);
+    padding: 10px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.mp-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+}
+
+.mp-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.mp-browse {
+    flex-basis: 100%;
+    border-top: 1px solid var(--stroke-1);
+    margin-top: 6px;
+    padding-top: 10px;
+}
+
+.mp-skill-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.mp-skill {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-s);
+    background: var(--bg-2);
+    cursor: pointer;
+}
+
+.mp-skill.is-imported {
+    opacity: .65;
+    cursor: default;
+}
+
+.mp-skill input[type="checkbox"] {
+    margin-top: 3px;
+}
+
+.mp-skill-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.mp-skill-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.mp-browse-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.mp-badge {
+    font-size: .68rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--bg-3);
+    color: var(--fg-2);
+    border: 1px solid var(--stroke-1);
+    white-space: nowrap;
+}
+
+.mp-badge.ver {
+    font-family: "Cascadia Code", Consolas, monospace;
+}
+
+.spin {
+    display: inline-block;
+    animation: mp-spin 1s linear infinite;
+}
+
+@keyframes mp-spin {
+    to { transform: rotate(360deg); }
+}

@@ -1,5 +1,6 @@
 ﻿@page "/skills"
 @inject AppState State
+@inject SkillMarketplaceService Marketplace
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -38,6 +39,121 @@
         </button>
     </div>
 
+    <div class="card-panel">
+        <div class="mp-title">
+            <h3><i class="bi bi-shop"></i> Skill marketplaces</h3>
+            <span class="field-hint">Connect a marketplace by URL, browse its skills, and import the ones you want. Imported skills auto-update on startup.</span>
+        </div>
+
+        <div class="mp-add-row">
+            <input class="full" placeholder="https://example.com/skills.json"
+                   @bind="marketUrl" @bind:event="oninput" @onkeydown="OnMarketKeyDown" disabled="@addingMarket" />
+            <button class="primary" @onclick="AddMarketplace" disabled="@(addingMarket || string.IsNullOrWhiteSpace(marketUrl))">
+                @if (addingMarket)
+                {
+                    <i class="bi bi-arrow-repeat spin"></i> <span>Adding</span>
+                }
+                else
+                {
+                    <i class="bi bi-plus-lg"></i> <span>Add</span>
+                }
+            </button>
+        </div>
+        @if (!string.IsNullOrEmpty(marketError)) { <div class="err-text">@marketError</div> }
+
+        @if (State.Profile.SkillMarketplaces.Count == 0)
+        {
+            <div class="muted small">No marketplaces yet. Add one to browse importable skills.</div>
+        }
+        else
+        {
+            <div class="mp-list">
+                @foreach (var m in State.Profile.SkillMarketplaces)
+                {
+                    <div class="mp-row">
+                        <div class="mp-info">
+                            <b>@m.Name</b>
+                            <span class="muted small">@HostOf(m.Url)</span>
+                            @if (m.LastSyncedAt is not null)
+                            {
+                                <span class="muted small">Last synced @m.LastSyncedAt.Value.LocalDateTime.ToString("g")</span>
+                            }
+                        </div>
+                        <div class="mp-actions">
+                            <button class="ghost" @onclick="() => Browse(m)" disabled="@(browsingId == m.Id)">
+                                @if (browsingId == m.Id)
+                                {
+                                    <i class="bi bi-arrow-repeat spin"></i> <span>Loading</span>
+                                }
+                                else
+                                {
+                                    <i class="bi bi-search"></i> <span>Browse</span>
+                                }
+                            </button>
+                            <button class="ghost" @onclick="() => SyncNow(m)" disabled="@(syncingId == m.Id)">
+                                @if (syncingId == m.Id)
+                                {
+                                    <i class="bi bi-arrow-repeat spin"></i> <span>Syncing</span>
+                                }
+                                else
+                                {
+                                    <i class="bi bi-arrow-repeat"></i> <span>Sync now</span>
+                                }
+                            </button>
+                            <button class="icon-btn" title="Remove marketplace" @onclick="() => RemoveMarketplace(m)"><i class="bi bi-trash"></i></button>
+                        </div>
+
+                        @if (openMarketId == m.Id)
+                        {
+                            <div class="mp-browse">
+                                @if (browseError is not null)
+                                {
+                                    <div class="err-text">@browseError</div>
+                                }
+                                else if (browseIndex is null)
+                                {
+                                    <div class="muted small">Loading skills…</div>
+                                }
+                                else if (browseIndex.Skills.Count == 0)
+                                {
+                                    <div class="muted small">This marketplace offers no skills right now.</div>
+                                }
+                                else
+                                {
+                                    <div class="mp-skill-list">
+                                        @foreach (var ms in browseIndex.Skills)
+                                        {
+                                            var imported = IsImported(m.Id, ms.Id);
+                                            <label class="mp-skill @(imported ? "is-imported" : "")">
+                                                <input type="checkbox" disabled="@imported"
+                                                       checked="@selected.Contains(ms.Id)"
+                                                       @onchange="e => ToggleSelected(ms.Id, e)" />
+                                                <div class="mp-skill-body">
+                                                    <div class="mp-skill-head">
+                                                        <b>@ms.Name</b>
+                                                        @if (!string.IsNullOrWhiteSpace(ms.Version)) { <span class="chip">v@ms.Version</span> }
+                                                        @if (imported) { <span class="chip">Imported</span> }
+                                                    </div>
+                                                    @if (!string.IsNullOrWhiteSpace(ms.Description)) { <div class="muted small">@ms.Description</div> }
+                                                </div>
+                                            </label>
+                                        }
+                                    </div>
+                                    <div class="mp-browse-actions">
+                                        <button class="primary" @onclick="() => ImportSelected(m)" disabled="@(selected.Count == 0)">
+                                            <i class="bi bi-download"></i> Import selected (@selected.Count)
+                                        </button>
+                                        <button class="ghost" @onclick="CloseBrowse"><i class="bi bi-x-lg"></i> Close</button>
+                                    </div>
+                                }
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        }
+    </div>
+
     <div class="kn-list">
         @foreach (var s in State.Profile.Skills)
         {
@@ -68,6 +184,11 @@
                         </label>
                         <b>@s.Name</b>
                         <span class="vis @VisClass(s.Visibility)">@s.Visibility</span>
+                        @if (s.SourceMarketplaceId is not null)
+                        {
+                            <span class="mp-badge"><i class="bi bi-shop"></i> from @MarketNameFor(s.SourceMarketplaceId)</span>
+                            @if (!string.IsNullOrWhiteSpace(s.Version)) { <span class="mp-badge ver">v@s.Version</span> }
+                        }
                         <span class="spacer"></span>
                         <button class="icon-btn" title="Edit" @onclick="() => BeginEdit(s)"><i class="bi bi-pencil"></i></button>
                         <button class="icon-btn" title="Delete" @onclick="() => Remove(s)"><i class="bi bi-trash"></i></button>
@@ -125,6 +246,105 @@
     void Remove(Skill s) => State.Mutate(p => p.Skills.Remove(s));
 
     static string VisClass(string v) => v == "private" ? "priv" : v == "public" ? "pub" : "shared";
+
+    // ---- Skill marketplaces ----
+    string marketUrl = "";
+    string? marketError;
+    bool addingMarket;
+
+    string? browsingId;                 // marketplace currently being fetched
+    string? openMarketId;               // marketplace whose browse panel is open
+    string? syncingId;                  // marketplace currently syncing
+    SkillMarketplaceService.MarketplaceIndex? browseIndex;
+    string? browseError;
+    readonly HashSet<string> selected = new();
+
+    async Task AddMarketplace()
+    {
+        if (addingMarket || string.IsNullOrWhiteSpace(marketUrl)) return;
+        addingMarket = true;
+        marketError = null;
+        try
+        {
+            var (added, error) = await Marketplace.AddMarketplaceAsync(marketUrl);
+            if (added is null) { marketError = error; }
+            else { marketUrl = ""; }
+        }
+        finally { addingMarket = false; }
+    }
+
+    async Task OnMarketKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await AddMarketplace();
+    }
+
+    async Task Browse(SkillMarketplace m)
+    {
+        if (openMarketId == m.Id) { CloseBrowse(); return; }
+        browsingId = m.Id;
+        browseError = null;
+        browseIndex = null;
+        selected.Clear();
+        openMarketId = m.Id;
+        try
+        {
+            var (index, error) = await Marketplace.FetchAsync(m.Url);
+            browseIndex = index;
+            browseError = error;
+        }
+        finally { browsingId = null; }
+    }
+
+    void CloseBrowse()
+    {
+        openMarketId = null;
+        browseIndex = null;
+        browseError = null;
+        selected.Clear();
+    }
+
+    void ToggleSelected(string skillId, ChangeEventArgs e)
+    {
+        if ((bool)(e.Value ?? false)) selected.Add(skillId);
+        else selected.Remove(skillId);
+    }
+
+    void ImportSelected(SkillMarketplace m)
+    {
+        if (browseIndex is null || selected.Count == 0) return;
+        Marketplace.ImportSkills(m.Id, browseIndex, selected.ToList());
+        selected.Clear();
+    }
+
+    async Task SyncNow(SkillMarketplace m)
+    {
+        if (syncingId is not null) return;
+        syncingId = m.Id;
+        marketError = null;
+        try
+        {
+            await Marketplace.SyncAllAsync();
+        }
+        finally { syncingId = null; }
+    }
+
+    void RemoveMarketplace(SkillMarketplace m)
+    {
+        if (openMarketId == m.Id) CloseBrowse();
+        Marketplace.RemoveMarketplace(m.Id);
+    }
+
+    bool IsImported(string marketplaceId, string skillId)
+        => State.Profile.Skills.Any(s => s.SourceMarketplaceId == marketplaceId && s.SourceSkillId == skillId);
+
+    string MarketNameFor(string? marketplaceId)
+    {
+        var m = State.Profile.SkillMarketplaces.FirstOrDefault(x => x.Id == marketplaceId);
+        return m?.Name ?? "marketplace";
+    }
+
+    static string HostOf(string url)
+        => Uri.TryCreate(url, UriKind.Absolute, out var u) ? u.Host : url;
 
     public void Dispose() => State.Changed -= Refresh;
 }
