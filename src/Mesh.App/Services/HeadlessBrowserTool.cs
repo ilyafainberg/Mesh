@@ -7,17 +7,19 @@ using IPlaywright = Microsoft.Playwright.IPlaywright;
 namespace Mesh.App.Services;
 
 /// <summary>
-/// Owner-gated browser-automation tool backed by Playwright.
-/// The browser is HEADED (visible) so the user can watch the agent work, and it PERSISTS across
-/// calls: a single shared Chromium browser and page are created lazily on first use and reused for
-/// the whole app session, so the agent can navigate then act on the same page over multiple calls.
+/// Owner-gated browser-automation tool backed by Playwright, running HEADLESS (no visible window).
+/// Like <see cref="BrowserTool"/> the browser PERSISTS across calls: a single shared Chromium browser
+/// and page are created lazily on first use and reused for the whole app session, so the agent can
+/// navigate then act on the same page over multiple calls. Keeps its own separate static state so it
+/// does not interfere with the headed browser tool.
 /// </summary>
-public sealed class BrowserTool(AgentMedia media) : IAgentTool
+public sealed class HeadlessBrowserTool(AgentMedia media) : IAgentTool
 {
-    public string Name => "browser";
+    public string Name => "headless_browser";
     public string Description =>
-        "Control a real web browser (Playwright): navigate to URLs, read page text or HTML, click, " +
-        "type, press keys, screenshot, and evaluate JavaScript. Use for web tasks that need a live browser.";
+        "Control a background headless web browser (Playwright, invisible): navigate to URLs, read " +
+        "page text or HTML, click, type, press keys, screenshot, and evaluate JavaScript. Like the " +
+        "browser tool but runs without a visible window.";
     public object ParametersSchema => new
     {
         type = "object",
@@ -39,12 +41,12 @@ public sealed class BrowserTool(AgentMedia media) : IAgentTool
         required = new[] { "action" }
     };
 
-    // Shared, session-lived Playwright state. Guarded by initLock so concurrent calls do not
-    // double-initialize the browser.
-    private static readonly SemaphoreSlim initLock = new(1, 1);
-    private static IPlaywright? playwright;
-    private static IBrowser? browser;
-    private static IPage? page;
+    // Shared, session-lived Playwright state, separate from BrowserTool's. Guarded by hbInitLock so
+    // concurrent calls do not double-initialize the browser.
+    private static readonly SemaphoreSlim hbInitLock = new(1, 1);
+    private static IPlaywright? hbPlaywright;
+    private static IBrowser? hbBrowser;
+    private static IPage? hbPage;
 
     public async Task<string> ExecuteAsync(JsonElement args, CancellationToken ct = default)
     {
@@ -57,7 +59,7 @@ public sealed class BrowserTool(AgentMedia media) : IAgentTool
             var ensured = await EnsurePageAsync().ConfigureAwait(false);
             if (ensured is not null)
                 return ensured; // an error string from initialization
-            var activePage = page!;
+            var activePage = hbPage!;
 
             switch (action)
             {
@@ -194,44 +196,42 @@ public sealed class BrowserTool(AgentMedia media) : IAgentTool
         }
         catch (Exception ex)
         {
-            return $"ERROR: browser tool failed: {ex.Message}";
+            return $"ERROR: headless browser tool failed: {ex.Message}";
         }
     }
 
     /// <summary>
-    /// Ensures the shared headed browser and page exist. Returns null on success, or an error string
-    /// to be surfaced to the caller. Installs the Chromium binaries on demand if the first launch
-    /// fails because they are missing.
+    /// Ensures the shared headless browser and page exist. Returns null on success, or an error string
+    /// to be surfaced to the caller.
     /// </summary>
     private static async Task<string?> EnsurePageAsync()
     {
-        if (page is not null && !page.IsClosed && browser is not null && browser.IsConnected)
+        if (hbPage is not null && !hbPage.IsClosed && hbBrowser is not null && hbBrowser.IsConnected)
             return null;
 
-        await initLock.WaitAsync().ConfigureAwait(false);
+        await hbInitLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (page is not null && !page.IsClosed && browser is not null && browser.IsConnected)
+            if (hbPage is not null && !hbPage.IsClosed && hbBrowser is not null && hbBrowser.IsConnected)
                 return null;
 
-            playwright ??= await Microsoft.Playwright.Playwright.CreateAsync().ConfigureAwait(false);
+            hbPlaywright ??= await Microsoft.Playwright.Playwright.CreateAsync().ConfigureAwait(false);
 
-            if (browser is null || !browser.IsConnected)
+            if (hbBrowser is null || !hbBrowser.IsConnected)
             {
-                // Prefer the user's default system browser (Edge/Chrome) over bundled Chromium.
-                browser = await BrowserLaunch.LaunchAsync(playwright, headless: false).ConfigureAwait(false);
+                hbBrowser = await BrowserLaunch.LaunchAsync(hbPlaywright, headless: true).ConfigureAwait(false);
             }
 
-            page = await browser.NewPageAsync().ConfigureAwait(false);
+            hbPage = await hbBrowser.NewPageAsync().ConfigureAwait(false);
             return null;
         }
         catch (Exception ex)
         {
-            return $"ERROR: could not start the browser: {ex.Message}";
+            return $"ERROR: could not start the headless browser: {ex.Message}";
         }
         finally
         {
-            initLock.Release();
+            hbInitLock.Release();
         }
     }
 

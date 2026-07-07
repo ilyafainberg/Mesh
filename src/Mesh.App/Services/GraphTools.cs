@@ -404,6 +404,8 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         LocalToolKind.Python => new RunPythonTool(),
         LocalToolKind.CSharpScript => new RunCSharpScriptTool(),
         LocalToolKind.Browser => new BrowserTool(media),
+        LocalToolKind.HeadlessBrowser => new HeadlessBrowserTool(media),
+        LocalToolKind.WebSearch => new WebSearchTool(),
         LocalToolKind.FileSystem => new FileSystemTool(extractor),
         LocalToolKind.WorkIq => new AskWorkIqTool(),
         _ => null

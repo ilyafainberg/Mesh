@@ -17,10 +17,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         || !string.IsNullOrWhiteSpace(state.Profile.Model.Endpoint); // local endpoints need no key
 
     /// <summary>Owner chat: the user talking to their own agent with full access.</summary>
-    public async Task<string> AskAsOwnerAsync(string userText, CancellationToken ct = default)
+    public async Task<string> AskAsOwnerAsync(string threadId, string userText, CancellationToken ct = default)
     {
         var p = state.Profile;
-        state.AddOwnChatLine(new ChatLine { Role = "user", Text = userText });
+        var thread = state.GetOrCreateOwnThread(threadId);
+        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "user", Text = userText });
 
         // Owner may use every connected source's tools, plus local tools and bundled MCP servers.
         var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
@@ -28,7 +29,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
-        var history = Window(p.OwnChat, p.Model.Provider);
+        var history = Window(thread.Lines, p.Model.Provider);
 
         // Collect any images tools produce during the turn (screenshots, etc.) and append them so the
         // chat displays them instead of the model narrating raw bytes it cannot see.
@@ -40,7 +41,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             answer = AppendImages(answer, images);
         }
 
-        state.AddOwnChatLine(new ChatLine { Role = "assistant", Text = answer });
+        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer });
         return answer;
     }
 

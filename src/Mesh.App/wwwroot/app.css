@@ -421,6 +421,18 @@ input[type=checkbox]:not(.switch input):checked::after {
 .list-row .row-sub { font-size: .78rem; color: var(--fg-3); }
 .list-row .row-actions { display: flex; gap: 2px; flex-shrink: 0; }
 
+/* Search result rows are <button>s: reset button chrome and keep the snippet on one clipped line. */
+.search-hit { width: 100%; text-align: left; background: transparent; border: none;
+    border-bottom: 1px solid var(--stroke-1); font: inherit; color: inherit; cursor: pointer; }
+.search-hit:last-child { border-bottom: none; }
+.search-hit:hover { background: var(--surface-2, rgba(0,0,0,.03)); }
+.search-hit .row-main { overflow: hidden; }
+.search-hit .row-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.search-hit .row-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.rename-input { font-size: 1.05rem; font-weight: 600; padding: 4px 8px; min-width: 180px;
+    border: 1px solid var(--stroke-2, var(--stroke-1)); border-radius: 6px; background: var(--surface-1, #fff); }
+
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { display: inline-flex; align-items: center; gap: 5px; font-size: .8rem;
   padding: 3px 8px; border-radius: 999px; border: 1px solid var(--stroke-2); background: var(--bg-1); cursor: pointer; }

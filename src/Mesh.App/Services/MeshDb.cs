@@ -77,6 +77,10 @@ public sealed class MeshDb : IDisposable
                 via TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT '',
                 at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS own_threads(
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL);
             INSERT OR IGNORE INTO meta(k, v) VALUES('schema_version', '1');");
 
         // Idempotent migration for databases created before line_id/status existed.
@@ -84,6 +88,7 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("chat_lines", "status", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("own_chat", "line_id", "TEXT");
         AddColumnIfMissing("own_chat", "status", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing("own_chat", "thread_id", "TEXT");
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)
@@ -122,7 +127,8 @@ public sealed class MeshDb : IDisposable
 
         var profile = JsonSerializer.Deserialize<MeshProfile>(json, JsonOpts) ?? new MeshProfile();
         profile.Conversations = LoadConversations();
-        profile.OwnChat = LoadOwnChat();
+        profile.OwnThreads = LoadOwnThreads();
+        profile.OwnChat = new List<ChatLine>();
         return profile;
     }
 
@@ -170,23 +176,59 @@ public sealed class MeshDb : IDisposable
         return order;
     }
 
-    private List<ChatLine> LoadOwnChat()
+    private List<OwnThread> LoadOwnThreads()
     {
-        var lines = new List<ChatLine>();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT role, text, via, at, line_id, status FROM own_chat ORDER BY id;";
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
-            lines.Add(new ChatLine
+        // Migrate any legacy own_chat rows (written before threads existed, thread_id IS NULL) into a
+        // single default thread so no history is lost.
+        long legacyCount;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM own_chat WHERE thread_id IS NULL;";
+            legacyCount = Convert.ToInt64(cmd.ExecuteScalar());
+        }
+        if (legacyCount > 0)
+        {
+            var defaultId = Guid.NewGuid().ToString("n");
+            EnsureOwnThread(defaultId, "General", DateTimeOffset.UtcNow);
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE own_chat SET thread_id = $tid WHERE thread_id IS NULL;";
+            cmd.Parameters.AddWithValue("$tid", defaultId);
+            cmd.ExecuteNonQuery();
+        }
+
+        var threads = new List<OwnThread>();
+        var byId = new Dictionary<string, OwnThread>();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT id, title, created_at FROM own_threads ORDER BY created_at, id;";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
             {
-                Role = r.GetString(0),
-                Text = r.GetString(1),
-                Via = r.GetString(2),
-                At = ParseAt(r.GetString(3)),
-                Id = r.IsDBNull(4) ? Guid.NewGuid().ToString("n") : r.GetString(4),
-                Status = r.IsDBNull(5) ? "" : r.GetString(5)
-            });
-        return lines;
+                var t = new OwnThread { Id = r.GetString(0), Title = r.GetString(1), CreatedAt = ParseAt(r.GetString(2)) };
+                threads.Add(t);
+                byId[t.Id] = t;
+            }
+        }
+
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT thread_id, role, text, via, at, line_id, status FROM own_chat WHERE thread_id IS NOT NULL ORDER BY id;";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                if (!byId.TryGetValue(r.GetString(0), out var thread)) continue;
+                thread.Lines.Add(new ChatLine
+                {
+                    Role = r.GetString(1),
+                    Text = r.GetString(2),
+                    Via = r.GetString(3),
+                    At = ParseAt(r.GetString(4)),
+                    Id = r.IsDBNull(5) ? Guid.NewGuid().ToString("n") : r.GetString(5),
+                    Status = r.IsDBNull(6) ? "" : r.GetString(6)
+                });
+            }
+        }
+        return threads;
     }
 
     /// <summary>
@@ -198,6 +240,7 @@ public sealed class MeshDb : IDisposable
         var node = JsonSerializer.SerializeToNode(profile, JsonOpts)!.AsObject();
         node.Remove("conversations");
         node.Remove("ownChat");
+        node.Remove("ownThreads");
         var json = node.ToJsonString(JsonOpts);
 
         using var cmd = conn.CreateCommand();
@@ -232,18 +275,70 @@ public sealed class MeshDb : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    /// <summary>Appends a single line to the owner's own-agent chat.</summary>
-    public void AppendOwnChat(ChatLine line)
+    /// <summary>Appends a single line to a "Me" topic thread.</summary>
+    public void AppendOwnChat(string threadId, ChatLine line)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO own_chat(line_id, role, text, via, status, at) VALUES($lid, $r, $x, $v, $s, $a);";
+        cmd.CommandText = "INSERT INTO own_chat(line_id, thread_id, role, text, via, status, at) VALUES($lid, $tid, $r, $x, $v, $s, $a);";
         cmd.Parameters.AddWithValue("$lid", line.Id);
+        cmd.Parameters.AddWithValue("$tid", threadId);
         cmd.Parameters.AddWithValue("$r", line.Role);
         cmd.Parameters.AddWithValue("$x", line.Text);
         cmd.Parameters.AddWithValue("$v", line.Via);
         cmd.Parameters.AddWithValue("$s", line.Status);
         cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Records that a "Me" thread exists so an empty thread survives a reload.</summary>
+    public void EnsureOwnThread(string id, string title, DateTimeOffset createdAt)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "INSERT OR IGNORE INTO own_threads(id, title, created_at) VALUES($id, $t, $c);";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$t", title);
+        cmd.Parameters.AddWithValue("$c", createdAt.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Renames a "Me" thread.</summary>
+    public void RenameOwnThread(string id, string title)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE own_threads SET title = $t WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$t", title);
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Clears a "Me" thread's messages but keeps the thread.</summary>
+    public void ClearOwnThread(string id)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM own_chat WHERE thread_id = $id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Deletes a "Me" thread and all its messages.</summary>
+    public void DeleteOwnThread(string id)
+    {
+        using var tx = conn.BeginTransaction();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM own_chat WHERE thread_id = $id;";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM own_threads WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
     }
 
     /// <summary>Updates the delivery status of an outgoing line by its stable id.</summary>
@@ -254,6 +349,36 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$s", status);
         cmd.Parameters.AddWithValue("$lid", lineId);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Deletes all message history for a conversation (keeps the conversation itself).</summary>
+    public void ClearConversation(string handle)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM chat_lines WHERE handle = $h;";
+        cmd.Parameters.AddWithValue("$h", handle);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Deletes a conversation and all its message history.</summary>
+    public void DeleteConversation(string handle)
+    {
+        using var tx = conn.BeginTransaction();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM chat_lines WHERE handle = $h;";
+            cmd.Parameters.AddWithValue("$h", handle);
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM conversations WHERE handle = $h;";
+            cmd.Parameters.AddWithValue("$h", handle);
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
     }
 
     /// <summary>A single search hit across conversations and own-chat.</summary>

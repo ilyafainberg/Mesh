@@ -146,7 +146,11 @@ public sealed class AppState
                 activeDb.EnsureConversation(conv.Handle);
                 foreach (var line in conv.Lines) activeDb.AppendChatLine(Norm(conv.Handle), line);
             }
-            foreach (var line in Profile.OwnChat) activeDb.AppendOwnChat(line);
+            foreach (var thread in Profile.OwnThreads)
+            {
+                activeDb.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+                foreach (var line in thread.Lines) activeDb.AppendOwnChat(thread.Id, line);
+            }
         }
 
         if (activeId is not null)
@@ -183,11 +187,62 @@ public sealed class AppState
         NotifyChanged();
     }
 
-    /// <summary>Appends a line to the owner's own-agent chat as a single row.</summary>
-    public void AddOwnChatLine(ChatLine line)
+    /// <summary>Appends a line to a "Me" topic thread as a single row.</summary>
+    public void AddOwnChatLine(string threadId, ChatLine line)
     {
-        Profile.OwnChat.Add(line);
-        activeDb?.AppendOwnChat(line);
+        var thread = GetOrCreateOwnThread(threadId);
+        thread.Lines.Add(line);
+        activeDb?.AppendOwnChat(thread.Id, line);
+        NotifyChanged();
+    }
+
+    /// <summary>Returns the thread with this id, or the first thread, creating one if none exist.</summary>
+    public OwnThread GetOrCreateOwnThread(string? threadId = null)
+    {
+        if (threadId is not null)
+        {
+            var found = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            if (found is not null) return found;
+        }
+        if (Profile.OwnThreads.Count > 0) return Profile.OwnThreads[0];
+        return NewOwnThread();
+    }
+
+    /// <summary>Creates a new empty "Me" thread and returns it.</summary>
+    public OwnThread NewOwnThread(string title = "New chat")
+    {
+        var thread = new OwnThread { Title = title };
+        Profile.OwnThreads.Add(thread);
+        activeDb?.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+        NotifyChanged();
+        return thread;
+    }
+
+    /// <summary>Renames a "Me" thread.</summary>
+    public void RenameOwnThread(string threadId, string title)
+    {
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        if (thread is null) return;
+        thread.Title = string.IsNullOrWhiteSpace(title) ? thread.Title : title.Trim();
+        activeDb?.RenameOwnThread(thread.Id, thread.Title);
+        NotifyChanged();
+    }
+
+    /// <summary>Clears a "Me" thread's messages but keeps the thread.</summary>
+    public void ClearOwnThread(string threadId)
+    {
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        if (thread is null) return;
+        thread.Lines.Clear();
+        activeDb?.ClearOwnThread(thread.Id);
+        NotifyChanged();
+    }
+
+    /// <summary>Deletes a "Me" thread and all its messages.</summary>
+    public void DeleteOwnThread(string threadId)
+    {
+        Profile.OwnThreads.RemoveAll(t => t.Id == threadId);
+        activeDb?.DeleteOwnThread(threadId);
         NotifyChanged();
     }
 
@@ -340,7 +395,18 @@ public sealed class AppState
             db.EnsureConversation(conv.Handle);
             foreach (var line in conv.Lines) db.AppendChatLine(Norm(conv.Handle), line);
         }
-        foreach (var line in imported.OwnChat) db.AppendOwnChat(line);
+        // Migrate a legacy single OwnChat (older exports) into a thread so nothing is lost.
+        if (imported.OwnChat.Count > 0)
+        {
+            var legacy = new OwnThread { Title = "General", Lines = imported.OwnChat.ToList() };
+            imported.OwnThreads.Insert(0, legacy);
+            imported.OwnChat = new List<ChatLine>();
+        }
+        foreach (var thread in imported.OwnThreads)
+        {
+            db.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+            foreach (var line in thread.Lines) db.AppendOwnChat(thread.Id, line);
+        }
         db.SaveProfile(imported);
 
         activeDb?.Dispose();
@@ -454,6 +520,28 @@ public sealed class AppState
             activeDb?.EnsureConversation(handle);
         }
         return conv;
+    }
+
+    /// <summary>Clears all message history for a conversation but keeps it in the list.</summary>
+    public void ClearConversation(string handle)
+    {
+        var h = Norm(handle);
+        var conv = Profile.Conversations.FirstOrDefault(c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
+        if (conv is null) return;
+        conv.Lines.Clear();
+        activeDb?.ClearConversation(h);
+        NotifyChanged();
+    }
+
+    /// <summary>Deletes a conversation and its history entirely (the contact itself is kept).</summary>
+    public void DeleteConversation(string handle)
+    {
+        var h = Norm(handle);
+        Profile.Conversations.RemoveAll(c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
+        unread.Remove(h);
+        if (Profile.UnreadFrom.Remove(h)) activeDb?.SaveProfile(Profile);
+        activeDb?.DeleteConversation(h);
+        NotifyChanged();
     }
 
     public static string Norm(string handle) => handle.Trim().TrimStart('@').ToLowerInvariant();

@@ -6,100 +6,151 @@
 @inject IJSRuntime JS
 @implements IDisposable
 
-<div class="pane">
-    <header class="pane-head">
+<div class="split">
+    <div class="conv-list">
         <h2><i class="bi bi-person-badge"></i> Me</h2>
-        <span class="muted">your private space: your agent sees everything you know</span>
-        <span style="margin-left:auto;"><TokenMeter Compact="true" /></span>
-    </header>
-
-    <div class="messages" @ref="scrollEl">
-        <div class="messages-wrap">
-            @if (State.Profile.OwnChat.Count == 0)
-            {
-                <div class="empty">
-                    This is your private assistant. It knows everything in your Knowledge and Skills,
-                    and helps you manage what your public agent shares with others. Ask it anything.
-                </div>
-            }
-            @foreach (var line in State.Profile.OwnChat)
-            {
-                <div class="bubble @(line.Role)">
-                    <MessageContent Text="@line.Text" OnPin="PinWidget" />
-                </div>
-            }
-            @if (busy) { <div class="bubble assistant"><div class="text muted">@(building ? "…building widget" : "…thinking")</div></div> }
+        <div class="new-conv">
+            <span class="muted" style="flex:1;">your private topic chats</span>
+            <button class="primary icon-primary" @onclick="NewThread" title="New chat" aria-label="New chat"><i class="bi bi-plus-lg"></i></button>
         </div>
+        @foreach (var t in Threads)
+        {
+            <div class="conv-item @(t.Id == activeThread ? "active" : "")" @onclick="() => Select(t.Id)">
+                <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+            </div>
+        }
+        @if (State.Profile.OwnThreads.Count == 0)
+        {
+            <div class="empty conv-empty">No chats yet. Start one with the + above, or just type below.</div>
+        }
     </div>
 
-    <div class="composer-area">
-        <div class="composer-inner">
-            @if (pinHtml is not null)
+    <div class="thread">
+        <header class="pane-head">
+            @if (renaming && Active is not null)
             {
-                <div class="pin-bar">
-                    <i class="bi bi-pin-angle"></i>
-                    <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" aria-label="Name this widget" />
-                    <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
-                    <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
-                </div>
+                <input class="rename-input" @bind="renameText" @onkeydown="OnRenameKey" aria-label="Chat title" />
+                <button class="icon-btn" title="Save" @onclick="SaveRename" aria-label="Save title"><i class="bi bi-check-lg"></i></button>
+                <button class="icon-btn" title="Cancel" @onclick="() => renaming = false" aria-label="Cancel rename"><i class="bi bi-x-lg"></i></button>
             }
-            @if (widgetMode)
+            else
             {
-                <div class="mode-chip">
-                    <i class="bi bi-window-stack"></i> widget
-                    <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
-                    <span class="mode-hint">describe the mini-app you want</span>
-                </div>
+                <h2>@(Active is null ? "Me" : (string.IsNullOrWhiteSpace(Active.Title) ? "New chat" : Active.Title))</h2>
+                <span class="muted">your agent sees everything you know</span>
             }
-            else if (ShowPreview)
-            {
-                <div class="composer-preview">
-                    <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
-                    <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
-                </div>
-            }
-            @if (attachments.Count > 0)
-            {
-                <div class="attach-bar">
-                    @foreach (var a in attachments)
+            <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                <TokenMeter Compact="true" />
+                @if (Active is not null && !renaming)
+                {
+                    <button class="ghost icon-btn" title="Rename chat" aria-label="Rename chat" @onclick="BeginRename"><i class="bi bi-pencil"></i></button>
+                    @if (confirmDelete)
                     {
-                        <span class="attach-chip">
-                            <i class="bi bi-paperclip"></i>
-                            <span class="attach-name">@a.Name</span>
-                            <span class="attach-size">@a.SizeLabel</span>
-                            <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
-                        </span>
+                        <button class="ghost icon-btn" title="Clear messages, keep the chat" @onclick="ClearActive">Clear</button>
+                        <button class="danger" title="Delete this chat and its history" @onclick="DeleteActive">Delete</button>
+                        <button class="ghost icon-btn" title="Cancel" @onclick="() => confirmDelete = false" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
                     }
-                </div>
-            }
-            <div class="composer">
-                <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget">
-                    <i class="bi bi-plus-lg"></i>
-                </button>
-                <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
-                    <i class="bi bi-paperclip"></i>
-                </button>
-                <button class="ghost icon-btn plus-btn @(homeMode ? "on" : "")" @onclick="() => homeMode = !homeMode" disabled="@busy"
-                        title="Ask my home agent (runs on my desktop with full tools)" aria-label="Ask my home agent">
-                    <i class="bi bi-house-gear"></i>
-                </button>
-                <input @bind="input" @bind:event="oninput" @onkeydown="OnKey" placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" aria-label="Message your assistant" />
-                <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send" aria-label="Send">
-                    <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
-                </button>
+                    else
+                    {
+                        <button class="ghost icon-btn" title="Delete chat" aria-label="Delete chat" @onclick="() => confirmDelete = true"><i class="bi bi-trash"></i></button>
+                    }
+                }
+            </span>
+        </header>
+
+        <div class="messages" @ref="scrollEl">
+            <div class="messages-wrap">
+                @if (Active is null || Active.Lines.Count == 0)
+                {
+                    <div class="empty">
+                        This is your private assistant. It knows everything in your Knowledge and Skills,
+                        and helps you manage what your public agent shares with others. Ask it anything.
+                    </div>
+                }
+                @if (Active is not null)
+                {
+                    @foreach (var line in Active.Lines)
+                    {
+                        <div class="bubble @(line.Role)">
+                            <MessageContent Text="@line.Text" OnPin="PinWidget" />
+                        </div>
+                    }
+                }
+                @if (busy) { <div class="bubble assistant"><div class="text muted">@(building ? "…building widget" : "…thinking")</div></div> }
             </div>
-            @if (attachError is not null) { <p class="err-text">@attachError</p> }
-            @if (!Agent.IsModelReady)
-            {
-                <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
-            }
-            else if (QuotaExhausted)
-            {
-                <div class="warn-banner">
-                    <i class="bi bi-hourglass-bottom"></i>
-                    Today's free-model limit is reached. <a href="settings">Add your own model key</a> for unlimited use, or switch to an on-device model.
+        </div>
+
+        <div class="composer-area">
+            <div class="composer-inner">
+                @if (pinHtml is not null)
+                {
+                    <div class="pin-bar">
+                        <i class="bi bi-pin-angle"></i>
+                        <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" aria-label="Name this widget" />
+                        <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
+                        <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
+                    </div>
+                }
+                @if (widgetMode)
+                {
+                    <div class="mode-chip">
+                        <i class="bi bi-window-stack"></i> widget
+                        <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
+                        <span class="mode-hint">describe the mini-app you want</span>
+                    </div>
+                }
+                else if (ShowPreview)
+                {
+                    <div class="composer-preview">
+                        <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
+                        <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
+                    </div>
+                }
+                @if (attachments.Count > 0)
+                {
+                    <div class="attach-bar">
+                        @foreach (var a in attachments)
+                        {
+                            <span class="attach-chip">
+                                <i class="bi bi-paperclip"></i>
+                                <span class="attach-name">@a.Name</span>
+                                <span class="attach-size">@a.SizeLabel</span>
+                                <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
+                            </span>
+                        }
+                    </div>
+                }
+                <div class="composer">
+                    <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget">
+                        <i class="bi bi-plus-lg"></i>
+                    </button>
+                    <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
+                        <i class="bi bi-paperclip"></i>
+                    </button>
+                    @if (!IsDesktop)
+                    {
+                        <button class="ghost icon-btn plus-btn @(homeMode ? "on" : "")" @onclick="() => homeMode = !homeMode" disabled="@busy"
+                                title="Ask my home agent (runs on my desktop with full tools)" aria-label="Ask my home agent">
+                            <i class="bi bi-house-gear"></i>
+                        </button>
+                    }
+                    <input @bind="input" @bind:event="oninput" @onkeydown="OnKey" placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" aria-label="Message your assistant" />
+                    <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send" aria-label="Send">
+                        <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
+                    </button>
                 </div>
-            }
+                @if (attachError is not null) { <p class="err-text">@attachError</p> }
+                @if (!Agent.IsModelReady)
+                {
+                    <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
+                }
+                else if (QuotaExhausted)
+                {
+                    <div class="warn-banner">
+                        <i class="bi bi-hourglass-bottom"></i>
+                        Today's free-model limit is reached. <a href="settings">Add your own model key</a> for unlimited use, or switch to an on-device model.
+                    </div>
+                }
+            </div>
         </div>
     </div>
 </div>
@@ -110,6 +161,10 @@
     bool building;
     bool widgetMode;
     bool homeMode;
+    bool confirmDelete;
+    bool renaming;
+    string renameText = "";
+    string? activeThread;
     string? pinHtml;
     string pinName = "";
     ElementReference scrollEl;
@@ -123,32 +178,88 @@
         public string SizeLabel => Human(Size);
     }
 
+    // Desktop clients are the home agent, so the "ask my home agent" shortcut is only useful on mobile.
+    static bool IsDesktop => OperatingSystem.IsWindows() || OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS();
+
+    IReadOnlyList<OwnThread> Threads => State.Profile.OwnThreads;
+    OwnThread? Active => activeThread is null ? null : State.Profile.OwnThreads.FirstOrDefault(t => t.Id == activeThread);
+
     bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
     // The free model returns a friendly limit message when the daily token budget is spent.
-    // Surface it as a persistent, actionable banner (not just a chat line) so the fix is obvious.
     bool QuotaExhausted
     {
         get
         {
             if (State.Profile.Model.Provider != global::Mesh.App.Domain.ModelProvider.MeshHosted) return false;
-            var last = State.Profile.OwnChat.LastOrDefault(l => l.Role == "assistant");
+            var last = Active?.Lines.LastOrDefault(l => l.Role == "assistant");
             return last is not null && last.Text.StartsWith("You've reached today's free-model limit", StringComparison.Ordinal);
         }
     }
 
-    protected override void OnInitialized() => State.Changed += Refresh;
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+        // Land in the most recent thread if one exists.
+        if (activeThread is null && State.Profile.OwnThreads.Count > 0)
+            activeThread = State.Profile.OwnThreads[^1].Id;
+    }
+
     void Refresh() => InvokeAsync(StateHasChanged);
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // Scroll to the newest message whenever the count changes (or first paint).
-        var count = State.Profile.OwnChat.Count + (busy ? 1 : 0);
+        var count = (Active?.Lines.Count ?? 0) + (busy ? 1 : 0);
         if (firstRender || count != lastCount)
         {
             lastCount = count;
             try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
         }
+    }
+
+    void Select(string id) { activeThread = id; confirmDelete = false; renaming = false; }
+
+    void NewThread()
+    {
+        var t = State.NewOwnThread();
+        activeThread = t.Id;
+        confirmDelete = false;
+        renaming = false;
+        input = "";
+    }
+
+    void BeginRename()
+    {
+        if (Active is null) return;
+        renameText = Active.Title;
+        renaming = true;
+    }
+
+    void OnRenameKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") SaveRename();
+        else if (e.Key == "Escape") renaming = false;
+    }
+
+    void SaveRename()
+    {
+        if (Active is not null) State.RenameOwnThread(Active.Id, renameText);
+        renaming = false;
+    }
+
+    void ClearActive()
+    {
+        if (Active is not null) State.ClearOwnThread(Active.Id);
+        confirmDelete = false;
+    }
+
+    void DeleteActive()
+    {
+        if (Active is null) return;
+        var id = Active.Id;
+        confirmDelete = false;
+        State.DeleteOwnThread(id);
+        activeThread = State.Profile.OwnThreads.Count > 0 ? State.Profile.OwnThreads[^1].Id : null;
     }
 
     void ToggleWidget() { widgetMode = !widgetMode; }
@@ -173,8 +284,6 @@
             }
             long size = 0;
             try { size = new System.IO.FileInfo(path).Length; } catch { }
-            // No size cap on the owner's own machine: the file stays on disk and the agent reads it
-            // on demand via the read_local_file tool. Allow-list the path for this session.
             LocalFiles.Allow(path);
             attachments.Add(new StagedFile(file.FileName, path, size));
         }
@@ -193,7 +302,14 @@
     async Task Send()
     {
         if ((string.IsNullOrWhiteSpace(input) && attachments.Count == 0) || busy) return;
+
+        // Ensure there is a thread to write into, and name a fresh one after its first message.
+        var thread = Active ?? State.NewOwnThread();
+        activeThread = thread.Id;
         var text = input;
+        if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(text))
+            State.RenameOwnThread(thread.Id, Titleize(text));
+
         var files = attachments.ToList();
         input = "";
         attachments.Clear();
@@ -205,16 +321,14 @@
                 building = true;
                 widgetMode = false;
                 var html = await Agent.BuildWidgetAsync(text);
-                State.AddOwnChatLine(new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
-                State.AddOwnChatLine(new ChatLine { Role = "assistant", Text = html });
+                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
+                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = html });
             }
             else if (homeMode)
             {
-                // Route to the owner's home desktop agent (full local tools). The answer arrives
-                // asynchronously and is recorded in the self-conversation + a notification.
-                State.AddOwnChatLine(new ChatLine { Role = "user", Text = text });
+                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "user", Text = text });
                 var ok = await Mesh.AskHomeAgentAsync(text);
-                State.AddOwnChatLine(new ChatLine
+                State.AddOwnChatLine(thread.Id, new ChatLine
                 {
                     Role = "assistant",
                     Text = ok
@@ -224,8 +338,6 @@
             }
             else
             {
-                // Pass the file PATHS to the agent (not the bytes); it opens them on demand with the
-                // read_local_file tool, so there is no size limit here.
                 var prompt = text ?? "";
                 if (files.Count > 0)
                 {
@@ -235,11 +347,19 @@
                     foreach (var f in files) sb.Append($"\n- {f.Path}");
                     prompt = sb.ToString();
                 }
-                await Agent.AskAsOwnerAsync(prompt);
+                await Agent.AskAsOwnerAsync(thread.Id, prompt);
             }
         }
-        catch (Exception ex) { State.AddOwnChatLine(new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
+        catch (Exception ex) { State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
         finally { busy = false; building = false; }
+    }
+
+    // A short title from the first message of a new chat.
+    static string Titleize(string text)
+    {
+        var clean = text.Replace("\r", " ").Replace("\n", " ").Trim();
+        if (clean.Length == 0) return "New chat";
+        return clean.Length > 40 ? clean[..40].TrimEnd() + "…" : clean;
     }
 
     void PinWidget(string html)

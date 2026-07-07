@@ -80,6 +80,19 @@
                         <i class="bi bi-coin"></i> @spent.ToString("N0") tokens
                     </span>
                 }
+                <div class="head-actions" style="margin-left:auto;">
+                    @if (confirmDelete == active)
+                    {
+                        <span class="muted">Delete this conversation?</span>
+                        <button class="ghost icon-btn" title="Clear messages only, keep the conversation" @onclick="ClearActive">Clear</button>
+                        <button class="danger" title="Delete the conversation and its history" @onclick="DeleteActive">Delete</button>
+                        <button class="ghost icon-btn" title="Cancel" @onclick="() => confirmDelete = null" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
+                    }
+                    else
+                    {
+                        <button class="ghost icon-btn" title="Delete conversation history" aria-label="Delete conversation history" @onclick="() => confirmDelete = active"><i class="bi bi-trash"></i></button>
+                    }
+                </div>
             </header>
             @if (State.FindContact(active)?.KeyChanged == true)
             {
@@ -187,6 +200,7 @@
 
 @code {
     string? active;
+    string? confirmDelete;
     string input = "";
     string newHandle = "";
     bool busy;
@@ -272,7 +286,23 @@
         finally { reverifying = false; }
     }
 
-    void Select(string handle) { active = handle; State.MarkRead(handle); }
+    void Select(string handle) { active = handle; confirmDelete = null; State.MarkRead(handle); }
+
+    void ClearActive()
+    {
+        if (active is null) return;
+        State.ClearConversation(active);
+        confirmDelete = null;
+    }
+
+    void DeleteActive()
+    {
+        if (active is null) return;
+        var h = active;
+        active = null;
+        confirmDelete = null;
+        State.DeleteConversation(h);
+    }
 
     async Task OnNewKey(KeyboardEventArgs e)
     {

@@ -64,7 +64,9 @@ public enum LocalToolKind
     CSharpScript,
     Browser,
     FileSystem,
-    WorkIq
+    WorkIq,
+    HeadlessBrowser,
+    WebSearch
 }
 
 /// <summary>Per-tool grant: whether the local tool is enabled and who (beyond the owner) may use it.</summary>
@@ -217,6 +219,19 @@ public sealed class Conversation
 }
 
 /// <summary>
+/// One topic thread in the owner's private "Me" chat. The owner can keep several parallel
+/// conversations with their own agent (like separate chats in Messages). Lines are row-stored
+/// (see MeshDb.own_chat.thread_id); this metadata is hydrated on load.
+/// </summary>
+public sealed class OwnThread
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("n");
+    public string Title { get; set; } = "New chat";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public List<ChatLine> Lines { get; set; } = new();
+}
+
+/// <summary>
 /// Cumulative token usage for the currently selected model. Tracks the model the counts belong
 /// to so the counter can auto-reset when the model changes.
 /// </summary>
@@ -364,8 +379,12 @@ public sealed class MeshProfile
     /// <summary>User-added MCP tool servers (local command launched over stdio). Off by default.</summary>
     public List<CustomMcpServer> CustomMcpServers { get; set; } = new();
 
-    /// <summary>The agent's own private chat (owner context).</summary>
+    /// <summary>The agent's own private chat (owner context). Legacy single list, kept for migration
+    /// into <see cref="OwnThreads"/>; new code uses threads.</summary>
     public List<ChatLine> OwnChat { get; set; } = new();
+
+    /// <summary>The owner's private "Me" chats, split into topic threads (Messages-style).</summary>
+    public List<OwnThread> OwnThreads { get; set; } = new();
 
     [JsonIgnore] public bool IsOnboarded => !string.IsNullOrWhiteSpace(Handle) && !string.IsNullOrWhiteSpace(PrivateKey);
 }
