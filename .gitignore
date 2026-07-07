@@ -54,3 +54,4 @@ _deploy/meshai-repo/
 _deploy/pkg/
 _deploy/relay-repo/
 _deploy/shared-repo/
+_deploy/android-signing/

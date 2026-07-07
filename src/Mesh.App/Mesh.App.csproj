@@ -30,10 +30,10 @@
         <MauiXamlInflator>SourceGen</MauiXamlInflator>
 
         <!-- Display name -->
-        <ApplicationTitle>Mesh.App</ApplicationTitle>
+        <ApplicationTitle>Mesh</ApplicationTitle>
 
         <!-- App Identifier -->
-        <ApplicationId>com.companyname.mesh.app</ApplicationId>
+        <ApplicationId>net.meshrelay.mesh</ApplicationId>
 
         <!-- Versions -->
         <ApplicationDisplayVersion>1.2.9</ApplicationDisplayVersion>
