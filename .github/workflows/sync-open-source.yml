@@ -1,0 +1,77 @@
+name: Sync open-source mirrors
+
+# Auto-pushes the relay and shared-library SOURCE from this private monorepo to the
+# public open-source mirrors whenever those folders change on main:
+#   src/Mesh.Relay  -> github.com/MeshRelayAI/Relay   (AGPL-3.0)
+#   src/Mesh.Shared -> github.com/MeshRelayAI/Relay AND github.com/MeshRelayAI/Shared (Apache-2.0)
+#
+# Only source files are mirrored. Each public repo keeps its own scaffolding
+# (LICENSE, README, Dockerfile, docker-compose, SELF-HOSTING, workflows, .slnx,
+# .gitignore, NOTICE) because the sync never touches those paths and never
+# deletes a mirror's own LICENSE.
+#
+# Requires a repository secret SYNC_TOKEN: a fine-grained PAT with Contents:
+# Read and write on MeshRelayAI/Relay and MeshRelayAI/Shared.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/Mesh.Relay/**"
+      - "src/Mesh.Shared/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the monorepo
+        uses: actions/checkout@v4
+        with:
+          path: mono
+
+      - name: Sync to the open mirrors
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global user.name "Mesh Sync Bot"
+          git config --global user.email "sync@meshrelay.net"
+
+          sync_repo () {
+            local repo="$1"          # e.g. MeshRelayAI/Relay
+            local include_relay="$2" # yes|no
+            echo "::group::Sync $repo"
+            git clone --depth 1 "https://x-access-token:${SYNC_TOKEN}@github.com/${repo}.git" target
+
+            # Mesh.Shared source (all repos). Preserve the mirror's own LICENSE.
+            mkdir -p "target/src/Mesh.Shared"
+            rsync -a --delete --exclude='*.user' --exclude='LICENSE' \
+              mono/src/Mesh.Shared/ target/src/Mesh.Shared/
+
+            # Mesh.Relay source (relay mirror only).
+            if [ "$include_relay" = "yes" ]; then
+              mkdir -p "target/src/Mesh.Relay"
+              rsync -a --delete --exclude='*.user' \
+                mono/src/Mesh.Relay/ target/src/Mesh.Relay/
+            fi
+
+            cd target
+            if [ -z "$(git status --porcelain)" ]; then
+              echo "No changes to sync for $repo."
+            else
+              git add -A
+              git commit -m "Sync source from monorepo (${GITHUB_SHA::7})"
+              git push origin HEAD:main
+              echo "Pushed source update to $repo."
+            fi
+            cd ..
+            rm -rf target
+            echo "::endgroup::"
+          }
+
+          sync_repo "MeshRelayAI/Relay"  "yes"
+          sync_repo "MeshRelayAI/Shared" "no"
