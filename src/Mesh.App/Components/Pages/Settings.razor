@@ -393,7 +393,8 @@
                 @if (relayTestMsg is not null) { <div class="field-hint @(relayTestOk ? "" : "err-text")">@relayTestMsg</div> }
                 <div class="field-hint">
                     The default relay is run by Mesh. You can run your own, or use anyone's:
-                    see <b>docs/SELF-HOSTING.md</b>. A handle is registered per relay, so switching relays
+                    the relay is open source, see <b>Open source &amp; security</b> below.
+                    A handle is registered per relay, so switching relays
                     re-registers your handle there.
                 </div>
             </div>
@@ -403,6 +404,28 @@
                     <i class="bi @(Mesh.Connected ? "bi-check-circle-fill" : "bi-circle")"></i>
                     @(Mesh.Connected ? "connected" : "offline")
                 </span>
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Open source &amp; security</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Mesh is end-to-end encrypted: the relay only ever routes sealed messages and
+                never holds a key, so it cannot read what you send. You don't have to take our
+                word for it. The relay and the encryption library are open source, so anyone
+                can read exactly what they do and verify these claims.
+            </div>
+            <div class="model-row">
+                <button class="ghost" @onclick='() => OpenUrl("https://github.com/MeshRelayAI/Relay")' title="Open the relay source on GitHub">
+                    <i class="bi bi-hdd-network"></i> Relay source <span class="muted">(AGPL-3.0)</span>
+                </button>
+                <button class="ghost" @onclick='() => OpenUrl("https://github.com/MeshRelayAI/Shared")' title="Open the encryption library source on GitHub">
+                    <i class="bi bi-shield-lock"></i> Encryption library <span class="muted">(Apache-2.0)</span>
+                </button>
+            </div>
+            <div class="field-hint" style="margin-top:10px;">
+                For its message encryption and protocol, Mesh includes the Apache-2.0 licensed
+                <b>Mesh.Shared</b> library linked above.
             </div>
         </div>
 
