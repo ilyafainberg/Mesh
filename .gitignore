@@ -52,3 +52,5 @@ _deploy/relay-release/
 _deploy/relay-pkg/
 _deploy/meshai-repo/
 _deploy/pkg/
+_deploy/relay-repo/
+_deploy/shared-repo/
