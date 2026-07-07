@@ -4,22 +4,30 @@
         <img src="logo-text.png" alt="Mesh" class="brand-logo" />
     </div>
     <nav class="nav flex-column" role="navigation" aria-label="Main">
-        <NavLink class="nav-link" href="" Match="NavLinkMatch.All" @onclick="OnNavigate"><i class="bi bi-person-badge"></i> Me</NavLink>
-        <NavLink class="nav-link" href="messages" @onclick="OnNavigate">
-            <i class="bi bi-chat-dots"></i> Messages
-            @if (MessagesBadge > 0) { <span class="nav-badge" aria-label="@($"{MessagesBadge} unread")">@MessagesBadge</span> }
-        </NavLink>
-        <NavLink class="nav-link" href="contacts" @onclick="OnNavigate">
-            <i class="bi bi-people"></i> Contacts
-            @if (State.Profile.Requests.Count > 0) { <span class="nav-badge" aria-label="@($"{State.Profile.Requests.Count} pending requests")">@State.Profile.Requests.Count</span> }
-        </NavLink>
-        <NavLink class="nav-link" href="search" @onclick="OnNavigate"><i class="bi bi-search"></i> Search</NavLink>
-        <NavLink class="nav-link" href="knowledge" @onclick="OnNavigate"><i class="bi bi-journal-text"></i> Knowledge</NavLink>
-        <NavLink class="nav-link" href="skills" @onclick="OnNavigate"><i class="bi bi-lightning-charge"></i> Skills</NavLink>
-        <NavLink class="nav-link" href="widgets" @onclick="OnNavigate"><i class="bi bi-window-stack"></i> Widgets</NavLink>
-        <NavLink class="nav-link" href="settings" @onclick="OnNavigate"><i class="bi bi-gear"></i> Settings</NavLink>
-        <NavLink class="nav-link" href="backup" @onclick="OnNavigate"><i class="bi bi-shield-lock"></i> Backup</NavLink>
-        <NavLink class="nav-link" href="about" @onclick="OnNavigate"><i class="bi bi-info-circle"></i> About</NavLink>
+        <div class="nav-group">
+            <NavLink class="nav-link" href="" Match="NavLinkMatch.All" @onclick="OnNavigate"><i class="bi bi-person-badge"></i> Me</NavLink>
+            <NavLink class="nav-link" href="messages" @onclick="OnNavigate">
+                <i class="bi bi-chat-dots"></i> Messages
+                @if (MessagesBadge > 0) { <span class="nav-badge" aria-label="@($"{MessagesBadge} unread")">@MessagesBadge</span> }
+            </NavLink>
+            <NavLink class="nav-link" href="contacts" @onclick="OnNavigate">
+                <i class="bi bi-people"></i> Contacts
+                @if (State.Profile.Requests.Count > 0) { <span class="nav-badge" aria-label="@($"{State.Profile.Requests.Count} pending requests")">@State.Profile.Requests.Count</span> }
+            </NavLink>
+            <NavLink class="nav-link" href="search" @onclick="OnNavigate"><i class="bi bi-search"></i> Search</NavLink>
+        </div>
+        <div class="nav-divider"></div>
+        <div class="nav-group">
+            <NavLink class="nav-link" href="knowledge" @onclick="OnNavigate"><i class="bi bi-journal-text"></i> Knowledge</NavLink>
+            <NavLink class="nav-link" href="skills" @onclick="OnNavigate"><i class="bi bi-lightning-charge"></i> Skills</NavLink>
+            <NavLink class="nav-link" href="widgets" @onclick="OnNavigate"><i class="bi bi-window-stack"></i> Widgets</NavLink>
+        </div>
+        <div class="nav-divider"></div>
+        <div class="nav-group">
+            <NavLink class="nav-link" href="settings" @onclick="OnNavigate"><i class="bi bi-gear"></i> Settings</NavLink>
+            <NavLink class="nav-link" href="backup" @onclick="OnNavigate"><i class="bi bi-shield-lock"></i> Backup</NavLink>
+            <NavLink class="nav-link" href="about" @onclick="OnNavigate"><i class="bi bi-info-circle"></i> About</NavLink>
+        </div>
     </nav>
     <button class="nav-quit" @onclick="Quit" title="Quit Mesh completely" aria-label="Quit Mesh completely"><i class="bi bi-power"></i> Quit</button>
 </div>

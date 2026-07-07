@@ -10,7 +10,7 @@ namespace Mesh.App.Services;
 public static class WindowGeometry
 {
     public const double DefaultWidth = 1470;
-    public const double DefaultHeight = 350;
+    public const double DefaultHeight = 990;
 
     private const string KeyW = "win.width";
     private const string KeyH = "win.height";

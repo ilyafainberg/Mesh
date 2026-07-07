@@ -164,7 +164,8 @@
                     </div>
                     <div class="field">
                         <label>API version <span class="muted">(optional)</span></label>
-                        <input class="full" @bind="apiVersion" placeholder="2024-08-01-preview" />
+                        <input class="full" @bind="apiVersion" placeholder="leave blank for the current API" />
+                        <div class="field-hint">Leave blank to use Azure OpenAI's current API (recommended). Only set a dated version (e.g. 2024-10-21) if your resource requires the older deployment API.</div>
                     </div>
                 }
                 <div class="field">
@@ -238,13 +239,6 @@
                     <div class="field-sub">Suppress all popup notifications. In-app badges still update.</div>
                 </div>
                 <label class="switch"><input type="checkbox" checked="@State.Profile.DoNotDisturb" @onchange="e => Toggle(p => p.DoNotDisturb = (bool)(e.Value ?? false))" aria-label="Do not disturb" /></label>
-            </div>
-            <div class="field-row">
-                <div>
-                    <div class="field-label">Notification sound</div>
-                    <div class="field-sub">Play a sound with popup notifications.</div>
-                </div>
-                <label class="switch"><input type="checkbox" checked="@State.Profile.NotificationSound" @onchange="e => Toggle(p => p.NotificationSound = (bool)(e.Value ?? false))" aria-label="Notification sound" /></label>
             </div>
             <div class="field-row">
                 <div>
@@ -640,7 +634,7 @@
         new(LocalToolKind.PowerShell, "PowerShell", "bi-terminal", "Run PowerShell scripts on this machine."),
         new(LocalToolKind.Cmd, "Command Prompt", "bi-terminal-fill", "Run cmd.exe commands."),
         new(LocalToolKind.Python, "Python", "bi-filetype-py", "Run Python 3 scripts (Python must be installed)."),
-        new(LocalToolKind.CSharpScript, "C# scripting", "bi-filetype-cs", "Run C# scripts (needs the dotnet-script tool)."),
+        new(LocalToolKind.CSharpScript, "C# scripting", "bi-filetype-cs", "Run C# scripts as a .NET file-based app (needs the .NET SDK)."),
         new(LocalToolKind.Browser, "Browser", "bi-globe2", "Drive a real web browser (navigate, click, type, screenshot)."),
         new(LocalToolKind.HeadlessBrowser, "Headless browser", "bi-window-dock", "Drive a background (invisible) web browser: navigate, read, click, type, screenshot."),
         new(LocalToolKind.WebSearch, "Web search", "bi-search", "Search the web (Bing, Google, or DuckDuckGo) and return top results."),
@@ -983,7 +977,7 @@
         {
             var t = State.Profile.Tokens;
             var cost = ModelCatalog.EstimateCost(State.Profile.Model.Model, t.PromptTokens, t.CompletionTokens);
-            return cost is null ? "not available for this model" : $"~${cost.Value:0.00}";
+            return cost is null ? "N/A" : $"~${cost.Value:0.00}";
         }
     }
 

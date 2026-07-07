@@ -10,7 +10,10 @@
     <div class="conv-list">
         <h2>Messages</h2>
         <div class="new-conv">
-            <input @bind="newHandle" @onkeydown="OnNewKey" placeholder="Add by handle…" aria-label="Add a conversation by handle" />
+            <input @bind="newHandle" @bind:event="oninput" @onkeydown="OnNewKey" list="msg-handles" placeholder="Add by handle…" aria-label="Add a conversation by handle" />
+            <datalist id="msg-handles">
+                @foreach (var h in KnownHandles) { <option value="@h" /> }
+            </datalist>
             <button class="primary icon-primary" @onclick="StartConversation" title="Start conversation" aria-label="Start conversation"><i class="bi bi-plus-lg"></i></button>
         </div>
         @foreach (var c in State.Profile.Conversations)
@@ -290,6 +293,12 @@
     public Task SendFromComposer() => Send();
 
     bool IsAllowed(string handle) => State.FindContact(handle)?.Allowed == true;
+
+    // Handles offered for autocomplete when starting a conversation: contacts + existing threads.
+    IEnumerable<string> KnownHandles => State.Profile.Contacts.Select(c => c.Handle)
+        .Concat(State.Profile.Conversations.Select(c => c.Handle))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(h => h);
 
     bool reverifying;
 

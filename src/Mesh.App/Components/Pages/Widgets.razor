@@ -12,7 +12,7 @@
 
         <div class="card-panel">
             <div class="kn-row">
-                <input class="full" @bind="desc" @onkeydown="OnKey" placeholder="Describe a new widget (e.g. a tip calculator)…" disabled="@busy" />
+                <input class="full" @bind="desc" @bind:event="oninput" @onkeydown="OnKey" placeholder="Describe a new widget (e.g. a tip calculator)…" disabled="@busy" />
                 <button class="primary" @onclick="Build" disabled="@(busy || string.IsNullOrWhiteSpace(desc))">
                     <i class="bi bi-magic"></i> @(busy ? "Building…" : "Build")
                 </button>

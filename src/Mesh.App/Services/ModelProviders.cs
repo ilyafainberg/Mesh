@@ -446,12 +446,19 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
 /// </summary>
 public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
-    private const string DefaultApiVersion = "2024-08-01-preview";
+    // When the user provides no api-version we use Azure OpenAI's newer "v1" API surface
+    // ({endpoint}/openai/v1/chat/completions), which takes no api-version query parameter and
+    // carries the deployment name in the request body's "model" field. Older resources that need a
+    // specific dated version still work: set the API version in Settings to use the legacy
+    // deployment URL ({endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...).
+    private bool UseV1 => string.IsNullOrWhiteSpace(cfg.ApiVersion);
 
     private string ChatUrl()
     {
         var baseUrl = (cfg.Endpoint ?? "").TrimEnd('/');
-        var version = string.IsNullOrWhiteSpace(cfg.ApiVersion) ? DefaultApiVersion : cfg.ApiVersion!.Trim();
+        if (UseV1)
+            return $"{baseUrl}/openai/v1/chat/completions";
+        var version = cfg.ApiVersion!.Trim();
         return $"{baseUrl}/openai/deployments/{cfg.Model}/chat/completions?api-version={version}";
     }
 
@@ -465,7 +472,9 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
 
         using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
         req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
-        req.Content = JsonContent.Create(new { messages, max_tokens = 1024 });
+        // The v1 API carries the deployment name in the body; the legacy URL carries it in the path
+        // (and ignores an extra "model" field), so sending it is safe for both.
+        req.Content = JsonContent.Create(new { model = cfg.Model, messages, max_tokens = 1024 });
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
@@ -495,7 +504,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
             req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
-            req.Content = JsonContent.Create(new { messages, tools = toolDefs, max_tokens = 1024 });
+            req.Content = JsonContent.Create(new { model = cfg.Model, messages, tools = toolDefs, max_tokens = 1024 });
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);

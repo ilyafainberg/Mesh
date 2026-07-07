@@ -401,7 +401,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = "agent" });
             state.MarkUnread(from);
             if (ShouldNotify(state.FindContact(from)))
-                notifier.Notify("Your home agent replied", Preview(text), NotifyKind.Message, "messages", state.Profile.NotificationSound);
+                notifier.Notify("Your home agent replied", Preview(text), NotifyKind.Message, "messages");
             return;
         }
 
@@ -430,7 +430,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         {
             state.MarkUnread(from);
             if (ShouldNotify(contact))
-                notifier.Notify($"Message from {display}", Preview(text), NotifyKind.Message, "messages", state.Profile.NotificationSound);
+                notifier.Notify($"Message from {display}", Preview(text), NotifyKind.Message, "messages");
         }
 
         if (!allowed)

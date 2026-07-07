@@ -16,11 +16,11 @@ public enum NotifyKind
 public interface INotifier
 {
     /// <summary>Shows an OS toast. <paramref name="route"/> is an optional in-app path to open on click.</summary>
-    void Notify(string title, string body, NotifyKind kind, string? route = null, bool sound = true);
+    void Notify(string title, string body, NotifyKind kind, string? route = null);
 }
 
 /// <summary>No-op notifier for platforms without a toast implementation yet.</summary>
 public sealed class DefaultNotifier : INotifier
 {
-    public void Notify(string title, string body, NotifyKind kind, string? route = null, bool sound = true) { }
+    public void Notify(string title, string body, NotifyKind kind, string? route = null) { }
 }

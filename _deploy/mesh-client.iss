@@ -58,6 +58,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "startupicon"; Description: "Start Mesh when I sign in to Windows"; GroupDescription: "Startup:"; Flags: unchecked
+Name: "installpython"; Description: "Install Python 3 (enables the optional Python tool for the agent)"; GroupDescription: "Optional tools:"; Flags: unchecked; Check: not PythonInstalled
 
 [Files]
 ; The entire self-contained publish output.
@@ -69,4 +70,18 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: startupicon
 
 [Run]
+; Install Python via winget when the user opted in and it isn't already present. winget ships on
+; Windows 10 21H2+ and Windows 11; if it's missing the command simply no-ops (nowait, runhidden).
+Filename: "{cmd}"; Parameters: "/c winget install -e --id Python.Python.3.12 --source winget --accept-source-agreements --accept-package-agreements --scope user"; Tasks: installpython; Flags: runhidden shellexec waituntilterminated; StatusMsg: "Installing Python 3..."
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// True when a `python` or `py` launcher is already discoverable on PATH, so the optional install
+// task is hidden/unchecked for users who already have Python.
+function PythonInstalled(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec('cmd.exe', '/c where python >nul 2>nul || where py >nul 2>nul', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;

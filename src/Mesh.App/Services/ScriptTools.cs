@@ -47,20 +47,21 @@ public sealed class RunPythonTool : IAgentTool
 }
 
 /// <summary>
-/// Runs a C# script via `dotnet script` (if available) and returns its output. Owner-gated local tool.
+/// Runs a C# script as a .NET 10 file-based app (<c>dotnet run file.cs</c>) and returns its output.
+/// Owner-gated local tool. No extra tooling is required beyond the .NET 10 SDK.
 /// </summary>
 public sealed class RunCSharpScriptTool : IAgentTool
 {
     public string Name => "run_csharp_script";
     public string Description =>
-        "Run a C# script (top-level statements, like a .csx) on the local machine and return its " +
-        "stdout, stderr and exit code. Requires the 'dotnet-script' global tool to be installed.";
+        "Run a C# script (top-level statements, a single file) on the local machine and return its " +
+        "stdout, stderr and exit code. Runs as a .NET file-based app (dotnet run file.cs); the .NET SDK is required.";
     public object ParametersSchema => new
     {
         type = "object",
         properties = new
         {
-            code = new { type = "string", description = "The C# script source (top-level statements allowed)." },
+            code = new { type = "string", description = "The C# script source (top-level statements allowed). Use #:package Name@Version to reference NuGet packages." },
             working_directory = new { type = "string", description = "Optional working directory." },
             timeout_seconds = new { type = "integer", description = "Optional timeout (default 180)." }
         },
@@ -77,18 +78,15 @@ public sealed class RunCSharpScriptTool : IAgentTool
         var dotnet = ProcessRunner.Which("dotnet");
         if (dotnet is null) return "ERROR: the .NET SDK (dotnet) is not installed or not on PATH.";
 
-        var tmp = Path.Combine(Path.GetTempPath(), $"mesh-csx-{Guid.NewGuid():n}.csx");
+        // Each run gets its own file so the file-based app builds cleanly and in isolation.
+        var tmp = Path.Combine(Path.GetTempPath(), $"mesh-cs-{Guid.NewGuid():n}.cs");
         try
         {
             await File.WriteAllTextAsync(tmp, code, ct);
             var result = await ProcessRunner.RunAsync(
-                dotnet, $"script \"{tmp}\"",
+                dotnet, $"run \"{tmp}\"",
                 workingDir: string.IsNullOrWhiteSpace(wd) ? null : wd,
                 timeoutSeconds: timeout, ct: ct);
-            if (result.ExitCode != 0 && result.Stderr.Contains("script", StringComparison.OrdinalIgnoreCase)
-                && result.Stderr.Contains("not", StringComparison.OrdinalIgnoreCase))
-                return result.ToToolOutput() +
-                    "\n\nHint: install the C# scripting tool with: dotnet tool install -g dotnet-script";
             return result.ToToolOutput();
         }
         finally { try { File.Delete(tmp); } catch { } }

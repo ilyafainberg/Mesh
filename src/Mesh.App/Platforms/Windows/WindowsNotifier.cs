@@ -17,7 +17,7 @@ public sealed class WindowsNotifier : INotifier
     /// <summary>Optional hook the app sets so a clicked toast can bring the window up + navigate.</summary>
     public static Action<string?>? OnActivated { get; set; }
 
-    public void Notify(string title, string body, NotifyKind kind, string? route = null, bool sound = true)
+    public void Notify(string title, string body, NotifyKind kind, string? route = null)
     {
         try
         {
@@ -27,12 +27,14 @@ public sealed class WindowsNotifier : INotifier
                 .AddText(body);
             if (!string.IsNullOrWhiteSpace(route))
                 builder.AddArgument("route", route);
-            if (!sound)
-                builder.SetAudioEvent(AppNotificationSoundEvent.Default, AppNotificationAudioLooping.None).MuteAudio();
             AppNotificationManager.Default.Show(builder.BuildNotification());
         }
         catch { /* toast failures must never break message handling */ }
     }
+
+    /// <summary>Registers the notification manager eagerly (e.g. at startup) so the first toast pops
+    /// reliably on unpackaged apps instead of being dropped while registration is still pending.</summary>
+    public static void Prime() => EnsureRegistered();
 
     private static void EnsureRegistered()
     {

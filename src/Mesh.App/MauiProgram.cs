@@ -25,6 +25,9 @@ public static class MauiProgram
 			events.AddWindows(w => w.OnWindowCreated(window =>
 			{
 				Mesh.App.Platforms.Windows.WindowsAppControl.AttachTray(window);
+				// Register the toast manager up front so the first notification actually pops
+				// (unpackaged apps drop toasts shown before registration completes).
+				Mesh.App.Platforms.Windows.WindowsNotifier.Prime();
 			}));
 		});
 #endif
