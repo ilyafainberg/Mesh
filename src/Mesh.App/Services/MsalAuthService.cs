@@ -40,9 +40,15 @@ public sealed class MsalAuthService
             .Build();
 
         // Persist the token cache across restarts (DPAPI-protected, CurrentUser), so
-        // connected Microsoft accounts don't need to re-auth every launch.
-        app.UserTokenCache.SetBeforeAccess(OnBeforeAccess);
-        app.UserTokenCache.SetAfterAccess(OnAfterAccess);
+        // connected Microsoft accounts don't need to re-auth every launch. This custom cache
+        // serialization is only supported on desktop: on mobile (Android/iOS/MacCatalyst) MSAL
+        // manages and persists the cache itself via platform secure storage, and calling
+        // SetBeforeAccess/SetAfterAccess throws (TokenCache.Validate), so we skip it there.
+        if (OperatingSystem.IsWindows())
+        {
+            app.UserTokenCache.SetBeforeAccess(OnBeforeAccess);
+            app.UserTokenCache.SetAfterAccess(OnAfterAccess);
+        }
     }
 
     private void OnBeforeAccess(TokenCacheNotificationArgs args)
