@@ -398,7 +398,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         if (env.Kind == MeshKinds.RemoteAgentResponse)
         {
             // The mobile side records the home agent's answer as an incoming assistant line.
-            state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = "agent" });
+            state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = "agent", AddressedToAgent = true });
             state.MarkUnread(from);
             if (ShouldNotify(state.FindContact(from)))
                 notifier.Notify("Your home agent replied", Preview(text), NotifyKind.Message, "messages");
@@ -416,10 +416,12 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             return;
         }
 
-        // Record the inbound line. Agent replies are tagged "agent"; anything a person typed
-        // (chat or a direct message) is "person".
-        var via = env.Kind == MeshKinds.AgentResponse ? "agent" : "person";
-        state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = via });
+        // Record the inbound line. Anything routed through an agent (a reply from the peer's
+        // agent, or a request their agent addressed to ours) is tagged "agent"; a message a
+        // person typed to the human (chat or a direct message) is "person". Chat still engages
+        // our guest agent below, but for labeling/history it is treated as person-authored.
+        var via = env.Kind is MeshKinds.AgentResponse or MeshKinds.AgentRequest ? "agent" : "person";
+        state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = via, AddressedToAgent = via == "agent" });
 
         // Acknowledge receipt of any real message so the sender sees "delivered".
         if (env.Kind is MeshKinds.DirectMessage or MeshKinds.Chat or MeshKinds.AgentRequest or MeshKinds.AgentResponse)
@@ -495,7 +497,10 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             }
             else
             {
-                state.AddChatLine(from, new ChatLine { Role = "assistant", Text = reply });
+                // The guest agent's own reply travels on the agent channel (Via defaults to
+                // "agent" so it stays in the guest history and shows the agent icon), but it
+                // answers the requesting person, so it is AddressedToAgent == false -> "to them".
+                state.AddChatLine(from, new ChatLine { Role = "assistant", Text = reply, AddressedToAgent = false });
                 await SendAsync(from, MeshKinds.AgentResponse, reply);
             }
         }
@@ -555,7 +560,8 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var approval = state.Profile.Approvals.FirstOrDefault(a => a.Id == approvalId);
         if (approval is null) return;
         var text = string.IsNullOrWhiteSpace(editedReply) ? approval.DraftReply : editedReply!;
-        var line = new ChatLine { Role = "assistant", Text = text };
+        // An approved draft is the agent's reply to the contact who asked, so it reads "to them".
+        var line = new ChatLine { Role = "assistant", Text = text, AddressedToAgent = false };
         state.AddChatLine(approval.From, line);
         state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
         await SendAsync(approval.From, MeshKinds.AgentResponse, text, line.Id);

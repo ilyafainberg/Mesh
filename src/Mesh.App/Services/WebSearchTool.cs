@@ -50,6 +50,9 @@ public sealed class WebSearchTool : IAgentTool
         if (count < 1) count = 1;
         if (count > 10) count = 10;
 
+        if (PlatformCaps.IsMobile)
+            return await ExecuteMobileAsync(query, count, ct).ConfigureAwait(false);
+
         var encoded = Uri.EscapeDataString(query);
         var engines = new (string Name, string Url, string Script)[]
         {
@@ -107,6 +110,32 @@ public sealed class WebSearchTool : IAgentTool
             if (browser is not null)
                 await browser.DisposeAsync().ConfigureAwait(false);
             playwright?.Dispose();
+        }
+    }
+
+    private static async Task<string> ExecuteMobileAsync(string query, int count, CancellationToken ct)
+    {
+        try
+        {
+            var parsed = await DuckDuckGoHtmlSearch.SearchAsync(query, count, ct).ConfigureAwait(false);
+            var results = new List<SearchResult>(parsed.Count);
+            foreach (var (title, url, snippet) in parsed)
+            {
+                var cleanTitle = (title ?? string.Empty).Trim();
+                var cleanUrl = (url ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(cleanTitle) && string.IsNullOrEmpty(cleanUrl)) continue;
+                results.Add(new SearchResult(cleanTitle, cleanUrl, Truncate((snippet ?? string.Empty).Trim(), 300)));
+                if (results.Count >= count) break;
+            }
+
+            if (results.Count > 0)
+                return Format(query, "DuckDuckGo", results);
+
+            return "ERROR: web search failed on all engines (Bing, Google, DuckDuckGo). no results returned.";
+        }
+        catch (Exception ex)
+        {
+            return $"ERROR: web search failed on all engines (Bing, Google, DuckDuckGo). {ex.Message}";
         }
     }
 

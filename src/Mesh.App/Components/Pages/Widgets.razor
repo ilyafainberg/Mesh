@@ -1,6 +1,7 @@
 ﻿@page "/widgets"
 @inject AppState State
 @inject AgentService Agent
+@inject IJSRuntime JS
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -19,11 +20,11 @@
             </div>
             @if (draftHtml is not null)
             {
-                <div class="app-frame"><iframe sandbox="allow-scripts allow-forms allow-modals" srcdoc="@draftHtml" referrerpolicy="no-referrer"></iframe></div>
+                <div class="app-frame"><iframe @ref="draftFrame" sandbox="allow-scripts allow-forms allow-modals" referrerpolicy="no-referrer"></iframe></div>
                 <div class="kn-row">
                     <input class="full" @bind="draftName" placeholder="Name this widget…" />
                     <button class="primary" @onclick="SaveDraft" disabled="@string.IsNullOrWhiteSpace(draftName)"><i class="bi bi-pin-angle"></i> Pin</button>
-                    <button class="ghost" @onclick="() => draftHtml = null"><i class="bi bi-x-lg"></i> Discard</button>
+                    <button class="ghost" @onclick="DiscardDraft"><i class="bi bi-x-lg"></i> Discard</button>
                 </div>
             }
             @if (error is not null) { <p class="err">@error</p> }
@@ -44,7 +45,7 @@
                     </select>
                     <button class="icon-btn" title="Delete" @onclick="() => Remove(w)"><i class="bi bi-trash"></i></button>
                 </div>
-                <div class="app-frame"><iframe sandbox="allow-scripts allow-forms allow-modals" srcdoc="@w.Html" referrerpolicy="no-referrer"></iframe></div>
+                <div class="app-frame"><iframe @ref="widgetRefs[w]" sandbox="allow-scripts allow-forms allow-modals" referrerpolicy="no-referrer"></iframe></div>
             </div>
         }
         @if (State.Profile.Widgets.Count == 0)
@@ -61,8 +62,41 @@
     string? draftHtml;
     string draftName = "";
 
+    // Blob-URL plumbing: the draft preview frame plus one frame per pinned widget.
+    ElementReference draftFrame;
+    string? draftMountedHtml;
+    readonly Dictionary<Widget, ElementReference> widgetRefs = new();
+    readonly HashSet<Widget> widgetMounted = new();
+
     protected override void OnInitialized() => State.Changed += Refresh;
     void Refresh() => InvokeAsync(StateHasChanged);
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Load the draft HTML via a blob URL whenever it appears or changes.
+        if (draftHtml is not null && draftMountedHtml != draftHtml)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", draftFrame, draftHtml);
+                draftMountedHtml = draftHtml;
+            }
+            catch { /* frame not ready yet; retry on the next render */ }
+        }
+
+        // Load each newly rendered pinned widget frame once.
+        foreach (var w in State.Profile.Widgets)
+        {
+            if (widgetMounted.Contains(w)) continue;
+            if (!widgetRefs.TryGetValue(w, out var el)) continue;
+            try
+            {
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, w.Html);
+                widgetMounted.Add(w);
+            }
+            catch { /* frame not ready yet; retry on the next render */ }
+        }
+    }
 
     async Task OnKey(KeyboardEventArgs e)
     {
@@ -86,16 +120,45 @@
         finally { busy = false; }
     }
 
-    void SaveDraft()
+    async Task SaveDraft()
     {
         if (draftHtml is null || string.IsNullOrWhiteSpace(draftName)) return;
         State.Mutate(p => p.Widgets.Add(new Widget { Name = draftName.Trim(), Prompt = desc, Html = draftHtml!, Visibility = "private" }));
+        await RevokeDraft();
         draftHtml = null; draftName = ""; desc = "";
+    }
+
+    async Task DiscardDraft()
+    {
+        await RevokeDraft();
+        draftHtml = null;
+    }
+
+    async Task RevokeDraft()
+    {
+        if (draftMountedHtml is not null)
+        {
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", draftFrame); }
+            catch { /* ignore revoke failures */ }
+            draftMountedHtml = null;
+        }
     }
 
     void Rename(Widget w, ChangeEventArgs e) => State.Mutate(_ => w.Name = e.Value?.ToString()?.Trim() ?? w.Name);
     void SetVisibility(Widget w, ChangeEventArgs e) => State.Mutate(_ => w.Visibility = e.Value?.ToString() ?? "private");
-    void Remove(Widget w) => State.Mutate(p => p.Widgets.Remove(w));
+
+    async Task Remove(Widget w)
+    {
+        // Revoke the widget's blob URL while its iframe is still in the DOM.
+        if (widgetRefs.TryGetValue(w, out var el))
+        {
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", el); }
+            catch { /* ignore revoke failures */ }
+        }
+        widgetMounted.Remove(w);
+        widgetRefs.Remove(w);
+        State.Mutate(p => p.Widgets.Remove(w));
+    }
 
     public void Dispose() => State.Changed -= Refresh;
 }

@@ -19,9 +19,22 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     /// <summary>Owner chat: the user talking to their own agent with full access.</summary>
     public async Task<string> AskAsOwnerAsync(string threadId, string userText, CancellationToken ct = default)
     {
-        var p = state.Profile;
         var thread = state.GetOrCreateOwnThread(threadId);
         state.AddOwnChatLine(thread.Id, new ChatLine { Role = "user", Text = userText });
+        return await ContinueAsOwnerAsync(thread.Id, ct);
+    }
+
+    /// <summary>
+    /// Runs an owner turn over the thread's EXISTING history WITHOUT appending a new user line.
+    /// Used to answer messages the user queued while a previous turn was still running: those
+    /// lines are already in the thread, so this only generates and stores the reply. Answering
+    /// them in one continuation turn (they are consecutive user turns in the history) batches
+    /// the queued guidance in order without ever running two turns concurrently.
+    /// </summary>
+    public async Task<string> ContinueAsOwnerAsync(string threadId, CancellationToken ct = default)
+    {
+        var p = state.Profile;
+        var thread = state.GetOrCreateOwnThread(threadId);
 
         // Owner may use every connected source's tools, plus local tools and bundled MCP servers.
         var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
@@ -142,10 +155,20 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var contact = state.FindContact(fromHandle);
         var circles = contact?.Circles ?? new List<string>();
 
-        // The agent only sees the agent-to-agent exchange, never person-to-person messages the
-        // contact addressed directly to the human owner (Via == "person"). Those are private to
-        // the owner and must not steer or leak into the agent's replies.
-        var agentHistory = history.Where(l => l.Via != "person").ToList();
+        // The agent must see the requesting contact's inbound questions (any Role == "user"
+        // turn), plus its own prior agent-channel replies. It must NOT see the owner's private
+        // person-to-person messages the contact addressed directly to the human (an outbound
+        // line the owner typed in Person mode, Role == "assistant" && Via == "person"): those
+        // are private to the owner and must not steer or leak into the agent's replies.
+        var agentHistory = history.Where(l => l.Role == "user" || l.Via != "person").ToList();
+
+        // Safety net so the guest never falls back to a bare greeting: if filtering left nothing
+        // to answer, respond to the most recent inbound line rather than an empty history.
+        if (!agentHistory.Any(l => l.Role == "user"))
+        {
+            var lastInbound = history.LastOrDefault(l => l.Role == "user");
+            if (lastInbound is not null) agentHistory.Add(lastInbound);
+        }
 
         // Tools scoped to this contact's circles (whole-source or per-folder grants).
         static bool Visible(string vis, List<string> cs) =>

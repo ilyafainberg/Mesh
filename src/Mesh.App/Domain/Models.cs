@@ -242,6 +242,14 @@ public sealed class ChatLine
     /// can tell an agent exchange apart from a direct message.
     /// </summary>
     public string Via { get; set; } = "agent";
+    /// <summary>
+    /// Whether the PEER participant on this line is the peer's agent (true) rather than the
+    /// peer person (false). This captures addressee/author for the bubble label independently
+    /// of <see cref="Via"/> (the routing channel): an agent-authored auto-reply travels on the
+    /// agent channel (Via == "agent") yet answers the human, so it is AddressedToAgent == false
+    /// and reads "to them". Via still drives history scoping and the channel icon.
+    /// </summary>
+    public bool AddressedToAgent { get; set; }
     /// <summary>Delivery status for an outgoing line: "" | "sent" | "delivered" | "failed".</summary>
     public string Status { get; set; } = "";
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;

@@ -73,6 +73,10 @@
                     {
                         <div class="bubble @(line.Role)">
                             <MessageContent Text="@line.Text" OnPin="PinWidget" />
+                            @if (IsQueued(line))
+                            {
+                                <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
+                            }
                         </div>
                     }
                 }
@@ -135,8 +139,8 @@
                         </button>
                     }
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
-                              placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" disabled="@busy" aria-label="Message your assistant"></textarea>
-                    <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send" aria-label="Send">
+                              placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" aria-label="Message your assistant"></textarea>
+                    <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send">
                         <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
                     </button>
                 </div>
@@ -178,6 +182,12 @@
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
+
+    // Tier-1 steerable input: messages submitted while a turn is running are queued (shown
+    // immediately as a subtle "queued" line) and answered together in ONE follow-up turn after
+    // the current one finishes, in order. Never runs two agent turns concurrently.
+    readonly List<ChatLine> queued = new();
+    bool IsQueued(ChatLine line) => queued.Contains(line);
 
     sealed record StagedFile(string Name, string Path, long Size)
     {
@@ -338,7 +348,7 @@
 
     async Task Send()
     {
-        if ((string.IsNullOrWhiteSpace(input) && attachments.Count == 0) || busy) return;
+        if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0) return;
 
         // Ensure there is a thread to write into, and name a fresh one after its first message.
         var thread = Active ?? State.NewOwnThread();
@@ -351,6 +361,18 @@
         input = "";
         attachments.Clear();
         _ = ResetComposer();
+
+        // A turn is already running: queue this input for the next turn instead of starting a
+        // second concurrent agent call. Show it immediately as a subtle "queued" user line; it is
+        // already in the thread history, so the drain turn below answers it in order.
+        if (busy)
+        {
+            var qLine = new ChatLine { Role = "user", Text = ComposeOwnerPrompt(text, files) };
+            State.AddOwnChatLine(thread.Id, qLine);
+            queued.Add(qLine);
+            return;
+        }
+
         busy = true;
         try
         {
@@ -376,20 +398,36 @@
             }
             else
             {
-                var prompt = text ?? "";
-                if (files.Count > 0)
-                {
-                    var sb = new System.Text.StringBuilder(prompt);
-                    if (sb.Length > 0) sb.Append("\n\n");
-                    sb.Append("Attached local files (use the read_local_file tool to open any you need):");
-                    foreach (var f in files) sb.Append($"\n- {f.Path}");
-                    prompt = sb.ToString();
-                }
-                await Agent.AskAsOwnerAsync(thread.Id, prompt);
+                await Agent.AskAsOwnerAsync(thread.Id, ComposeOwnerPrompt(text, files));
+            }
+
+            // Drain anything queued while the turn above ran. Each drain answers ALL currently
+            // queued lines together in one continuation turn (they are consecutive user turns
+            // already in the history); loop in case more were queued while draining.
+            while (queued.Count > 0)
+            {
+                queued.Clear(); // they are now being answered, not waiting
+                building = false;
+                await Agent.ContinueAsOwnerAsync(thread.Id);
             }
         }
         catch (Exception ex) { State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
         finally { busy = false; building = false; }
+    }
+
+    // Builds the owner prompt, appending any staged local file paths the agent can open on request.
+    static string ComposeOwnerPrompt(string? text, List<StagedFile> files)
+    {
+        var prompt = text ?? "";
+        if (files.Count > 0)
+        {
+            var sb = new System.Text.StringBuilder(prompt);
+            if (sb.Length > 0) sb.Append("\n\n");
+            sb.Append("Attached local files (use the read_local_file tool to open any you need):");
+            foreach (var f in files) sb.Append($"\n- {f.Path}");
+            prompt = sb.ToString();
+        }
+        return prompt;
     }
 
     // A short title from the first message of a new chat.

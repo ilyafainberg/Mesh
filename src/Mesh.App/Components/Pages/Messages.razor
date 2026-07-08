@@ -120,6 +120,10 @@
                                             OnPin="PinWidget" />
                             <div class="msg-tag">
                                 <i class="bi @(line.Via == "person" ? "bi-person" : "bi-robot")"></i> @TagLabel(line)
+                                @if (queuedIds.Contains(line.Id))
+                                {
+                                    <span class="msg-status" title="Queued - will send after the current turn"><i class="bi bi-hourglass-split"></i> queued</span>
+                                }
                                 @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status))
                                 {
                                     <span class="msg-status @line.Status" title="@line.Status">
@@ -181,7 +185,7 @@
                             <i class="bi bi-paperclip"></i>
                         </button>
                         <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
-                               placeholder="@Placeholder" disabled="@busy" aria-label="Message input"></textarea>
+                               placeholder="@Placeholder" aria-label="Message input"></textarea>
                         <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
                             <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
                                     title="Send to their agent (it may auto-reply)">
@@ -192,7 +196,7 @@
                                 <i class="bi bi-person"></i> Person
                             </button>
                         </div>
-                        <button class="primary send-btn" @onclick="Send" disabled="@(busy || (string.IsNullOrWhiteSpace(input) && attachments.Count == 0))" title="Send" aria-label="Send"><i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i></button>
+                        <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send"><i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i></button>
                     </div>
                     @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 </div>
@@ -222,6 +226,14 @@
     readonly List<StagedFile> attachments = new();
     string? attachError;
     const long MaxAttachmentBytes = 20L * 1024 * 1024;
+
+    // Tier-1 steerable input: messages the user submits while a send is in flight are queued
+    // (shown immediately as a "queued" line) and delivered in order after the current turn,
+    // never concurrently. queuedIds tracks which lines still render the "queued" marker.
+    readonly Queue<PendingMsg> pending = new();
+    readonly HashSet<string> queuedIds = new();
+
+    sealed record PendingMsg(string Handle, ChatLine Line, string Text, List<StagedFile> Files, bool Direct, bool Widget);
 
     sealed record StagedFile(string Name, string Mime, string Base64, long Size)
     {
@@ -350,11 +362,13 @@
         try { await JS.InvokeVoidAsync("meshUI.resetComposer", composerEl); } catch { }
     }
 
-    // Bubble tag: whether a line was addressed to / came from an agent or a person.
+    // Bubble tag: whether a line was addressed to / came from the peer's AGENT or the peer person.
+    // Uses AddressedToAgent (addressee/author) rather than Via (routing channel), so an agent
+    // auto-reply that answers the human reads "to them" even though it travels on the agent channel.
     string TagLabel(ChatLine line)
     {
         var mine = line.Role != "user"; // "assistant" role = my own message
-        var agent = line.Via != "person";
+        var agent = line.AddressedToAgent;
         if (mine) return agent ? "to their agent" : "to them";
         return agent ? "their agent" : "them";
     }
@@ -418,46 +432,73 @@
 
     async Task Send()
     {
-        if (active is null || busy) return;
+        if (active is null) return;
         if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0) return;
         var text = input;
         var files = attachments.ToList();
         input = "";
         attachments.Clear();
         _ = ResetComposer();
+
+        var direct = directMode;
+        var widget = widgetMode;
+        if (widgetMode) widgetMode = false;
+
+        var via = direct ? "person" : "agent";
+        var line = new ChatLine { Role = "assistant", Text = text, Via = via, AddressedToAgent = !direct };
+        State.AddChatLine(active, line);
+
+        // A send is already running: queue this one for the next turn instead of starting a
+        // second concurrent send. The line is already visible; mark it "queued" until delivered.
+        if (busy)
+        {
+            queuedIds.Add(line.Id);
+            pending.Enqueue(new PendingMsg(active, line, text, files, direct, widget));
+            return;
+        }
+
         busy = true;
         try
         {
-            var toSend = text;
-            if (widgetMode && !string.IsNullOrWhiteSpace(text))
-            {
-                widgetMode = false;
-                toSend = await Agent.BuildWidgetAsync(text);
-            }
+            await DeliverAsync(active, line, text, files, direct, widget);
 
-            // Append any staged attachments as mesh-file blocks the recipient can render.
-            if (files.Count > 0)
+            // Drain anything queued while the turn(s) above ran, in order, one at a time.
+            while (pending.Count > 0)
             {
-                var sb = new System.Text.StringBuilder(toSend ?? "");
-                foreach (var f in files)
-                {
-                    if (sb.Length > 0) sb.Append("\n\n");
-                    sb.Append(Markdown.FileBlock(f.Name, f.Mime, f.Base64));
-                }
-                toSend = sb.ToString();
+                var next = pending.Dequeue();
+                queuedIds.Remove(next.Line.Id);
+                await DeliverAsync(next.Handle, next.Line, next.Text, next.Files, next.Direct, next.Widget);
             }
-
-            var kind = directMode ? MeshKinds.DirectMessage : MeshKinds.Chat;
-            var via = directMode ? "person" : "agent";
-            var line = new ChatLine { Role = "assistant", Text = toSend, Via = via }; // "assistant" = me, rendered right
-            State.AddChatLine(active, line);
-            await Mesh.SendAsync(active, kind, toSend, line.Id);
         }
         catch (Exception ex)
         {
             State.AddChatLine(active!, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" });
         }
         finally { busy = false; }
+    }
+
+    // Finalizes a bubble's text (widget build + attachments) and sends it to the peer, reusing
+    // the line's stable id so delivery receipts update the right bubble.
+    async Task DeliverAsync(string handle, ChatLine line, string text, List<StagedFile> files, bool direct, bool widget)
+    {
+        var toSend = text;
+        if (widget && !string.IsNullOrWhiteSpace(text))
+            toSend = await Agent.BuildWidgetAsync(text);
+
+        if (files.Count > 0)
+        {
+            var sb = new System.Text.StringBuilder(toSend ?? "");
+            foreach (var f in files)
+            {
+                if (sb.Length > 0) sb.Append("\n\n");
+                sb.Append(Markdown.FileBlock(f.Name, f.Mime, f.Base64));
+            }
+            toSend = sb.ToString();
+        }
+
+        line.Text = toSend; // "assistant" = me, rendered right
+        var kind = direct ? MeshKinds.DirectMessage : MeshKinds.Chat;
+        await Mesh.SendAsync(handle, kind, toSend, line.Id);
     }
 
     void PinWidget(string html) { pinHtml = html; pinName = ""; }

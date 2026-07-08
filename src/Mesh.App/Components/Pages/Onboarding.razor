@@ -111,7 +111,10 @@
             <label>Connect a model</label>
             <button class="primary full" disabled="@Working" @onclick="StartFree">@(Working && provider == "MeshHosted" ? "Setting up..." : "Start free")</button>
             <p class="hint">Runs on a shared Mesh model, no API key needed. You can switch to your own model anytime in Settings.</p>
-            <p class="hint">Prefer to stay fully on your machine? Foundry Local runs a free model on-device (pick it under "Use my own model" below).</p>
+            @if (!PlatformCaps.IsMobile)
+            {
+                <p class="hint">Prefer to stay fully on your machine? Foundry Local runs a free model on-device (pick it under "Use my own model" below).</p>
+            }
 
             <button class="ghost" @onclick="() => showAdvanced = !showAdvanced">@(showAdvanced ? "Hide advanced options" : "Use my own model key")</button>
 

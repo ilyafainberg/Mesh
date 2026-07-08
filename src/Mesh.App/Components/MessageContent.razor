@@ -39,11 +39,12 @@
     else
     {
         var id = seg.Content.GetHashCode();
+        appHtml[id] = seg.Content;
         @if (running.Contains(id))
         {
             <div class="app-frame @(expanded.Contains(id) ? "expanded" : "")">
-                <iframe sandbox="allow-scripts allow-forms allow-modals"
-                        srcdoc="@seg.Content"
+                <iframe @ref="frameRefs[id]"
+                        sandbox="allow-scripts allow-forms allow-modals"
                         referrerpolicy="no-referrer"></iframe>
                 <div class="app-toolbar">
                     @if (OnPin.HasDelegate)
@@ -53,7 +54,7 @@
                     <button @onclick="() => Toggle(expanded, id)" title="@(expanded.Contains(id) ? "Shrink" : "Expand")" aria-label="@(expanded.Contains(id) ? "Shrink" : "Expand")">
                         <i class="bi @(expanded.Contains(id) ? "bi-arrows-angle-contract" : "bi-arrows-angle-expand")"></i>
                     </button>
-                    <button @onclick="() => running.Remove(id)" title="Close app" aria-label="Close app"><i class="bi bi-x-lg"></i></button>
+                    <button @onclick="() => Close(id)" title="Close app" aria-label="Close app"><i class="bi bi-x-lg"></i></button>
                 </div>
             </div>
         }
@@ -78,9 +79,46 @@
     private readonly HashSet<int> running = new();
     private readonly HashSet<int> expanded = new();
 
+    // Per-app iframe element (keyed by the app id) plus the HTML to load into it
+    // and the set of frames whose blob URL has already been set.
+    private readonly Dictionary<int, ElementReference> frameRefs = new();
+    private readonly Dictionary<int, string> appHtml = new();
+    private readonly HashSet<int> mounted = new();
+
     private void Toggle(HashSet<int> set, int id)
     {
         if (!set.Remove(id)) set.Add(id);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // For each freshly shown app frame, hand its HTML to the iframe as a blob
+        // URL so inline scripts run. Only set once per mount to avoid reloading.
+        foreach (var id in running.ToList())
+        {
+            if (mounted.Contains(id)) continue;
+            if (!frameRefs.TryGetValue(id, out var el)) continue;
+            if (!appHtml.TryGetValue(id, out var html)) continue;
+            try
+            {
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, html);
+                mounted.Add(id);
+            }
+            catch { /* frame not ready yet; retry on the next render */ }
+        }
+    }
+
+    private async Task Close(int id)
+    {
+        // Revoke the blob URL while the iframe is still in the DOM, then remove it.
+        if (frameRefs.TryGetValue(id, out var el))
+        {
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", el); }
+            catch { /* ignore revoke failures */ }
+        }
+        mounted.Remove(id);
+        frameRefs.Remove(id);
+        running.Remove(id);
     }
 
     private async Task Download(MessageSegment seg)
