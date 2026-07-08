@@ -30,7 +30,7 @@
         <header class="pane-head">
             @if (renaming && Active is not null)
             {
-                <input class="rename-input" @bind="renameText" @onkeydown="OnRenameKey" aria-label="Chat title" />
+                <input class="rename-input" @bind="renameText" @bind:event="oninput" @onkeydown="OnRenameKey" aria-label="Chat title" />
                 <button class="icon-btn" title="Save" @onclick="SaveRename" aria-label="Save title"><i class="bi bi-check-lg"></i></button>
                 <button class="icon-btn" title="Cancel" @onclick="() => renaming = false" aria-label="Cancel rename"><i class="bi bi-x-lg"></i></button>
             }

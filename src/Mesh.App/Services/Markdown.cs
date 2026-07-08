@@ -12,6 +12,8 @@ public static class Markdown
         .UseEmphasisExtras()
         .UseAutoLinks()
         .UseSoftlineBreakAsHardlineBreak()
+        .UsePipeTables()
+        .UseGridTables()
         .DisableHtml() // strip raw HTML so agent output can't inject markup
         .Build();
 
@@ -25,7 +27,8 @@ public static class Markdown
         return text.Contains("**") || text.Contains("__") || text.Contains("`")
             || text.Contains("* ") || text.Contains("- ") || text.Contains("# ")
             || text.Contains("] (") || text.Contains("](") || text.Contains("\n1. ") || text.StartsWith("1. ")
-            || text.Contains("> ") || text.Contains("~~");
+            || text.Contains("> ") || text.Contains("~~")
+            || (text.Contains("|") && text.Contains("\n"));
     }
 
     /// <summary>

@@ -25,9 +25,22 @@ public interface ISecretStore
 }
 
 /// <summary>
-/// <see cref="ISecretStore"/> backed by MAUI SecureStorage. Keys are stored base64 under
-/// <c>meshdb-key-{id}</c>. If the platform secure store is unavailable (for example a headless
-/// test host), it falls back to a process-lifetime in-memory map so the app still runs.
+/// <see cref="ISecretStore"/> that keeps each identity's 32-byte SQLCipher key in its own file so
+/// N identities coexist for the same Windows user.
+///
+/// On Windows the key is protected with DPAPI at <see cref="DataProtectionScope.CurrentUser"/>
+/// scope and written to <c>{KeysDir}\meshdb-key-{id}.bin</c>. CurrentUser DPAPI is scoped to the
+/// Windows USER account, NOT to any file path or app package identity, so the encrypted key
+/// survives ApplicationId/publisher changes and reinstalls (the exact orphaning bug this fixes).
+/// The key directory itself (<see cref="StoragePaths.KeysDir"/>) is a fixed, app-identity-independent
+/// location, so the ciphertext file is never moved out from under the app either.
+///
+/// On non-Windows platforms DPAPI is unavailable, so the key is kept in the platform secure enclave
+/// via MAUI <see cref="Microsoft.Maui.Storage.SecureStorage"/> (Android Keystore, iOS Keychain),
+/// exactly as before.
+///
+/// A process-lifetime in-memory map backs both paths so the app still runs on a headless test host
+/// where neither DPAPI nor SecureStorage is available.
 /// </summary>
 public sealed class SecretStore : ISecretStore
 {
@@ -36,6 +49,11 @@ public sealed class SecretStore : ISecretStore
 
     private readonly Dictionary<string, byte[]> fallback = new();
     private readonly object gate = new();
+
+    // KeysDir is obtained statically from StoragePaths (the shared source of truth) rather than via
+    // a constructor parameter, so DI registration in MauiProgram stays unchanged.
+    private static string KeyFilePath(string identityId) =>
+        Path.Combine(StoragePaths.KeysDir, $"{Prefix}{identityId}.bin");
 
     public byte[] GetOrCreateDbKey(string identityId)
     {
@@ -48,6 +66,26 @@ public sealed class SecretStore : ISecretStore
 
     public byte[]? GetDbKey(string identityId)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                var path = KeyFilePath(identityId);
+                if (File.Exists(path))
+                {
+                    var protectedBytes = File.ReadAllBytes(path);
+                    var key = ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser);
+                    lock (gate) fallback[identityId] = key;
+                    return key;
+                }
+            }
+            catch { /* corrupt/unreadable file, fall back to in-memory */ }
+
+            lock (gate)
+                return fallback.TryGetValue(identityId, out var k) ? k : null;
+        }
+
+        // Non-Windows: MAUI SecureStorage (secure enclave), with in-memory fallback.
         var name = Prefix + identityId;
         try
         {
@@ -65,6 +103,20 @@ public sealed class SecretStore : ISecretStore
 
     public void PutDbKey(string identityId, byte[] key)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                Directory.CreateDirectory(StoragePaths.KeysDir);
+                var protectedBytes = ProtectedData.Protect(key, null, DataProtectionScope.CurrentUser);
+                File.WriteAllBytes(KeyFilePath(identityId), protectedBytes);
+            }
+            catch { /* fall through to in-memory */ }
+            lock (gate) fallback[identityId] = key;
+            return;
+        }
+
+        // Non-Windows: persist to the secure enclave, mirror into the in-memory fallback.
         var name = Prefix + identityId;
         var b64 = Convert.ToBase64String(key);
         try { Task.Run(() => Microsoft.Maui.Storage.SecureStorage.SetAsync(name, b64)).GetAwaiter().GetResult(); }
@@ -74,7 +126,14 @@ public sealed class SecretStore : ISecretStore
 
     public void DeleteDbKey(string identityId)
     {
-        try { Microsoft.Maui.Storage.SecureStorage.Remove(Prefix + identityId); } catch { }
+        if (OperatingSystem.IsWindows())
+        {
+            try { var p = KeyFilePath(identityId); if (File.Exists(p)) File.Delete(p); } catch { }
+        }
+        else
+        {
+            try { Microsoft.Maui.Storage.SecureStorage.Remove(Prefix + identityId); } catch { }
+        }
         lock (gate) fallback.Remove(identityId);
     }
 }

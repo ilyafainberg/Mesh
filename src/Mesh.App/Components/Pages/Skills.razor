@@ -42,11 +42,11 @@
     <div class="card-panel">
         <div class="mp-title">
             <h3><i class="bi bi-shop"></i> Skill marketplaces</h3>
-            <span class="field-hint">Connect a marketplace by URL, browse its skills, and import the ones you want. Imported skills auto-update on startup.</span>
+            <span class="field-hint">Connect a marketplace by URL, browse its skills, and import the ones you want. Add a bespoke skills.json, or a GitHub repo like microsoft/power-cat-skills. Imported skills auto-update on startup.</span>
         </div>
 
         <div class="mp-add-row">
-            <input class="full" placeholder="https://example.com/skills.json"
+            <input class="full" placeholder="microsoft/power-cat-skills or https://example.com/skills.json"
                    @bind="marketUrl" @bind:event="oninput" @onkeydown="OnMarketKeyDown" disabled="@addingMarket" />
             <button class="primary" @onclick="AddMarketplace" disabled="@(addingMarket || string.IsNullOrWhiteSpace(marketUrl))">
                 @if (addingMarket)
@@ -120,25 +120,46 @@
                                 }
                                 else
                                 {
-                                    <div class="mp-skill-list">
-                                        @foreach (var ms in browseIndex.Skills)
-                                        {
-                                            var imported = IsImported(m.Id, ms.Id);
-                                            <label class="mp-skill @(imported ? "is-imported" : "")">
-                                                <input type="checkbox" disabled="@imported"
-                                                       checked="@selected.Contains(ms.Id)"
-                                                       @onchange="e => ToggleSelected(ms.Id, e)" />
-                                                <div class="mp-skill-body">
-                                                    <div class="mp-skill-head">
-                                                        <b>@ms.Name</b>
-                                                        @if (!string.IsNullOrWhiteSpace(ms.Version)) { <span class="chip">v@ms.Version</span> }
-                                                        @if (imported) { <span class="chip">Imported</span> }
-                                                    </div>
-                                                    @if (!string.IsNullOrWhiteSpace(ms.Description)) { <div class="muted small">@ms.Description</div> }
+                                    RenderFragment<SkillMarketplaceService.MarketplaceSkill> skillRow = ms =>
+                                        @<label class="mp-skill @(IsImported(m.Id, ms.Id) ? "is-imported" : "")">
+                                            <input type="checkbox" disabled="@IsImported(m.Id, ms.Id)"
+                                                   checked="@selected.Contains(ms.Id)"
+                                                   @onchange="e => ToggleSelected(ms.Id, e)" />
+                                            <div class="mp-skill-body">
+                                                <div class="mp-skill-head">
+                                                    <b>@ms.Name</b>
+                                                    @if (!string.IsNullOrWhiteSpace(ms.Version)) { <span class="chip">v@ms.Version</span> }
+                                                    @if (IsImported(m.Id, ms.Id)) { <span class="chip">Imported</span> }
                                                 </div>
-                                            </label>
-                                        }
-                                    </div>
+                                                @if (!string.IsNullOrWhiteSpace(ms.Description)) { <div class="muted small">@ms.Description</div> }
+                                            </div>
+                                        </label>;
+
+                                    if (browseIndex.Plugins.Count > 0)
+                                    {
+                                        <div class="mp-plugin-list">
+                                            @foreach (var pl in browseIndex.Plugins)
+                                            {
+                                                <div class="mp-plugin">
+                                                    <div class="mp-plugin-head">
+                                                        <i class="bi bi-box-seam"></i>
+                                                        <b>@pl.Name</b>
+                                                        <span class="muted small">@pl.Skills.Count skill@(pl.Skills.Count == 1 ? "" : "s")</span>
+                                                    </div>
+                                                    @if (!string.IsNullOrWhiteSpace(pl.Description)) { <div class="muted small mp-plugin-desc">@pl.Description</div> }
+                                                    <div class="mp-skill-list">
+                                                        @foreach (var ms in pl.Skills) { @skillRow(ms) }
+                                                    </div>
+                                                </div>
+                                            }
+                                        </div>
+                                    }
+                                    else
+                                    {
+                                        <div class="mp-skill-list">
+                                            @foreach (var ms in browseIndex.Skills) { @skillRow(ms) }
+                                        </div>
+                                    }
                                     <div class="mp-browse-actions">
                                         <button class="primary" @onclick="() => ImportSelected(m)" disabled="@(selected.Count == 0)">
                                             <i class="bi bi-download"></i> Import selected (@selected.Count)

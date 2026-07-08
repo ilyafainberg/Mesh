@@ -53,13 +53,11 @@ public sealed class AppState
     public AppState(ISecretStore secrets)
     {
         this.secrets = secrets;
-        // Allow an override directory so multiple instances (e.g. two users on one machine for
-        // testing) run with isolated stores.
-        var d = Environment.GetEnvironmentVariable("MESH_PROFILE_DIR");
-        if (string.IsNullOrWhiteSpace(d))
-            d = Microsoft.Maui.Storage.FileSystem.AppDataDirectory;
-        Directory.CreateDirectory(d);
-        dir = d;
+        // Directory is owned by StoragePaths, the single source of truth shared with SecretStore.
+        // It resolves to a stable, app-identity-independent root on Windows (%LOCALAPPDATA%\Mesh\Data),
+        // still honoring the MESH_PROFILE_DIR override used for isolated test instances.
+        dir = StoragePaths.DataDir;
+        Directory.CreateDirectory(dir);
         indexPath = Path.Combine(dir, "accounts.json");
         Load();
     }

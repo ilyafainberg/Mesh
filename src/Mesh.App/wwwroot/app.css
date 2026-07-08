@@ -366,6 +366,13 @@ input[type=checkbox]:not(.switch input):checked::after {
 .text.md a { color: inherit; text-decoration: underline; }
 .text.md h1, .text.md h2, .text.md h3 { font-size: 1em; margin: 6px 0 3px; }
 .bubble.user .text.md code, .bubble.user .text.md pre { background: rgba(255,255,255,.2); }
+/* markdown pipe/grid tables in bubbles */
+.text.md table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 0.92em;
+  display: block; overflow-x: auto; }
+.text.md th, .text.md td { border: 1px solid var(--stroke-2); padding: 6px 10px; text-align: left; }
+.text.md th { background: var(--bg-2); font-weight: 600; }
+.bubble.user .text.md th, .bubble.user .text.md td { border-color: rgba(255,255,255,.35); }
+.bubble.user .text.md th { background: rgba(255,255,255,.15); }
 
 /* composer live preview */
 .composer-preview { display: flex; gap: 8px; align-items: flex-start; background: var(--bg-2);
