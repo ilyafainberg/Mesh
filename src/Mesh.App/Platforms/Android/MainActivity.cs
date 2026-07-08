@@ -46,15 +46,19 @@ public class MainActivity : MauiAppCompatActivity
         }
     }
 
-    /// <summary>Pads the content view by the system bars and display cutout (top + sides), leaving
-    /// the bottom to the IME/AdjustResize handling so the keyboard still resizes the view.</summary>
+    /// <summary>Pads the content view by the system bars and display cutout (top + sides) and by the
+    /// IME (keyboard) at the bottom, so the WebView shrinks and the focused field stays above the
+    /// keyboard. In edge-to-edge mode WindowSoftInputMode=AdjustResize does not resize the WebView on
+    /// its own, so the keyboard inset must be applied here.</summary>
     private sealed class SafeAreaInsetsListener : Java.Lang.Object, IOnApplyWindowInsetsListener
     {
         public WindowInsetsCompat OnApplyWindowInsets(Android.Views.View? v, WindowInsetsCompat? insets)
         {
             if (v is null || insets is null) return insets ?? WindowInsetsCompat.Consumed;
             var bars = insets.GetInsets(WindowInsetsCompat.Type.SystemBars() | WindowInsetsCompat.Type.DisplayCutout());
-            v.SetPadding(bars.Left, bars.Top, bars.Right, 0);
+            var ime = insets.GetInsets(WindowInsetsCompat.Type.Ime());
+            var bottom = System.Math.Max(bars.Bottom, ime.Bottom);
+            v.SetPadding(bars.Left, bars.Top, bars.Right, bottom);
             return insets;
         }
     }
