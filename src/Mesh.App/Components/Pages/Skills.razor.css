@@ -165,3 +165,77 @@
 @keyframes mp-spin {
     to { transform: rotate(360deg); }
 }
+
+/* Browse marketplace as a centered popup dialog (opened like a file picker). */
+.sk-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .42);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 24px;
+}
+
+.sk-modal {
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-2);
+    width: min(720px, 100%);
+    max-height: min(82vh, 900px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.sk-modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--stroke-1);
+}
+
+.sk-modal-head b {
+    font-size: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.sk-modal-body {
+    padding: 16px 18px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+/* Roomier, uncramped skill rows and checkboxes inside the dialog. */
+.sk-modal .mp-skill {
+    padding: 12px 14px;
+    gap: 12px;
+    align-items: flex-start;
+}
+
+.sk-modal .mp-skill input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    margin-top: 1px;
+    flex-shrink: 0;
+}
+
+.sk-modal .mp-skill-list { gap: 8px; }
+.sk-modal .mp-plugin-list { gap: 16px; }
+
+.sk-modal .mp-browse-actions {
+    position: sticky;
+    bottom: 0;
+    background: var(--bg-1);
+    padding-top: 12px;
+    margin-top: 4px;
+    border-top: 1px solid var(--stroke-1);
+}

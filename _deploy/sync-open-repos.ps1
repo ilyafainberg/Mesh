@@ -59,7 +59,7 @@ function Sync-Mirror {
     if ($Push) {
       $sha = (Invoke-Git -C $MonoRoot rev-parse --short HEAD)
       Invoke-Git add -A | Out-Null
-      Invoke-Git -c user.name="Ilya Fainberg" -c user.email="ilyafainberg@users.noreply.github.com" commit -q -m "Sync source from monorepo ($sha)" | Out-Null
+      Invoke-Git -c user.name="Quonkel" -c user.email="ilyafainberg@users.noreply.github.com" commit -q -m "Sync source from monorepo ($sha)" | Out-Null
       Invoke-Git push origin HEAD:main | Out-Null
       Write-Host "  Pushed to $Repo." -ForegroundColor Green
     } else {

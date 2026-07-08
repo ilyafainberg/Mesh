@@ -19,7 +19,7 @@
 #endif
 
 #define AppName "Mesh"
-#define AppPublisher "Ilya Fainberg"
+#define AppPublisher "Quonkel"
 #define AppExeName "Mesh.App.exe"
 #define AppId "{{7E2B9C64-4E1F-4C2A-9B3D-9A7F3D2E5A10}}"
 

@@ -42,11 +42,11 @@
     <div class="card-panel">
         <div class="mp-title">
             <h3><i class="bi bi-shop"></i> Skill marketplaces</h3>
-            <span class="field-hint">Connect a marketplace by URL, browse its skills, and import the ones you want. Add a bespoke skills.json, or a GitHub repo like microsoft/power-cat-skills. Imported skills auto-update on startup.</span>
+            <span class="field-hint">Connect a marketplace by URL, browse its skills, and import the ones you want. Add a bespoke skills.json, or a GitHub repo like owner/repo. Imported skills auto-update on startup.</span>
         </div>
 
         <div class="mp-add-row">
-            <input class="full" placeholder="microsoft/power-cat-skills or https://example.com/skills.json"
+            <input class="full" placeholder="owner/repo or https://example.com/skills.json"
                    @bind="marketUrl" @bind:event="oninput" @onkeydown="OnMarketKeyDown" disabled="@addingMarket" />
             <button class="primary" @onclick="AddMarketplace" disabled="@(addingMarket || string.IsNullOrWhiteSpace(marketUrl))">
                 @if (addingMarket)
@@ -105,7 +105,13 @@
 
                         @if (openMarketId == m.Id)
                         {
-                            <div class="mp-browse">
+                            <div class="sk-modal-backdrop" @onclick="CloseBrowse">
+                            <div class="sk-modal" @onclick:stopPropagation="true">
+                            <div class="sk-modal-head">
+                                <b><i class="bi bi-shop"></i> @m.Name</b>
+                                <button class="icon-btn" title="Close" @onclick="CloseBrowse"><i class="bi bi-x-lg"></i></button>
+                            </div>
+                            <div class="sk-modal-body">
                                 @if (browseError is not null)
                                 {
                                     <div class="err-text">@browseError</div>
@@ -128,7 +134,6 @@
                                             <div class="mp-skill-body">
                                                 <div class="mp-skill-head">
                                                     <b>@ms.Name</b>
-                                                    @if (!string.IsNullOrWhiteSpace(ms.Version)) { <span class="chip">v@ms.Version</span> }
                                                     @if (IsImported(m.Id, ms.Id)) { <span class="chip">Imported</span> }
                                                 </div>
                                                 @if (!string.IsNullOrWhiteSpace(ms.Description)) { <div class="muted small">@ms.Description</div> }
@@ -168,6 +173,8 @@
                                     </div>
                                 }
                             </div>
+                            </div>
+                            </div>
                         }
                     </div>
                 }
@@ -181,9 +188,18 @@
             <div class="kn-card">
                 @if (editingId == s.Id)
                 {
-                    <input class="full" @bind="editName" />
-                    <input class="full" @bind="editDescription" />
-                    <textarea class="full" rows="3" @bind="editInstructions"></textarea>
+                    <div class="field">
+                        <label>Name</label>
+                        <input class="full" @bind="editName" />
+                    </div>
+                    <div class="field">
+                        <label>Description</label>
+                        <input class="full" @bind="editDescription" />
+                    </div>
+                    <div class="field">
+                        <label>Instructions <span class="muted">(how the agent performs it)</span></label>
+                        <textarea class="full" rows="6" @bind="editInstructions"></textarea>
+                    </div>
                     <div class="kn-row">
                         <select @bind="editVisibility">
                             <option value="private">Private</option>
@@ -208,7 +224,6 @@
                         @if (s.SourceMarketplaceId is not null)
                         {
                             <span class="mp-badge"><i class="bi bi-shop"></i> from @MarketNameFor(s.SourceMarketplaceId)</span>
-                            @if (!string.IsNullOrWhiteSpace(s.Version)) { <span class="mp-badge ver">v@s.Version</span> }
                         }
                         <span class="spacer"></span>
                         <button class="icon-btn" title="Edit" @onclick="() => BeginEdit(s)"><i class="bi bi-pencil"></i></button>

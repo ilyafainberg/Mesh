@@ -26,10 +26,10 @@ namespace Mesh.App.Services;
 /// under plugins:
 /// <code>
 /// {
-///   "name": "power-cat-skills", "displayName": "Power CAT Skills",
+///   "name": "example-skills", "displayName": "Example Skills",
 ///   "plugins": [
-///     { "name": "powercat-canvas-apps", "description": "...", "version": "1.0.7",
-///       "skills": [ "./plugins/powercat-canvas-apps/skills/analyze-canvas-performance" ] }
+///     { "name": "example-plugin", "description": "...", "version": "1.0.0",
+///       "skills": [ "./plugins/example-plugin/skills/do-something" ] }
 ///   ]
 /// }
 /// </code>

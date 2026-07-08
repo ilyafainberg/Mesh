@@ -8,7 +8,7 @@ This product includes the following open-source component:
 
 ------------------------------------------------------------------------
 Mesh.Shared (protocol and end-to-end encryption library)
-Copyright 2026 Ilya Fainberg
+Copyright 2026 Quonkel
 Source: https://github.com/MeshRelayAI/Shared
 Licensed under the Apache License, Version 2.0.
 ------------------------------------------------------------------------
