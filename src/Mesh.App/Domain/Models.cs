@@ -78,18 +78,33 @@ public sealed class LocalToolSetting
     public string Visibility { get; set; } = "private";
 }
 
+/// <summary>How Mesh connects to a custom MCP server.</summary>
+public enum McpTransport
+{
+    /// <summary>Launch a local command as a child process and talk over stdio (desktop only).</summary>
+    Stdio,
+    /// <summary>Connect to a remote MCP server over HTTP/SSE (works on mobile and desktop).</summary>
+    Http
+}
+
 /// <summary>
-/// A user-added MCP tool server: a local command Mesh launches over stdio to expose its tools to the
-/// agent. Same off-by-default, owner-first, optionally-circle-shared model as the bundled servers.
+/// A user-added MCP tool server. Two transports: a local <see cref="McpTransport.Stdio"/> command Mesh
+/// launches over stdio (desktop only), or a remote <see cref="McpTransport.Http"/> endpoint reached over
+/// the network (works on mobile too). Same off-by-default, owner-first, optionally-circle-shared model
+/// as the bundled servers.
 /// </summary>
 public sealed class CustomMcpServer
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Name { get; set; } = "";
-    /// <summary>The executable or command to launch (e.g. a full path to an .exe, "npx", "python").</summary>
+    /// <summary>Which transport to use. Defaults to stdio for backward compatibility with saved servers.</summary>
+    public McpTransport Transport { get; set; } = McpTransport.Stdio;
+    /// <summary>The executable or command to launch for a stdio server (e.g. a full path to an .exe, "npx", "python").</summary>
     public string Command { get; set; } = "";
     /// <summary>Command arguments, one per entry (e.g. ["-y", "@modelcontextprotocol/server-filesystem"]).</summary>
     public List<string> Arguments { get; set; } = new();
+    /// <summary>The remote endpoint URL for an <see cref="McpTransport.Http"/> server (e.g. https://host/mcp).</summary>
+    public string Url { get; set; } = "";
     public bool Enabled { get; set; }
     /// <summary>"private" | "public" | "shared:&lt;circle&gt;".</summary>
     public string Visibility { get; set; } = "private";

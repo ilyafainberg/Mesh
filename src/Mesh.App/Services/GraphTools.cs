@@ -386,6 +386,9 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         foreach (var (kind, setting) in settings)
         {
             if (setting is null || !setting.Enabled) continue;
+            // Desktop-only tools (scripts, browsers) cannot run on a phone, so never offer them to the
+            // agent on mobile. This gates both the owner and guest paths since both flow through here.
+            if (PlatformCaps.IsMobile && kind.IsDesktopOnly()) continue;
             if (!owner)
             {
                 // Guest: only if explicitly shared with one of their circles (or public).

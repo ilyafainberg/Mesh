@@ -70,7 +70,10 @@
                     <option value="Grok">Grok (xAI)</option>
                     <option value="Groq">Groq (fast inference)</option>
                     <option value="AzureOpenAI">Azure OpenAI</option>
-                    <option value="FoundryLocal">On Device</option>
+                    @if (!PlatformCaps.IsMobile)
+                    {
+                        <option value="FoundryLocal">On Device</option>
+                    }
                 </select>
             </div>
 
@@ -174,26 +177,6 @@
                 </div>
             }
 
-            <div class="field" style="margin-top:4px;">
-                <label>Token usage</label>
-                <TokenMeter />
-                <div class="tm-actions" style="margin-top:8px;">
-                    <button class="ghost" @onclick="ResetCounter"><i class="bi bi-arrow-counterclockwise"></i> Reset counter</button>
-                </div>
-                <div class="field-hint">
-                    Counts reset automatically when you switch models. The free hosted model has a daily
-                    token budget, so it can pause once that budget is used up for the day.
-                </div>
-            </div>
-
-            <div class="field-row">
-                <div>
-                    <div class="field-label">Estimated spend</div>
-                    <div class="field-sub">Approximate cost of your usage, based on the model's published prices. Actual billing comes from your provider.</div>
-                </div>
-                <span>@SpendLabel</span>
-            </div>
-
             <div class="field" style="margin-top:8px;">
                 <button class="primary" @onclick="ChangeModel" disabled="@Setup.Running">
                     <i class="bi bi-check-lg"></i> @(Setup.Running ? "Working…" : "Change model")
@@ -212,6 +195,29 @@
                         <span>@Setup.Status</span>
                     </div>
                 }
+            </div>
+        </div>
+
+        <div class="card-panel">
+            <h3>Usage report</h3>
+            <div class="field" style="margin-top:4px;">
+                <label>Token usage</label>
+                <TokenMeter />
+                <div class="tm-actions" style="margin-top:8px;">
+                    <button class="ghost" @onclick="ResetCounter"><i class="bi bi-arrow-counterclockwise"></i> Reset counter</button>
+                </div>
+                <div class="field-hint">
+                    Counts reset automatically when you switch models. The free hosted model has a daily
+                    token budget, so it can pause once that budget is used up for the day.
+                </div>
+            </div>
+
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Estimated spend</div>
+                    <div class="field-sub">Approximate cost of your usage, based on the model's published prices. Actual billing comes from your provider.</div>
+                </div>
+                <span>@SpendLabel</span>
             </div>
         </div>
 
@@ -273,7 +279,7 @@
                 share a tool with a circle. Shared tools let that circle's agents run them on your machine, only
                 enable sharing for people you fully trust.
             </div>
-            @foreach (var lt in LocalToolRows)
+            @foreach (var lt in VisibleLocalToolRows)
             {
                 var setting = GetLocalTool(lt.Kind);
                 <div class="local-tool-row">
@@ -312,53 +318,56 @@
                 default, yours to use in Me, and only reach a contact's agent if you share the server with
                 their circle.
             </div>
-            @foreach (var def in McpServerRegistry.All)
+            @if (!PlatformCaps.IsMobile)
             {
-                var setting = GetMcpServer(def.Id);
-                var available = McpHostSvc.IsAvailable(def);
-                <div class="local-tool-row">
-                    <div class="lt-main">
-                        <label class="switch">
-                            <input type="checkbox" checked="@setting.Enabled" disabled="@(!available)"
-                                   @onchange="e => SetMcpEnabled(def.Id, (bool)(e.Value ?? false))" aria-label="@($"Enable {def.DisplayName}")" />
-                        </label>
-                        <div class="lt-text">
-                            <div class="lt-name"><i class="bi @def.Icon"></i> @def.DisplayName</div>
-                            <div class="lt-sub">@def.Description</div>
-                            @if (!available)
-                            {
-                                <div class="lt-sub" style="color:var(--danger);">Not installed on this machine.</div>
-                            }
-                        </div>
-                    </div>
-                    @if (setting.Enabled && available)
-                    {
-                        <div class="lt-share">
-                            <span class="lt-share-label">Who can use it</span>
-                            <select value="@setting.Visibility" @onchange="e => SetMcpVisibility(def.Id, e.Value?.ToString())" aria-label="Who can use it">
-                                <option value="private">Only me (Me chat)</option>
-                                @foreach (var c in State.CircleNames)
+                @foreach (var def in McpServerRegistry.All)
+                {
+                    var setting = GetMcpServer(def.Id);
+                    var available = McpHostSvc.IsAvailable(def);
+                    <div class="local-tool-row">
+                        <div class="lt-main">
+                            <label class="switch">
+                                <input type="checkbox" checked="@setting.Enabled" disabled="@(!available)"
+                                       @onchange="e => SetMcpEnabled(def.Id, (bool)(e.Value ?? false))" aria-label="@($"Enable {def.DisplayName}")" />
+                            </label>
+                            <div class="lt-text">
+                                <div class="lt-name"><i class="bi @def.Icon"></i> @def.DisplayName</div>
+                                <div class="lt-sub">@def.Description</div>
+                                @if (!available)
                                 {
-                                    <option value="@($"shared:{c}")">Share with @c</option>
+                                    <div class="lt-sub" style="color:var(--danger);">Not installed on this machine.</div>
                                 }
-                                <option value="public">Anyone allowed</option>
-                            </select>
+                            </div>
                         </div>
-                    }
-                </div>
+                        @if (setting.Enabled && available)
+                        {
+                            <div class="lt-share">
+                                <span class="lt-share-label">Who can use it</span>
+                                <select value="@setting.Visibility" @onchange="e => SetMcpVisibility(def.Id, e.Value?.ToString())" aria-label="Who can use it">
+                                    <option value="private">Only me (Me chat)</option>
+                                    @foreach (var c in State.CircleNames)
+                                    {
+                                        <option value="@($"shared:{c}")">Share with @c</option>
+                                    }
+                                    <option value="public">Anyone allowed</option>
+                                </select>
+                            </div>
+                        }
+                    </div>
+                }
             }
 
-            @foreach (var c in State.Profile.CustomMcpServers)
+            @foreach (var c in VisibleCustomServers)
             {
                 <div class="local-tool-row">
                     <div class="lt-main">
                         <label class="switch">
                             <input type="checkbox" checked="@c.Enabled"
-                                   @onchange="e => SetCustomEnabled(c, (bool)(e.Value ?? false))" aria-label="@($"Enable {(string.IsNullOrWhiteSpace(c.Name) ? c.Command : c.Name)}")" />
+                                   @onchange="e => SetCustomEnabled(c, (bool)(e.Value ?? false))" aria-label="@($"Enable {CustomLabel(c)}")" />
                         </label>
                         <div class="lt-text">
-                            <div class="lt-name"><i class="bi bi-plugin"></i> @(string.IsNullOrWhiteSpace(c.Name) ? c.Command : c.Name)</div>
-                            <div class="lt-sub">@c.Command @string.Join(' ', c.Arguments)</div>
+                            <div class="lt-name"><i class="bi bi-plugin"></i> @CustomLabel(c)</div>
+                            <div class="lt-sub">@(c.Transport == McpTransport.Http ? c.Url : $"{c.Command} {string.Join(' ', c.Arguments)}")</div>
                         </div>
                         <button class="icon-btn" title="Remove server" @onclick="() => RemoveCustom(c)" aria-label="Remove server"><i class="bi bi-trash"></i></button>
                     </div>
@@ -384,19 +393,35 @@
                 <div class="mcp-add">
                     <label>Name</label>
                     <input class="full" @bind="newMcpName" placeholder="My MCP server" />
-                    <label>Command</label>
-                    <input class="full" @bind="newMcpCommand" placeholder="e.g. npx, python, or C:\path\to\server.exe" />
-                    <label>Arguments <span class="muted">(one per line)</span></label>
-                    <textarea class="full" rows="3" @bind="newMcpArgs" placeholder="-y&#10;@@modelcontextprotocol/server-filesystem&#10;C:\some\dir"></textarea>
+                    @if (!PlatformCaps.IsMobile)
+                    {
+                        <label>Connection</label>
+                        <select class="full" value="@newMcpTransport" @onchange="OnNewMcpTransportChange">
+                            <option value="Stdio">Local command (stdio)</option>
+                            <option value="Http">Remote (HTTP)</option>
+                        </select>
+                    }
+                    @if (newMcpTransport == "Http")
+                    {
+                        <label>URL</label>
+                        <input class="full" @bind="newMcpUrl" placeholder="https://host/mcp" />
+                    }
+                    else
+                    {
+                        <label>Command</label>
+                        <input class="full" @bind="newMcpCommand" placeholder="e.g. npx, python, or C:\path\to\server.exe" />
+                        <label>Arguments <span class="muted">(one per line)</span></label>
+                        <textarea class="full" rows="3" @bind="newMcpArgs" placeholder="-y&#10;@@modelcontextprotocol/server-filesystem&#10;C:\some\dir"></textarea>
+                    }
                     <div class="mcp-add-actions">
-                        <button class="primary" @onclick="AddCustom" disabled="@string.IsNullOrWhiteSpace(newMcpCommand)">Add server</button>
+                        <button class="primary" @onclick="AddCustom" disabled="@AddMcpDisabled">Add server</button>
                         <button class="ghost" @onclick="() => addingMcp = false">Cancel</button>
                     </div>
                 </div>
             }
             else
             {
-                <button class="ghost" style="margin-top:10px;" @onclick="() => addingMcp = true">
+                <button class="ghost" style="margin-top:10px;" @onclick="StartAddMcp">
                     <i class="bi bi-plus-lg"></i> Add MCP server
                 </button>
             }
@@ -643,6 +668,10 @@
         new(LocalToolKind.WorkIq, "WorkIQ", "bi-microsoft", "Ask about your Microsoft 365 world: email, Teams, meetings, files, people."),
     };
 
+    // On mobile, hide desktop-only tools (scripts, browsers) since they cannot run on a phone.
+    IEnumerable<LocalToolRow> VisibleLocalToolRows =>
+        PlatformCaps.IsMobile ? LocalToolRows.Where(r => !r.Kind.IsDesktopOnly()) : LocalToolRows;
+
     LocalToolSetting GetLocalTool(LocalToolKind kind)
     {
         if (!State.Profile.LocalTools.TryGetValue(kind, out var s) || s is null)
@@ -697,23 +726,66 @@
     string newMcpName = "";
     string newMcpCommand = "";
     string newMcpArgs = "";
+    string newMcpUrl = "";
+    // "Stdio" or "Http". Mobile can only add remote (HTTP) servers since stdio launches a process.
+    string newMcpTransport = "Stdio";
+
+    // On mobile, only remote (HTTP) custom servers can run; hide stdio ones that cannot.
+    IEnumerable<CustomMcpServer> VisibleCustomServers =>
+        PlatformCaps.IsMobile
+            ? State.Profile.CustomMcpServers.Where(c => c.Transport == McpTransport.Http)
+            : State.Profile.CustomMcpServers;
+
+    static string CustomLabel(CustomMcpServer c)
+        => !string.IsNullOrWhiteSpace(c.Name) ? c.Name
+           : c.Transport == McpTransport.Http ? c.Url : c.Command;
+
+    bool AddMcpDisabled => newMcpTransport == "Http"
+        ? string.IsNullOrWhiteSpace(newMcpUrl)
+        : string.IsNullOrWhiteSpace(newMcpCommand);
+
+    void StartAddMcp()
+    {
+        addingMcp = true;
+        // Mobile has no stdio option, so force the remote transport.
+        newMcpTransport = PlatformCaps.IsMobile ? "Http" : "Stdio";
+    }
+
+    void OnNewMcpTransportChange(ChangeEventArgs e) => newMcpTransport = e.Value?.ToString() ?? "Stdio";
 
     void AddCustom()
     {
-        if (string.IsNullOrWhiteSpace(newMcpCommand)) return;
-        var args = (newMcpArgs ?? "")
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(a => a.Trim())
-            .Where(a => a.Length > 0)
-            .ToList();
-        State.Mutate(p => p.CustomMcpServers.Add(new CustomMcpServer
+        var isHttp = newMcpTransport == "Http" || PlatformCaps.IsMobile;
+        if (isHttp)
         {
-            Name = newMcpName.Trim(),
-            Command = newMcpCommand.Trim(),
-            Arguments = args,
-            Enabled = true
-        }));
-        newMcpName = ""; newMcpCommand = ""; newMcpArgs = ""; addingMcp = false;
+            if (string.IsNullOrWhiteSpace(newMcpUrl)) return;
+            State.Mutate(p => p.CustomMcpServers.Add(new CustomMcpServer
+            {
+                Name = newMcpName.Trim(),
+                Transport = McpTransport.Http,
+                Url = newMcpUrl.Trim(),
+                Enabled = true
+            }));
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(newMcpCommand)) return;
+            var args = (newMcpArgs ?? "")
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(a => a.Trim())
+                .Where(a => a.Length > 0)
+                .ToList();
+            State.Mutate(p => p.CustomMcpServers.Add(new CustomMcpServer
+            {
+                Name = newMcpName.Trim(),
+                Transport = McpTransport.Stdio,
+                Command = newMcpCommand.Trim(),
+                Arguments = args,
+                Enabled = true
+            }));
+        }
+        newMcpName = ""; newMcpCommand = ""; newMcpArgs = ""; newMcpUrl = ""; addingMcp = false;
+        newMcpTransport = PlatformCaps.IsMobile ? "Http" : "Stdio";
     }
 
     void RemoveCustom(CustomMcpServer c) => State.Mutate(p => p.CustomMcpServers.RemoveAll(x => x.Id == c.Id));
@@ -769,12 +841,19 @@
         if (wasActive) SyncFields(); // active cleared → app shows the picker
     }
 
+    // On mobile, Foundry Local (On Device) cannot run, so a persisted FoundryLocal profile is coerced
+    // to the safe hosted default for the UI. Saving keeps that coerced value.
+    string EffectiveProvider(ModelProvider pv)
+        => PlatformCaps.IsMobile && pv == ModelProvider.FoundryLocal
+            ? nameof(ModelProvider.MeshHosted)
+            : pv.ToString();
+
     void SyncFields()
     {
         var p = State.Profile;
         display = p.DisplayName;
         relay = p.RelayUrl;
-        provider = p.Model.Provider.ToString();
+        provider = EffectiveProvider(p.Model.Provider);
         model = p.Model.Model;
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
@@ -827,7 +906,7 @@
         var p = State.Profile;
         display = p.DisplayName;
         relay = p.RelayUrl;
-        provider = p.Model.Provider.ToString();
+        provider = EffectiveProvider(p.Model.Provider);
         model = p.Model.Model;
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";

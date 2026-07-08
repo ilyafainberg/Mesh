@@ -197,6 +197,7 @@
     gap: 12px;
     padding: 14px 18px;
     border-bottom: 1px solid var(--stroke-1);
+    flex: 0 0 auto;
 }
 
 .sk-modal-head b {
@@ -208,10 +209,23 @@
 
 .sk-modal-body {
     padding: 16px 18px;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 14px;
+}
+
+.sk-modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 18px;
+    border-top: 1px solid var(--stroke-1);
+    background: var(--bg-1);
+    flex: 0 0 auto;
 }
 
 /* Roomier, uncramped skill rows and checkboxes inside the dialog. */
@@ -230,12 +244,3 @@
 
 .sk-modal .mp-skill-list { gap: 8px; }
 .sk-modal .mp-plugin-list { gap: 16px; }
-
-.sk-modal .mp-browse-actions {
-    position: sticky;
-    bottom: 0;
-    background: var(--bg-1);
-    padding-top: 12px;
-    margin-top: 4px;
-    border-top: 1px solid var(--stroke-1);
-}

@@ -165,14 +165,23 @@
                                             @foreach (var ms in browseIndex.Skills) { @skillRow(ms) }
                                         </div>
                                     }
-                                    <div class="mp-browse-actions">
-                                        <button class="primary" @onclick="() => ImportSelected(m)" disabled="@(selected.Count == 0)">
-                                            <i class="bi bi-download"></i> Import selected (@selected.Count)
-                                        </button>
-                                        <button class="ghost" @onclick="CloseBrowse"><i class="bi bi-x-lg"></i> Close</button>
-                                    </div>
                                 }
                             </div>
+                            @if (browseError is null && browseIndex is not null && browseIndex.Skills.Count > 0)
+                            {
+                                <div class="sk-modal-foot">
+                                    <button class="ghost" @onclick="CloseBrowse"><i class="bi bi-x-lg"></i> Close</button>
+                                    <button class="primary" @onclick="() => ImportSelected(m)" disabled="@(selected.Count == 0)">
+                                        <i class="bi bi-download"></i> Import selected (@selected.Count)
+                                    </button>
+                                </div>
+                            }
+                            else
+                            {
+                                <div class="sk-modal-foot">
+                                    <button class="ghost" @onclick="CloseBrowse"><i class="bi bi-x-lg"></i> Close</button>
+                                </div>
+                            }
                             </div>
                             </div>
                         }

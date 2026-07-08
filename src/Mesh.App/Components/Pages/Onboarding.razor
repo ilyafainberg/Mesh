@@ -126,7 +126,10 @@
                         <option value="Grok">Grok (xAI)</option>
                         <option value="Groq">Groq (fast inference)</option>
                         <option value="AzureOpenAI">Azure OpenAI</option>
-                        <option value="FoundryLocal">Foundry Local (free, on-device, desktop)</option>
+                        @if (!PlatformCaps.IsMobile)
+                        {
+                            <option value="FoundryLocal">Foundry Local (free, on-device, desktop)</option>
+                        }
                     </select>
 
                     @if (provider == "FoundryLocal")

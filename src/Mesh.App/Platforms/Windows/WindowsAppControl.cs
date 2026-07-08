@@ -92,10 +92,8 @@ public sealed class WindowsAppControl : IAppControl
         };
 
         var menu = new MenuFlyout();
-        var open = new MenuFlyoutItem { Text = "Open Mesh" };
-        open.Click += (_, _) => Show();
-        var quit = new MenuFlyoutItem { Text = "Quit Mesh" };
-        quit.Click += (_, _) => QuitApp();
+        var open = new MenuFlyoutItem { Text = "Open Mesh", Command = new RelayCommand(Show) };
+        var quit = new MenuFlyoutItem { Text = "Quit Mesh", Command = new RelayCommand(QuitApp) };
         menu.Items.Add(open);
         menu.Items.Add(new MenuFlyoutSeparator());
         menu.Items.Add(quit);
