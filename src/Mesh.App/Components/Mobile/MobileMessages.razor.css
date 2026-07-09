@@ -554,6 +554,7 @@ button:disabled {
 
 .target-toggle {
     display: inline-flex;
+    align-self: flex-start;
     background: var(--bg-3);
     border: 1px solid var(--stroke-1);
     border-radius: 999px;
