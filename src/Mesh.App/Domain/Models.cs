@@ -196,6 +196,42 @@ public sealed class Circle
     public bool RequireApproval { get; set; }
 }
 
+/// <summary>
+/// Reserved system circles. The "Public" circle is not a member list: it is the marker that a
+/// capability (KnowledgeItem / Skill / Widget) has been published to the Community directory and may
+/// be reached by ANY handle through the sandboxed service path (never the normal contact guest path).
+/// </summary>
+public static class SystemCircles
+{
+    /// <summary>Reserved circle name used to flag a capability as public-listed.</summary>
+    public const string Public = "__public__";
+
+    /// <summary>The visibility string a published (public-listed) capability carries.</summary>
+    public const string PublicVisibility = "shared:__public__";
+
+    /// <summary>True when a capability's visibility marks it public-listed (in the Community directory).</summary>
+    public static bool IsPublicListed(string? visibility) => visibility == PublicVisibility;
+}
+
+/// <summary>
+/// A capability bundle the owner has published to the Community directory as a public service anyone
+/// can discover and invoke. The service runs a sandboxed, service-scoped agent over the owner's
+/// public-listed capabilities (KB/Skills/Widgets only, never private connectors or local tools).
+/// </summary>
+public sealed class PublishedService
+{
+    /// <summary>Stable service id (also its key in the relay directory).</summary>
+    public string Id { get; set; } = Guid.NewGuid().ToString("n");
+    public string Name { get; set; } = "";
+    public string Description { get; set; } = "";
+    public string Category { get; set; } = "General";
+    /// <summary>Persona / system guidance the service-scoped agent follows when answering.</summary>
+    public string Persona { get; set; } = "";
+    /// <summary>Whether this service is currently listed/live in the relay directory.</summary>
+    public bool Published { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class Contact
 {
     public string Handle { get; set; } = "";
@@ -352,6 +388,8 @@ public sealed class MeshProfile
     public List<Skill> Skills { get; set; } = new();
     public List<SkillMarketplace> SkillMarketplaces { get; set; } = new();
     public List<Widget> Widgets { get; set; } = new();
+    /// <summary>Services this user has published to the Community directory (public capability bundles).</summary>
+    public List<PublishedService> PublishedServices { get; set; } = new();
     public List<ConnectedSource> Sources { get; set; } = new();
     public List<Contact> Contacts { get; set; } = new();
     public List<Circle> Circles { get; set; } = new()
