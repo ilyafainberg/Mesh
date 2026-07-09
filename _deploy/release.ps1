@@ -231,7 +231,10 @@ function Build-Windows {
   if (Test-Path $zip) { Remove-Item $zip -Force }
   Compress-Archive -Path $exe -DestinationPath $zip -Force
   Ok "zipped: $([math]::Round((Get-Item $zip).Length/1MB,1)) MB"
-  return @{ Exe = $exe; Zip = $zip }
+  # Use script scope (not a return value): external tool stdout from Invoke-Native would otherwise
+  # pollute the function's output stream and turn the returned object into an array.
+  $script:WinExe = $exe
+  $script:WinZip = $zip
 }
 
 # ------------------------------------------------------------- android build --
@@ -251,7 +254,7 @@ function Build-Android {
   & "$($env:JAVA_HOME)\bin\jarsigner.exe" -verify $aab.FullName *> $null
   if ($LASTEXITCODE -ne 0) { Die "AAB signature verification failed." }
   Ok "AAB signed + verified: $([math]::Round($aab.Length/1MB,1)) MB"
-  return $aab.FullName
+  $script:AndroidAab = $aab.FullName
 }
 
 # ------------------------------------------------------------------ publish ---
@@ -380,21 +383,22 @@ Set-ProjectVersion
 Invoke-EmDashLint
 
 $win = $null; $aab = $null
-if (-not $SkipWindows) { $win = Build-Windows } else { Warn "skipping Windows build" }
-if (-not $SkipAndroid) { $aab = Build-Android } else { Warn "skipping Android build" }
+$script:WinExe = $null; $script:WinZip = $null; $script:AndroidAab = $null
+if (-not $SkipWindows) { Build-Windows } else { Warn "skipping Windows build" }
+if (-not $SkipAndroid) { Build-Android } else { Warn "skipping Android build" }
 
 if (-not $SkipPush)   { Invoke-GitCommitPush }
-if ($win -and -not $SkipBlob)   { Publish-Blob   $win.Exe }
-if ($win -and -not $SkipGitHub) { Publish-GitHubRelease $win.Zip }
+if ($script:WinExe -and -not $SkipBlob)   { Publish-Blob   $script:WinExe }
+if ($script:WinZip -and -not $SkipGitHub) { Publish-GitHubRelease $script:WinZip }
 
 if ($PushStores) {
-  if ($win) { Push-MicrosoftStore $win.Exe }
-  if ($aab) { Push-GooglePlay     $aab }
+  if ($script:WinExe)     { Push-MicrosoftStore $script:WinExe }
+  if ($script:AndroidAab) { Push-GooglePlay     $script:AndroidAab }
 } else {
   Note "stores: use -PushStores to submit to Microsoft Store + Google Play (Phase 2 creds required)."
 }
 
 $sw.Stop()
 Say "Done in $([math]::Round($sw.Elapsed.TotalMinutes,1)) min"
-if ($win) { Ok "installer: $($win.Exe)"; Ok "zip: $($win.Zip)" }
-if ($aab) { Ok "aab: $aab" }
+if ($script:WinExe) { Ok "installer: $script:WinExe"; Ok "zip: $script:WinZip" }
+if ($script:AndroidAab) { Ok "aab: $script:AndroidAab" }
