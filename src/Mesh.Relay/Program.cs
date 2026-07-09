@@ -306,12 +306,12 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
     if (!MeshCrypto.Verify(req.DevicePublicKey, HostedModelProtocol.Message(handleKey, promptHash), req.Signature))
         return Results.BadRequest(new { error = "invalid signature" });
 
-    // The hosted free model is an OpenAI-compatible chat endpoint (Groq by default). Only a
+    // The hosted free model is an OpenAI-compatible chat endpoint (OpenRouter by default). Only a
     // key + endpoint are needed; there is no provider branching. Tools execute on the client,
     // so the relay just forwards tool definitions and returns the model's tool_calls.
     var apiKey = Config(app.Configuration, "MODEL_API_KEY", "Model:ApiKey");
-    var endpoint = Config(app.Configuration, "MODEL_ENDPOINT", "Model:Endpoint");
-    if (string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(endpoint))
+    var endpoint = Config(app.Configuration, "MODEL_ENDPOINT", "Model:Endpoint") ?? "https://openrouter.ai/api";
+    if (string.IsNullOrWhiteSpace(apiKey))
         return Results.Json(new { error = "hosted model not configured" }, statusCode: StatusCodes.Status503ServiceUnavailable);
 
     // Durable per-handle daily TOKEN quota (Redis in prod). Tokens are the primary cost currency,
@@ -322,7 +322,7 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
     if (tokenLimit > 0 && usedTokens >= tokenLimit)
         return Results.Json(new { error = "daily free-model token limit reached" }, statusCode: StatusCodes.Status429TooManyRequests);
 
-    var model = Config(app.Configuration, "MODEL_NAME", "Model:Model") ?? "llama-3.3-70b-versatile";
+    var model = Config(app.Configuration, "MODEL_NAME", "Model:Model") ?? "openai/gpt-oss-120b";
 
     try
     {
@@ -345,6 +345,10 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
 
         using var upstream = new HttpRequestMessage(HttpMethod.Post, $"{endpoint.TrimEnd('/')}/v1/chat/completions");
         upstream.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        // OpenRouter uses these optional headers for app attribution/ranking; harmless on other
+        // OpenAI-compatible providers, which ignore unknown headers.
+        upstream.Headers.TryAddWithoutValidation("HTTP-Referer", "https://meshrelay.net");
+        upstream.Headers.TryAddWithoutValidation("X-Title", "Mesh");
         upstream.Content = JsonContent.Create(payload);
 
         using var resp = await modelHttp.SendAsync(upstream);
