@@ -56,3 +56,22 @@ _deploy/relay-repo/
 _deploy/shared-repo/
 _deploy/android-signing/
 _deploy/android-artifacts/
+
+# Secrets and credentials (never commit)
+*Key.txt
+*key.txt
+CREDENTIALS.txt
+*.pem
+*.p12
+
+# Design/art working files (kept out of the code repo)
+/ArtWork/
+/SVG/
+_deploy/store/
+*.psd
+*.ai
+*.aep
+Logo*.png
+LogoV*.png
+logo.aep
+1x/
