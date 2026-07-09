@@ -87,6 +87,10 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
         ModelProvider.FoundryLocal => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithFoundryDefault(cfg), meter),
         ModelProvider.Grok => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.x.ai"), meter),
         ModelProvider.Groq => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.groq.com/openai"), meter),
+        // OpenRouter: the user's OpenRouter account (key) decides the model/provider routing, so the
+        // client never sends a specific model; it always requests "openrouter/auto" and lets OpenRouter
+        // route. We do not replicate any OpenRouter settings in the client.
+        ModelProvider.OpenRouter => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), OpenRouterConfig(cfg), meter),
         ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg, meter),
         ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg, meter),
         _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg, meter),
@@ -98,6 +102,13 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
         if (!string.IsNullOrWhiteSpace(cfg.Endpoint)) return cfg;
         return new ModelConfig { Provider = cfg.Provider, Model = cfg.Model, ApiKey = cfg.ApiKey, Endpoint = defaultEndpoint };
     }
+
+    /// <summary>
+    /// OpenRouter always routes with "openrouter/auto": the user's OpenRouter account settings decide
+    /// the actual model/provider, so the client never pins a model. The endpoint is fixed.
+    /// </summary>
+    private static ModelConfig OpenRouterConfig(ModelConfig cfg)
+        => new ModelConfig { Provider = cfg.Provider, Model = "openrouter/auto", ApiKey = cfg.ApiKey, Endpoint = "https://openrouter.ai/api" };
 
     /// <summary>Foundry Local exposes an OpenAI-compatible endpoint on a dynamic port.</summary>
     private static ModelConfig WithFoundryDefault(ModelConfig cfg)

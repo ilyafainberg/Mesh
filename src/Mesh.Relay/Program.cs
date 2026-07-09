@@ -339,7 +339,7 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
     if (tokenLimit > 0 && usedTokens >= tokenLimit)
         return Results.Json(new { error = "daily free-model token limit reached" }, statusCode: StatusCodes.Status429TooManyRequests);
 
-    var model = Config(app.Configuration, "MODEL_NAME", "Model:Model") ?? "openai/gpt-oss-120b";
+    var model = Config(app.Configuration, "MODEL_NAME", "Model:Model") ?? "openrouter/auto";
 
     try
     {
