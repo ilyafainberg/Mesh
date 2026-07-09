@@ -100,6 +100,7 @@ public sealed class MeshHub(
         }
 
         var stamped = env with { From = state.Handle }; // relay asserts the authenticated sender
+        stamped = stamped with { FromDevice = state.DeviceId }; // stamp the sending device (set at auth)
 
         // Usage attestation note: a ServiceRequest envelope carries the serviceId inside its
         // end-to-end encrypted body (ServiceProtocol-framed), so the relay cannot observe which

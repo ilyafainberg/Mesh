@@ -253,6 +253,36 @@
                 </div>
                 <label class="switch"><input type="checkbox" checked="@State.Profile.ActAsRemoteAgent" @onchange="e => Toggle(p => p.ActAsRemoteAgent = (bool)(e.Value ?? false))" aria-label="Answer my other devices (remote agent)" /></label>
             </div>
+            <div class="field">
+                <label>This device's name</label>
+                <input class="full" value="@State.Profile.DeviceName" @onchange="e => Toggle(p => p.DeviceName = e.Value?.ToString() ?? string.Empty)" />
+                <div class="field-hint">Shown to your other devices in the picker above.</div>
+            </div>
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Home device</div>
+                    <div class="field-sub">Choose which device answers when you ask your home agent from another device. Requests go only to this device.</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <select class="field" value="@(State.Profile.HomeDeviceId ?? "")"
+                            @onchange="e => { var val = e.Value?.ToString() ?? string.Empty; Toggle(p => p.HomeDeviceId = string.IsNullOrEmpty(val) ? null : val); }"
+                            aria-label="Home device">
+                        <option value="">(broadcast to any device)</option>
+                        @foreach (var d in devices)
+                        {
+                            var label = (string.IsNullOrWhiteSpace(d.Name) ? d.DeviceId : d.Name)
+                                + (d.DeviceId == Mesh.MyDeviceId ? " (this device)" : "")
+                                + (d.Online ? "" : " - offline");
+                            <option value="@d.DeviceId">@label</option>
+                        }
+                    </select>
+                    <button class="ghost" @onclick="LoadDevicesAsync" aria-label="Refresh devices"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                </div>
+            </div>
+            @if (devices.Count == 0)
+            {
+                <div class="field-hint muted">No other devices linked yet, or the relay is unreachable.</div>
+            }
         </div>
 
         <div class="card-panel">
@@ -927,6 +957,20 @@
         Updater.Changed += Refresh;
 
         launchAtStartup = AppControl.IsLaunchAtStartupEnabled();
+    }
+
+    List<Mesh.Shared.DeviceInfo> devices = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadDevicesAsync();
+    }
+
+    async Task LoadDevicesAsync()
+    {
+        try { devices = (await Mesh.ListMyDevicesAsync()).ToList(); }
+        catch { devices = new(); }
+        StateHasChanged();
     }
 
     bool launchAtStartup;

@@ -19,6 +19,13 @@ public sealed class StoredHandle
     /// once set it is never overwritten, so a later attacker cannot replace it.
     /// </summary>
     public string? RecoveryPublicKey { get; set; }
+
+    /// <summary>
+    /// Friendly per-device names, keyed by the stable device id (see <c>DeviceProtocol.DeviceId</c>).
+    /// A device may set a name so the owner can pick a "home device" from the directory
+    /// (GET /handles/{handle}/devices). Absence of an entry just means the device is unnamed.
+    /// </summary>
+    public Dictionary<string, string> DeviceNames { get; set; } = new();
 }
 
 /// <summary>A pending device-link invite: single use, short lived, addressed to a handle.</summary>
@@ -68,6 +75,12 @@ public interface IRelayStore
 
     /// <summary>Updates only the display name of an existing handle. No-op if missing.</summary>
     Task SetDisplayNameAsync(string handle, string displayName, CancellationToken ct = default);
+
+    /// <summary>
+    /// Sets a friendly name for one device (by stable device id) under a handle, so the per-device
+    /// directory can show it as a pickable "home device". No-op if the handle is missing.
+    /// </summary>
+    Task SetDeviceNameAsync(string handle, string deviceId, string name, CancellationToken ct = default);
 
     /// <summary>
     /// Sets the handle's recovery public key, but only if one is not already stored (first writer

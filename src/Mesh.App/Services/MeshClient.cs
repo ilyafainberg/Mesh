@@ -28,6 +28,14 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     public event Action<string>? Log;
 
     /// <summary>
+    /// This device's stable id, derived from its public signing key. Same derivation the relay uses,
+    /// so both agree on the id that targets one specific device (MeshEnvelope.ToDevice). Empty when
+    /// this profile has no key yet.
+    /// </summary>
+    public string MyDeviceId =>
+        string.IsNullOrWhiteSpace(state.Profile.PublicKey) ? "" : DeviceProtocol.DeviceId(state.Profile.PublicKey);
+
+    /// <summary>
     /// Retry policy that never gives up: SignalR's built-in reconnect stops after a fixed schedule,
     /// which leaves the client permanently offline after a longer network drop (sleep, wifi switch).
     /// This backs off up to 30s and keeps trying for as long as the user wants to be connected.
@@ -58,8 +66,9 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             // Proof of possession: sign the claim with this device's private key so the relay can
             // confirm we control the key we are registering (collision avoidance).
             var sig = IdentityService.Sign(p.PrivateKey, ClaimProtocol.Message(h, p.PublicKey));
+            var deviceName = EnsureDeviceName();
             var resp = await http.PostAsJsonAsync($"{p.RelayUrl.TrimEnd('/')}/handles",
-                new RegisterHandleRequest(p.Handle, p.PublicKey, p.DisplayName, NullIfBlank(p.RecoveryPublicKey), sig));
+                new RegisterHandleRequest(p.Handle, p.PublicKey, p.DisplayName, NullIfBlank(p.RecoveryPublicKey), sig, deviceName));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
             if (resp.IsSuccessStatusCode) return true;
 
@@ -86,6 +95,25 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     }
 
     private static string? NullIfBlank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s;
+
+    /// <summary>
+    /// Returns the device name to register, defaulting it the first time. If the profile has no
+    /// device name yet, pick a sensible one (the OS device name where available, else the machine
+    /// name) and persist it so the relay can show a friendly label in the device picker.
+    /// </summary>
+    private string EnsureDeviceName()
+    {
+        var current = state.Profile.DeviceName;
+        if (!string.IsNullOrWhiteSpace(current)) return current;
+
+        var name = "";
+        try { name = Microsoft.Maui.Devices.DeviceInfo.Current.Name; } catch { }
+        if (string.IsNullOrWhiteSpace(name)) name = Environment.MachineName;
+        if (string.IsNullOrWhiteSpace(name)) return "";
+
+        state.Mutate(x => x.DeviceName = name);
+        return name;
+    }
 
     /// <summary>
     /// Checks whether a handle is already claimed on a relay. Returns true if taken, false if free,
@@ -388,10 +416,14 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         // our own handle (the relay only routes same-handle envelopes between our linked devices).
         if (env.Kind == MeshKinds.RemoteAgentRequest)
         {
+            // Belt-and-suspenders: the relay already delivers a targeted request only to the chosen
+            // device, but if this envelope names a different device than ours, ignore it.
+            if (env.ToDevice is not null && env.ToDevice != MyDeviceId) return;
             if (state.Profile.ActAsRemoteAgent && from == AppState.Norm(state.Profile.Handle))
             {
                 var answer = await agent.AskAsRemoteAsync(text, ct);
-                await SendAsync(from, MeshKinds.RemoteAgentResponse, answer);
+                // Target the answer back to the device that asked so only it receives the response.
+                await SendAsync(from, MeshKinds.RemoteAgentResponse, answer, toDevice: env.FromDevice);
             }
             return;
         }
@@ -613,7 +645,26 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     /// desktop that opted in (ActAsRemoteAgent) responds. Returns false when not connected.
     /// </summary>
     public async Task<bool> AskHomeAgentAsync(string prompt)
-        => await SendAsync(state.Profile.Handle, MeshKinds.RemoteAgentRequest, prompt);
+        => await SendAsync(state.Profile.Handle, MeshKinds.RemoteAgentRequest, prompt, toDevice: state.Profile.HomeDeviceId);
+
+    /// <summary>
+    /// Lists the devices currently registered under this handle (from the relay directory) so the
+    /// Settings UI can offer a "home device" picker. Best-effort: returns an empty list on any error
+    /// (unreachable relay, bad response) rather than throwing.
+    /// </summary>
+    public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListMyDevicesAsync(CancellationToken ct = default)
+    {
+        var h = AppState.Norm(state.Profile.Handle);
+        if (string.IsNullOrWhiteSpace(h)) return Array.Empty<Mesh.Shared.DeviceInfo>();
+        try
+        {
+            var http = httpFactory.CreateClient("relay");
+            var devices = await http.GetFromJsonAsync<Mesh.Shared.DeviceInfo[]>(
+                $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/devices", Json, ct);
+            return devices ?? Array.Empty<Mesh.Shared.DeviceInfo>();
+        }
+        catch { return Array.Empty<Mesh.Shared.DeviceInfo>(); }
+    }
 
     /// <summary>
     /// Invokes another handle's PUBLIC service by id, sending the prompt on the service channel.
@@ -623,7 +674,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         => await SendAsync(providerHandle, MeshKinds.ServiceRequest, ServiceProtocol.Body(serviceId, prompt));
 
 
-    public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null)
+    public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null, string? toDevice = null)
     {
         if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
         {
@@ -646,7 +697,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         }
 
         var sig = IdentityService.Sign(p.PrivateKey, wire);
-        var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig);
+        var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig, toDevice: toDevice);
         try
         {
             await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);

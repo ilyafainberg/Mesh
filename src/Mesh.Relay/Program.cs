@@ -88,7 +88,18 @@ var router = app.Services.GetRequiredService<MeshRouter>();
 var connectorCatalog = app.Services.GetRequiredService<Mesh.Relay.RelayConnectorCatalog>();
 await backplane.StartAsync(async (toHandle, envelopeJson) =>
 {
-    await router.DeliverLocalAsync(toHandle, envelopeJson);
+    // A cross-instance forward may target one specific device (MeshEnvelope.ToDevice). Parse it out of
+    // the envelope JSON so the owning instance re-applies the same per-device filter on local delivery.
+    string? toDevice = null;
+    try
+    {
+        toDevice = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, json)?.ToDevice;
+    }
+    catch (JsonException)
+    {
+        toDevice = null; // Malformed payload: fall back to a normal broadcast.
+    }
+    await router.DeliverLocalAsync(toHandle, envelopeJson, excludeConnectionId: null, toDevice: toDevice);
 });
 
 // ---- Health ---------------------------------------------------------------
@@ -137,9 +148,12 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         // Capture the recovery public key at registration so a future device can recover the handle.
         if (!string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
+        // Record the friendly device name (if provided) so the per-device directory can show it.
+        if (!string.IsNullOrWhiteSpace(req.DeviceName))
+            await store.SetDeviceNameAsync(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), req.DeviceName);
         metrics.HandleRegistered();
         app.Logger.LogInformation("handle registered: {Handle}", handle);
-        return Results.Ok(new RegisterHandleResponse(handle, DeviceIdOf(req.DevicePublicKey), created.RegisteredAt));
+        return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), created.RegisteredAt));
     }
 
     if (existing.DevicePublicKeys.Contains(req.DevicePublicKey))
@@ -149,7 +163,10 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         // First-writer-wins: adopt a recovery key on re-register only if none is stored yet.
         if (existing.RecoveryPublicKey is null && !string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
-        return Results.Ok(new RegisterHandleResponse(handle, DeviceIdOf(req.DevicePublicKey), existing.RegisteredAt));
+        // Refresh the friendly device name (if provided) on re-register.
+        if (!string.IsNullOrWhiteSpace(req.DeviceName))
+            await store.SetDeviceNameAsync(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), req.DeviceName);
+        return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), existing.RegisteredAt));
     }
 
     // A different key cannot silently join a claimed handle; it must use device linking.
@@ -195,7 +212,7 @@ app.MapPost("/handles/{handle}/link/redeem", async (string handle, LinkRedeemReq
         return Results.BadRequest(new { error = "invite invalid, already used, or expired" });
 
     var (updated, _) = await store.UpsertHandleAsync(key, req.NewPublicKey, displayName: null, allowNewDevice: true);
-    return Results.Ok(new LinkRedeemResponse(key, DeviceIdOf(req.NewPublicKey), updated.DisplayName));
+    return Results.Ok(new LinkRedeemResponse(key, DeviceProtocol.DeviceId(req.NewPublicKey), updated.DisplayName));
 });
 
 // Handle recovery: a brand-new device authorizes itself under an existing handle by proving
@@ -228,7 +245,7 @@ app.MapPost("/handles/{handle}/recover", async (string handle, RecoverHandleRequ
 
     var (updated, _) = await store.UpsertHandleAsync(key, req.NewPublicKey, displayName: null, allowNewDevice: true);
     app.Logger.LogInformation("recover succeeded: {Handle}", key);
-    return Results.Ok(new RegisterHandleResponse(key, DeviceIdOf(req.NewPublicKey), updated.RegisteredAt));
+    return Results.Ok(new RegisterHandleResponse(key, DeviceProtocol.DeviceId(req.NewPublicKey), updated.RegisteredAt));
 });
 
 // ---- Connectors: public catalog + token broker ---------------------------
@@ -393,6 +410,28 @@ app.MapGet("/handles/{handle}", async (string handle) =>
     if (rec is null) return Results.NotFound();
     var online = await backplane.GetInstanceForAsync(key) is not null;
     return Results.Ok(new HandleInfo(rec.Handle, rec.DisplayName, rec.DevicePublicKeys, online, rec.RegisteredAt));
+});
+
+// Per-device directory: one DeviceInfo per registered device key, with its friendly name (if set)
+// and whether it is currently connected. Lets a client offer a "home device" picker and route a
+// remote-agent request to exactly one device. Online is best-effort per-instance presence for now.
+app.MapGet("/handles/{handle}/devices", async (string handle, ConnectionRegistry registry) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null) return Results.NotFound();
+
+    var onlineDevices = registry.OnlineDeviceIds(key);
+    var devices = rec.DevicePublicKeys
+        .Select(pubkey => DeviceProtocol.DeviceId(pubkey))
+        .Distinct()
+        .Select(deviceId => new DeviceInfo(
+            deviceId,
+            rec.DeviceNames.GetValueOrDefault(deviceId),
+            onlineDevices.Contains(deviceId)))
+        .ToArray();
+
+    return Results.Ok(devices);
 });
 
 app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.Mvc.FromBody] DeleteHandleRequest req) =>
@@ -567,9 +606,6 @@ return;
 // ---- helpers --------------------------------------------------------------
 static string Normalize(string handle)
     => handle.Trim().TrimStart('@').ToLowerInvariant();
-
-static string DeviceIdOf(string publicKey)
-    => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(publicKey)))[..12].ToLowerInvariant();
 
 static string Trim(string s) => s.Length > 300 ? s[..300] : s;
 

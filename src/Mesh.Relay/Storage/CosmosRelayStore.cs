@@ -243,6 +243,45 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <inheritdoc />
+    public async Task SetDeviceNameAsync(string handle, string deviceId, string name, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            HandleDoc doc;
+            string etag;
+            try
+            {
+                var read = await handlesContainer
+                    .ReadItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return; // No-op if the handle does not exist.
+            }
+
+            doc.DeviceNames ??= new Dictionary<string, string>();
+            doc.DeviceNames[deviceId] = name;
+            try
+            {
+                await handlesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    /// <inheritdoc />
     public async Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
@@ -672,7 +711,8 @@ public sealed class CosmosRelayStore : IRelayStore
         DisplayName = doc.DisplayName,
         RegisteredAt = doc.RegisteredAt,
         DevicePublicKeys = doc.DevicePublicKeys is null ? new List<string>() : new List<string>(doc.DevicePublicKeys),
-        RecoveryPublicKey = doc.RecoveryPublicKey
+        RecoveryPublicKey = doc.RecoveryPublicKey,
+        DeviceNames = doc.DeviceNames is null ? new Dictionary<string, string>() : new Dictionary<string, string>(doc.DeviceNames)
     };
 
     /// <summary>Cosmos document for a handle registration. Uses lowercase "handle" as the partition key.</summary>
@@ -695,6 +735,9 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("recoveryPublicKey")]
         public string? RecoveryPublicKey { get; set; }
+
+        [JsonPropertyName("deviceNames")]
+        public Dictionary<string, string>? DeviceNames { get; set; }
     }
 
     /// <summary>Cosmos document for a link invite, carrying a per-item "ttl" for native expiry.</summary>

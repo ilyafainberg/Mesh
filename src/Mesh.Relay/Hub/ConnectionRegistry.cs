@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Mesh.Shared;
 
 namespace Mesh.Relay.Hub;
 
@@ -17,6 +18,14 @@ public sealed class ConnectionRegistry
     {
         public string? Handle { get; set; }
         public string? PublicKey { get; set; }
+
+        /// <summary>
+        /// Stable short device id derived from this connection's authenticated device public key
+        /// (see <see cref="DeviceProtocol.DeviceId"/>). Set at authentication so the router can
+        /// target one specific device of a handle (MeshEnvelope.ToDevice) and so the directory can
+        /// report which devices are online.
+        /// </summary>
+        public string? DeviceId { get; set; }
         public string Nonce { get; set; } = "";
         public bool Authenticated { get; set; }
     }
@@ -37,6 +46,7 @@ public sealed class ConnectionRegistry
     {
         if (!byConnection.TryGetValue(connectionId, out var s) || s.Handle is null) return;
         s.PublicKey = publicKey;
+        s.DeviceId = DeviceProtocol.DeviceId(publicKey);
         s.Authenticated = true;
         byHandle.GetOrAdd(s.Handle, _ => new()).TryAdd(connectionId, 0);
     }
@@ -59,6 +69,30 @@ public sealed class ConnectionRegistry
     /// <summary>All local connection ids currently authenticated for a handle.</summary>
     public IReadOnlyCollection<string> ConnectionsFor(string handle)
         => byHandle.TryGetValue(handle, out var set) ? set.Keys.ToArray() : Array.Empty<string>();
+
+    /// <summary>
+    /// The local connection ids for a handle whose authenticated device id matches
+    /// <paramref name="deviceId"/>. Used to route an envelope to ONE specific device of a handle.
+    /// </summary>
+    public IReadOnlyCollection<string> ConnectionsForDevice(string handle, string deviceId)
+    {
+        if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
+        return set.Keys
+            .Where(c => byConnection.TryGetValue(c, out var s) && s.DeviceId == deviceId)
+            .ToArray();
+    }
+
+    /// <summary>The distinct device ids of a handle's authenticated connections on this instance.</summary>
+    public IReadOnlyCollection<string> OnlineDeviceIds(string handle)
+    {
+        if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
+        return set.Keys
+            .Select(c => byConnection.TryGetValue(c, out var s) ? s.DeviceId : null)
+            .Where(d => d is not null)
+            .Select(d => d!)
+            .Distinct()
+            .ToArray();
+    }
 
     /// <summary>Every handle with at least one authenticated connection on this instance.</summary>
     public IReadOnlyCollection<string> LocalHandles() => byHandle.Keys.ToArray();

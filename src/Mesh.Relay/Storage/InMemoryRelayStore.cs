@@ -59,6 +59,13 @@ public sealed class InMemoryRelayStore : IRelayStore
         return Task.CompletedTask;
     }
 
+    public Task SetDeviceNameAsync(string handle, string deviceId, string name, CancellationToken ct = default)
+    {
+        if (handles.TryGetValue(handle, out var rec))
+            lock (rec) rec.DeviceNames[deviceId] = name;
+        return Task.CompletedTask;
+    }
+
     public Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))
@@ -204,7 +211,8 @@ public sealed class InMemoryRelayStore : IRelayStore
                 DisplayName = r.DisplayName,
                 RegisteredAt = r.RegisteredAt,
                 DevicePublicKeys = r.DevicePublicKeys.ToList(),
-                RecoveryPublicKey = r.RecoveryPublicKey
+                RecoveryPublicKey = r.RecoveryPublicKey,
+                DeviceNames = new Dictionary<string, string>(r.DeviceNames)
             };
     }
 }

@@ -34,6 +34,35 @@ public sealed class MeshRouter(
     {
         var to = Normalize(env.To);
         var envelopeJson = JsonSerializer.Serialize(env, Json);
+        var toDevice = env.ToDevice;
+
+        if (toDevice is not null)
+        {
+            // Per-device directed routing: target exactly one device of the handle.
+            // Cross-instance per-device presence is best-effort for now: we only know which device
+            // ids are connected on THIS instance, so a device on another replica is reached by the
+            // same directed forward as today (the owning instance re-applies the ToDevice filter
+            // from the envelope JSON). If the chosen device is not reachable anywhere, we fall back
+            // to a normal broadcast so the request is not silently dropped.
+
+            // 1a. Local delivery restricted to the target device.
+            if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId, toDevice)) return;
+
+            // 1b. Directed cross-instance forward; the owner re-runs DeliverLocalAsync and re-applies
+            //     the ToDevice filter because the envelope JSON carries ToDevice.
+            var deviceOwner = await backplane.GetInstanceForAsync(to);
+            if (deviceOwner is not null && deviceOwner != backplane.InstanceId
+                && await backplane.PublishToOwnerAsync(deviceOwner, to, envelopeJson))
+                return;
+
+            // 1c. Fallback: the chosen device is offline/unreachable. Broadcast to the handle's other
+            //     connections (toDevice=null) so the request still reaches the owner.
+            if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId)) return;
+
+            // Nobody at all is connected on this instance for the fallback either: queue offline.
+            await store.EnqueueAsync(to, envelopeJson);
+            return;
+        }
 
         // 1. Local delivery to any of the recipient's connections on this instance.
         if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId)) return;
@@ -53,9 +82,19 @@ public sealed class MeshRouter(
     /// connection). Returns true if at least one local connection received it. Used both by the
     /// local fast path and by the backplane when another instance forwards a message to this one.
     /// </summary>
-    public async Task<bool> DeliverLocalAsync(string handle, string envelopeJson, string? excludeConnectionId = null)
+    /// <param name="toDevice">
+    /// When non-null, restrict delivery to the connections whose authenticated device id matches this
+    /// value (one specific device of the handle). When null, behavior is unchanged: deliver to every
+    /// connection of the handle. The backplane path parses ToDevice out of the envelope JSON and passes
+    /// it here so a cross-instance forward re-applies the same per-device filter on the owning instance.
+    /// </param>
+    public async Task<bool> DeliverLocalAsync(
+        string handle, string envelopeJson, string? excludeConnectionId = null, string? toDevice = null)
     {
-        var conns = registry.ConnectionsFor(Normalize(handle));
+        var normalized = Normalize(handle);
+        var conns = toDevice is not null
+            ? registry.ConnectionsForDevice(normalized, toDevice)
+            : registry.ConnectionsFor(normalized);
         if (excludeConnectionId is not null)
             conns = conns.Where(c => c != excludeConnectionId).ToList();
         if (conns.Count == 0) return false;
