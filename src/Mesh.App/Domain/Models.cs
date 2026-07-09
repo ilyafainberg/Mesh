@@ -441,6 +441,19 @@ public sealed class MeshProfile
     /// </summary>
     public bool ActAsRemoteAgent { get; set; }
 
+    /// <summary>
+    /// A friendly name for THIS device (e.g. "Ilya's Laptop"), shown to the owner's other devices in
+    /// the home-device picker. Defaults from the machine name at onboarding.
+    /// </summary>
+    public string DeviceName { get; set; } = "";
+
+    /// <summary>
+    /// The device id (see DeviceProtocol.DeviceId) of the ONE device this client routes "ask my home
+    /// agent" requests to. When set, remote-agent requests are addressed to just that device instead
+    /// of broadcasting to every device, so exactly one device answers. Null means no home device chosen.
+    /// </summary>
+    public string? HomeDeviceId { get; set; }
+
     /// <summary>Handles this device has an unread inbound person-message from (persisted read-state).</summary>
     public List<string> UnreadFrom { get; set; } = new();
 
