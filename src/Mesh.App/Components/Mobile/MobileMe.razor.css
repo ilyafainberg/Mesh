@@ -1,0 +1,323 @@
+/* Mobile "Me" agent chat: WhatsApp-style topic list + full-screen thread overlay.
+   All styling is scoped to this component. Shared composer/chip/button classes are
+   already defined in app.css and are reused as-is; this file styles the mobile-only
+   layout (list rows, thread overlay, bubbles) and pins bubble visuals to the spec. */
+
+/* ---------- A) LIST screen ---------- */
+.me-list {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: var(--bg-canvas);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.list-head {
+    padding: 16px 16px 10px;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--stroke-1);
+}
+
+.list-head h2 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    font-size: 20px;
+    color: var(--fg-1);
+}
+
+.list-head h2 i { color: var(--brand); }
+
+.list-sub {
+    margin: 4px 0 0;
+    font-size: 13px;
+    color: var(--fg-3);
+}
+
+.new-chat-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    padding: 14px 16px;
+    background: var(--bg-1);
+    border: none;
+    border-bottom: 1px solid var(--stroke-1);
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: background .12s ease;
+}
+
+.new-chat-row:active { background: var(--brand-tint); }
+
+.new-chat-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: var(--brand);
+    color: #fff;
+    font-size: 18px;
+    flex: none;
+}
+
+.new-chat-label {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--brand);
+}
+
+.thread-rows {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-1);
+}
+
+.thread-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    padding: 12px 16px;
+    background: var(--bg-1);
+    border: none;
+    border-bottom: 1px solid var(--stroke-1);
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: background .12s ease;
+}
+
+.thread-row:active { background: var(--bg-3); }
+
+.row-avatar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: var(--brand-tint);
+    color: var(--brand);
+    font-size: 18px;
+    flex: none;
+}
+
+.row-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 15px;
+    color: var(--fg-1);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.row-chevron {
+    color: var(--fg-3);
+    font-size: 14px;
+    flex: none;
+}
+
+.list-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 48px 24px;
+    text-align: center;
+    color: var(--fg-3);
+}
+
+.list-empty i {
+    font-size: 34px;
+    color: var(--brand);
+    opacity: .8;
+}
+
+.empty-title {
+    margin: 8px 0 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--fg-1);
+}
+
+.empty-sub {
+    margin: 0;
+    font-size: 13px;
+    color: var(--fg-3);
+    max-width: 260px;
+}
+
+/* ---------- B) THREAD overlay (full screen) ---------- */
+.thread-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1100;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-1);
+}
+
+.thread-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 8px;
+    padding-top: max(8px, env(safe-area-inset-top));
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--stroke-1);
+    box-shadow: var(--shadow-2);
+    flex: none;
+}
+
+.bar-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--fg-1);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+}
+
+.bar-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 36px;
+    height: 36px;
+    padding: 0 8px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--fg-1);
+    font-size: 16px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.bar-btn:active { background: var(--bg-3); }
+
+.back-btn {
+    color: var(--brand);
+    font-size: 20px;
+}
+
+.text-btn { font-size: 13px; font-weight: 600; }
+
+.danger-btn { color: var(--danger); font-weight: 600; }
+
+.rename-input {
+    flex: 1;
+    min-width: 0;
+    height: 36px;
+    padding: 0 10px;
+    border: 1px solid var(--stroke-1);
+    border-radius: 8px;
+    font-size: 15px;
+    color: var(--fg-1);
+    background: var(--bg-1);
+}
+
+.rename-input:focus {
+    outline: none;
+    border-color: var(--brand);
+}
+
+/* ---------- Messages area ---------- */
+.messages {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    background: var(--bg-canvas);
+}
+
+.messages-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+}
+
+.empty {
+    align-self: center;
+    max-width: 320px;
+    margin: 18px auto;
+    padding: 14px 16px;
+    text-align: center;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--fg-3);
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-l);
+}
+
+.bubble {
+    max-width: 82%;
+    padding: 8px 12px;
+    margin: 3px 0;
+    border-radius: 14px;
+    box-shadow: var(--shadow-2);
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+}
+
+.bubble.user {
+    align-self: flex-end;
+    background: var(--brand-tint-2);
+    color: var(--fg-1);
+    border-bottom-right-radius: 4px;
+}
+
+.bubble.assistant {
+    align-self: flex-start;
+    background: var(--bg-3);
+    color: var(--fg-1);
+    border-bottom-left-radius: 4px;
+}
+
+.bubble .text.muted { color: var(--fg-3); font-size: 14px; }
+
+.msg-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--fg-3);
+}
+
+/* ---------- Composer area ---------- */
+.composer-area {
+    flex: none;
+    background: var(--bg-1);
+    border-top: 1px solid var(--stroke-1);
+    padding-bottom: env(safe-area-inset-bottom);
+}
+
+.composer-inner {
+    padding: 8px 10px;
+}
+
+.err-text {
+    margin: 6px 2px 0;
+    font-size: 12px;
+    color: var(--danger);
+}

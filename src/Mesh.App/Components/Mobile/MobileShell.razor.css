@@ -1,0 +1,207 @@
+/* Mobile shell: scrollable body + WhatsApp-style floating bottom tab bar + overflow sheet. */
+
+.m-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--bg-canvas);
+}
+
+/* Scrollable body region. Sits above the in-flow tab bar in the flex column. */
+.m-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 8px;
+}
+
+/* Bottom tab bar. In-flow flex child (NOT position:fixed): a fixed bar sibling to a
+   -webkit-overflow-scrolling scroll container has its touches swallowed by the scroll
+   layer on Android WebView, making the tabs untappable. A normal flex child at the
+   bottom of the column is always hit-testable. */
+.m-tabbar {
+    flex: 0 0 auto;
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: stretch;
+    justify-content: space-around;
+    height: calc(58px + env(safe-area-inset-bottom));
+    padding-bottom: env(safe-area-inset-bottom);
+    background: var(--bg-1);
+    border-top: 1px solid var(--stroke-1);
+    box-shadow: 0 -2px 10px rgba(0, 0, 0, .06);
+}
+
+.m-tab {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    padding: 6px 2px 8px;
+    background: transparent;
+    border: none;
+    color: var(--fg-3);
+    font-family: inherit;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: color .12s ease;
+}
+
+.m-tab:hover { color: var(--fg-2); }
+
+.m-tab.active { color: var(--brand); }
+
+.m-tab-icon {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    line-height: 1;
+}
+
+.m-tab-label {
+    font-size: 11px;
+    line-height: 1;
+    font-weight: 500;
+    letter-spacing: .1px;
+}
+
+/* Small numeric badge, top-right of the icon. */
+.m-badge {
+    position: absolute;
+    top: -6px;
+    left: 12px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--danger);
+    color: #FFFFFF;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    border-radius: 999px;
+    border: 2px solid var(--bg-1);
+}
+
+/* Overflow ("More") bottom sheet. */
+.m-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 1050;
+    background: rgba(0, 0, 0, .35);
+    animation: m-fade-in .15s ease;
+}
+
+.m-sheet {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1050;
+    background: var(--bg-1);
+    border-top-left-radius: 16px;
+    border-top-right-radius: 16px;
+    box-shadow: var(--shadow-16);
+    padding: 8px 16px calc(16px + env(safe-area-inset-bottom));
+    animation: m-slide-up .2s ease;
+}
+
+.m-sheet-grip {
+    width: 40px;
+    height: 4px;
+    margin: 6px auto 12px;
+    border-radius: 999px;
+    background: var(--stroke-2);
+}
+
+.m-sheet-head {
+    padding: 4px 4px 12px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--stroke-1);
+}
+
+.m-sheet-links {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.m-sheet-link {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    padding: 12px 10px;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-l);
+    color: var(--fg-1);
+    font-family: inherit;
+    font-size: .95rem;
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: background .12s ease;
+}
+
+.m-sheet-link:hover,
+.m-sheet-link:active { background: var(--bg-3); }
+
+.m-sheet-link i {
+    font-size: 18px;
+    color: var(--brand);
+    width: 22px;
+    text-align: center;
+    flex: 0 0 auto;
+}
+
+.m-sheet-quit {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    margin-top: 10px;
+    padding: 12px 10px;
+    background: transparent;
+    border: none;
+    border-top: 1px solid var(--stroke-1);
+    border-radius: 0 0 var(--radius-l) var(--radius-l);
+    color: var(--danger);
+    font-family: inherit;
+    font-size: .95rem;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.m-sheet-quit:hover,
+.m-sheet-quit:active { background: rgba(177, 14, 28, .08); }
+
+.m-sheet-quit i {
+    font-size: 18px;
+    width: 22px;
+    text-align: center;
+    flex: 0 0 auto;
+}
+
+@keyframes m-slide-up {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+@keyframes m-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}

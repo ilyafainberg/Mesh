@@ -1,0 +1,564 @@
+@* Mobile Messages: WhatsApp-style conversation list that drills into a full-screen thread.
+   Logic ported verbatim from Components/Pages/Messages.razor; markup restructured into two screens. *@
+@page "/m/messages"
+@inject AppState State
+@inject MeshClient Mesh
+@inject AgentService Agent
+@inject IJSRuntime JS
+@inject NavigationManager Nav
+@implements IDisposable
+
+@if (active is null)
+{
+    @* ---------- A) LIST SCREEN ---------- *@
+    <div class="m-list">
+        <header class="m-list-head">
+            <h2>Messages</h2>
+        </header>
+
+        <div class="new-conv">
+            <input @bind="newHandle" @bind:event="oninput" @onkeydown="OnNewKey" list="msg-handles" placeholder="Add by handle…" aria-label="Add a conversation by handle" />
+            <datalist id="msg-handles">
+                @foreach (var h in KnownHandles) { <option value="@h" /> }
+            </datalist>
+            <button class="primary round-add" @onclick="StartConversation" title="Start conversation" aria-label="Start conversation"><i class="bi bi-plus-lg"></i></button>
+        </div>
+
+        <div class="chat-rows">
+            @foreach (var c in State.Profile.Conversations)
+            {
+                var nm = State.DisplayNameFor(c.Handle);
+                var initial = string.IsNullOrEmpty(nm) ? "?" : nm.Substring(0, 1).ToUpperInvariant();
+                <div class="chat-row" @onclick="() => Select(c.Handle)">
+                    <span class="avatar">@initial</span>
+                    <div class="chat-main">
+                        <span class="chat-name">@nm</span>
+                        @if (!IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
+                    </div>
+                    @if (State.IsUnread(c.Handle)) { <span class="chat-unread" title="Unread message"></span> }
+                </div>
+            }
+        </div>
+
+        @if (State.Profile.Conversations.Count == 0)
+        {
+            <div class="empty conv-empty">No conversations yet. Add someone by their handle above to start one.</div>
+        }
+
+        @if (State.Profile.Approvals.Count > 0)
+        {
+            <div class="requests approvals">
+                <div class="req-head"><i class="bi bi-hourglass-split"></i> Awaiting your approval</div>
+                @foreach (var a in State.Profile.Approvals)
+                {
+                    <div class="req">
+                        <div class="req-from"><b>@State.DisplayNameFor(a.From)</b> asked:</div>
+                        <div class="req-body">@a.RequestBody</div>
+                        <div class="req-draft-label">Your agent drafted:</div>
+                        <textarea class="req-draft" value="@GetDraft(a)" @onchange="e => SetDraft(a, e)" rows="3" aria-label="Edit draft reply"></textarea>
+                        <div class="req-actions">
+                            <button class="primary" @onclick="() => Approve(a)"><i class="bi bi-send"></i> Approve &amp; send</button>
+                            <button class="ghost" @onclick="() => Reject(a)"><i class="bi bi-x-lg"></i> Reject</button>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+
+        @if (State.Profile.Requests.Count > 0)
+        {
+            <div class="requests">
+                <div class="req-head"><i class="bi bi-person-plus"></i> Requests</div>
+                @foreach (var r in State.Profile.Requests)
+                {
+                    <div class="req">
+                        <div><b>@State.DisplayNameFor(r.From)</b>: @r.Body</div>
+                        <div class="req-actions">
+                            <button class="primary" @onclick="() => ApproveContact(r.From)">Allow</button>
+                            <button class="ghost" @onclick="() => Decline(r.From)">Decline</button>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+else
+{
+    @* ---------- B) THREAD SCREEN (full-screen overlay) ---------- *@
+    var conv = State.GetOrCreateConversation(active);
+    <div class="m-thread">
+        <header class="thread-bar">
+            <button class="ghost icon-btn back-btn" @onclick="() => active = null" title="Back" aria-label="Back to conversations"><i class="bi bi-chevron-left"></i></button>
+            <div class="thread-id">
+                <span class="thread-name">@State.DisplayNameFor(active)</span>
+                <span class="thread-sub">@(IsAllowed(active) ? "their agent can talk to yours" : "you can message them")</span>
+            </div>
+            <div class="head-actions">
+                @if (confirmDelete == active)
+                {
+                    <button class="ghost icon-btn" title="Clear messages only, keep the conversation" @onclick="ClearActive">Clear</button>
+                    <button class="danger" title="Delete the conversation and its history" @onclick="DeleteActive">Delete</button>
+                    <button class="ghost icon-btn" title="Cancel" @onclick="() => confirmDelete = null" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
+                }
+                else
+                {
+                    <button class="ghost icon-btn" title="Delete conversation history" aria-label="Delete conversation history" @onclick="() => confirmDelete = active"><i class="bi bi-trash"></i></button>
+                }
+            </div>
+        </header>
+
+        @if (State.FindContact(active)?.KeyChanged == true)
+        {
+            <div class="key-change-banner">
+                <i class="bi bi-shield-exclamation"></i>
+                <div class="kc-text">
+                    <strong>@State.DisplayNameFor(active)'s identity keys changed.</strong>
+                    Messages are held until you re-verify. Confirm out of band (in person, a call)
+                    that this is really them before trusting the new keys.
+                </div>
+                <button class="primary" @onclick="ReverifyActive" disabled="@reverifying">
+                    @(reverifying ? "Verifying…" : "Re-verify")
+                </button>
+            </div>
+        }
+
+        <div class="messages" @ref="scrollEl">
+            <div class="messages-wrap">
+                @foreach (var line in conv.Lines)
+                {
+                    <div class="bubble @(line.Role == "user" ? "assistant" : "user")">
+                        <MessageContent Text="@line.Text" From="@(line.Role == "user" ? State.DisplayNameFor(active) : null)"
+                                        OnPin="PinWidget" />
+                        <div class="msg-tag">
+                            <i class="bi @(line.Via == "person" ? "bi-person" : "bi-robot")"></i> @TagLabel(line)
+                            @if (queuedIds.Contains(line.Id))
+                            {
+                                <span class="msg-status" title="Queued - will send after the current turn"><i class="bi bi-hourglass-split"></i> queued</span>
+                            }
+                            @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status))
+                            {
+                                <span class="msg-status @line.Status" title="@line.Status">
+                                    @if (line.Status == "delivered") { <i class="bi bi-check2-all"></i> }
+                                    else if (line.Status == "sent") { <i class="bi bi-check2"></i> }
+                                    else if (line.Status == "failed") { <i class="bi bi-exclamation-circle"></i> }
+                                </span>
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="composer-area">
+            <div class="composer-inner">
+                @if (pinHtml is not null)
+                {
+                    <div class="pin-bar">
+                        <i class="bi bi-pin-angle"></i>
+                        <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" aria-label="Name this widget" />
+                        <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
+                        <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
+                    </div>
+                }
+                @if (widgetMode)
+                {
+                    <div class="mode-chip">
+                        <i class="bi bi-window-stack"></i> widget
+                        <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
+                        <span class="mode-hint">describe a mini-app to send</span>
+                    </div>
+                }
+                else if (ShowPreview)
+                {
+                    <div class="composer-preview">
+                        <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
+                        <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
+                    </div>
+                }
+                @if (attachments.Count > 0)
+                {
+                    <div class="attach-bar">
+                        @foreach (var a in attachments)
+                        {
+                            <span class="attach-chip">
+                                <i class="bi @(a.Mime.StartsWith("image/") ? "bi-image" : "bi-file-earmark")"></i>
+                                <span class="attach-name">@a.Name</span>
+                                <span class="attach-size">@a.SizeLabel</span>
+                                <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
+                            </span>
+                        }
+                    </div>
+                }
+                <div class="composer">
+                    <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="() => widgetMode = !widgetMode" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget (mini-app)">
+                        <i class="bi bi-plus-lg"></i>
+                    </button>
+                    <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
+                        <i class="bi bi-paperclip"></i>
+                    </button>
+                    <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
+                           placeholder="@Placeholder" aria-label="Message input"></textarea>
+                    <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
+                        <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
+                                title="Send to their agent (it may auto-reply)">
+                            <i class="bi bi-robot"></i> Agent
+                        </button>
+                        <button class="@(directMode ? "on" : "")" @onclick="() => directMode = true" disabled="@busy"
+                                title="Send to them directly (no agent reply)">
+                            <i class="bi bi-person"></i> Person
+                        </button>
+                    </div>
+                    <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send"><i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i></button>
+                </div>
+                @if (attachError is not null) { <p class="err-text">@attachError</p> }
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    string? active;
+    string? confirmDelete;
+    string input = "";
+    string newHandle = "";
+    bool busy;
+    bool widgetMode;
+    bool directMode;
+    string? pinHtml;
+    string pinName = "";
+    ElementReference scrollEl;
+    ElementReference composerEl;
+    Microsoft.JSInterop.DotNetObjectReference<MobileMessages>? selfRef;
+    bool composerWired;
+    int lastCount = -1;
+    string? lastActive;
+    Dictionary<string, string> editedDrafts = new();
+
+    readonly List<StagedFile> attachments = new();
+    string? attachError;
+    const long MaxAttachmentBytes = 20L * 1024 * 1024;
+
+    // Tier-1 steerable input: messages the user submits while a send is in flight are queued
+    // (shown immediately as a "queued" line) and delivered in order after the current turn,
+    // never concurrently. queuedIds tracks which lines still render the "queued" marker.
+    readonly Queue<PendingMsg> pending = new();
+    readonly HashSet<string> queuedIds = new();
+
+    sealed record PendingMsg(string Handle, ChatLine Line, string Text, List<StagedFile> Files, bool Direct, bool Widget);
+
+    sealed record StagedFile(string Name, string Mime, string Base64, long Size)
+    {
+        public string SizeLabel => Human(Size);
+    }
+
+    bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
+
+    string Placeholder => widgetMode
+        ? "Describe a widget to send…"
+        : directMode
+            ? $"Message {State.DisplayNameFor(active!)}…"
+            : $"Message {State.DisplayNameFor(active!)}'s Agent…";
+
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+        Mesh.StateChanged += Refresh;
+
+        // Deep-link: /m/messages?to=handle opens that conversation (used by Search).
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        var to = ParseQueryValue(uri.Query, "to");
+        if (!string.IsNullOrWhiteSpace(to))
+        {
+            var h = AppState.Norm(to!);
+            State.GetOrCreateConversation(h);
+            active = h;
+            State.MarkRead(h);
+        }
+    }
+
+    static string? ParseQueryValue(string queryString, string key)
+    {
+        var q = queryString.TrimStart('?');
+        foreach (var pair in q.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var i = pair.IndexOf('=');
+            if (i < 0) continue;
+            if (Uri.UnescapeDataString(pair[..i]) == key)
+                return Uri.UnescapeDataString(pair[(i + 1)..]);
+        }
+        return null;
+    }
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (active is null) return;
+
+        if (!composerWired)
+        {
+            composerWired = true;
+            selfRef ??= Microsoft.JSInterop.DotNetObjectReference.Create(this);
+            try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
+        }
+
+        var count = State.GetOrCreateConversation(active).Lines.Count;
+        // Scroll on new messages or when switching into a conversation.
+        if (count != lastCount || active != lastActive)
+        {
+            lastCount = count;
+            lastActive = active;
+            try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
+        }
+    }
+
+    /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
+    [Microsoft.JSInterop.JSInvokable]
+    public Task SendFromComposer() => Send();
+
+    bool IsAllowed(string handle) => State.FindContact(handle)?.Allowed == true;
+
+    // Handles offered for autocomplete when starting a conversation: contacts + existing threads.
+    IEnumerable<string> KnownHandles => State.Profile.Contacts.Select(c => c.Handle)
+        .Concat(State.Profile.Conversations.Select(c => c.Handle))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(h => h);
+
+    bool reverifying;
+
+    async Task ReverifyActive()
+    {
+        if (active is null || reverifying) return;
+        reverifying = true;
+        try { await Mesh.ReverifyContactAsync(active); }
+        finally { reverifying = false; }
+    }
+
+    void Select(string handle) { active = handle; confirmDelete = null; composerWired = false; State.MarkRead(handle); }
+
+    void ClearActive()
+    {
+        if (active is null) return;
+        State.ClearConversation(active);
+        confirmDelete = null;
+    }
+
+    void DeleteActive()
+    {
+        if (active is null) return;
+        var h = active;
+        active = null;
+        confirmDelete = null;
+        composerWired = false;
+        State.DeleteConversation(h);
+    }
+
+    async Task OnNewKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") StartConversation();
+        await Task.CompletedTask;
+    }
+
+    void StartConversation()
+    {
+        if (string.IsNullOrWhiteSpace(newHandle)) return;
+        active = AppState.Norm(newHandle);
+        composerWired = false;
+        State.GetOrCreateConversation(active);
+        newHandle = "";
+        State.Save();
+    }
+
+    async Task ResetComposer()
+    {
+        try { await JS.InvokeVoidAsync("meshUI.resetComposer", composerEl); } catch { }
+    }
+
+    // Bubble tag: whether a line was addressed to / came from the peer's AGENT or the peer person.
+    // Uses AddressedToAgent (addressee/author) rather than Via (routing channel), so an agent
+    // auto-reply that answers the human reads "to them" even though it travels on the agent channel.
+    string TagLabel(ChatLine line)
+    {
+        var mine = line.Role != "user"; // "assistant" role = my own message
+        var agent = line.AddressedToAgent;
+        if (mine) return agent ? "to their agent" : "to them";
+        return agent ? "their agent" : "them";
+    }
+
+    async Task PickFile()
+    {
+        attachError = null;
+        try
+        {
+            var file = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
+            if (file is null) return;
+            using var stream = await file.OpenReadAsync();
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+            var bytes = ms.ToArray();
+            if (bytes.LongLength == 0) { attachError = "That file is empty."; return; }
+            if (bytes.LongLength > MaxAttachmentBytes)
+            {
+                attachError = $"\"{file.FileName}\" is {Human(bytes.LongLength)}, over the {Human(MaxAttachmentBytes)} limit.";
+                return;
+            }
+            var mime = string.IsNullOrWhiteSpace(file.ContentType) ? GuessMime(file.FileName) : file.ContentType;
+            attachments.Add(new StagedFile(file.FileName, mime, Convert.ToBase64String(bytes), bytes.LongLength));
+        }
+        catch (Exception ex) { attachError = "Couldn't attach that file: " + ex.Message; }
+    }
+
+    static string Human(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB" };
+        double size = bytes;
+        int u = 0;
+        while (size >= 1024 && u < units.Length - 1) { size /= 1024; u++; }
+        return $"{size:0.#} {units[u]}";
+    }
+
+    static string GuessMime(string name)
+    {
+        var ext = Path.GetExtension(name).ToLowerInvariant();
+        return ext switch
+        {
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            ".bmp" => "image/bmp",
+            ".pdf" => "application/pdf",
+            ".txt" or ".md" or ".log" or ".csv" => "text/plain",
+            ".doc" => "application/msword",
+            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xls" => "application/vnd.ms-excel",
+            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".ppt" => "application/vnd.ms-powerpoint",
+            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".zip" => "application/zip",
+            ".json" => "application/json",
+            _ => "application/octet-stream"
+        };
+    }
+
+    async Task Send()
+    {
+        if (active is null) return;
+        if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0) return;
+        var text = input;
+        var files = attachments.ToList();
+        input = "";
+        attachments.Clear();
+        _ = ResetComposer();
+
+        var direct = directMode;
+        var widget = widgetMode;
+        if (widgetMode) widgetMode = false;
+
+        var via = direct ? "person" : "agent";
+        var line = new ChatLine { Role = "assistant", Text = text, Via = via, AddressedToAgent = !direct };
+        State.AddChatLine(active, line);
+
+        // A send is already running: queue this one for the next turn instead of starting a
+        // second concurrent send. The line is already visible; mark it "queued" until delivered.
+        if (busy)
+        {
+            queuedIds.Add(line.Id);
+            pending.Enqueue(new PendingMsg(active, line, text, files, direct, widget));
+            return;
+        }
+
+        busy = true;
+        try
+        {
+            await DeliverAsync(active, line, text, files, direct, widget);
+
+            // Drain anything queued while the turn(s) above ran, in order, one at a time.
+            while (pending.Count > 0)
+            {
+                var next = pending.Dequeue();
+                queuedIds.Remove(next.Line.Id);
+                await DeliverAsync(next.Handle, next.Line, next.Text, next.Files, next.Direct, next.Widget);
+            }
+        }
+        catch (Exception ex)
+        {
+            State.AddChatLine(active!, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" });
+        }
+        finally { busy = false; }
+    }
+
+    // Finalizes a bubble's text (widget build + attachments) and sends it to the peer, reusing
+    // the line's stable id so delivery receipts update the right bubble.
+    async Task DeliverAsync(string handle, ChatLine line, string text, List<StagedFile> files, bool direct, bool widget)
+    {
+        var toSend = text;
+        if (widget && !string.IsNullOrWhiteSpace(text))
+            toSend = await Agent.BuildWidgetAsync(text);
+
+        if (files.Count > 0)
+        {
+            var sb = new System.Text.StringBuilder(toSend ?? "");
+            foreach (var f in files)
+            {
+                if (sb.Length > 0) sb.Append("\n\n");
+                sb.Append(Markdown.FileBlock(f.Name, f.Mime, f.Base64));
+            }
+            toSend = sb.ToString();
+        }
+
+        line.Text = toSend; // "assistant" = me, rendered right
+        var kind = direct ? MeshKinds.DirectMessage : MeshKinds.Chat;
+        await Mesh.SendAsync(handle, kind, toSend, line.Id);
+    }
+
+    void PinWidget(string html) { pinHtml = html; pinName = ""; }
+    void OnPinKey(KeyboardEventArgs e) { if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(pinName)) ConfirmPin(); }
+    void ConfirmPin()
+    {
+        if (pinHtml is null || string.IsNullOrWhiteSpace(pinName)) return;
+        State.Mutate(p => p.Widgets.Add(new Widget { Name = pinName.Trim(), Html = pinHtml!, Visibility = "private" }));
+        pinHtml = null; pinName = "";
+    }
+
+    // ---- approvals (human-in-the-loop) ----
+    string GetDraft(PendingApproval a) => editedDrafts.TryGetValue(a.Id, out var v) ? v : a.DraftReply;
+    void SetDraft(PendingApproval a, ChangeEventArgs e) => editedDrafts[a.Id] = e.Value?.ToString() ?? "";
+
+    async Task Approve(PendingApproval a)
+    {
+        var edited = GetDraft(a);
+        await Mesh.ApproveDraftAsync(a.Id, edited);
+        editedDrafts.Remove(a.Id);
+        active = a.From;
+    }
+
+    void Reject(PendingApproval a)
+    {
+        Mesh.RejectDraft(a.Id);
+        editedDrafts.Remove(a.Id);
+    }
+
+    // ---- contact requests (unknown senders) ----
+    void ApproveContact(string from)
+    {
+        State.Mutate(p =>
+        {
+            var c = State.FindContact(from);
+            if (c is null) { c = new Contact { Handle = from, Allowed = true }; p.Contacts.Add(c); }
+            else c.Allowed = true;
+            p.Requests.RemoveAll(r => r.From == from);
+        });
+        active = from;
+    }
+
+    void Decline(string from) => State.Mutate(p => p.Requests.RemoveAll(r => r.From == from));
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        Mesh.StateChanged -= Refresh;
+        selfRef?.Dispose();
+    }
+}

@@ -1,0 +1,175 @@
+@* Mobile chrome: hosts the routed page body plus a floating bottom tab bar and an overflow sheet.
+   Rendered by MainLayout only when PlatformCaps.IsMobile. Desktop never uses this. *@
+@inject NavigationManager Nav
+@inject AppState State
+@inject MeshClient Mesh
+@inject IAppControl AppControl
+@inject ModelSetupService Setup
+@inject UpdateService Updater
+@implements IDisposable
+
+<div class="m-shell">
+    <div class="m-body">
+        @if (Setup.HasBanner)
+        {
+            <div class="global-banner @(Setup.Running ? "running" : Setup.Success == true ? "ok" : "err")">
+                @if (Setup.Running)
+                {
+                    <span class="spinner"></span>
+                    <span class="gb-text">Model setup: @(Setup.Status ?? "working...")</span>
+                }
+                else
+                {
+                    <i class="bi @(Setup.Success == true ? "bi-check-circle" : "bi-exclamation-triangle")"></i>
+                    <span class="gb-text">@Setup.Status</span>
+                }
+                @if (!Setup.Running)
+                {
+                    <button class="gb-close" @onclick="Setup.Dismiss" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
+                }
+                else
+                {
+                    <a class="gb-link" href="settings">View</a>
+                }
+            </div>
+        }
+        @if (Updater.Available is not null && !Updater.BannerDismissed)
+        {
+            <div class="global-banner update">
+                <i class="bi bi-arrow-up-circle-fill"></i>
+                <span class="gb-text">Mesh @Updater.Available.Version.ToString(3) is available.</span>
+                <a class="gb-link" href="settings">Update</a>
+                <button class="gb-close" @onclick="Updater.DismissBanner" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
+            </div>
+        }
+        @ChildContent
+    </div>
+
+    <nav class="m-tabbar" aria-label="Primary">
+        <button class="m-tab @(Current == Tab.Me ? "active" : "")" @onclick='() => Go("/m/me")' aria-label="Me">
+            <span class="m-tab-icon"><i class="bi bi-person-badge"></i></span>
+            <span class="m-tab-label">Me</span>
+        </button>
+        <button class="m-tab @(Current == Tab.Messages ? "active" : "")" @onclick='() => Go("/m/messages")' aria-label="Messages">
+            <span class="m-tab-icon">
+                <i class="bi bi-chat-dots"></i>
+                @if (MessagesBadge > 0)
+                {
+                    <span class="m-badge">@(MessagesBadge > 99 ? "99+" : MessagesBadge.ToString())</span>
+                }
+            </span>
+            <span class="m-tab-label">Messages</span>
+        </button>
+        <button class="m-tab @(Current == Tab.Contacts ? "active" : "")" @onclick='() => Go("/contacts")' aria-label="Contacts">
+            <span class="m-tab-icon">
+                <i class="bi bi-people"></i>
+                @if (ContactsBadge > 0)
+                {
+                    <span class="m-badge">@(ContactsBadge > 99 ? "99+" : ContactsBadge.ToString())</span>
+                }
+            </span>
+            <span class="m-tab-label">Contacts</span>
+        </button>
+        <button class="m-tab @(Current == Tab.Search ? "active" : "")" @onclick='() => Go("/search")' aria-label="Search">
+            <span class="m-tab-icon"><i class="bi bi-search"></i></span>
+            <span class="m-tab-label">Search</span>
+        </button>
+        <button class="m-tab @(moreOpen ? "active" : "")" @onclick="ToggleMore" aria-label="More">
+            <span class="m-tab-icon"><i class="bi bi-three-dots"></i></span>
+            <span class="m-tab-label">More</span>
+        </button>
+    </nav>
+
+    @if (moreOpen)
+    {
+        <div class="m-scrim" @onclick="CloseMore"></div>
+        <div class="m-sheet" role="dialog" aria-label="More">
+            <div class="m-sheet-grip"></div>
+            <div class="m-sheet-head">
+                <div class="me-name">@DisplayName</div>
+                <div class="me-status @(Mesh.Connected ? "on" : "off")">
+                    <i class="bi @(Mesh.Connected ? "bi-check-circle-fill" : "bi-circle")"></i>
+                    @(Mesh.Connected ? "connected" : "offline")
+                </div>
+            </div>
+            <div class="m-sheet-links">
+                <button class="m-sheet-link" @onclick='() => Go("/knowledge")'><i class="bi bi-journal-text"></i><span>Knowledge</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/skills")'><i class="bi bi-lightning-charge"></i><span>Skills</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/widgets")'><i class="bi bi-window-stack"></i><span>Widgets</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/settings")'><i class="bi bi-gear"></i><span>Settings</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/backup")'><i class="bi bi-shield-lock"></i><span>Backup</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/about")'><i class="bi bi-info-circle"></i><span>About</span></button>
+            </div>
+            <button class="m-sheet-quit" @onclick="Quit"><i class="bi bi-power"></i><span>Quit</span></button>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+
+    enum Tab { None, Me, Messages, Contacts, Search }
+
+    bool moreOpen;
+
+    int MessagesBadge => State.UnreadHandles.Count + State.Profile.Approvals.Count;
+    int ContactsBadge => State.Profile.Requests.Count;
+
+    string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
+        ? State.Profile.Handle : State.Profile.DisplayName;
+
+    Tab Current
+    {
+        get
+        {
+            var path = Nav.ToBaseRelativePath(Nav.Uri).Split('?')[0].TrimEnd('/');
+            return path switch
+            {
+                "" => Tab.Me,
+                "m/me" => Tab.Me,
+                "m/messages" => Tab.Messages,
+                "contacts" => Tab.Contacts,
+                "search" => Tab.Search,
+                _ => Tab.None,
+            };
+        }
+    }
+
+    void Go(string route)
+    {
+        moreOpen = false;
+        Nav.NavigateTo(route);
+    }
+
+    void ToggleMore() => moreOpen = !moreOpen;
+
+    void CloseMore() => moreOpen = false;
+
+    void Quit()
+    {
+        moreOpen = false;
+        AppControl.Quit();
+    }
+
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+        Mesh.StateChanged += Refresh;
+        Setup.Changed += Refresh;
+        Updater.Changed += Refresh;
+        Nav.LocationChanged += OnLocationChanged;
+    }
+
+    private void OnLocationChanged(object? sender, LocationChangedEventArgs e) => Refresh();
+
+    private void Refresh() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        Mesh.StateChanged -= Refresh;
+        Setup.Changed -= Refresh;
+        Updater.Changed -= Refresh;
+        Nav.LocationChanged -= OnLocationChanged;
+    }
+}

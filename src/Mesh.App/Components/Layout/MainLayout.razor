@@ -15,6 +15,12 @@
 {
     <Onboarding OnDone="Refresh" />
 }
+else if (PlatformCaps.IsMobile)
+{
+    <MobileShell>
+        @Body
+    </MobileShell>
+}
 else
 {
     <div class="page">
@@ -101,6 +107,15 @@ else
 
         if (State.IsOnboarded)
         {
+            // On mobile, the desktop Home ("/") and Messages ("/messages") routes are replaced by
+            // the reworked mobile screens. Redirect the initial landing to the mobile equivalents.
+            if (PlatformCaps.IsMobile)
+            {
+                var path = Nav.ToBaseRelativePath(Nav.Uri).Split('?')[0].TrimEnd('/');
+                if (path == "") { Nav.NavigateTo("/m/me"); }
+                else if (path == "messages") { Nav.NavigateTo("/m/messages"); }
+            }
+
             await Msal.InitializeAsync();
             await Mesh.RegisterAsync();
             await Mesh.ConnectAsync();
