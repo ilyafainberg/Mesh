@@ -90,4 +90,43 @@ public interface IRelayStore
 
     /// <summary>Drains and returns all queued messages for a handle (FIFO), removing them.</summary>
     Task<IReadOnlyList<string>> DrainInboxAsync(string toHandle, CancellationToken ct = default);
+
+    // ---- Capability directory + reputation ----------------------------------
+
+    /// <summary>
+    /// Publishes a new service or updates an existing one. Only the public metadata
+    /// (name/description/category) is written; existing reputation state (votes and attested users)
+    /// is preserved across updates so a re-publish cannot reset a service's standing.
+    /// </summary>
+    Task UpsertServiceAsync(StoredService svc, CancellationToken ct = default);
+
+    /// <summary>
+    /// Unpublishes a service, but only when it is owned by <paramref name="handle"/>. Returns false
+    /// when the service does not exist or is owned by a different handle.
+    /// </summary>
+    Task<bool> RemoveServiceAsync(string handle, string serviceId, CancellationToken ct = default);
+
+    /// <summary>Loads a service by id, or null when it is not published.</summary>
+    Task<StoredService?> GetServiceAsync(string serviceId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Lists published services. When <paramref name="query"/> is non-empty it filters (case
+    /// insensitive) on name, description, or category; null or whitespace returns everything.
+    /// </summary>
+    Task<IReadOnlyList<StoredService>> ListServicesAsync(string? query, CancellationToken ct = default);
+
+    /// <summary>
+    /// Records an attested usage event: adds <paramref name="userHandle"/> to the service's user set.
+    /// This is what later unlocks that handle's ability to vote. No-op if the service is missing.
+    /// </summary>
+    Task RecordServiceUsageAsync(string serviceId, string userHandle, CancellationToken ct = default);
+
+    /// <summary>Returns true when <paramref name="userHandle"/> has an attested usage event for the service (vote gate).</summary>
+    Task<bool> HasUsedServiceAsync(string serviceId, string userHandle, CancellationToken ct = default);
+
+    /// <summary>
+    /// Sets, updates, or clears a voter's vote on a service. <paramref name="vote"/> is +1/-1 to set
+    /// (one updatable vote per voter) or 0 to remove the voter's vote. No-op if the service is missing.
+    /// </summary>
+    Task SetServiceVoteAsync(string serviceId, string voterHandle, int vote, CancellationToken ct = default);
 }

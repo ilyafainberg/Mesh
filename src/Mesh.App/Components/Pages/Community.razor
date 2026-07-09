@@ -1,0 +1,352 @@
+@page "/community"
+@inject DirectoryClient Dir
+@inject MeshClient Mesh
+@inject AppState State
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-globe"></i> Community</h2>
+            <span class="muted">Discover services published by other people's agents.</span>
+        </div>
+
+        <div class="tabs">
+            <button class="tab @(tab == "discover" ? "on" : "")" @onclick='() => tab = "discover"'>Discover</button>
+            <button class="tab @(tab == "mine" ? "on" : "")" @onclick='() => tab = "mine"'>My services</button>
+        </div>
+
+        @if (tab == "discover")
+        {
+            <div class="add-row">
+                <input class="full" @bind="query" @bind:event="oninput" @onkeydown="OnSearchKey"
+                       placeholder="Search services by name, description or category…" aria-label="Search services" />
+                <button class="primary" @onclick="Search"><i class="bi bi-search"></i> Search</button>
+            </div>
+
+            @if (loading)
+            {
+                <div class="empty">Loading services…</div>
+            }
+            else if (results.Count == 0)
+            {
+                <div class="empty">No services yet. Publish one from the My services tab.</div>
+            }
+            else
+            {
+                <div class="svc-list">
+                    @foreach (var l in results)
+                    {
+                        <div class="svc-card" @key="l.ServiceId">
+                            <div class="svc-top">
+                                <div class="svc-title">
+                                    @l.Name
+                                    @if (l.Verified)
+                                    {
+                                        <span class="svc-verified" title="Verified publisher"><i class="bi bi-patch-check-fill"></i> Verified</span>
+                                    }
+                                </div>
+                                <span class="svc-cat">@l.Category</span>
+                            </div>
+                            <div class="svc-by">by @("@" + l.Handle)</div>
+                            @if (!string.IsNullOrWhiteSpace(l.Description))
+                            {
+                                <div class="svc-desc">@l.Description</div>
+                            }
+
+                            <div class="svc-rep">
+                                <span title="Upvotes"><i class="bi bi-hand-thumbs-up"></i> @l.Upvotes</span>
+                                <span title="Downvotes"><i class="bi bi-hand-thumbs-down"></i> @l.Downvotes</span>
+                                <span title="People who have used this"><i class="bi bi-people"></i> @l.UniqueUsers</span>
+                                <span class="svc-score" title="Community ranking score"><i class="bi bi-graph-up-arrow"></i> ranked @l.Score.ToString("0.0")</span>
+                            </div>
+
+                            <div class="svc-vote">
+                                <button class="ghost" title="Upvote" @onclick="() => Vote(l, 1)"><i class="bi bi-hand-thumbs-up"></i> Upvote</button>
+                                <button class="ghost" title="Downvote" @onclick="() => Vote(l, -1)"><i class="bi bi-hand-thumbs-down"></i> Downvote</button>
+                                @if (voteHints.TryGetValue(l.ServiceId, out var vh))
+                                {
+                                    <span class="svc-hint"><i class="bi bi-info-circle"></i> @vh</span>
+                                }
+                            </div>
+
+                            <div class="svc-invoke">
+                                <input class="full" value="@GetPrompt(l.ServiceId)"
+                                       @oninput="e => prompts[l.ServiceId] = e.Value?.ToString() ?? string.Empty"
+                                       @onkeydown="e => OnInvokeKey(e, l)"
+                                       placeholder="Ask this service something…" aria-label="Prompt for @l.Name" />
+                                <button class="primary" @onclick="() => Send(l)"
+                                        disabled="@string.IsNullOrWhiteSpace(GetPrompt(l.ServiceId))">
+                                    <i class="bi bi-send"></i> Send
+                                </button>
+                            </div>
+                            @if (confirms.TryGetValue(l.ServiceId, out var cf))
+                            {
+                                <div class="svc-sent"><i class="bi bi-check-circle"></i> @cf</div>
+                            }
+                        </div>
+                    }
+                </div>
+            }
+        }
+        else
+        {
+            <p class="hint">
+                Publish a service to let anyone reach these capabilities through your agent. Only Knowledge,
+                Skills and Widgets can be public - never your private connectors or device tools.
+            </p>
+
+            <div class="card-panel">
+                <h3>Create a service</h3>
+                <input class="full" @bind="newName" placeholder="Name (e.g. Travel planner)" aria-label="Service name" />
+                <textarea class="full" rows="2" @bind="newDesc" placeholder="Description others will see" aria-label="Service description"></textarea>
+                <div class="kn-row">
+                    <input class="full" @bind="newCat" placeholder="Category" aria-label="Category" />
+                    <button class="primary" @onclick="Create" disabled="@string.IsNullOrWhiteSpace(newName)">
+                        <i class="bi bi-plus-lg"></i> Create
+                    </button>
+                </div>
+                <textarea class="full" rows="3" @bind="newPersona" placeholder="How should your service agent behave?" aria-label="Persona"></textarea>
+            </div>
+
+            <div class="pane-head" style="padding-left:0;padding-right:0;">
+                <h2><i class="bi bi-broadcast"></i> Your services</h2>
+                <span class="muted">toggle Published to list or delist each service in the directory</span>
+            </div>
+
+            <div class="card-panel">
+                @foreach (var svc in State.Profile.PublishedServices.ToList())
+                {
+                    var stat = StatFor(svc.Id);
+                    <div class="list-row" @key="svc.Id">
+                        <div class="row-main">
+                            <div class="row-title">@svc.Name @(string.IsNullOrWhiteSpace(svc.Category) ? "" : $"· {svc.Category}")</div>
+                            <div class="row-sub">@svc.Description</div>
+                            @if (stat is not null)
+                            {
+                                <div class="svc-rep" style="margin-top:6px;">
+                                    <span title="Upvotes"><i class="bi bi-hand-thumbs-up"></i> @stat.Upvotes</span>
+                                    <span title="Downvotes"><i class="bi bi-hand-thumbs-down"></i> @stat.Downvotes</span>
+                                    <span title="People who have used this"><i class="bi bi-people"></i> @stat.UniqueUsers</span>
+                                </div>
+                            }
+                        </div>
+                        <div class="row-actions">
+                            <button class="@(svc.Published ? "primary" : "ghost")" title="@(svc.Published ? "Delist from the directory" : "List in the directory")"
+                                    @onclick="() => TogglePublish(svc, !svc.Published)">
+                                <i class="bi @(svc.Published ? "bi-broadcast" : "bi-broadcast-pin")"></i> @(svc.Published ? "Published" : "Publish")
+                            </button>
+                            <button class="icon-btn" title="Delete" aria-label="Delete service" @onclick="() => Delete(svc)"><i class="bi bi-trash"></i></button>
+                        </div>
+                    </div>
+                }
+                @if (State.Profile.PublishedServices.Count == 0)
+                {
+                    <div class="empty">No services yet. Create one above, then toggle Published to list it.</div>
+                }
+            </div>
+
+            <div class="pane-head" style="padding-left:0;padding-right:0;">
+                <h2><i class="bi bi-unlock"></i> What's public</h2>
+                <span class="muted">@PublicCount items public · these capabilities may be reached by anyone through a service</span>
+            </div>
+
+            <div class="card-panel">
+                <h3><i class="bi bi-journal-text"></i> Knowledge</h3>
+                <div class="chip-row">
+                    @foreach (var k in State.Profile.Knowledge)
+                    {
+                        <label class="chip @(SystemCircles.IsPublicListed(k.Visibility) ? "on" : "")" @key="k.Id">
+                            <input type="checkbox" checked="@SystemCircles.IsPublicListed(k.Visibility)"
+                                   @onchange="e => TogglePublic(v => k.Visibility = v, (bool)(e.Value ?? false))" />
+                            @(string.IsNullOrWhiteSpace(k.Title) ? "(untitled)" : k.Title)
+                        </label>
+                    }
+                    @if (State.Profile.Knowledge.Count == 0)
+                    {
+                        <span class="empty-mini">No knowledge items yet.</span>
+                    }
+                </div>
+
+                <h3><i class="bi bi-lightning-charge"></i> Skills</h3>
+                <div class="chip-row">
+                    @foreach (var s in State.Profile.Skills)
+                    {
+                        <label class="chip @(SystemCircles.IsPublicListed(s.Visibility) ? "on" : "")" @key="s.Id">
+                            <input type="checkbox" checked="@SystemCircles.IsPublicListed(s.Visibility)"
+                                   @onchange="e => TogglePublic(v => s.Visibility = v, (bool)(e.Value ?? false))" />
+                            @(string.IsNullOrWhiteSpace(s.Name) ? "(unnamed)" : s.Name)
+                        </label>
+                    }
+                    @if (State.Profile.Skills.Count == 0)
+                    {
+                        <span class="empty-mini">No skills yet.</span>
+                    }
+                </div>
+
+                <h3><i class="bi bi-window-stack"></i> Widgets</h3>
+                <div class="chip-row">
+                    @foreach (var w in State.Profile.Widgets)
+                    {
+                        <label class="chip @(SystemCircles.IsPublicListed(w.Visibility) ? "on" : "")" @key="w.Id">
+                            <input type="checkbox" checked="@SystemCircles.IsPublicListed(w.Visibility)"
+                                   @onchange="e => TogglePublic(v => w.Visibility = v, (bool)(e.Value ?? false))" />
+                            @(string.IsNullOrWhiteSpace(w.Name) ? "(unnamed)" : w.Name)
+                        </label>
+                    }
+                    @if (State.Profile.Widgets.Count == 0)
+                    {
+                        <span class="empty-mini">No widgets yet.</span>
+                    }
+                </div>
+            </div>
+        }
+    </div>
+</div>
+
+@code {
+    string tab = "discover";
+
+    // Discover state
+    string query = "";
+    bool loading = true;
+    List<ServiceListing> results = new();
+    readonly Dictionary<string, string> prompts = new();
+    readonly Dictionary<string, string> confirms = new();
+    readonly Dictionary<string, string> voteHints = new();
+
+    // My services form state
+    string newName = "";
+    string newDesc = "";
+    string newCat = "General";
+    string newPersona = "";
+
+    // Best-effort live stats for the owner's own services, keyed by ServiceId.
+    readonly Dictionary<string, ServiceListing> statsById = new(StringComparer.Ordinal);
+
+    protected override void OnInitialized() => State.Changed += Refresh;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await Search();
+        await RefreshStats();
+    }
+
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    // ---- Discover ----
+    string GetPrompt(string id) => prompts.TryGetValue(id, out var p) ? p : "";
+
+    void OnSearchKey(KeyboardEventArgs e) { if (e.Key == "Enter") _ = Search(); }
+
+    void OnInvokeKey(KeyboardEventArgs e, ServiceListing l) { if (e.Key == "Enter") _ = Send(l); }
+
+    async Task Search()
+    {
+        loading = true;
+        StateHasChanged();
+        var q = string.IsNullOrWhiteSpace(query) ? null : query.Trim();
+        var list = await Dir.BrowseAsync(q);
+        results = list.ToList();
+        loading = false;
+        StateHasChanged();
+    }
+
+    async Task RefreshStats()
+    {
+        var list = await Dir.BrowseAsync(null);
+        statsById.Clear();
+        foreach (var l in list) statsById[l.ServiceId] = l;
+        StateHasChanged();
+    }
+
+    async Task Send(ServiceListing l)
+    {
+        var prompt = GetPrompt(l.ServiceId).Trim();
+        if (string.IsNullOrWhiteSpace(prompt)) return;
+
+        await Mesh.InvokeServiceAsync(l.Handle, l.ServiceId, prompt);
+        await Dir.ReportUsedAsync(l.ServiceId);
+
+        prompts[l.ServiceId] = "";
+        confirms[l.ServiceId] = $"Sent. The reply will arrive in Messages from @{l.Handle}.";
+        StateHasChanged();
+    }
+
+    async Task Vote(ServiceListing l, int vote)
+    {
+        var ok = await Dir.VoteAsync(l.ServiceId, vote);
+        if (!ok)
+        {
+            voteHints[l.ServiceId] = "Vote after you have used a service.";
+            StateHasChanged();
+            return;
+        }
+
+        voteHints.Remove(l.ServiceId);
+        var updated = await Dir.GetAsync(l.ServiceId);
+        if (updated is not null)
+        {
+            var idx = results.IndexOf(l);
+            if (idx >= 0) results[idx] = updated;
+            statsById[updated.ServiceId] = updated;
+        }
+        StateHasChanged();
+    }
+
+    // ---- My services ----
+    ServiceListing? StatFor(string id) => statsById.TryGetValue(id, out var s) ? s : null;
+
+    void Create()
+    {
+        if (string.IsNullOrWhiteSpace(newName)) return;
+        var name = newName.Trim();
+        var desc = newDesc.Trim();
+        var cat = string.IsNullOrWhiteSpace(newCat) ? "General" : newCat.Trim();
+        var persona = newPersona.Trim();
+        State.Mutate(p => p.PublishedServices.Add(new PublishedService
+        {
+            Name = name,
+            Description = desc,
+            Category = cat,
+            Persona = persona
+        }));
+        newName = "";
+        newDesc = "";
+        newCat = "General";
+        newPersona = "";
+    }
+
+    async Task TogglePublish(PublishedService svc, bool on)
+    {
+        if (on)
+        {
+            var ok = await Dir.PublishAsync(svc);
+            if (ok) State.Mutate(_ => svc.Published = true);
+        }
+        else
+        {
+            await Dir.UnpublishAsync(svc.Id);
+            State.Mutate(_ => svc.Published = false);
+        }
+        await RefreshStats();
+    }
+
+    async Task Delete(PublishedService svc)
+    {
+        await Dir.UnpublishAsync(svc.Id);
+        State.Mutate(p => p.PublishedServices.Remove(svc));
+        await RefreshStats();
+    }
+
+    // ---- Public-capability whitelist ----
+    int PublicCount =>
+        State.Profile.Knowledge.Count(k => SystemCircles.IsPublicListed(k.Visibility))
+        + State.Profile.Skills.Count(s => SystemCircles.IsPublicListed(s.Visibility))
+        + State.Profile.Widgets.Count(w => SystemCircles.IsPublicListed(w.Visibility));
+
+    void TogglePublic(Action<string> setVisibility, bool on)
+        => State.Mutate(_ => setVisibility(on ? SystemCircles.PublicVisibility : "private"));
+
+    public void Dispose() => State.Changed -= Refresh;
+}

@@ -86,6 +86,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ModelSetupService>();
 		builder.Services.AddSingleton<UpdateService>();
 		builder.Services.AddSingleton<MeshClient>();
+		builder.Services.AddSingleton<DirectoryClient>();
 
 #if DEBUG
 		builder.Services.AddBlazorWebViewDeveloperTools();

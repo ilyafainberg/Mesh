@@ -415,6 +415,145 @@ app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.M
     return removed ? Results.Ok(new { deleted = key }) : Results.NotFound();
 });
 
+// ---- Capability directory + reputation (REST) -----------------------------
+// A public directory of published services with usage-gated up/down voting. Publishing, unpublishing,
+// voting, and usage attestation are all authenticated with a device key registered under the acting
+// handle and a signature over the relevant canonical message (same device-key auth as the connector
+// broker / hosted model). Reads (list + get) are public: they expose only public metadata + relay
+// computed reputation, never private capability content.
+
+// Public discovery: list services, optionally filtered by a free-text query over name/description/
+// category. Ranked by the Wilson score (a conservative lower bound of the positive vote proportion),
+// then by unique attested users, both descending, so well-reviewed and widely-used services surface.
+app.MapGet("/capabilities", async (string? q) =>
+{
+    var services = await store.ListServicesAsync(q);
+    var listings = services
+        .Select(ToListing)
+        .OrderByDescending(l => l.Score)
+        .ThenByDescending(l => l.UniqueUsers)
+        .ToList();
+    return Results.Ok(listings);
+});
+
+// Single service lookup by id.
+app.MapGet("/capabilities/{serviceId}", async (string serviceId) =>
+{
+    var svc = await store.GetServiceAsync(serviceId);
+    return svc is null ? Results.NotFound() : Results.Ok(ToListing(svc));
+});
+
+// Publish (or update) a service. Verifies the device key is registered under the handle AND that it
+// signed the publish claim, so nobody can publish under a handle they do not control. An update
+// preserves the service's existing reputation (votes + attested users).
+app.MapPost("/capabilities", async (PublishServiceRequest req) =>
+{
+    var handle = Normalize(req.Handle);
+    if (string.IsNullOrWhiteSpace(handle)
+        || string.IsNullOrWhiteSpace(req.ServiceId)
+        || string.IsNullOrWhiteSpace(req.Name))
+        return Results.BadRequest(new { error = "handle, serviceId and name are required" });
+
+    var rec = await store.GetHandleAsync(handle);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var message = ServiceDirectoryProtocol.PublishMessage(handle, req.ServiceId, req.Name);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    await store.UpsertServiceAsync(new StoredService
+    {
+        ServiceId = req.ServiceId,
+        Handle = handle,
+        Name = req.Name,
+        Description = req.Description ?? "",
+        Category = req.Category ?? "",
+        PublishedAt = DateTimeOffset.UtcNow
+    });
+    app.Logger.LogInformation("service published: {ServiceId} by {Handle}", req.ServiceId, handle);
+    return Results.Ok(new { published = req.ServiceId });
+});
+
+// Unpublish a service. Only the owning handle (verified by registered device key + signature) can
+// remove it. Returns 404 when the service does not exist or is not owned by the caller.
+app.MapDelete("/capabilities/{serviceId}", async (string serviceId, [Microsoft.AspNetCore.Mvc.FromBody] UnpublishServiceRequest req) =>
+{
+    var handle = Normalize(req.Handle);
+    var rec = await store.GetHandleAsync(handle);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var message = ServiceDirectoryProtocol.UnpublishMessage(handle, serviceId);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var removed = await store.RemoveServiceAsync(handle, serviceId);
+    if (!removed) return Results.NotFound();
+    app.Logger.LogInformation("service unpublished: {ServiceId} by {Handle}", serviceId, handle);
+    return Results.Ok(new { unpublished = serviceId });
+});
+
+// Attest usage: the consumer's client calls this right after a successful service invocation. Because
+// a ServiceRequest envelope's body is end-to-end encrypted, the relay cannot observe the serviceId
+// while routing, so usage is SELF-ATTESTED-BUT-SIGNED for the MVP: a signed claim by a real handle
+// registered under a device key it controls. This unlocks that handle's ability to vote. A future
+// version can make usage relay-observed once the serviceId is exposed in a cleartext routing header.
+// The signed message reuses the vote canonical form with vote=0 (VoteMessage(handle, serviceId, 0)).
+app.MapPost("/capabilities/{serviceId}/used", async (string serviceId, ServiceVoteRequest req) =>
+{
+    var handle = Normalize(req.VoterHandle);
+    var rec = await store.GetHandleAsync(handle);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    // Vote value is ignored here; the signed message is VoteMessage(handle, serviceId, 0).
+    var message = ServiceDirectoryProtocol.VoteMessage(handle, serviceId, 0);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var svc = await store.GetServiceAsync(serviceId);
+    if (svc is null) return Results.NotFound();
+
+    await store.RecordServiceUsageAsync(serviceId, handle);
+    return Results.Ok(new { used = serviceId });
+});
+
+// Cast, change, or clear a usage-gated vote. Verifies the voter's registered device key + signature,
+// then enforces usage-gating: the voter must have an attested usage event for the service (403
+// otherwise). Vote is clamped to {-1, 0, 1}; 0 clears the voter's vote. One updatable vote per voter.
+app.MapPost("/capabilities/{serviceId}/vote", async (string serviceId, ServiceVoteRequest req) =>
+{
+    var handle = Normalize(req.VoterHandle);
+    var rec = await store.GetHandleAsync(handle);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var message = ServiceDirectoryProtocol.VoteMessage(handle, serviceId, req.Vote);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var svc = await store.GetServiceAsync(serviceId);
+    if (svc is null) return Results.NotFound();
+
+    // Usage-gating: only a handle that has actually invoked the service (attested usage) may vote.
+    // This is the core anti-fake-reputation mechanism.
+    if (!await store.HasUsedServiceAsync(serviceId, handle))
+        return Results.Json(new { error = "must use the service before voting" }, statusCode: StatusCodes.Status403Forbidden);
+
+    var vote = Math.Sign(req.Vote); // clamp to {-1, 0, 1}
+    await store.SetServiceVoteAsync(serviceId, handle, vote);
+    return Results.Ok(new { voted = serviceId, vote });
+});
+
 // ---- SignalR transport hub ------------------------------------------------
 app.MapHub<MeshHub>(MeshHubProtocol.Route);
 
@@ -429,6 +568,27 @@ static string DeviceIdOf(string publicKey)
     => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(publicKey)))[..12].ToLowerInvariant();
 
 static string Trim(string s) => s.Length > 300 ? s[..300] : s;
+
+// Projects a stored service + its reputation to the public directory listing shape. Upvotes/Downvotes
+// are counted from the per-voter vote map, UniqueUsers from the attested-usage set, and Score is the
+// Wilson lower bound used for ranking. Verified is false for now (reserved for a future trust signal).
+static ServiceListing ToListing(StoredService s)
+{
+    var up = s.Votes.Values.Count(v => v > 0);
+    var down = s.Votes.Values.Count(v => v < 0);
+    return new ServiceListing(
+        s.ServiceId,
+        s.Handle,
+        s.Name,
+        s.Description,
+        s.Category,
+        up,
+        down,
+        s.Users.Count,
+        ServiceDirectoryProtocol.WilsonScore(up, down),
+        false,
+        s.PublishedAt);
+}
 
 // Reads the OpenAI-compatible "usage" object from an upstream chat completion. Returns prompt,
 // completion, and total token counts, defaulting each to 0 when absent. When total_tokens is

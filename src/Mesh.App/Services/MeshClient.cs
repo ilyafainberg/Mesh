@@ -405,6 +405,43 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             return;
         }
 
+        // Public service invocation. Handled BEFORE the allow-list gate below: any handle may invoke a
+        // public-listed service, so it must not be dropped into the request inbox for non-contacts.
+        // The answer comes from a hard-sandboxed, service-scoped agent (public KB/Skills/Widgets only,
+        // no tools of any kind).
+        if (env.Kind == MeshKinds.ServiceRequest)
+        {
+            var (serviceId, prompt) = ServiceProtocol.Parse(text);
+            var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
+            if (svc is null || !svc.Published) return;                 // not a live service here
+            if (!agent.IsModelReady) return;                           // no model to answer with
+            if (!state.TryConsumeAgentReply()) return;                 // daily budget spent; don't burn the model
+
+            var svcHistory = new[] { new ChatLine { Role = "user", Text = prompt } };
+            var answer = await agent.RespondAsServiceAsync(serviceId, from, svcHistory, ct);
+
+            // Do not send model-failure text to the caller as if it were a real answer; refund budget.
+            if (ModelReply.IsFailure(answer))
+            {
+                state.RefundAgentReply();
+                Log?.Invoke($"service '{serviceId}' reply to @{from} skipped: model unavailable");
+                return;
+            }
+
+            await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId, answer));
+            return;
+        }
+        if (env.Kind == MeshKinds.ServiceResponse)
+        {
+            var (_, answer) = ServiceProtocol.Parse(text);
+            // Record the provider's service reply as an incoming assistant line from that handle.
+            state.AddChatLine(from, new ChatLine { Role = "user", Text = answer, Via = "agent", AddressedToAgent = true });
+            state.MarkUnread(from);
+            if (ShouldNotify(state.FindContact(from)))
+                notifier.Notify("Service replied", Preview(answer), NotifyKind.Message, "messages");
+            return;
+        }
+
         var contact = state.FindContact(from);
         var allowed = contact?.Allowed == true;
         var display = state.DisplayNameFor(from);
@@ -577,6 +614,13 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     /// </summary>
     public async Task<bool> AskHomeAgentAsync(string prompt)
         => await SendAsync(state.Profile.Handle, MeshKinds.RemoteAgentRequest, prompt);
+
+    /// <summary>
+    /// Invokes another handle's PUBLIC service by id, sending the prompt on the service channel.
+    /// No contact relationship is required; the provider answers with its sandboxed service agent.
+    /// </summary>
+    public async Task<bool> InvokeServiceAsync(string providerHandle, string serviceId, string prompt)
+        => await SendAsync(providerHandle, MeshKinds.ServiceRequest, ServiceProtocol.Body(serviceId, prompt));
 
 
     public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null)

@@ -31,6 +31,7 @@ public sealed class CosmosRelayStore : IRelayStore
     private Container handlesContainer = null!;
     private Container invitesContainer = null!;
     private Container inboxContainer = null!;
+    private Container servicesContainer = null!;
     private volatile bool initialized;
 
     /// <summary>
@@ -82,6 +83,13 @@ public sealed class CosmosRelayStore : IRelayStore
                 .CreateContainerIfNotExistsAsync(
                     new ContainerProperties("inbox", "/to") { DefaultTimeToLive = InboxTtlSeconds },
                     cancellationToken: ct)
+                .ConfigureAwait(false);
+
+            // Capability directory: one document per published service, keyed on "/serviceId". No TTL:
+            // services persist until explicitly unpublished. Reputation (votes + attested users) lives
+            // on the same document so a vote/usage mutation is a single-partition read-modify-write.
+            servicesContainer = await db
+                .CreateContainerIfNotExistsAsync(new ContainerProperties("services", "/serviceId"), cancellationToken: ct)
                 .ConfigureAwait(false);
 
             initialized = true;
@@ -389,6 +397,274 @@ public sealed class CosmosRelayStore : IRelayStore
         return result;
     }
 
+    // ---- Capability directory + reputation ----------------------------------
+
+    /// <inheritdoc />
+    public async Task UpsertServiceAsync(StoredService svc, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            ServiceDoc? doc = null;
+            string? etag = null;
+            try
+            {
+                var read = await servicesContainer
+                    .ReadItemAsync<ServiceDoc>(svc.ServiceId, new PartitionKey(svc.ServiceId), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                doc = null;
+            }
+
+            if (doc is null)
+            {
+                var fresh = ToDoc(svc);
+                try
+                {
+                    await servicesContainer
+                        .CreateItemAsync(fresh, new PartitionKey(fresh.ServiceId), cancellationToken: ct)
+                        .ConfigureAwait(false);
+                    return;
+                }
+                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.Conflict && attempt < maxAttempts)
+                {
+                    continue; // A concurrent create won the race; re-read and update instead.
+                }
+            }
+            else
+            {
+                // Preserve reputation (votes + attested users) across a re-publish; only refresh metadata.
+                doc.Handle = svc.Handle;
+                doc.Name = svc.Name;
+                doc.Description = svc.Description;
+                doc.Category = svc.Category;
+                try
+                {
+                    var options = etag is null ? null : new ItemRequestOptions { IfMatchEtag = etag };
+                    await servicesContainer
+                        .UpsertItemAsync(doc, new PartitionKey(doc.ServiceId), options, ct)
+                        .ConfigureAwait(false);
+                    return;
+                }
+                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+                {
+                    continue; // Lost the optimistic concurrency check; retry the read-modify-write.
+                }
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RemoveServiceAsync(string handle, string serviceId, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        ServiceDoc doc;
+        try
+        {
+            var read = await servicesContainer
+                .ReadItemAsync<ServiceDoc>(serviceId, new PartitionKey(serviceId), cancellationToken: ct)
+                .ConfigureAwait(false);
+            doc = read.Resource;
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return false;
+        }
+
+        // Only the owning handle may unpublish.
+        if (!string.Equals(doc.Handle, handle, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        try
+        {
+            await servicesContainer
+                .DeleteItemAsync<ServiceDoc>(serviceId, new PartitionKey(serviceId), cancellationToken: ct)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return false; // Lost the race to a concurrent delete.
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<StoredService?> GetServiceAsync(string serviceId, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var response = await servicesContainer
+                .ReadItemAsync<ServiceDoc>(serviceId, new PartitionKey(serviceId), cancellationToken: ct)
+                .ConfigureAwait(false);
+            return ToStored(response.Resource);
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<StoredService>> ListServicesAsync(string? query, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        // Simple ReadAll + in-memory filter: the directory is small relative to messaging volume, so a
+        // cross-partition scan is acceptable for now. A future version can push the filter into a Cosmos
+        // query (CONTAINS on name/description/category) once the directory grows.
+        var iterator = servicesContainer.GetItemQueryIterator<ServiceDoc>(new QueryDefinition("SELECT * FROM c"));
+        var docs = new List<ServiceDoc>();
+        using (iterator)
+        {
+            while (iterator.HasMoreResults)
+            {
+                var page = await iterator.ReadNextAsync(ct).ConfigureAwait(false);
+                docs.AddRange(page);
+            }
+        }
+
+        IEnumerable<StoredService> all = docs.Select(ToStored);
+        var q = query?.Trim();
+        if (!string.IsNullOrEmpty(q))
+            all = all.Where(s =>
+                s.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
+                || s.Description.Contains(q, StringComparison.OrdinalIgnoreCase)
+                || s.Category.Contains(q, StringComparison.OrdinalIgnoreCase));
+        return all.ToList();
+    }
+
+    /// <inheritdoc />
+    public async Task RecordServiceUsageAsync(string serviceId, string userHandle, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            ServiceDoc doc;
+            string etag;
+            try
+            {
+                var read = await servicesContainer
+                    .ReadItemAsync<ServiceDoc>(serviceId, new PartitionKey(serviceId), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return; // No-op if the service does not exist.
+            }
+
+            doc.Users ??= new List<string>();
+            if (doc.Users.Any(u => string.Equals(u, userHandle, StringComparison.OrdinalIgnoreCase)))
+                return; // Already recorded.
+            doc.Users.Add(userHandle);
+
+            try
+            {
+                await servicesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(serviceId), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> HasUsedServiceAsync(string serviceId, string userHandle, CancellationToken ct = default)
+    {
+        var svc = await GetServiceAsync(serviceId, ct).ConfigureAwait(false);
+        return svc is not null && svc.Users.Contains(userHandle);
+    }
+
+    /// <inheritdoc />
+    public async Task SetServiceVoteAsync(string serviceId, string voterHandle, int vote, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            ServiceDoc doc;
+            string etag;
+            try
+            {
+                var read = await servicesContainer
+                    .ReadItemAsync<ServiceDoc>(serviceId, new PartitionKey(serviceId), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return; // No-op if the service does not exist.
+            }
+
+            doc.Votes ??= new Dictionary<string, int>();
+            // Votes are keyed by normalized voter handle; clear the existing entry then re-set to keep
+            // one updatable vote per voter regardless of the stored key's original casing.
+            var existingKey = doc.Votes.Keys.FirstOrDefault(k => string.Equals(k, voterHandle, StringComparison.OrdinalIgnoreCase));
+            if (existingKey is not null) doc.Votes.Remove(existingKey);
+            if (vote != 0) doc.Votes[voterHandle] = vote > 0 ? 1 : -1;
+
+            try
+            {
+                await servicesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(serviceId), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    /// <summary>Projects a persisted service document back to the public <see cref="StoredService"/> shape.</summary>
+    private static StoredService ToStored(ServiceDoc doc) => new()
+    {
+        ServiceId = doc.ServiceId,
+        Handle = doc.Handle,
+        Name = doc.Name,
+        Description = doc.Description,
+        Category = doc.Category,
+        PublishedAt = doc.PublishedAt,
+        Votes = doc.Votes is null
+            ? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, int>(doc.Votes, StringComparer.OrdinalIgnoreCase),
+        Users = doc.Users is null
+            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(doc.Users, StringComparer.OrdinalIgnoreCase)
+    };
+
+    /// <summary>Projects a <see cref="StoredService"/> to its persisted Cosmos document form.</summary>
+    private static ServiceDoc ToDoc(StoredService svc) => new()
+    {
+        Id = svc.ServiceId,
+        ServiceId = svc.ServiceId,
+        Handle = svc.Handle,
+        Name = svc.Name,
+        Description = svc.Description,
+        Category = svc.Category,
+        PublishedAt = svc.PublishedAt,
+        Votes = new Dictionary<string, int>(svc.Votes),
+        Users = svc.Users.ToList()
+    };
+
     /// <summary>Projects a persisted handle document back to the public <see cref="StoredHandle"/> shape.</summary>
     private static StoredHandle ToStored(HandleDoc doc) => new()
     {
@@ -454,6 +730,41 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("queuedAt")]
         public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    /// <summary>
+    /// Cosmos document for a published service and its reputation. Uses "serviceId" as the partition
+    /// key so a vote/usage mutation is a single-partition read-modify-write. Users are stored as a list
+    /// (Cosmos has no native set type) and de-duplicated on read into a <see cref="HashSet{T}"/>.
+    /// </summary>
+    private sealed class ServiceDoc
+    {
+        [JsonPropertyName("id")]
+        public string Id { get; set; } = "";
+
+        [JsonPropertyName("serviceId")]
+        public string ServiceId { get; set; } = "";
+
+        [JsonPropertyName("handle")]
+        public string Handle { get; set; } = "";
+
+        [JsonPropertyName("name")]
+        public string Name { get; set; } = "";
+
+        [JsonPropertyName("description")]
+        public string Description { get; set; } = "";
+
+        [JsonPropertyName("category")]
+        public string Category { get; set; } = "";
+
+        [JsonPropertyName("publishedAt")]
+        public DateTimeOffset PublishedAt { get; set; } = DateTimeOffset.UtcNow;
+
+        [JsonPropertyName("votes")]
+        public Dictionary<string, int> Votes { get; set; } = new();
+
+        [JsonPropertyName("users")]
+        public List<string> Users { get; set; } = new();
     }
 
     /// <summary>

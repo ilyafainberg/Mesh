@@ -100,6 +100,14 @@ public sealed class MeshHub(
         }
 
         var stamped = env with { From = state.Handle }; // relay asserts the authenticated sender
+
+        // Usage attestation note: a ServiceRequest envelope carries the serviceId inside its
+        // end-to-end encrypted body (ServiceProtocol-framed), so the relay cannot observe which
+        // service was invoked while routing here. Attested usage for reputation is therefore recorded
+        // out-of-band via the signed POST /capabilities/{serviceId}/used endpoint the consumer calls
+        // after a successful invocation. A future version can record it here once the serviceId is
+        // exposed in a cleartext routing header. Routing itself is unchanged for every envelope kind.
+
         // When a device sends to its own handle (remote-to-desktop), exclude the sender's own
         // connection so the message reaches the owner's OTHER devices rather than echoing back.
         var exclude = Normalize(stamped.To) == state.Handle ? Context.ConnectionId : null;

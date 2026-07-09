@@ -13,6 +13,7 @@ public sealed class InMemoryRelayStore : IRelayStore
     private readonly ConcurrentDictionary<string, StoredHandle> handles = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DateTimeOffset>> invites = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> inboxes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, StoredService> services = new(StringComparer.Ordinal);
 
     public Task<StoredHandle?> GetHandleAsync(string handle, CancellationToken ct = default)
         => Task.FromResult(handles.TryGetValue(handle, out var rec) ? Clone(rec) : null);
@@ -95,6 +96,96 @@ public sealed class InMemoryRelayStore : IRelayStore
         if (inboxes.TryGetValue(toHandle, out var q))
             while (q.TryDequeue(out var item)) result.Add(item);
         return Task.FromResult<IReadOnlyList<string>>(result);
+    }
+
+    // ---- Capability directory + reputation ----------------------------------
+
+    public Task UpsertServiceAsync(StoredService svc, CancellationToken ct = default)
+    {
+        services.AddOrUpdate(svc.ServiceId,
+            _ => CloneService(svc),
+            (_, existing) =>
+            {
+                // Preserve reputation (votes + attested users) across a re-publish; only refresh metadata.
+                lock (existing)
+                {
+                    existing.Handle = svc.Handle;
+                    existing.Name = svc.Name;
+                    existing.Description = svc.Description;
+                    existing.Category = svc.Category;
+                }
+                return existing;
+            });
+        return Task.CompletedTask;
+    }
+
+    public Task<bool> RemoveServiceAsync(string handle, string serviceId, CancellationToken ct = default)
+    {
+        if (!services.TryGetValue(serviceId, out var svc))
+            return Task.FromResult(false);
+
+        bool owned;
+        lock (svc) owned = string.Equals(svc.Handle, handle, StringComparison.OrdinalIgnoreCase);
+        if (!owned) return Task.FromResult(false);
+
+        return Task.FromResult(services.TryRemove(serviceId, out _));
+    }
+
+    public Task<StoredService?> GetServiceAsync(string serviceId, CancellationToken ct = default)
+        => Task.FromResult(services.TryGetValue(serviceId, out var svc) ? CloneService(svc) : null);
+
+    public Task<IReadOnlyList<StoredService>> ListServicesAsync(string? query, CancellationToken ct = default)
+    {
+        var q = query?.Trim();
+        var all = services.Values.Select(CloneService);
+        if (!string.IsNullOrEmpty(q))
+            all = all.Where(s =>
+                s.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
+                || s.Description.Contains(q, StringComparison.OrdinalIgnoreCase)
+                || s.Category.Contains(q, StringComparison.OrdinalIgnoreCase));
+        return Task.FromResult<IReadOnlyList<StoredService>>(all.ToList());
+    }
+
+    public Task RecordServiceUsageAsync(string serviceId, string userHandle, CancellationToken ct = default)
+    {
+        if (services.TryGetValue(serviceId, out var svc))
+            lock (svc) svc.Users.Add(userHandle);
+        return Task.CompletedTask;
+    }
+
+    public Task<bool> HasUsedServiceAsync(string serviceId, string userHandle, CancellationToken ct = default)
+    {
+        if (!services.TryGetValue(serviceId, out var svc)) return Task.FromResult(false);
+        bool used;
+        lock (svc) used = svc.Users.Contains(userHandle);
+        return Task.FromResult(used);
+    }
+
+    public Task SetServiceVoteAsync(string serviceId, string voterHandle, int vote, CancellationToken ct = default)
+    {
+        if (services.TryGetValue(serviceId, out var svc))
+            lock (svc)
+            {
+                if (vote == 0) svc.Votes.Remove(voterHandle);
+                else svc.Votes[voterHandle] = vote > 0 ? 1 : -1; // one updatable vote per voter
+            }
+        return Task.CompletedTask;
+    }
+
+    private static StoredService CloneService(StoredService s)
+    {
+        lock (s)
+            return new StoredService
+            {
+                ServiceId = s.ServiceId,
+                Handle = s.Handle,
+                Name = s.Name,
+                Description = s.Description,
+                Category = s.Category,
+                PublishedAt = s.PublishedAt,
+                Votes = new Dictionary<string, int>(s.Votes, StringComparer.OrdinalIgnoreCase),
+                Users = new HashSet<string>(s.Users, StringComparer.OrdinalIgnoreCase)
+            };
     }
 
     private static void Purge(ConcurrentDictionary<string, DateTimeOffset> map)
