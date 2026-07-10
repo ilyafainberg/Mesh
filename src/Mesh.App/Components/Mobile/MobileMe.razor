@@ -77,6 +77,10 @@ else
                     }
                     else
                     {
+                        @if (Active.Lines.Count > 0)
+                        {
+                            <button class="bar-btn" title="Report AI content" aria-label="Report AI content" @onclick="OpenReport"><i class="bi bi-flag"></i></button>
+                        }
                         <button class="bar-btn" title="Delete chat" aria-label="Delete chat" @onclick="() => confirmDelete = true"><i class="bi bi-trash"></i></button>
                     }
                 </span>
@@ -183,8 +187,11 @@ else
     </div>
 }
 
+<ReportDialog @ref="reportDialog" />
+
 @code {
     string input = "";
+    ReportDialog? reportDialog;
     bool busy;
     bool building;
     bool widgetMode;
@@ -333,6 +340,14 @@ else
     }
 
     void ToggleWidget() { widgetMode = !widgetMode; }
+
+    void OpenReport()
+    {
+        var thread = Active;
+        if (thread is null || thread.Lines.Count == 0) return;
+        reportDialog?.Show($"Me topic: {thread.Title}", thread.Lines,
+            l => l.Role == "assistant" ? "agent" : "me", State.CurrentModelKey());
+    }
 
     async Task ResetComposer()
     {

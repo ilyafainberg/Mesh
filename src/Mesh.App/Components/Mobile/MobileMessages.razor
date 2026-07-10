@@ -118,6 +118,7 @@ else
                 }
                 else
                 {
+                    <button class="ghost icon-btn" title="Report AI content" aria-label="Report AI content" @onclick="OpenReport"><i class="bi bi-flag"></i></button>
                     <button class="ghost icon-btn" title="Delete conversation history" aria-label="Delete conversation history" @onclick="() => confirmDelete = active"><i class="bi bi-trash"></i></button>
                 }
             </div>
@@ -235,8 +236,11 @@ else
     </div>
 }
 
+<ReportDialog @ref="reportDialog" />
+
 @code {
     string? active;
+    ReportDialog? reportDialog;
     string? confirmDelete;
     string input = "";
     string newHandle = "";
@@ -373,6 +377,22 @@ else
         confirmDelete = null;
         composerWired = false;
         State.DeleteConversation(h);
+    }
+
+    void OpenReport()
+    {
+        if (active is null) return;
+        var conv = State.GetOrCreateConversation(active);
+        if (conv.IsService)
+        {
+            reportDialog?.Show($"service {conv.ServiceName}", conv.Lines,
+                l => l.Role == "assistant" ? "me" : State.DisplayNameFor(active), State.CurrentModelKey(), conv.ServiceId);
+        }
+        else
+        {
+            reportDialog?.Show($"chat with @{active}", conv.Lines,
+                l => l.Role == "assistant" ? "me" : State.DisplayNameFor(active), State.CurrentModelKey());
+        }
     }
 
     async Task OnNewKey(KeyboardEventArgs e)

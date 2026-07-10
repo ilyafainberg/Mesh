@@ -511,6 +511,18 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             return;
         }
 
+        if (env.Kind == MeshKinds.Report)
+        {
+            // Inbound AI-content report (this device is signed in as the reserved report handle).
+            // Render it as a readable message from the reporter so the operator can review it.
+            var payload = ReportProtocol.Parse(text);
+            var rendered = payload is null ? text : FormatReport(payload);
+            state.AddChatLine(from, new ChatLine { Role = "user", Text = rendered, Via = "person" });
+            state.MarkUnread(from);
+            notifier.Notify("New report", Preview(rendered), NotifyKind.Message, "messages");
+            return;
+        }
+
         var contact = state.FindContact(from);
         var allowed = contact?.Allowed == true;
         var display = state.DisplayNameFor(from);
@@ -701,6 +713,47 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             return devices ?? Array.Empty<Mesh.Shared.DeviceInfo>();
         }
         catch { return Array.Empty<Mesh.Shared.DeviceInfo>(); }
+    }
+
+    /// <summary>
+    /// Sends a user-submitted report of inappropriate AI content to the reserved report handle as an
+    /// end-to-end encrypted message (Microsoft Store Policy 11.16). The caller has shown the user the
+    /// exact transcript and obtained explicit consent before calling this.
+    /// </summary>
+    public async Task<bool> SendReportAsync(string target, string category, string? note, string? serviceId, IReadOnlyList<ReportLine> transcript)
+    {
+        var payload = new ReportPayload(
+            Target: target,
+            Category: category,
+            Note: string.IsNullOrWhiteSpace(note) ? null : note!.Trim(),
+            Model: state.CurrentModelKey(),
+            ServiceId: serviceId,
+            AppVersion: AppVersionString(),
+            At: DateTimeOffset.UtcNow,
+            Transcript: transcript);
+        return await SendAsync(ReservedHandles.Report, MeshKinds.Report, ReportProtocol.Body(payload));
+    }
+
+    private static string AppVersionString()
+    {
+        try { return Microsoft.Maui.ApplicationModel.AppInfo.Current.VersionString; }
+        catch { return "unknown"; }
+    }
+
+    // Renders an inbound report into readable text for the operator's Messages view.
+    private static string FormatReport(ReportPayload p)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("[AI content report]\n\n");
+        sb.Append("Target: ").Append(p.Target).Append('\n');
+        sb.Append("Category: ").Append(p.Category).Append('\n');
+        if (!string.IsNullOrWhiteSpace(p.Note)) sb.Append("Note: ").Append(p.Note).Append('\n');
+        if (!string.IsNullOrWhiteSpace(p.Model)) sb.Append("Model: ").Append(p.Model).Append('\n');
+        sb.Append("App: ").Append(p.AppVersion).Append("  ").Append(p.At.ToString("u")).Append("\n\n");
+        sb.Append("Transcript:\n");
+        foreach (var l in p.Transcript)
+            sb.Append("- ").Append(l.Author).Append(": ").Append(l.Text).Append('\n');
+        return sb.ToString();
     }
 
     /// <summary>

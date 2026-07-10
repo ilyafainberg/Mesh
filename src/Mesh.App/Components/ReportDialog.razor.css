@@ -1,0 +1,134 @@
+.report-scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 16px;
+}
+
+.report-modal {
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-2);
+    width: 100%;
+    max-width: 520px;
+    max-height: 88vh;
+    overflow-y: auto;
+    padding: 18px 20px 20px;
+}
+
+.report-modal h3 {
+    margin: 0 0 10px;
+    font-size: 1.05rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.report-intro {
+    color: var(--fg-2);
+    font-size: .88rem;
+    margin: 0 0 14px;
+}
+
+.report-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+    font-size: .8rem;
+    color: var(--fg-3);
+}
+
+.report-field select,
+.report-field textarea {
+    width: 100%;
+}
+
+.report-preview {
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-m);
+    background: var(--bg-2);
+    padding: 10px 12px;
+    margin: 4px 0 14px;
+}
+
+.report-preview-head {
+    font-size: .78rem;
+    font-weight: 600;
+    color: var(--fg-2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.report-meta {
+    font-size: .78rem;
+    color: var(--fg-3);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--stroke-1);
+}
+
+.report-transcript {
+    max-height: 220px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.report-line {
+    font-size: .82rem;
+    color: var(--fg-1);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.report-line b {
+    color: var(--fg-3);
+}
+
+.report-empty {
+    font-size: .8rem;
+    color: var(--fg-3);
+    font-style: italic;
+}
+
+.report-consent {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: .84rem;
+    color: var(--fg-2);
+    margin-bottom: 16px;
+    cursor: pointer;
+}
+
+.report-consent input {
+    margin-top: 2px;
+    flex-shrink: 0;
+}
+
+.report-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.report-done {
+    color: var(--ok);
+    font-size: .9rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0 4px;
+}

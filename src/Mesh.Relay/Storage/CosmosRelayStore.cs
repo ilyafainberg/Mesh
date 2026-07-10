@@ -392,6 +392,12 @@ public sealed class CosmosRelayStore : IRelayStore
             QueuedAt = DateTimeOffset.UtcNow
         };
 
+        // Messages queued for a reserved system handle (for example "meshreport") never expire:
+        // a per-item ttl of -1 overrides the container's 14-day DefaultTimeToLive. Normal recipients
+        // leave Ttl null so the existing 14-day default still applies.
+        if (Mesh.Shared.ReservedHandles.IsReserved(toHandle))
+            doc.Ttl = -1;
+
         await inboxContainer
             .CreateItemAsync(doc, new PartitionKey(toHandle), cancellationToken: ct)
             .ConfigureAwait(false);
@@ -773,10 +779,17 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("queuedAt")]
         public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
+
+        // Per-item time-to-live in seconds. When null it is omitted from the document so the
+        // container DefaultTimeToLive (14 days) applies. A value of -1 makes the item never
+        // expire, overriding the container default for reserved-handle queued messages.
+        [JsonPropertyName("ttl")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public int? Ttl { get; set; }
     }
 
     /// <summary>
-    /// Cosmos document for a published service and its reputation. Uses "serviceId" as the partition
+    /// Cosmos document for a published service and its reputation.Uses "serviceId" as the partition
     /// key so a vote/usage mutation is a single-partition read-modify-write. Users are stored as a list
     /// (Cosmos has no native set type) and de-duplicated on read into a <see cref="HashSet{T}"/>.
     /// </summary>

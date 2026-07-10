@@ -1,4 +1,5 @@
 @page "/about"
+@inject AppState State
 
 <div class="pane-scroll">
     <div class="pane-narrow">
@@ -37,10 +38,28 @@
                 the PolyForm Noncommercial License 1.0.0.
             </div>
         </div>
+        <div class="card-panel">
+            <h3>Report a problem</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Mesh's agent can generate content using AI. If the AI produced something inappropriate,
+                you can report it for review. You can also report from any chat using the flag button in
+                its header. You choose exactly what is shared before anything is sent.
+            </div>
+            <button class="ghost" @onclick="OpenReport" title="Report inappropriate AI content">
+                <i class="bi bi-flag"></i> Report AI content
+            </button>
+        </div>
     </div>
 </div>
 
+<ReportDialog @ref="reportDialog" />
+
 @code {
+    ReportDialog? reportDialog;
+
+    void OpenReport()
+        => reportDialog?.Show("General report", System.Array.Empty<Mesh.App.Domain.ChatLine>(), _ => "", State.CurrentModelKey());
+
     static string Version =>
         System.Reflection.Assembly.GetExecutingAssembly().GetName().Version is { } v
             ? $"{v.Major}.{v.Minor}.{v.Build}"

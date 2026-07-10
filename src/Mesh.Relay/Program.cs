@@ -143,6 +143,11 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
     var existing = await store.GetHandleAsync(handle);
     if (existing is null)
     {
+        // Reserved system handles (for example "meshreport") cannot be claimed by ordinary users.
+        // This only blocks a brand-new claim; the legitimate owner re-asserts via the path below.
+        if (Mesh.Shared.ReservedHandles.IsReserved(handle))
+            return Results.Conflict(new { error = "handle is reserved" });
+
         // First registration CLAIMS the handle for this device key.
         var (created, _) = await store.UpsertHandleAsync(handle, req.DevicePublicKey, req.DisplayName, allowNewDevice: true);
         // Capture the recovery public key at registration so a future device can recover the handle.

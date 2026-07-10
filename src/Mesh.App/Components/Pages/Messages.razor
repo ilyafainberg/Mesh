@@ -108,6 +108,7 @@
                     }
                     else
                     {
+                        <button class="ghost icon-btn" title="Report AI content" aria-label="Report AI content" @onclick="OpenReport"><i class="bi bi-flag"></i></button>
                         <button class="ghost icon-btn" title="Delete conversation history" aria-label="Delete conversation history" @onclick="() => confirmDelete = active"><i class="bi bi-trash"></i></button>
                     }
                 </div>
@@ -223,9 +224,12 @@
     </div>
 </div>
 
+<ReportDialog @ref="reportDialog" />
+
 @code {
     string? active;
     string? confirmDelete;
+    ReportDialog? reportDialog;
     string input = "";
     string newHandle = "";
     bool busy;
@@ -290,6 +294,16 @@
     }
 
     // Opens a conversation a mesh:// deep link asked for (the router pre-created it and set the key).
+    void OpenReport()
+    {
+        if (active is null) return;
+        var conv = State.GetOrCreateConversation(active);
+        var target = conv.IsService ? $"service {conv.ServiceName}" : $"chat with @{active}";
+        reportDialog?.Show(target, conv.Lines,
+            l => l.Role == "assistant" ? "me" : State.DisplayNameFor(active!),
+            State.CurrentModelKey(), conv.ServiceId);
+    }
+
     void OpenPendingDeepLink()
     {
         var key = State.ConsumePendingOpen();

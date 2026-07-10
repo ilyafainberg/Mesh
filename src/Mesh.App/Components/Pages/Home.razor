@@ -52,6 +52,7 @@
                     }
                     else
                     {
+                        <button class="ghost icon-btn" title="Report AI content" aria-label="Report AI content" @onclick="OpenReport"><i class="bi bi-flag"></i></button>
                         <button class="ghost icon-btn" title="Delete chat" aria-label="Delete chat" @onclick="() => confirmDelete = true"><i class="bi bi-trash"></i></button>
                     }
                 }
@@ -161,6 +162,8 @@
     </div>
 </div>
 
+<ReportDialog @ref="reportDialog" />
+
 @code {
     string input = "";
     bool busy;
@@ -171,6 +174,7 @@
     bool renaming;
     string renameText = "";
     string? activeThread;
+    ReportDialog? reportDialog;
     string? pinHtml;
     string pinName = "";
     ElementReference scrollEl;
@@ -265,6 +269,13 @@
     public Task SendFromComposer() => Send();
 
     void Select(string id) { activeThread = id; confirmDelete = false; renaming = false; }
+
+    void OpenReport()
+    {
+        if (Active is null) return;
+        reportDialog?.Show($"Me topic: {Active.Title}", Active.Lines,
+            l => l.Role == "assistant" ? "agent" : "me", State.CurrentModelKey());
+    }
 
     void NewThread()
     {
