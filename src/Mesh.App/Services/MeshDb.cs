@@ -88,6 +88,10 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("chat_lines", "status", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("own_chat", "line_id", "TEXT");
         AddColumnIfMissing("own_chat", "status", "TEXT NOT NULL DEFAULT ''");
+        // Service-thread metadata on conversations (null for normal person DMs).
+        AddColumnIfMissing("conversations", "service_id", "TEXT");
+        AddColumnIfMissing("conversations", "service_name", "TEXT");
+        AddColumnIfMissing("conversations", "provider_handle", "TEXT");
         AddColumnIfMissing("own_chat", "thread_id", "TEXT");
     }
 
@@ -150,9 +154,15 @@ public sealed class MeshDb : IDisposable
 
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT handle FROM conversations ORDER BY created_at, handle;";
+            cmd.CommandText = "SELECT handle, service_id, service_name, provider_handle FROM conversations ORDER BY created_at, handle;";
             using var r = cmd.ExecuteReader();
-            while (r.Read()) Get(r.GetString(0));
+            while (r.Read())
+            {
+                var c = Get(r.GetString(0));
+                if (!r.IsDBNull(1)) c.ServiceId = r.GetString(1);
+                if (!r.IsDBNull(2)) c.ServiceName = r.GetString(2);
+                if (!r.IsDBNull(3)) c.ProviderHandle = r.GetString(3);
+            }
         }
 
         using (var cmd = conn.CreateCommand())
@@ -256,6 +266,19 @@ public sealed class MeshDb : IDisposable
         cmd.CommandText = "INSERT OR IGNORE INTO conversations(handle, created_at) VALUES($h, $t);";
         cmd.Parameters.AddWithValue("$h", handle);
         cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Marks a conversation as a service thread and persists its service metadata.</summary>
+    public void SetConversationService(string handle, string serviceId, string? serviceName, string providerHandle)
+    {
+        EnsureConversation(handle);
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE conversations SET service_id = $sid, service_name = $sname, provider_handle = $ph WHERE handle = $h;";
+        cmd.Parameters.AddWithValue("$sid", serviceId);
+        cmd.Parameters.AddWithValue("$sname", (object?)serviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$ph", providerHandle);
+        cmd.Parameters.AddWithValue("$h", handle);
         cmd.ExecuteNonQuery();
     }
 

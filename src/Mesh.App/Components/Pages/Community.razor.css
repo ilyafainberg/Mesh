@@ -176,6 +176,53 @@
     width: 100%;
 }
 
+/* Number inputs: keep a stable height so focus (spinner appearing) never resizes the panel. */
+.budget-field input[type=number] {
+    box-sizing: border-box;
+    height: 34px;
+    line-height: 34px;
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+
+.budget-field input[type=number]::-webkit-outer-spin-button,
+.budget-field input[type=number]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    appearance: none;
+    margin: 0;
+}
+
+/* My services: inline edit */
+.svc-item {
+    border-bottom: 1px solid var(--stroke-1);
+}
+
+.svc-item:last-child {
+    border-bottom: none;
+}
+
+.svc-item.editing {
+    background: var(--bg-2);
+    border-radius: var(--radius-m);
+}
+
+.svc-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 12px 14px;
+}
+
+.svc-percap {
+    margin-top: 4px;
+    font-size: .76rem;
+    color: var(--fg-3);
+}
+
+.svc-percap i.bi {
+    margin-right: 3px;
+}
+
 .budget-hint {
     margin-top: 8px;
     font-size: .78rem;

@@ -20,8 +20,9 @@
         {
             <div class="conv-item @(c.Handle == active ? "active" : "")" @onclick="() => Select(c.Handle)">
                 <span class="conv-name">@State.DisplayNameFor(c.Handle)</span>
+                @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
                 @if (State.IsUnread(c.Handle)) { <span class="conv-unread" title="Unread message"></span> }
-                @if (!IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
+                @if (!c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
             </div>
         }
         @if (State.Profile.Conversations.Count == 0)
@@ -75,13 +76,27 @@
             var conv = State.GetOrCreateConversation(active);
             <header class="pane-head">
                 <h2>@State.DisplayNameFor(active)</h2>
-                <span class="muted">@(IsAllowed(active) ? "their agent can talk to yours" : "you can message them")</span>
-                @{ var spent = State.FindContact(active)?.TokensSpent ?? 0; }
-                @if (spent > 0)
+                @if (conv.IsService)
                 {
-                    <span class="contact-tokens" title="Tokens this contact's requests have cost your agent">
-                        <i class="bi bi-coin"></i> @spent.ToString("N0") tokens
-                    </span>
+                    <span class="muted">public service - your messages go to its sandboxed agent</span>
+                    var svc = State.Profile.PublishedServices.FirstOrDefault(s => s.Id == conv.ServiceId);
+                    if (svc is not null)
+                    {
+                        <span class="contact-tokens" title="Tokens spent vs this service's lifetime budget">
+                            <i class="bi bi-coin"></i> @TokenFormat.SpentOfTotal(svc.SpentTokens, svc.TotalTokenBudget)
+                        </span>
+                    }
+                }
+                else
+                {
+                    <span class="muted">@(IsAllowed(active) ? "their agent can talk to yours" : "you can message them")</span>
+                    var spent = State.FindContact(active)?.TokensSpent ?? 0;
+                    if (spent > 0)
+                    {
+                        <span class="contact-tokens" title="Tokens this contact's requests have cost your agent">
+                            <i class="bi bi-coin"></i> @spent.ToString("N0") tokens
+                        </span>
+                    }
                 }
                 <div class="head-actions" style="margin-left:auto;">
                     @if (confirmDelete == active)
@@ -444,6 +459,10 @@
         var widget = widgetMode;
         if (widgetMode) widgetMode = false;
 
+        // Service threads always route through the sandboxed service channel (no direct/widget modes).
+        var isService = State.FindConversation(active)?.IsService == true;
+        if (isService) { direct = false; widget = false; }
+
         var via = direct ? "person" : "agent";
         var line = new ChatLine { Role = "assistant", Text = text, Via = via, AddressedToAgent = !direct };
         State.AddChatLine(active, line);
@@ -481,6 +500,17 @@
     // the line's stable id so delivery receipts update the right bubble.
     async Task DeliverAsync(string handle, ChatLine line, string text, List<StagedFile> files, bool direct, bool widget)
     {
+        // Service thread: send a ServiceRequest with transcript context to the provider's sandboxed
+        // agent, instead of a normal person/agent message.
+        var svcConv = State.FindConversation(handle);
+        if (svcConv?.IsService == true)
+        {
+            line.Text = text;
+            line.Status = "sent";
+            await Mesh.SendServiceRequestAsync(svcConv);
+            return;
+        }
+
         var toSend = text;
         if (widget && !string.IsNullOrWhiteSpace(text))
             toSend = await Agent.BuildWidgetAsync(text);

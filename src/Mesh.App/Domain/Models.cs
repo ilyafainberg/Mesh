@@ -233,42 +233,51 @@ public sealed class PublishedService
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     /// <summary>
-    /// Total token budget the owner allots to this service across all callers. 0 means unlimited.
-    /// Enforced provider-side (the relay never sees the E2E-encrypted token spend), so this is the
-    /// owner's own cost control over the AI tokens their public service consumes.
+    /// Total token budget the owner allots to this service across all callers for its LIFETIME.
+    /// 0 means unlimited. Enforced provider-side (the relay never sees the E2E-encrypted token spend),
+    /// so this is the owner's own hard ceiling on the AI tokens their public service will ever consume.
+    /// Defaults to 1.0 MTokens.
     /// </summary>
-    public long TotalTokenBudget { get; set; }
+    public long TotalTokenBudget { get; set; } = 1_000_000;
 
-    /// <summary>Per-caller (per handle) token budget. 0 means unlimited. Enforced provider-side.</summary>
-    public long PerHandleTokenBudget { get; set; }
+    /// <summary>Per-caller (per handle) token budget PER DAY (resets on UTC date rollover). 0 means
+    /// unlimited. Defaults to 0.1 MTokens per person per day. Enforced provider-side.</summary>
+    public long PerHandleTokenBudget { get; set; } = 100_000;
 
-    /// <summary>Total tokens spent answering this service so far.</summary>
+    /// <summary>Total tokens spent answering this service so far (lifetime).</summary>
     public long SpentTokens { get; set; }
 
-    /// <summary>Tokens spent per requesting handle, used to enforce <see cref="PerHandleTokenBudget"/>.</summary>
-    public Dictionary<string, long> SpentByHandle { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Tokens spent per requesting handle TODAY, used to enforce the daily per-handle cap.</summary>
+    public Dictionary<string, long> SpentByHandleToday { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>UTC date (yyyy-MM-dd) the <see cref="SpentByHandleToday"/> buckets belong to; a new day resets them.</summary>
+    public string SpentTodayUtc { get; set; } = "";
+
+    private static string TodayUtc => DateTime.UtcNow.ToString("yyyy-MM-dd");
+
+    /// <summary>Tokens the given handle has spent TODAY (0 when the stored buckets are from a past day).</summary>
+    public long SpentTodayFor(string handle)
+        => SpentTodayUtc == TodayUtc && SpentByHandleToday.TryGetValue(handle, out var v) ? v : 0;
 
     /// <summary>
-    /// True when this request must be refused because the service's total budget is exhausted or the
-    /// calling handle has hit its per-handle cap. A 0 budget (unlimited) never blocks.
+    /// True when this request must be refused: the service's LIFETIME total budget is exhausted, or the
+    /// calling handle has hit its DAILY per-handle cap. A 0 budget (unlimited) never blocks.
     /// </summary>
     public bool IsBudgetExhausted(string handle)
     {
         if (TotalTokenBudget > 0 && SpentTokens >= TotalTokenBudget) return true;
-        if (PerHandleTokenBudget > 0)
-        {
-            var used = SpentByHandle.TryGetValue(handle, out var v) ? v : 0;
-            if (used >= PerHandleTokenBudget) return true;
-        }
+        if (PerHandleTokenBudget > 0 && SpentTodayFor(handle) >= PerHandleTokenBudget) return true;
         return false;
     }
 
-    /// <summary>Adds a completed request's token cost to the total and per-handle spend counters.</summary>
+    /// <summary>Adds a completed request's token cost to the lifetime total and today's per-handle bucket.</summary>
     public void RecordSpend(string handle, long tokens)
     {
         if (tokens <= 0) return;
         SpentTokens += tokens;
-        SpentByHandle[handle] = (SpentByHandle.TryGetValue(handle, out var v) ? v : 0) + tokens;
+        var today = TodayUtc;
+        if (SpentTodayUtc != today) { SpentTodayUtc = today; SpentByHandleToday.Clear(); }
+        SpentByHandleToday[handle] = (SpentByHandleToday.TryGetValue(handle, out var v) ? v : 0) + tokens;
     }
 }
 
@@ -335,6 +344,19 @@ public sealed class Conversation
 {
     public string Handle { get; set; } = "";
     public List<ChatLine> Lines { get; set; } = new();
+
+    /// <summary>
+    /// Service-thread metadata (null for a normal person DM). When set, this conversation is a thread
+    /// with a published service: <see cref="Handle"/> is a synthetic key (svc:{provider}:{serviceId})
+    /// so it never collides with a person DM or a sibling service, and <see cref="ProviderHandle"/> is
+    /// the real handle a follow-up ServiceRequest routes to.
+    /// </summary>
+    public string? ServiceId { get; set; }
+    public string? ServiceName { get; set; }
+    public string? ProviderHandle { get; set; }
+
+    /// <summary>True when this conversation is a thread with a published service.</summary>
+    public bool IsService => ServiceId is not null;
 }
 
 /// <summary>

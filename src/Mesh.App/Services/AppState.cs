@@ -507,6 +507,45 @@ public sealed class AppState
     public Domain.Contact? FindContact(string handle)
         => Profile.Contacts.FirstOrDefault(c => c.Handle.Equals(Norm(handle), StringComparison.OrdinalIgnoreCase));
 
+    /// <summary>Synthetic conversation key for a service thread: <c>svc:{provider}:{serviceId}</c>.</summary>
+    public static string ServiceKey(string providerHandle, string serviceId)
+        => "svc:" + Norm(providerHandle) + ":" + serviceId;
+
+    /// <summary>Finds a conversation by its (already-known) key, or null.</summary>
+    public Conversation? FindConversation(string handle)
+    {
+        var h = Norm(handle);
+        return Profile.Conversations.FirstOrDefault(c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Gets or creates the service thread for a (provider, service) pair, keyed distinctly so it never
+    /// collides with a person DM or a sibling service, and carrying the real provider handle to route
+    /// follow-up ServiceRequests to. Persists the service metadata so the thread survives a restart.
+    /// </summary>
+    public Conversation GetOrCreateServiceConversation(string providerHandle, string serviceId, string? serviceName)
+    {
+        var key = ServiceKey(providerHandle, serviceId);
+        var provider = Norm(providerHandle);
+        var name = string.IsNullOrWhiteSpace(serviceName) ? serviceId : serviceName!.Trim();
+        var conv = FindConversation(key);
+        if (conv is null)
+        {
+            conv = new Conversation { Handle = key, ServiceId = serviceId, ServiceName = name, ProviderHandle = provider };
+            Profile.Conversations.Add(conv);
+            activeDb?.SetConversationService(key, serviceId, name, provider);
+        }
+        else if (!string.IsNullOrWhiteSpace(serviceName) && conv.ServiceName != name)
+        {
+            conv.ServiceId = serviceId;
+            conv.ServiceName = name;
+            conv.ProviderHandle = provider;
+            activeDb?.SetConversationService(key, serviceId, name, provider);
+        }
+        NotifyChanged();
+        return conv;
+    }
+
     public Conversation GetOrCreateConversation(string handle)
     {
         handle = Norm(handle);
@@ -544,9 +583,11 @@ public sealed class AppState
 
     public static string Norm(string handle) => handle.Trim().TrimStart('@').ToLowerInvariant();
 
-    /// <summary>Friendly display name for a handle (contact's name, else the handle itself).</summary>
+    /// <summary>Friendly display name for a handle (service name for a service thread, contact's name, else the handle).</summary>
     public string DisplayNameFor(string handle)
     {
+        var conv = FindConversation(handle);
+        if (conv?.IsService == true) return string.IsNullOrWhiteSpace(conv.ServiceName) ? Norm(handle) : conv.ServiceName!;
         var c = FindContact(handle);
         if (c is not null && !string.IsNullOrWhiteSpace(c.DisplayName)) return c.DisplayName!;
         return Norm(handle);

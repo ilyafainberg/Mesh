@@ -473,6 +473,8 @@ input[type=checkbox]:not(.switch input):checked::after {
 
 /* pills / tags */
 .tag { font-size: .68rem; background: #FDE8B8; color: #6B4E00; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.svc-thread-tag { background: var(--brand); color: #fff; }
+.svc-thread-tag i.bi { margin-right: 3px; }
 .vis { font-size: .7rem; padding: 2px 8px; border-radius: 999px; }
 .vis.priv { background: var(--bg-3); color: var(--fg-2); }
 .vis.pub { background: #DBF3DB; color: #0E6A0B; }

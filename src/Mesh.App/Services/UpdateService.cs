@@ -275,9 +275,13 @@ public sealed class UpdateService
     }
 
     /// <summary>
-    /// Launch the downloaded installer (a visible, branded wizard) and quit the app so the installer
-    /// can replace files and relaunch. The installer uses the Windows Restart Manager to close any
-    /// lingering instance, so the swap is reliable even if a WebView child is slow to exit.
+    /// Launch the downloaded installer (a visible, branded wizard) and force this app to exit so the
+    /// installer can replace files and relaunch. We first ask the app to quit gracefully, then after a
+    /// short delay we hard-kill this process and its child tree (including the WebView2
+    /// msedgewebview2.exe processes). A force-kill is used instead of Environment.Exit because
+    /// Environment.Exit runs finalizers and AppDomain teardown that can hang on a live WebView2 or
+    /// SignalR connection and leave an orphaned Mesh.App.exe resident in memory, which would then hold
+    /// file locks and fight the installer's Restart Manager.
     /// </summary>
     public void ApplyAndExit(string installerPath)
     {
@@ -290,19 +294,36 @@ public sealed class UpdateService
             UseShellExecute = true,
             WorkingDirectory = Path.GetDirectoryName(installerPath) ?? Path.GetTempPath()
         };
-        Process.Start(psi);
 
-        // Quit gracefully on the UI thread, then guarantee the process exits shortly after so the
-        // installer never has to fight this process for file locks (the installer's Restart Manager
-        // handling is a backstop, but exiting first keeps the update fast and clean).
+        // Confirm the installer actually started before we tear ourselves down. It is launched with
+        // UseShellExecute, so it is a detached process that survives our exit. If it failed to start,
+        // do not kill the app, otherwise the user is left with nothing.
+        var installer = Process.Start(psi);
+        if (installer is null)
+            throw new InvalidOperationException("Failed to launch the update installer.");
+
+        // Quit gracefully on the UI thread first (closes the window and tears down the tray), then
+        // guarantee the process exits shortly after so the installer never has to fight this process
+        // for file locks.
         MainThread.BeginInvokeOnMainThread(() =>
         {
             try { appControl.Quit(); } catch { }
         });
+
+        // Backstop: after a brief grace period, force-kill the whole process tree. This is the reliable
+        // way to remove the orphaned process and its WebView2 children on Windows. Fall back to
+        // Environment.Exit only if the kill somehow throws.
         _ = Task.Run(async () =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(3));
-            Environment.Exit(0);
+            await Task.Delay(TimeSpan.FromMilliseconds(1000));
+            try
+            {
+                Process.GetCurrentProcess().Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                Environment.Exit(0);
+            }
         });
     }
 

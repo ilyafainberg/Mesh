@@ -443,14 +443,14 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         // no tools of any kind).
         if (env.Kind == MeshKinds.ServiceRequest)
         {
-            var (serviceId, prompt) = ServiceProtocol.Parse(text);
+            var (serviceId, turns) = ServiceProtocol.ParseRequest(text);
             var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
             if (svc is null || !svc.Published) return;                 // not a live service here
             if (!agent.IsModelReady) return;                           // no model to answer with
 
             // Token-budget gate (provider-side cost control; the relay never sees the E2E-encrypted
             // token spend, so the owner enforces their own budget here). Refuse politely when the
-            // service's total budget is exhausted or this caller has hit their per-handle cap.
+            // service's lifetime total budget is exhausted or this caller has hit their daily cap.
             if (svc.IsBudgetExhausted(from))
             {
                 await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId,
@@ -461,7 +461,13 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
             if (!state.TryConsumeAgentReply()) return;                 // daily budget spent; don't burn the model
 
-            var svcHistory = new[] { new ChatLine { Role = "user", Text = prompt } };
+            // The consumer supplies the (windowed) transcript so a follow-up has context; the provider
+            // stays stateless per caller. Map turns to chat lines the sandboxed agent understands.
+            var svcHistory = turns
+                .Select(t => new ChatLine { Role = t.Role == "user" ? "user" : "assistant", Text = t.Text, Via = "agent" })
+                .ToList();
+            if (svcHistory.Count == 0) svcHistory.Add(new ChatLine { Role = "user", Text = "" });
+
             var reply = await agent.RespondAsServiceAsync(serviceId, from, svcHistory, ct);
 
             // Do not send model-failure text to the caller as if it were a real answer; refund budget.
@@ -472,7 +478,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
                 return;
             }
 
-            // Charge the tokens this reply cost against the service's budget (total + per-handle).
+            // Charge the tokens this reply cost against the service's budget (lifetime total + daily per-handle).
             if (reply.Tokens > 0)
                 state.Mutate(_ => svc.RecordSpend(from, reply.Tokens));
 
@@ -481,12 +487,14 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         }
         if (env.Kind == MeshKinds.ServiceResponse)
         {
-            var (_, answer) = ServiceProtocol.Parse(text);
-            // Record the provider's service reply as an incoming assistant line from that handle.
-            state.AddChatLine(from, new ChatLine { Role = "user", Text = answer, Via = "agent", AddressedToAgent = true });
-            state.MarkUnread(from);
-            if (ShouldNotify(state.FindContact(from)))
-                notifier.Notify("Service replied", Preview(answer), NotifyKind.Message, "messages");
+            var (svcId, answer) = ServiceProtocol.Parse(text);
+            // Land the reply in the dedicated service thread (not the provider's person DM), so the
+            // consumer can keep a real multi-turn conversation with the service.
+            var conv = state.FindConversation(AppState.ServiceKey(from, svcId))
+                       ?? state.GetOrCreateServiceConversation(from, svcId, null);
+            state.AddChatLine(conv.Handle, new ChatLine { Role = "user", Text = answer, Via = "agent", AddressedToAgent = true });
+            state.MarkUnread(conv.Handle);
+            notifier.Notify($"{conv.ServiceName} replied", Preview(answer), NotifyKind.Message, "messages");
             return;
         }
 
@@ -683,11 +691,24 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     }
 
     /// <summary>
-    /// Invokes another handle's PUBLIC service by id, sending the prompt on the service channel.
-    /// No contact relationship is required; the provider answers with its sandboxed service agent.
+    /// Sends a ServiceRequest for the given service thread, carrying a windowed transcript so the
+    /// provider's sandboxed agent has multi-turn context for follow-ups. The caller has already
+    /// appended the user's prompt line to <paramref name="conv"/>. No contact relationship is required;
+    /// the request routes to the real provider handle behind the synthetic thread key.
     /// </summary>
-    public async Task<bool> InvokeServiceAsync(string providerHandle, string serviceId, string prompt)
-        => await SendAsync(providerHandle, MeshKinds.ServiceRequest, ServiceProtocol.Body(serviceId, prompt));
+    public async Task<bool> SendServiceRequestAsync(Conversation conv)
+    {
+        if (conv.ServiceId is null || string.IsNullOrWhiteSpace(conv.ProviderHandle)) return false;
+        // From the provider agent's point of view, my outgoing lines (Role "assistant") are the user,
+        // and the service's prior answers (Role "user") are the assistant.
+        var window = conv.Lines
+            .Where(l => !string.IsNullOrWhiteSpace(l.Text))
+            .TakeLast(20)
+            .Select(l => new ServiceTurn(l.Role == "assistant" ? "user" : "assistant", l.Text))
+            .ToList();
+        var body = ServiceProtocol.RequestBody(conv.ServiceId, window);
+        return await SendAsync(conv.ProviderHandle!, MeshKinds.ServiceRequest, body);
+    }
 
 
     public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null, string? toDevice = null)
