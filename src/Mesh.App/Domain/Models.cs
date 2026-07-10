@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Mesh.Shared;
 
 namespace Mesh.App.Domain;
 
@@ -224,12 +225,51 @@ public sealed class PublishedService
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Name { get; set; } = "";
     public string Description { get; set; } = "";
-    public string Category { get; set; } = "General";
+    public string Category { get; set; } = ServiceCategories.Fallback;
     /// <summary>Persona / system guidance the service-scoped agent follows when answering.</summary>
     public string Persona { get; set; } = "";
     /// <summary>Whether this service is currently listed/live in the relay directory.</summary>
     public bool Published { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    /// <summary>
+    /// Total token budget the owner allots to this service across all callers. 0 means unlimited.
+    /// Enforced provider-side (the relay never sees the E2E-encrypted token spend), so this is the
+    /// owner's own cost control over the AI tokens their public service consumes.
+    /// </summary>
+    public long TotalTokenBudget { get; set; }
+
+    /// <summary>Per-caller (per handle) token budget. 0 means unlimited. Enforced provider-side.</summary>
+    public long PerHandleTokenBudget { get; set; }
+
+    /// <summary>Total tokens spent answering this service so far.</summary>
+    public long SpentTokens { get; set; }
+
+    /// <summary>Tokens spent per requesting handle, used to enforce <see cref="PerHandleTokenBudget"/>.</summary>
+    public Dictionary<string, long> SpentByHandle { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// True when this request must be refused because the service's total budget is exhausted or the
+    /// calling handle has hit its per-handle cap. A 0 budget (unlimited) never blocks.
+    /// </summary>
+    public bool IsBudgetExhausted(string handle)
+    {
+        if (TotalTokenBudget > 0 && SpentTokens >= TotalTokenBudget) return true;
+        if (PerHandleTokenBudget > 0)
+        {
+            var used = SpentByHandle.TryGetValue(handle, out var v) ? v : 0;
+            if (used >= PerHandleTokenBudget) return true;
+        }
+        return false;
+    }
+
+    /// <summary>Adds a completed request's token cost to the total and per-handle spend counters.</summary>
+    public void RecordSpend(string handle, long tokens)
+    {
+        if (tokens <= 0) return;
+        SpentTokens += tokens;
+        SpentByHandle[handle] = (SpentByHandle.TryGetValue(handle, out var v) ? v : 0) + tokens;
+    }
 }
 
 public sealed class Contact

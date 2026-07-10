@@ -513,7 +513,7 @@ app.MapPost("/capabilities", async (PublishServiceRequest req) =>
         Handle = handle,
         Name = req.Name,
         Description = req.Description ?? "",
-        Category = req.Category ?? "",
+        Category = ServiceCategories.Coerce(req.Category),
         PublishedAt = DateTimeOffset.UtcNow
     });
     app.Logger.LogInformation("service published: {ServiceId} by {Handle}", req.ServiceId, handle);

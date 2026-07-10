@@ -3,6 +3,10 @@ using Mesh.App.Domain;
 
 namespace Mesh.App.Services;
 
+/// <summary>The result of a sandboxed public-service reply: the text to send back plus the total
+/// tokens it cost, so the caller can charge it against the service's token budget.</summary>
+public readonly record struct ServiceReply(string Text, long Tokens);
+
 /// <summary>
 /// Runs the user's agent in one of two contexts:
 ///  - Owner context: full knowledge + the user's own chat.
@@ -199,11 +203,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     /// The reply is metered to the caller only when they are already a known contact (a random public
     /// invoker does not create a phantom contact).
     /// </summary>
-    public async Task<string> RespondAsServiceAsync(string serviceId, string fromHandle, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
+    public async Task<ServiceReply> RespondAsServiceAsync(string serviceId, string fromHandle, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
     {
         var p = state.Profile;
         var svc = p.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
-        if (svc is null) return "This service is currently unavailable.";
+        if (svc is null) return new ServiceReply("This service is currently unavailable.", 0);
 
         // Public-listed capabilities ONLY. This binding (not instructions) is what keeps private
         // knowledge, skills and widgets out of a public service's reach.
@@ -226,19 +230,21 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             if (lastInbound is not null) agentHistory.Add(lastInbound);
         }
 
+        // Meter this call's spend so the caller (MeshClient) can charge it against the service's token
+        // budget, and additionally attribute it to the caller when they are already a known contact (a
+        // random public invoker is not turned into a phantom contact just to attribute tokens).
+        long spent = 0;
+        var isContact = state.FindContact(fromHandle) is not null;
         string reply;
-        // Meter token spend to the caller only if they already exist as a contact; a public
-        // invoker who is not a contact is not turned into one just to attribute tokens.
-        if (state.FindContact(fromHandle) is not null)
+        using (meter.BeginScope((pt, cc) =>
         {
-            using (meter.BeginScope((pt, cc) => state.AddContactTokens(fromHandle, pt, cc)))
-                reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct);
-        }
-        else
+            spent += pt + cc;
+            if (isContact) state.AddContactTokens(fromHandle, pt, cc);
+        }))
         {
             reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct);
         }
-        return ExpandWidgets(reply, widgets);
+        return new ServiceReply(ExpandWidgets(reply, widgets), spent);
     }
 
     // ---- history windowing (keeps small local models under their context limit) ----

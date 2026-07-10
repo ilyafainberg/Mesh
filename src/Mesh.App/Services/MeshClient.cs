@@ -447,20 +447,36 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
             if (svc is null || !svc.Published) return;                 // not a live service here
             if (!agent.IsModelReady) return;                           // no model to answer with
+
+            // Token-budget gate (provider-side cost control; the relay never sees the E2E-encrypted
+            // token spend, so the owner enforces their own budget here). Refuse politely when the
+            // service's total budget is exhausted or this caller has hit their per-handle cap.
+            if (svc.IsBudgetExhausted(from))
+            {
+                await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId,
+                    "This service has reached its usage budget and is not accepting requests right now."));
+                Log?.Invoke($"service '{serviceId}' refused for @{from}: budget exhausted");
+                return;
+            }
+
             if (!state.TryConsumeAgentReply()) return;                 // daily budget spent; don't burn the model
 
             var svcHistory = new[] { new ChatLine { Role = "user", Text = prompt } };
-            var answer = await agent.RespondAsServiceAsync(serviceId, from, svcHistory, ct);
+            var reply = await agent.RespondAsServiceAsync(serviceId, from, svcHistory, ct);
 
             // Do not send model-failure text to the caller as if it were a real answer; refund budget.
-            if (ModelReply.IsFailure(answer))
+            if (ModelReply.IsFailure(reply.Text))
             {
                 state.RefundAgentReply();
                 Log?.Invoke($"service '{serviceId}' reply to @{from} skipped: model unavailable");
                 return;
             }
 
-            await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId, answer));
+            // Charge the tokens this reply cost against the service's budget (total + per-handle).
+            if (reply.Tokens > 0)
+                state.Mutate(_ => svc.RecordSpend(from, reply.Tokens));
+
+            await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId, reply.Text));
             return;
         }
         if (env.Kind == MeshKinds.ServiceResponse)

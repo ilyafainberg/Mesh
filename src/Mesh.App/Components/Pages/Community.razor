@@ -24,18 +24,30 @@
                 <button class="primary" @onclick="Search"><i class="bi bi-search"></i> Search</button>
             </div>
 
+            <div class="cat-filter">
+                <button class="cat-chip @(catFilter is null ? "on" : "")" @onclick="() => SetCatFilter(null)">All</button>
+                @foreach (var c in ServiceCategories.All)
+                {
+                    <button class="cat-chip @(catFilter == c ? "on" : "")" @onclick="() => SetCatFilter(c)">@c</button>
+                }
+            </div>
+
             @if (loading)
             {
                 <div class="empty">Loading services…</div>
             }
-            else if (results.Count == 0)
+            else if (!FilteredResults.Any())
             {
-                <div class="empty">No services yet. Publish one from the My services tab.</div>
+                <div class="empty">
+                    @(catFilter is null
+                        ? "No services yet. Publish one from the My services tab."
+                        : $"No {catFilter} services yet.")
+                </div>
             }
             else
             {
                 <div class="svc-list">
-                    @foreach (var l in results)
+                    @foreach (var l in FilteredResults)
                     {
                         <div class="svc-card" @key="l.ServiceId">
                             <div class="svc-top">
@@ -97,16 +109,38 @@
             </p>
 
             <div class="card-panel">
-                <h3>Create a service</h3>
+                <h3>@(editingId is null ? "Create a service" : "Edit service")</h3>
                 <input class="full" @bind="newName" placeholder="Name (e.g. Travel planner)" aria-label="Service name" />
                 <textarea class="full" rows="2" @bind="newDesc" placeholder="Description others will see" aria-label="Service description"></textarea>
-                <div class="kn-row">
-                    <input class="full" @bind="newCat" placeholder="Category" aria-label="Category" />
-                    <button class="primary" @onclick="Create" disabled="@string.IsNullOrWhiteSpace(newName)">
-                        <i class="bi bi-plus-lg"></i> Create
+                <select class="full" @bind="newCat" aria-label="Category">
+                    @foreach (var c in ServiceCategories.All)
+                    {
+                        <option value="@c">@c</option>
+                    }
+                </select>
+                <textarea class="full" rows="3" @bind="newPersona" placeholder="How should your service agent behave?" aria-label="Persona"></textarea>
+
+                <div class="budget-row">
+                    <label class="budget-field">
+                        <span>Total token budget</span>
+                        <input type="number" min="0" step="1000" @bind="newTotalBudget" aria-label="Total token budget" />
+                    </label>
+                    <label class="budget-field">
+                        <span>Per-person token budget</span>
+                        <input type="number" min="0" step="1000" @bind="newPerHandleBudget" aria-label="Per-person token budget" />
+                    </label>
+                </div>
+                <div class="budget-hint"><i class="bi bi-info-circle"></i> 0 = unlimited. Budgets can be raised later; spending never resets.</div>
+
+                <div class="form-actions">
+                    @if (editingId is not null)
+                    {
+                        <button class="ghost" @onclick="CancelEdit"><i class="bi bi-x-lg"></i> Cancel</button>
+                    }
+                    <button class="primary" @onclick="Save" disabled="@string.IsNullOrWhiteSpace(newName)">
+                        <i class="bi @(editingId is null ? "bi-plus-lg" : "bi-check-lg")"></i> @(editingId is null ? "Create" : "Save")
                     </button>
                 </div>
-                <textarea class="full" rows="3" @bind="newPersona" placeholder="How should your service agent behave?" aria-label="Persona"></textarea>
             </div>
 
             <div class="pane-head" style="padding-left:0;padding-right:0;">
@@ -122,6 +156,17 @@
                         <div class="row-main">
                             <div class="row-title">@svc.Name @(string.IsNullOrWhiteSpace(svc.Category) ? "" : $"· {svc.Category}")</div>
                             <div class="row-sub">@svc.Description</div>
+                            @if (svc.TotalTokenBudget > 0 || svc.SpentTokens > 0)
+                            {
+                                <div class="svc-budget" title="Tokens spent vs total budget">
+                                    <div class="budget-bar">
+                                        <div class="budget-fill @(svc.IsBudgetExhausted(string.Empty) ? "full" : "")" style="width:@(BudgetPct(svc))%"></div>
+                                    </div>
+                                    <span class="budget-label">
+                                        @svc.SpentTokens.ToString("N0") / @(svc.TotalTokenBudget > 0 ? svc.TotalTokenBudget.ToString("N0") : "\u221E") tokens
+                                    </span>
+                                </div>
+                            }
                             @if (stat is not null)
                             {
                                 <div class="svc-rep" style="margin-top:6px;">
@@ -132,6 +177,7 @@
                             }
                         </div>
                         <div class="row-actions">
+                            <button class="icon-btn" title="Edit" aria-label="Edit service" @onclick="() => BeginEdit(svc)"><i class="bi bi-pencil"></i></button>
                             <button class="@(svc.Published ? "primary" : "ghost")" title="@(svc.Published ? "Delist from the directory" : "List in the directory")"
                                     @onclick="() => TogglePublish(svc, !svc.Published)">
                                 <i class="bi @(svc.Published ? "bi-broadcast" : "bi-broadcast-pin")"></i> @(svc.Published ? "Published" : "Publish")
@@ -211,15 +257,26 @@
     string query = "";
     bool loading = true;
     List<ServiceListing> results = new();
+    string? catFilter;
     readonly Dictionary<string, string> prompts = new();
     readonly Dictionary<string, string> confirms = new();
     readonly Dictionary<string, string> voteHints = new();
 
+    // Results narrowed to the selected category chip (client-side; the text search is server-side).
+    IEnumerable<ServiceListing> FilteredResults =>
+        catFilter is null
+            ? results
+            : results.Where(r => string.Equals(r.Category, catFilter, StringComparison.OrdinalIgnoreCase));
+
     // My services form state
     string newName = "";
     string newDesc = "";
-    string newCat = "General";
+    string newCat = ServiceCategories.Fallback;
     string newPersona = "";
+    long newTotalBudget;
+    long newPerHandleBudget;
+    // Id of the service being edited, or null when the form is in "create" mode.
+    string? editingId;
 
     // Best-effort live stats for the owner's own services, keyed by ServiceId.
     readonly Dictionary<string, ServiceListing> statsById = new(StringComparer.Ordinal);
@@ -240,6 +297,8 @@
     void OnSearchKey(KeyboardEventArgs e) { if (e.Key == "Enter") _ = Search(); }
 
     void OnInvokeKey(KeyboardEventArgs e, ServiceListing l) { if (e.Key == "Enter") _ = Send(l); }
+
+    void SetCatFilter(string? c) { catFilter = c; StateHasChanged(); }
 
     async Task Search()
     {
@@ -297,24 +356,86 @@
     // ---- My services ----
     ServiceListing? StatFor(string id) => statsById.TryGetValue(id, out var s) ? s : null;
 
-    void Create()
+    // Percentage of the total budget consumed (0 when the budget is unlimited).
+    static int BudgetPct(PublishedService svc)
+    {
+        if (svc.TotalTokenBudget <= 0) return 0;
+        var pct = (int)Math.Round(100.0 * svc.SpentTokens / svc.TotalTokenBudget);
+        return Math.Clamp(pct, 0, 100);
+    }
+
+    void BeginEdit(PublishedService svc)
+    {
+        editingId = svc.Id;
+        newName = svc.Name;
+        newDesc = svc.Description;
+        newCat = ServiceCategories.Coerce(svc.Category);
+        newPersona = svc.Persona;
+        newTotalBudget = svc.TotalTokenBudget;
+        newPerHandleBudget = svc.PerHandleTokenBudget;
+        StateHasChanged();
+    }
+
+    void CancelEdit() => ResetForm();
+
+    void ResetForm()
+    {
+        editingId = null;
+        newName = "";
+        newDesc = "";
+        newCat = ServiceCategories.Fallback;
+        newPersona = "";
+        newTotalBudget = 0;
+        newPerHandleBudget = 0;
+    }
+
+    async Task Save()
     {
         if (string.IsNullOrWhiteSpace(newName)) return;
         var name = newName.Trim();
         var desc = newDesc.Trim();
-        var cat = string.IsNullOrWhiteSpace(newCat) ? "General" : newCat.Trim();
+        var cat = ServiceCategories.Coerce(newCat);
         var persona = newPersona.Trim();
-        State.Mutate(p => p.PublishedServices.Add(new PublishedService
+        var total = Math.Max(0, newTotalBudget);
+        var perHandle = Math.Max(0, newPerHandleBudget);
+
+        if (editingId is null)
         {
-            Name = name,
-            Description = desc,
-            Category = cat,
-            Persona = persona
-        }));
-        newName = "";
-        newDesc = "";
-        newCat = "General";
-        newPersona = "";
+            State.Mutate(p => p.PublishedServices.Add(new PublishedService
+            {
+                Name = name,
+                Description = desc,
+                Category = cat,
+                Persona = persona,
+                TotalTokenBudget = total,
+                PerHandleTokenBudget = perHandle
+            }));
+        }
+        else
+        {
+            var svc = State.Profile.PublishedServices.FirstOrDefault(s => s.Id == editingId);
+            if (svc is not null)
+            {
+                // A budget can be raised but never dropped below what has already been spent.
+                if (total > 0 && total < svc.SpentTokens) total = svc.SpentTokens;
+                State.Mutate(_ =>
+                {
+                    svc.Name = name;
+                    svc.Description = desc;
+                    svc.Category = cat;
+                    svc.Persona = persona;
+                    svc.TotalTokenBudget = total;
+                    svc.PerHandleTokenBudget = perHandle;
+                });
+                // Propagate metadata changes to the live directory listing when published.
+                if (svc.Published)
+                {
+                    await Dir.PublishAsync(svc);
+                    await RefreshStats();
+                }
+            }
+        }
+        ResetForm();
     }
 
     async Task TogglePublish(PublishedService svc, bool on)
@@ -334,6 +455,7 @@
 
     async Task Delete(PublishedService svc)
     {
+        if (editingId == svc.Id) ResetForm();
         await Dir.UnpublishAsync(svc.Id);
         State.Mutate(p => p.PublishedServices.Remove(svc));
         await RefreshStats();
