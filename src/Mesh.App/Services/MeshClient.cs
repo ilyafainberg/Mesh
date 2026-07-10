@@ -719,8 +719,53 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             .TakeLast(20)
             .Select(l => new ServiceTurn(l.Role == "assistant" ? "user" : "assistant", l.Text))
             .ToList();
+
+        // Self-owned service: the relay deliberately does NOT echo a message back to the sending
+        // device when it is addressed to your own handle (so home-calls reach your OTHER devices).
+        // That means a provider invoking their OWN service would never get a reply. Answer locally
+        // instead, running the same sandboxed service agent in-process.
+        if (AppState.Norm(conv.ProviderHandle!) == AppState.Norm(state.Profile.Handle))
+        {
+            await AnswerOwnServiceLocallyAsync(conv, window);
+            return true;
+        }
+
         var body = ServiceProtocol.RequestBody(conv.ServiceId, window);
         return await SendAsync(conv.ProviderHandle!, MeshKinds.ServiceRequest, body);
+    }
+
+    /// <summary>
+    /// Answers a service the current user owns, locally (no relay round-trip), so a provider can use
+    /// and test their own service. Runs the same hard-sandboxed service agent as the remote path
+    /// (public-listed capabilities only), so what the owner sees matches what other handles get. No
+    /// budget or rate-limit gating is applied to the owner using their own service.
+    /// </summary>
+    private async Task AnswerOwnServiceLocallyAsync(Conversation conv, IReadOnlyList<ServiceTurn> window)
+    {
+        var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == conv.ServiceId);
+        if (svc is null) return;
+        if (!agent.IsModelReady)
+        {
+            state.AddChatLine(conv.Handle, new ChatLine
+            {
+                Role = "user",
+                Text = "No model is configured, so this service cannot answer yet. Set one up in Settings.",
+                Via = "agent",
+                AddressedToAgent = true
+            });
+            return;
+        }
+
+        var me = AppState.Norm(state.Profile.Handle);
+        var svcHistory = window
+            .Select(t => new ChatLine { Role = t.Role == "user" ? "user" : "assistant", Text = t.Text, Via = "agent" })
+            .ToList();
+
+        var reply = await agent.RespondAsServiceAsync(conv.ServiceId!, me, svcHistory, CancellationToken.None);
+        if (ModelReply.IsFailure(reply.Text)) return;
+
+        state.AddChatLine(conv.Handle, new ChatLine { Role = "user", Text = reply.Text, Via = "agent", AddressedToAgent = true });
+        state.MarkRead(conv.Handle);
     }
 
 

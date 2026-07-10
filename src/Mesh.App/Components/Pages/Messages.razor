@@ -201,16 +201,19 @@
                         </button>
                         <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
                                placeholder="@Placeholder" aria-label="Message input"></textarea>
-                        <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
-                            <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
-                                    title="Send to their agent (it may auto-reply)">
-                                <i class="bi bi-robot"></i> Agent
-                            </button>
-                            <button class="@(directMode ? "on" : "")" @onclick="() => directMode = true" disabled="@busy"
-                                    title="Send to them directly (no agent reply)">
-                                <i class="bi bi-person"></i> Person
-                            </button>
-                        </div>
+                        @if (!ActiveIsService)
+                        {
+                            <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
+                                <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
+                                        title="Send to their agent (it may auto-reply)">
+                                    <i class="bi bi-robot"></i> Agent
+                                </button>
+                                <button class="@(directMode ? "on" : "")" @onclick="() => directMode = true" disabled="@busy"
+                                        title="Send to them directly (no agent reply)">
+                                    <i class="bi bi-person"></i> Person
+                                </button>
+                            </div>
+                        }
                         <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send"><i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i></button>
                     </div>
                     @if (attachError is not null) { <p class="err-text">@attachError</p> }
@@ -257,11 +260,15 @@
 
     bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
+    bool ActiveIsService => active is not null && State.FindConversation(active)?.IsService == true;
+
     string Placeholder => widgetMode
         ? "Describe a widget to send…"
-        : directMode
+        : ActiveIsService
             ? $"Message {State.DisplayNameFor(active!)}…"
-            : $"Message {State.DisplayNameFor(active!)}'s Agent…";
+            : directMode
+                ? $"Message {State.DisplayNameFor(active!)}…"
+                : $"Message {State.DisplayNameFor(active!)}'s Agent…";
 
     protected override void OnInitialized()
     {
