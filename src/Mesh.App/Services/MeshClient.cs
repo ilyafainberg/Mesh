@@ -459,7 +459,20 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
                 return;
             }
 
+            // Rate-limit gate: cap the number of requests one caller can make per day, independent of
+            // token cost, so nobody can flood the service with cheap requests (anti-abuse).
+            if (svc.IsRateLimited(from))
+            {
+                await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId,
+                    "You have reached this service's daily request limit. Please try again tomorrow."));
+                Log?.Invoke($"service '{serviceId}' refused for @{from}: daily rate limit");
+                return;
+            }
+
             if (!state.TryConsumeAgentReply()) return;                 // daily budget spent; don't burn the model
+
+            // Count this accepted request against the caller's daily rate limit.
+            state.Mutate(_ => svc.RecordRequest(from));
 
             // The consumer supplies the (windowed) transcript so a follow-up has context; the provider
             // stays stateless per caller. Map turns to chat lines the sandboxed agent understands.

@@ -250,7 +250,18 @@ public sealed class PublishedService
     /// <summary>Tokens spent per requesting handle TODAY, used to enforce the daily per-handle cap.</summary>
     public Dictionary<string, long> SpentByHandleToday { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>UTC date (yyyy-MM-dd) the <see cref="SpentByHandleToday"/> buckets belong to; a new day resets them.</summary>
+    /// <summary>
+    /// Max number of REQUESTS one handle may make to this service PER DAY (resets on UTC date rollover),
+    /// independent of token cost. This is the anti-abuse rate limit: it stops a caller flooding the
+    /// service with many cheap requests even when they stay under the token budget. 0 means unlimited.
+    /// Defaults to 100 requests per person per day.
+    /// </summary>
+    public int PerHandleDailyRequestLimit { get; set; } = 100;
+
+    /// <summary>Number of requests per handle TODAY, used to enforce <see cref="PerHandleDailyRequestLimit"/>.</summary>
+    public Dictionary<string, int> RequestsByHandleToday { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>UTC date (yyyy-MM-dd) the daily per-handle buckets belong to; a new day resets them.</summary>
     public string SpentTodayUtc { get; set; } = "";
 
     private static string TodayUtc => DateTime.UtcNow.ToString("yyyy-MM-dd");
@@ -259,9 +270,13 @@ public sealed class PublishedService
     public long SpentTodayFor(string handle)
         => SpentTodayUtc == TodayUtc && SpentByHandleToday.TryGetValue(handle, out var v) ? v : 0;
 
+    /// <summary>Requests the given handle has made TODAY (0 when the stored buckets are from a past day).</summary>
+    public int RequestsTodayFor(string handle)
+        => SpentTodayUtc == TodayUtc && RequestsByHandleToday.TryGetValue(handle, out var v) ? v : 0;
+
     /// <summary>
     /// True when this request must be refused: the service's LIFETIME total budget is exhausted, or the
-    /// calling handle has hit its DAILY per-handle cap. A 0 budget (unlimited) never blocks.
+    /// calling handle has hit its DAILY per-handle token cap. A 0 budget (unlimited) never blocks.
     /// </summary>
     public bool IsBudgetExhausted(string handle)
     {
@@ -270,13 +285,33 @@ public sealed class PublishedService
         return false;
     }
 
+    /// <summary>True when the calling handle has hit its daily request rate limit. A 0 limit never blocks.</summary>
+    public bool IsRateLimited(string handle)
+        => PerHandleDailyRequestLimit > 0 && RequestsTodayFor(handle) >= PerHandleDailyRequestLimit;
+
+    /// <summary>Resets the daily per-handle buckets (tokens + requests) when the UTC day has rolled over.</summary>
+    private void RollDailyBuckets()
+    {
+        var today = TodayUtc;
+        if (SpentTodayUtc == today) return;
+        SpentTodayUtc = today;
+        SpentByHandleToday.Clear();
+        RequestsByHandleToday.Clear();
+    }
+
+    /// <summary>Counts one accepted request from a handle against its daily rate limit.</summary>
+    public void RecordRequest(string handle)
+    {
+        RollDailyBuckets();
+        RequestsByHandleToday[handle] = (RequestsByHandleToday.TryGetValue(handle, out var v) ? v : 0) + 1;
+    }
+
     /// <summary>Adds a completed request's token cost to the lifetime total and today's per-handle bucket.</summary>
     public void RecordSpend(string handle, long tokens)
     {
         if (tokens <= 0) return;
         SpentTokens += tokens;
-        var today = TodayUtc;
-        if (SpentTodayUtc != today) { SpentTodayUtc = today; SpentByHandleToday.Clear(); }
+        RollDailyBuckets();
         SpentByHandleToday[handle] = (SpentByHandleToday.TryGetValue(handle, out var v) ? v : 0) + tokens;
     }
 }

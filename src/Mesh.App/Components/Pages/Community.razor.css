@@ -223,6 +223,11 @@
     margin-right: 3px;
 }
 
+.svc-percap-sep {
+    margin: 0 8px;
+    color: var(--stroke-2, var(--fg-3));
+}
+
 .budget-hint {
     margin-top: 8px;
     font-size: .78rem;

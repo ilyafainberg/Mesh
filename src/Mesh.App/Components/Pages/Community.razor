@@ -129,8 +129,12 @@
                         <span>Per person (MTokens, per day)</span>
                         <input type="number" min="0" step="0.1" @bind="newPerHandleMt" aria-label="Per-person daily budget in MTokens" />
                     </label>
+                    <label class="budget-field">
+                        <span>Requests / person / day</span>
+                        <input type="number" min="0" step="1" @bind="newReqLimit" aria-label="Daily request limit per person" />
+                    </label>
                 </div>
-                <div class="budget-hint"><i class="bi bi-info-circle"></i> 0 = unlimited. Total is a lifetime ceiling; per-person resets daily. Budgets can be raised later; spending never resets.</div>
+                <div class="budget-hint"><i class="bi bi-info-circle"></i> 0 = unlimited. Total is a lifetime ceiling; per-person budget and request limit reset daily. The request limit stops abuse from cheap request floods.</div>
 
                 <div class="form-actions">
                     <button class="primary" @onclick="Create" disabled="@string.IsNullOrWhiteSpace(newName)">
@@ -161,7 +165,11 @@
                                         </div>
                                         <span class="budget-label">@TokenFormat.SpentOfTotal(svc.SpentTokens, svc.TotalTokenBudget)</span>
                                     </div>
-                                    <div class="svc-percap"><i class="bi bi-person"></i> @(svc.PerHandleTokenBudget > 0 ? $"{TokenFormat.ToMTokens(svc.PerHandleTokenBudget)} / person / day" : "unlimited per person")</div>
+                                    <div class="svc-percap">
+                                        <i class="bi bi-person"></i> @(svc.PerHandleTokenBudget > 0 ? $"{TokenFormat.ToMTokens(svc.PerHandleTokenBudget)} / person / day" : "unlimited per person")
+                                        <span class="svc-percap-sep">·</span>
+                                        <i class="bi bi-speedometer2"></i> @(svc.PerHandleDailyRequestLimit > 0 ? $"{svc.PerHandleDailyRequestLimit} requests / person / day" : "unlimited requests")
+                                    </div>
                                 }
                                 @if (stat is not null)
                                 {
@@ -201,6 +209,10 @@
                                     <label class="budget-field">
                                         <span>Per person (MTokens, per day)</span>
                                         <input type="number" min="0" step="0.1" @bind="editPerHandleMt" aria-label="Per-person daily budget in MTokens" />
+                                    </label>
+                                    <label class="budget-field">
+                                        <span>Requests / person / day</span>
+                                        <input type="number" min="0" step="1" @bind="editReqLimit" aria-label="Daily request limit per person" />
                                     </label>
                                 </div>
                                 <div class="budget-hint"><i class="bi bi-info-circle"></i> 0 = unlimited. Total cannot go below the @TokenFormat.ToMTokens(svc.SpentTokens) already spent.</div>
@@ -301,6 +313,7 @@
     string newPersona = "";
     double newTotalMt = 1.0;
     double newPerHandleMt = 0.1;
+    int newReqLimit = 100;
 
     // Inline edit state (null when no service is being edited).
     string? editingId;
@@ -310,6 +323,7 @@
     string editPersona = "";
     double editTotalMt;
     double editPerHandleMt;
+    int editReqLimit;
 
     // Best-effort live stats for the owner's own services, keyed by ServiceId.
     readonly Dictionary<string, ServiceListing> statsById = new(StringComparer.Ordinal);
@@ -409,6 +423,7 @@
         editPersona = svc.Persona;
         editTotalMt = TokenFormat.ToMTokensValue(svc.TotalTokenBudget);
         editPerHandleMt = TokenFormat.ToMTokensValue(svc.PerHandleTokenBudget);
+        editReqLimit = svc.PerHandleDailyRequestLimit;
         StateHasChanged();
     }
 
@@ -424,7 +439,8 @@
             Category = ServiceCategories.Coerce(newCat),
             Persona = newPersona.Trim(),
             TotalTokenBudget = TokenFormat.FromMTokens(newTotalMt),
-            PerHandleTokenBudget = TokenFormat.FromMTokens(newPerHandleMt)
+            PerHandleTokenBudget = TokenFormat.FromMTokens(newPerHandleMt),
+            PerHandleDailyRequestLimit = Math.Max(0, newReqLimit)
         }));
         newName = "";
         newDesc = "";
@@ -432,6 +448,7 @@
         newPersona = "";
         newTotalMt = 1.0;
         newPerHandleMt = 0.1;
+        newReqLimit = 100;
     }
 
     async Task SaveEdit(PublishedService svc)
@@ -454,6 +471,7 @@
             svc.Persona = persona;
             svc.TotalTokenBudget = total;
             svc.PerHandleTokenBudget = perHandle;
+            svc.PerHandleDailyRequestLimit = Math.Max(0, editReqLimit);
         });
         // Propagate metadata changes to the live directory listing when published.
         if (svc.Published)
