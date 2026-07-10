@@ -597,6 +597,72 @@ app.MapPost("/capabilities/{serviceId}/vote", async (string serviceId, ServiceVo
     return Results.Ok(new { voted = serviceId, vote });
 });
 
+// ---- Public shareable landing pages (HTML) --------------------------------
+// These render self-contained, mobile-friendly pages so an https link works for anyone, including
+// people without the app installed. Each page first attempts the mesh:// deep link, then after a
+// short fallback timer reveals install call-to-actions. No external assets, no private data leaked.
+
+// Service landing page: previews public service metadata + reputation, deep-links into the app.
+app.MapGet("/s/{handle}/{serviceId}", async (string handle, string serviceId) =>
+{
+    var svc = await store.GetServiceAsync(serviceId);
+    if (svc is null)
+    {
+        var missing = $$"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Mesh</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f3f4f6;margin:0;color:#111827}.wrap{max-width:420px;margin:0 auto;padding:48px 16px}.brand{font-weight:700;font-size:20px;color:#2563eb;text-align:center;margin-bottom:24px}.card{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.1);text-align:center}h1{font-size:19px;margin:0 0 8px}p{color:#6b7280;font-size:14px;line-height:1.5;margin:0 0 12px}.btn{display:block;text-align:center;background:#2563eb;color:#fff;text-decoration:none;padding:12px;border-radius:10px;margin-top:10px;font-weight:600}.muted{color:#9ca3af;font-size:13px;text-align:center;margin:12px 0 0}</style></head>
+<body><div class="wrap"><div class="brand">Mesh</div><div class="card">
+<h1>Service not found</h1><p>This service is no longer available or the link is incorrect.</p>
+<a class="btn" href="https://meshrelaydl.blob.core.windows.net/releases/Mesh-Setup-v1.5.2.exe">Download for Windows</a>
+<p class="muted">Also on Android</p></div></div></body></html>
+""";
+        return Results.Content(missing, "text/html", Encoding.UTF8, 404);
+    }
+
+    var listing = ToListing(svc);
+    var deep = $"mesh://service?handle={Uri.EscapeDataString(listing.Handle)}&id={Uri.EscapeDataString(listing.ServiceId)}&name={Uri.EscapeDataString(listing.Name)}";
+    var html = $$"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{{Escape(listing.Name)}} on Mesh</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f3f4f6;margin:0;color:#111827}.wrap{max-width:420px;margin:0 auto;padding:40px 16px}.brand{font-weight:700;font-size:20px;color:#2563eb;text-align:center;margin-bottom:24px}.card{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.1)}h1{font-size:20px;margin:0 0 4px}.by{color:#6b7280;font-size:14px;margin:0 0 12px}.desc{font-size:15px;line-height:1.5;margin:0 0 12px}.cat{display:inline-block;background:#eff6ff;color:#2563eb;border-radius:999px;padding:2px 10px;font-size:12px;margin-bottom:12px}.rating{color:#6b7280;font-size:13px;margin:0}.btn{display:block;text-align:center;background:#2563eb;color:#fff;text-decoration:none;padding:12px;border-radius:10px;margin-top:10px;font-weight:600}.btn.ghost{background:#fff;color:#2563eb;border:1px solid #2563eb}.muted{color:#9ca3af;font-size:13px;text-align:center;margin:12px 0 0}</style></head>
+<body><div class="wrap"><div class="brand">Mesh</div><div class="card">
+<h1>{{Escape(listing.Name)}}</h1><p class="by">by @{{Escape(listing.Handle)}}</p>
+<span class="cat">{{Escape(listing.Category)}}</span>
+<p class="desc">{{Escape(listing.Description)}}</p>
+<p class="rating">{{listing.Upvotes}} up, {{listing.Downvotes}} down, {{listing.UniqueUsers}} users</p>
+<div id="cta" style="display:none">
+<a class="btn" href="https://meshrelaydl.blob.core.windows.net/releases/Mesh-Setup-v1.5.2.exe">Download for Windows</a>
+<a class="btn ghost" href="{{deep}}">Open in Mesh</a>
+<p class="muted">Also on Android</p></div></div></div>
+<script>setTimeout(function(){document.getElementById('cta').style.display='block';},1500);window.location.href="{{deep}}";</script>
+</body></html>
+""";
+    return Results.Content(html, "text/html");
+});
+
+// Handle landing page: PRIVACY GUARDRAIL - no backend lookup, no private data. Renders only the
+// normalized @handle plus the deep link and install CTAs.
+app.MapGet("/u/{handle}", (string handle) =>
+{
+    var normalized = Normalize(handle);
+    var deep = $"mesh://user?handle={Uri.EscapeDataString(normalized)}";
+    var html = $$"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>@{{Escape(normalized)}} on Mesh</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f3f4f6;margin:0;color:#111827}.wrap{max-width:420px;margin:0 auto;padding:48px 16px}.brand{font-weight:700;font-size:20px;color:#2563eb;text-align:center;margin-bottom:24px}.card{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.1);text-align:center}h1{font-size:22px;margin:0 0 16px}.btn{display:block;text-align:center;background:#2563eb;color:#fff;text-decoration:none;padding:12px;border-radius:10px;margin-top:10px;font-weight:600}.btn.ghost{background:#fff;color:#2563eb;border:1px solid #2563eb}.muted{color:#9ca3af;font-size:13px;text-align:center;margin:12px 0 0}</style></head>
+<body><div class="wrap"><div class="brand">Mesh</div><div class="card">
+<h1>@{{Escape(normalized)}}</h1>
+<div id="cta" style="display:none">
+<a class="btn" href="https://meshrelaydl.blob.core.windows.net/releases/Mesh-Setup-v1.5.2.exe">Download for Windows</a>
+<a class="btn ghost" href="{{deep}}">Open in Mesh</a>
+<p class="muted">Also on Android</p></div></div></div>
+<script>setTimeout(function(){document.getElementById('cta').style.display='block';},1500);window.location.href="{{deep}}";</script>
+</body></html>
+""";
+    return Results.Content(html, "text/html");
+});
+
 // ---- SignalR transport hub ------------------------------------------------
 app.MapHub<MeshHub>(MeshHubProtocol.Route);
 
@@ -608,6 +674,11 @@ static string Normalize(string handle)
     => handle.Trim().TrimStart('@').ToLowerInvariant();
 
 static string Trim(string s) => s.Length > 300 ? s[..300] : s;
+
+// Minimal HTML-entity escaper for values interpolated into the public landing pages, so untrusted
+// service metadata cannot break the markup or inject script.
+static string Escape(string s)
+    => (s ?? "").Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
 
 // Projects a stored service + its reputation to the public directory listing shape. Upvotes/Downvotes
 // are counted from the per-voter vote map, UniqueUsers from the attested-usage set, and Score is the

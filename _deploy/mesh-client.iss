@@ -69,6 +69,15 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon; IconFilename: "{app}\meshicon.ico"
 Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: startupicon; IconFilename: "{app}\meshicon.ico"
 
+[Registry]
+; Register the mesh:// URL protocol so clicked deep links (mesh://service?..., mesh://user?...,
+; and the pairing mesh://link?...) launch the app with the URI as the first argument. Per-user
+; (HKA maps to HKCU for a lowest-privilege install); removed on uninstall.
+Root: HKA; Subkey: "Software\Classes\mesh"; ValueType: string; ValueName: ""; ValueData: "URL:Mesh Protocol"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\mesh"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\mesh\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExeName},0"
+Root: HKA; Subkey: "Software\Classes\mesh\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
+
 [Run]
 ; Install Python via winget when the user opted in and it isn't already present. winget ships on
 ; Windows 10 21H2+ and Windows 11; if it's missing the command simply no-ops (nowait, runhidden).

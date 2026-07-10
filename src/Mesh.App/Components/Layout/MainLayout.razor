@@ -105,6 +105,9 @@ else
         });
 #endif
 
+        // A clicked mesh:// deep link (service or handle) opens the matching conversation.
+        DeepLinkDispatch.SetHandler(uri => InvokeAsync(() => HandleDeepLink(uri)));
+
         if (State.IsOnboarded)
         {
             // On mobile, the desktop Home ("/") and Messages ("/messages") routes are replaced by
@@ -134,6 +137,23 @@ else
 
     private void Refresh() => InvokeAsync(StateHasChanged);
 
+    // Routes a mesh:// deep link: ensure the target conversation exists, bring the window forward,
+    // and open it in Messages. Services and handles both land in a Messages thread.
+    private void HandleDeepLink(string uri)
+    {
+        var link = DeepLink.TryParse(uri);
+        string? key = null;
+        if (link.Kind == DeepLink.Kind.Service && !string.IsNullOrEmpty(link.Handle) && !string.IsNullOrEmpty(link.ServiceId))
+            key = State.GetOrCreateServiceConversation(link.Handle!, link.ServiceId!, link.ServiceName).Handle;
+        else if (link.Kind == DeepLink.Kind.User && !string.IsNullOrEmpty(link.Handle))
+            key = State.GetOrCreateConversation(link.Handle!).Handle;
+        if (key is null) return;
+
+        AppControl.ShowMainWindow();
+        State.RequestOpenConversation(key);
+        Nav.NavigateTo(PlatformCaps.IsMobile ? "/m/messages" : "/messages");
+    }
+
     public void Dispose()
     {
         State.Changed -= Refresh;
@@ -143,5 +163,6 @@ else
 #if WINDOWS
         global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = null;
 #endif
+        DeepLinkDispatch.SetHandler(null);
     }
 }

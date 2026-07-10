@@ -621,6 +621,11 @@
                             {
                                 <button class="ghost" disabled="@switching" @onclick="() => Switch(a)">Switch</button>
                             }
+                            <button class="icon-btn" title="Copy a shareable link to this handle" aria-label="Copy share link" @onclick="() => ShareHandle(a)"><i class="bi bi-share"></i></button>
+                            @if (copiedHandle == a.Handle)
+                            {
+                                <span class="vis shared" title="Link copied to clipboard">copied</span>
+                            }
                             @if (deleteId == a.Id)
                             {
                                 <button class="danger" @onclick="() => DeleteAccount(a)">Delete</button>
@@ -865,6 +870,22 @@
             }
         }
         finally { switching = false; }
+    }
+
+    // Copies a public, shareable web link to this handle to the clipboard (works for anyone: the
+    // meshrelay.net landing page bounces to the mesh:// deep link or offers install).
+    string? copiedHandle;
+    async Task ShareHandle(AccountRef a)
+    {
+        try
+        {
+            await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(UniversalLink.ForHandle(a.Handle));
+            copiedHandle = a.Handle;
+            StateHasChanged();
+            await Task.Delay(2000);
+            if (copiedHandle == a.Handle) { copiedHandle = null; StateHasChanged(); }
+        }
+        catch { /* clipboard is best-effort */ }
     }
 
     async Task DeleteAccount(AccountRef a)

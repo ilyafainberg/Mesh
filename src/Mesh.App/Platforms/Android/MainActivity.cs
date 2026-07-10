@@ -1,17 +1,25 @@
 using Android.App;
+using Android.Content;
 using Android.Content.PM;
 using Android.OS;
 using Android.Views;
 using AndroidX.Core.View;
+using Mesh.App.Services;
 
 namespace Mesh.App;
 
-[Activity(Theme = "@style/Maui.SplashTheme", MainLauncher = true, ConfigurationChanges = ConfigChanges.ScreenSize | ConfigChanges.Orientation | ConfigChanges.UiMode | ConfigChanges.ScreenLayout | ConfigChanges.SmallestScreenSize | ConfigChanges.Density, WindowSoftInputMode = SoftInput.AdjustResize)]
+[Activity(Theme = "@style/Maui.SplashTheme", MainLauncher = true, LaunchMode = LaunchMode.SingleTask, ConfigurationChanges = ConfigChanges.ScreenSize | ConfigChanges.Orientation | ConfigChanges.UiMode | ConfigChanges.ScreenLayout | ConfigChanges.SmallestScreenSize | ConfigChanges.Density, WindowSoftInputMode = SoftInput.AdjustResize)]
+[IntentFilter(new[] { Intent.ActionView },
+    Categories = new[] { Intent.CategoryDefault, Intent.CategoryBrowsable },
+    DataScheme = "mesh")]
 public class MainActivity : MauiAppCompatActivity
 {
     protected override void OnCreate(Bundle? savedInstanceState)
     {
         base.OnCreate(savedInstanceState);
+
+        // Cold start: the app was launched by a clicked mesh:// link (SingleTask so there is one task).
+        HandleDeepLinkIntent(Intent);
 
         // Let the window draw into the display cutout on the short edges (API 28+ / P).
         if (OperatingSystem.IsAndroidVersionAtLeast(28))
@@ -44,6 +52,21 @@ public class MainActivity : MauiAppCompatActivity
             ViewCompat.SetOnApplyWindowInsetsListener(content, new SafeAreaInsetsListener());
             ViewCompat.RequestApplyInsets(content);
         }
+    }
+
+    /// <summary>Warm start: a clicked mesh:// link arrives while the app is already running (SingleTask).</summary>
+    protected override void OnNewIntent(Intent? intent)
+    {
+        base.OnNewIntent(intent);
+        HandleDeepLinkIntent(intent);
+    }
+
+    /// <summary>Routes a mesh:// deep link from an intent to the Blazor UI, if present.</summary>
+    private static void HandleDeepLinkIntent(Intent? intent)
+    {
+        var data = intent?.DataString;
+        if (!string.IsNullOrWhiteSpace(data) && data.StartsWith("mesh://", System.StringComparison.OrdinalIgnoreCase))
+            DeepLinkDispatch.Dispatch(data);
     }
 
     /// <summary>Pads the content view by the system bars and display cutout (top + sides) and by the

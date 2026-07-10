@@ -120,6 +120,68 @@
                 </select>
                 <textarea class="full" rows="3" @bind="newPersona" placeholder="How should your service agent behave?" aria-label="Persona"></textarea>
 
+                <div class="cap-pickers">
+                    <div class="cap-pickers-head">
+                        <span><i class="bi bi-unlock"></i> Exposed capabilities</span>
+                        <span class="cap-summary">@CapSummary(newKnowledgeIds, newSkillIds, newWidgetIds)</span>
+                    </div>
+                    <span class="cap-note">Pick which of your items THIS service may use. Anything not selected stays private to it.</span>
+
+                    <div class="cap-group">
+                        <h4><i class="bi bi-journal-text"></i> Knowledge</h4>
+                        <div class="chip-row">
+                            @foreach (var k in State.Profile.Knowledge)
+                            {
+                                <label class="chip @(newKnowledgeIds.Contains(k.Id) ? "on" : "")" @key="k.Id">
+                                    <input type="checkbox" checked="@newKnowledgeIds.Contains(k.Id)"
+                                           @onchange="e => ToggleCap(newKnowledgeIds, k.Id, (bool)(e.Value ?? false))" />
+                                    @(string.IsNullOrWhiteSpace(k.Title) ? "(untitled)" : k.Title)
+                                </label>
+                            }
+                            @if (State.Profile.Knowledge.Count == 0)
+                            {
+                                <span class="empty-mini">No knowledge items yet.</span>
+                            }
+                        </div>
+                    </div>
+
+                    <div class="cap-group">
+                        <h4><i class="bi bi-lightning-charge"></i> Skills</h4>
+                        <div class="chip-row">
+                            @foreach (var s in State.Profile.Skills)
+                            {
+                                <label class="chip @(newSkillIds.Contains(s.Id) ? "on" : "")" @key="s.Id">
+                                    <input type="checkbox" checked="@newSkillIds.Contains(s.Id)"
+                                           @onchange="e => ToggleCap(newSkillIds, s.Id, (bool)(e.Value ?? false))" />
+                                    @(string.IsNullOrWhiteSpace(s.Name) ? "(unnamed)" : s.Name)
+                                </label>
+                            }
+                            @if (State.Profile.Skills.Count == 0)
+                            {
+                                <span class="empty-mini">No skills yet.</span>
+                            }
+                        </div>
+                    </div>
+
+                    <div class="cap-group">
+                        <h4><i class="bi bi-window-stack"></i> Widgets</h4>
+                        <div class="chip-row">
+                            @foreach (var w in State.Profile.Widgets)
+                            {
+                                <label class="chip @(newWidgetIds.Contains(w.Id) ? "on" : "")" @key="w.Id">
+                                    <input type="checkbox" checked="@newWidgetIds.Contains(w.Id)"
+                                           @onchange="e => ToggleCap(newWidgetIds, w.Id, (bool)(e.Value ?? false))" />
+                                    @(string.IsNullOrWhiteSpace(w.Name) ? "(unnamed)" : w.Name)
+                                </label>
+                            }
+                            @if (State.Profile.Widgets.Count == 0)
+                            {
+                                <span class="empty-mini">No widgets yet.</span>
+                            }
+                        </div>
+                    </div>
+                </div>
+
                 <div class="budget-row">
                     <label class="budget-field">
                         <span>Total budget (MTokens, lifetime)</span>
@@ -181,6 +243,11 @@
                                 }
                             </div>
                             <div class="row-actions">
+                                <button class="icon-btn" title="Copy share link" aria-label="Copy share link" @onclick="() => CopyShareLink(svc)"><i class="bi bi-share"></i></button>
+                                @if (copiedId == svc.Id)
+                                {
+                                    <span class="svc-copied"><i class="bi bi-check-lg"></i> Copied!</span>
+                                }
                                 <button class="icon-btn" title="Edit" aria-label="Edit service" @onclick="() => BeginEdit(svc)"><i class="bi bi-pencil"></i></button>
                                 <button class="@(svc.Published ? "primary" : "ghost")" title="@(svc.Published ? "Delist from the directory" : "List in the directory")"
                                         @onclick="() => TogglePublish(svc, !svc.Published)">
@@ -201,6 +268,69 @@
                                     }
                                 </select>
                                 <textarea class="full" rows="3" @bind="editPersona" placeholder="How should your service agent behave?" aria-label="Persona"></textarea>
+
+                                <div class="cap-pickers">
+                                    <div class="cap-pickers-head">
+                                        <span><i class="bi bi-unlock"></i> Exposed capabilities</span>
+                                        <span class="cap-summary">@CapSummary(editKnowledgeIds, editSkillIds, editWidgetIds)</span>
+                                    </div>
+                                    <span class="cap-note">Pick which of your items THIS service may use. Anything not selected stays private to it.</span>
+
+                                    <div class="cap-group">
+                                        <h4><i class="bi bi-journal-text"></i> Knowledge</h4>
+                                        <div class="chip-row">
+                                            @foreach (var k in State.Profile.Knowledge)
+                                            {
+                                                <label class="chip @(editKnowledgeIds.Contains(k.Id) ? "on" : "")" @key="k.Id">
+                                                    <input type="checkbox" checked="@editKnowledgeIds.Contains(k.Id)"
+                                                           @onchange="e => ToggleCap(editKnowledgeIds, k.Id, (bool)(e.Value ?? false))" />
+                                                    @(string.IsNullOrWhiteSpace(k.Title) ? "(untitled)" : k.Title)
+                                                </label>
+                                            }
+                                            @if (State.Profile.Knowledge.Count == 0)
+                                            {
+                                                <span class="empty-mini">No knowledge items yet.</span>
+                                            }
+                                        </div>
+                                    </div>
+
+                                    <div class="cap-group">
+                                        <h4><i class="bi bi-lightning-charge"></i> Skills</h4>
+                                        <div class="chip-row">
+                                            @foreach (var s in State.Profile.Skills)
+                                            {
+                                                <label class="chip @(editSkillIds.Contains(s.Id) ? "on" : "")" @key="s.Id">
+                                                    <input type="checkbox" checked="@editSkillIds.Contains(s.Id)"
+                                                           @onchange="e => ToggleCap(editSkillIds, s.Id, (bool)(e.Value ?? false))" />
+                                                    @(string.IsNullOrWhiteSpace(s.Name) ? "(unnamed)" : s.Name)
+                                                </label>
+                                            }
+                                            @if (State.Profile.Skills.Count == 0)
+                                            {
+                                                <span class="empty-mini">No skills yet.</span>
+                                            }
+                                        </div>
+                                    </div>
+
+                                    <div class="cap-group">
+                                        <h4><i class="bi bi-window-stack"></i> Widgets</h4>
+                                        <div class="chip-row">
+                                            @foreach (var w in State.Profile.Widgets)
+                                            {
+                                                <label class="chip @(editWidgetIds.Contains(w.Id) ? "on" : "")" @key="w.Id">
+                                                    <input type="checkbox" checked="@editWidgetIds.Contains(w.Id)"
+                                                           @onchange="e => ToggleCap(editWidgetIds, w.Id, (bool)(e.Value ?? false))" />
+                                                    @(string.IsNullOrWhiteSpace(w.Name) ? "(unnamed)" : w.Name)
+                                                </label>
+                                            }
+                                            @if (State.Profile.Widgets.Count == 0)
+                                            {
+                                                <span class="empty-mini">No widgets yet.</span>
+                                            }
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <div class="budget-row">
                                     <label class="budget-field">
                                         <span>Total budget (MTokens, lifetime)</span>
@@ -228,61 +358,6 @@
                 {
                     <div class="empty">No services yet. Create one above, then toggle Published to list it.</div>
                 }
-            </div>
-
-            <div class="pane-head" style="padding-left:0;padding-right:0;">
-                <h2><i class="bi bi-unlock"></i> What's public</h2>
-                <span class="muted">@PublicCount items public · these capabilities may be reached by anyone through a service</span>
-            </div>
-
-            <div class="card-panel">
-                <h3><i class="bi bi-journal-text"></i> Knowledge</h3>
-                <div class="chip-row">
-                    @foreach (var k in State.Profile.Knowledge)
-                    {
-                        <label class="chip @(SystemCircles.IsPublicListed(k.Visibility) ? "on" : "")" @key="k.Id">
-                            <input type="checkbox" checked="@SystemCircles.IsPublicListed(k.Visibility)"
-                                   @onchange="e => TogglePublic(v => k.Visibility = v, (bool)(e.Value ?? false))" />
-                            @(string.IsNullOrWhiteSpace(k.Title) ? "(untitled)" : k.Title)
-                        </label>
-                    }
-                    @if (State.Profile.Knowledge.Count == 0)
-                    {
-                        <span class="empty-mini">No knowledge items yet.</span>
-                    }
-                </div>
-
-                <h3><i class="bi bi-lightning-charge"></i> Skills</h3>
-                <div class="chip-row">
-                    @foreach (var s in State.Profile.Skills)
-                    {
-                        <label class="chip @(SystemCircles.IsPublicListed(s.Visibility) ? "on" : "")" @key="s.Id">
-                            <input type="checkbox" checked="@SystemCircles.IsPublicListed(s.Visibility)"
-                                   @onchange="e => TogglePublic(v => s.Visibility = v, (bool)(e.Value ?? false))" />
-                            @(string.IsNullOrWhiteSpace(s.Name) ? "(unnamed)" : s.Name)
-                        </label>
-                    }
-                    @if (State.Profile.Skills.Count == 0)
-                    {
-                        <span class="empty-mini">No skills yet.</span>
-                    }
-                </div>
-
-                <h3><i class="bi bi-window-stack"></i> Widgets</h3>
-                <div class="chip-row">
-                    @foreach (var w in State.Profile.Widgets)
-                    {
-                        <label class="chip @(SystemCircles.IsPublicListed(w.Visibility) ? "on" : "")" @key="w.Id">
-                            <input type="checkbox" checked="@SystemCircles.IsPublicListed(w.Visibility)"
-                                   @onchange="e => TogglePublic(v => w.Visibility = v, (bool)(e.Value ?? false))" />
-                            @(string.IsNullOrWhiteSpace(w.Name) ? "(unnamed)" : w.Name)
-                        </label>
-                    }
-                    @if (State.Profile.Widgets.Count == 0)
-                    {
-                        <span class="empty-mini">No widgets yet.</span>
-                    }
-                </div>
             </div>
         }
     </div>
@@ -315,6 +390,11 @@
     double newPerHandleMt = 0.1;
     int newReqLimit = 100;
 
+    // Per-service capability selections for the create form (ids of items THIS new service may use).
+    readonly HashSet<string> newKnowledgeIds = new(StringComparer.Ordinal);
+    readonly HashSet<string> newSkillIds = new(StringComparer.Ordinal);
+    readonly HashSet<string> newWidgetIds = new(StringComparer.Ordinal);
+
     // Inline edit state (null when no service is being edited).
     string? editingId;
     string editName = "";
@@ -324,6 +404,14 @@
     double editTotalMt;
     double editPerHandleMt;
     int editReqLimit;
+
+    // Per-service capability selections for the inline edit panel, seeded from the service in BeginEdit.
+    readonly HashSet<string> editKnowledgeIds = new(StringComparer.Ordinal);
+    readonly HashSet<string> editSkillIds = new(StringComparer.Ordinal);
+    readonly HashSet<string> editWidgetIds = new(StringComparer.Ordinal);
+
+    // Transient: id of the service whose share link was just copied (drives the inline "Copied!" hint).
+    string? copiedId;
 
     // Best-effort live stats for the owner's own services, keyed by ServiceId.
     readonly Dictionary<string, ServiceListing> statsById = new(StringComparer.Ordinal);
@@ -424,6 +512,12 @@
         editTotalMt = TokenFormat.ToMTokensValue(svc.TotalTokenBudget);
         editPerHandleMt = TokenFormat.ToMTokensValue(svc.PerHandleTokenBudget);
         editReqLimit = svc.PerHandleDailyRequestLimit;
+        editKnowledgeIds.Clear();
+        editKnowledgeIds.UnionWith(svc.KnowledgeIds);
+        editSkillIds.Clear();
+        editSkillIds.UnionWith(svc.SkillIds);
+        editWidgetIds.Clear();
+        editWidgetIds.UnionWith(svc.WidgetIds);
         StateHasChanged();
     }
 
@@ -440,7 +534,10 @@
             Persona = newPersona.Trim(),
             TotalTokenBudget = TokenFormat.FromMTokens(newTotalMt),
             PerHandleTokenBudget = TokenFormat.FromMTokens(newPerHandleMt),
-            PerHandleDailyRequestLimit = Math.Max(0, newReqLimit)
+            PerHandleDailyRequestLimit = Math.Max(0, newReqLimit),
+            KnowledgeIds = newKnowledgeIds.ToList(),
+            SkillIds = newSkillIds.ToList(),
+            WidgetIds = newWidgetIds.ToList()
         }));
         newName = "";
         newDesc = "";
@@ -449,6 +546,9 @@
         newTotalMt = 1.0;
         newPerHandleMt = 0.1;
         newReqLimit = 100;
+        newKnowledgeIds.Clear();
+        newSkillIds.Clear();
+        newWidgetIds.Clear();
     }
 
     async Task SaveEdit(PublishedService svc)
@@ -472,6 +572,9 @@
             svc.TotalTokenBudget = total;
             svc.PerHandleTokenBudget = perHandle;
             svc.PerHandleDailyRequestLimit = Math.Max(0, editReqLimit);
+            svc.KnowledgeIds = editKnowledgeIds.ToList();
+            svc.SkillIds = editSkillIds.ToList();
+            svc.WidgetIds = editWidgetIds.ToList();
         });
         // Propagate metadata changes to the live directory listing when published.
         if (svc.Published)
@@ -505,14 +608,36 @@
         await RefreshStats();
     }
 
-    // ---- Public-capability whitelist ----
-    int PublicCount =>
-        State.Profile.Knowledge.Count(k => SystemCircles.IsPublicListed(k.Visibility))
-        + State.Profile.Skills.Count(s => SystemCircles.IsPublicListed(s.Visibility))
-        + State.Profile.Widgets.Count(w => SystemCircles.IsPublicListed(w.Visibility));
+    // ---- Per-service capability pickers ----
+    // Toggles one capability id in a selection set (used by both the create form and the edit panel).
+    void ToggleCap(HashSet<string> set, string id, bool on)
+    {
+        if (on) set.Add(id);
+        else set.Remove(id);
+        StateHasChanged();
+    }
 
-    void TogglePublic(Action<string> setVisibility, bool on)
-        => State.Mutate(_ => setVisibility(on ? SystemCircles.PublicVisibility : "private"));
+    // A short "N knowledge, N skills, N widgets exposed" summary for a selection.
+    static string CapSummary(HashSet<string> knowledge, HashSet<string> skills, HashSet<string> widgets)
+    {
+        static string Pluralize(int n, string noun) => $"{n} {noun}{(n == 1 ? "" : "s")}";
+        return $"{knowledge.Count} knowledge, {Pluralize(skills.Count, "skill")}, {Pluralize(widgets.Count, "widget")} exposed";
+    }
+
+    // Copies the public web share link for a service and briefly shows a "Copied!" confirmation.
+    async Task CopyShareLink(PublishedService svc)
+    {
+        var link = global::Mesh.Shared.UniversalLink.ForService(State.Profile.Handle, svc.Id);
+        await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(link);
+        copiedId = svc.Id;
+        StateHasChanged();
+        await Task.Delay(2000);
+        if (copiedId == svc.Id)
+        {
+            copiedId = null;
+            StateHasChanged();
+        }
+    }
 
     public void Dispose() => State.Changed -= Refresh;
 }

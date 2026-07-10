@@ -203,14 +203,88 @@
 
 .svc-item.editing {
     background: var(--bg-2);
-    border-radius: var(--radius-m);
+    /* Go edge-to-edge inside the .card-panel: cancel its 20px horizontal padding, then restore the
+       same inset internally so the title row and the edit fields share one left edge (no collision). */
+    margin: 0 -20px;
+    padding: 0 20px;
+    border-top: 1px solid var(--stroke-1);
+    border-bottom: 1px solid var(--stroke-1);
 }
 
 .svc-edit {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    padding: 4px 12px 14px;
+    padding: 8px 0 16px;
+}
+
+/* Per-service capability pickers (Knowledge / Skills / Widgets chip groups) */
+.cap-pickers {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-m);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.cap-pickers-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-weight: 600;
+    font-size: .88rem;
+}
+
+.cap-pickers-head i.bi {
+    color: var(--brand);
+    margin-right: 4px;
+}
+
+.cap-summary {
+    font-weight: 500;
+    font-size: .76rem;
+    color: var(--brand);
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-1);
+    border-radius: 999px;
+    padding: 2px 10px;
+    white-space: nowrap;
+}
+
+.cap-note {
+    font-size: .78rem;
+    color: var(--fg-3);
+    margin-top: -4px;
+}
+
+.cap-group h4 {
+    font-size: .82rem;
+    font-weight: 600;
+    color: var(--fg-2);
+    margin: 0 0 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.cap-group h4 i.bi {
+    color: var(--brand);
+}
+
+/* "Copied!" confirmation next to the share button on a service row */
+.svc-copied {
+    align-self: center;
+    font-size: .76rem;
+    font-weight: 600;
+    color: var(--ok);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
 }
 
 .svc-percap {

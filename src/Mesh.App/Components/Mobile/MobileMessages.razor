@@ -33,7 +33,8 @@
                     <span class="avatar">@initial</span>
                     <div class="chat-main">
                         <span class="chat-name">@nm</span>
-                        @if (!IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
+                        @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
+                        @if (!c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
                     </div>
                     @if (State.IsUnread(c.Handle)) { <span class="chat-unread" title="Unread message"></span> }
                 </div>
@@ -92,7 +93,21 @@ else
             <button class="ghost icon-btn back-btn" @onclick="() => active = null" title="Back" aria-label="Back to conversations"><i class="bi bi-chevron-left"></i></button>
             <div class="thread-id">
                 <span class="thread-name">@State.DisplayNameFor(active)</span>
-                <span class="thread-sub">@(IsAllowed(active) ? "their agent can talk to yours" : "you can message them")</span>
+                @if (conv.IsService)
+                {
+                    var svc = State.Profile.PublishedServices.FirstOrDefault(s => s.Id == conv.ServiceId);
+                    <span class="thread-sub">
+                        public service - messages go to its sandboxed agent
+                        @if (svc is not null)
+                        {
+                            <span class="contact-tokens" title="Tokens spent vs this service's lifetime budget"><i class="bi bi-coin"></i> @TokenFormat.SpentOfTotal(svc.SpentTokens, svc.TotalTokenBudget)</span>
+                        }
+                    </span>
+                }
+                else
+                {
+                    <span class="thread-sub">@(IsAllowed(active) ? "their agent can talk to yours" : "you can message them")</span>
+                }
             </div>
             <div class="head-actions">
                 @if (confirmDelete == active)
@@ -190,16 +205,19 @@ else
                         }
                     </div>
                 }
-                <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
-                    <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
-                            title="Send to their agent (it may auto-reply)">
-                        <i class="bi bi-robot"></i> Agent
-                    </button>
-                    <button class="@(directMode ? "on" : "")" @onclick="() => directMode = true" disabled="@busy"
-                            title="Send to them directly (no agent reply)">
-                        <i class="bi bi-person"></i> Person
-                    </button>
-                </div>
+                @if (!ActiveIsService)
+                {
+                    <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
+                        <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
+                                title="Send to their agent (it may auto-reply)">
+                            <i class="bi bi-robot"></i> Agent
+                        </button>
+                        <button class="@(directMode ? "on" : "")" @onclick="() => directMode = true" disabled="@busy"
+                                title="Send to them directly (no agent reply)">
+                            <i class="bi bi-person"></i> Person
+                        </button>
+                    </div>
+                }
                 <div class="composer">
                     <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="() => widgetMode = !widgetMode" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget (mini-app)">
                         <i class="bi bi-plus-lg"></i>
@@ -254,11 +272,15 @@ else
 
     bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
+    bool ActiveIsService => active is not null && State.FindConversation(active)?.IsService == true;
+
     string Placeholder => widgetMode
         ? "Describe a widget to send…"
-        : directMode
+        : ActiveIsService
             ? $"Message {State.DisplayNameFor(active!)}…"
-            : $"Message {State.DisplayNameFor(active!)}'s Agent…";
+            : directMode
+                ? $"Message {State.DisplayNameFor(active!)}…"
+                : $"Message {State.DisplayNameFor(active!)}'s Agent…";
 
     protected override void OnInitialized()
     {
@@ -456,6 +478,10 @@ else
         var widget = widgetMode;
         if (widgetMode) widgetMode = false;
 
+        // Service threads always route through the sandboxed service channel (no direct/widget modes).
+        var isService = State.FindConversation(active)?.IsService == true;
+        if (isService) { direct = false; widget = false; }
+
         var via = direct ? "person" : "agent";
         var line = new ChatLine { Role = "assistant", Text = text, Via = via, AddressedToAgent = !direct };
         State.AddChatLine(active, line);
@@ -493,6 +519,17 @@ else
     // the line's stable id so delivery receipts update the right bubble.
     async Task DeliverAsync(string handle, ChatLine line, string text, List<StagedFile> files, bool direct, bool widget)
     {
+        // Service thread: send a ServiceRequest with transcript context to the provider's sandboxed
+        // agent, instead of a normal person/agent message.
+        var svcConv = State.FindConversation(handle);
+        if (svcConv?.IsService == true)
+        {
+            line.Text = text;
+            line.Status = "sent";
+            await Mesh.SendServiceRequestAsync(svcConv);
+            return;
+        }
+
         var toSend = text;
         if (widget && !string.IsNullOrWhiteSpace(text))
             toSend = await Agent.BuildWidgetAsync(text);

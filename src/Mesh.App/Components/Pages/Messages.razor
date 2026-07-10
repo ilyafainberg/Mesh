@@ -285,6 +285,20 @@
             active = h;
             State.MarkRead(h);
         }
+
+        OpenPendingDeepLink();
+    }
+
+    // Opens a conversation a mesh:// deep link asked for (the router pre-created it and set the key).
+    void OpenPendingDeepLink()
+    {
+        var key = State.ConsumePendingOpen();
+        if (key is null) return;
+        if (State.FindConversation(key) is null) return;
+        active = key;
+        confirmDelete = null;
+        composerWired = false;
+        State.MarkRead(key);
     }
 
     static string? ParseQueryValue(string queryString, string key)
@@ -299,7 +313,11 @@
         }
         return null;
     }
-    void Refresh() => InvokeAsync(StateHasChanged);
+    void Refresh()
+    {
+        if (State.PendingOpenConversation is not null) OpenPendingDeepLink();
+        InvokeAsync(StateHasChanged);
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {

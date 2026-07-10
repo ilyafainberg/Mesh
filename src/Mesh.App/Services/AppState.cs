@@ -306,6 +306,28 @@ public sealed class AppState
     /// <summary>True when the given conversation has an unread inbound message.</summary>
     public bool IsUnread(string handle) => unread.Contains(Norm(handle));
 
+    /// <summary>
+    /// A conversation key a deep link asked to open. The Messages screen consumes this on navigation
+    /// and selects that conversation. Set by the deep-link router after it ensures the conversation
+    /// exists; cleared once opened.
+    /// </summary>
+    public string? PendingOpenConversation { get; private set; }
+
+    /// <summary>Requests that the Messages screen open the given conversation key (from a deep link).</summary>
+    public void RequestOpenConversation(string key)
+    {
+        PendingOpenConversation = key;
+        NotifyChanged();
+    }
+
+    /// <summary>Returns and clears the pending deep-link conversation, or null when there is none.</summary>
+    public string? ConsumePendingOpen()
+    {
+        var k = PendingOpenConversation;
+        PendingOpenConversation = null;
+        return k;
+    }
+
     /// <summary>Clears the unread flag for a conversation (called when the owner opens it).</summary>
     public void MarkRead(string handle)
     {

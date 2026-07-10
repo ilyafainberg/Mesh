@@ -196,8 +196,9 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     /// Answers an inbound PUBLIC-SERVICE request with a hard-sandboxed, service-scoped agent.
     /// Unlike the guest path this is reachable by ANY handle (no allow-list), so the sandbox is the
     /// only guarantee of safety:
-    ///  - capabilities are scoped to PUBLIC-LISTED items only (KB/Skills/Widgets whose visibility is
-    ///    <see cref="SystemCircles.PublicVisibility"/>), never private or circle-shared items;
+    ///  - capabilities are scoped to this SERVICE'S OWN attached items only (the KB/Skills/Widgets whose
+    ///    ids are in the service's KnowledgeIds/SkillIds/WidgetIds), never private, circle-shared, or
+    ///    another service's items;
     ///  - NO tools are exposed at all (no connectors, no local/device tools, no MCP), so a public
     ///    service can never reach the provider's private data, accounts, files or machine.
     /// The reply is metered to the caller only when they are already a known contact (a random public
@@ -209,11 +210,12 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var svc = p.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
         if (svc is null) return new ServiceReply("This service is currently unavailable.", 0);
 
-        // Public-listed capabilities ONLY. This binding (not instructions) is what keeps private
-        // knowledge, skills and widgets out of a public service's reach.
-        var knowledge = p.Knowledge.Where(k => SystemCircles.IsPublicListed(k.Visibility)).ToList();
-        var skills = p.Skills.Where(s => s.Enabled && SystemCircles.IsPublicListed(s.Visibility)).ToList();
-        var widgets = p.Widgets.Where(w => SystemCircles.IsPublicListed(w.Visibility)).ToList();
+        // Per-service capabilities ONLY: this service exposes exactly the KB/Skills/Widgets its owner
+        // attached to it. This binding (not instructions) is what keeps every other item (private,
+        // circle-shared, or attached to a different service) out of this service's reach.
+        var knowledge = p.Knowledge.Where(k => svc.KnowledgeIds.Contains(k.Id)).ToList();
+        var skills = p.Skills.Where(s => s.Enabled && svc.SkillIds.Contains(s.Id)).ToList();
+        var widgets = p.Widgets.Where(w => svc.WidgetIds.Contains(w.Id)).ToList();
 
         // HARD SANDBOX: a public service never exposes tools of any kind.
         var agentTools = new List<IAgentTool>();

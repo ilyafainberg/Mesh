@@ -233,6 +233,19 @@ public sealed class PublishedService
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     /// <summary>
+    /// Ids of the Knowledge items THIS service exposes. Per-service scoping: a service answers using
+    /// only the capabilities explicitly attached to it (not a global public pool). The sandboxed
+    /// service agent materializes these ids at invocation; they are never uploaded to the relay.
+    /// </summary>
+    public List<string> KnowledgeIds { get; set; } = new();
+
+    /// <summary>Ids of the Skills this service exposes (still subject to the skill being enabled).</summary>
+    public List<string> SkillIds { get; set; } = new();
+
+    /// <summary>Ids of the Widgets this service exposes.</summary>
+    public List<string> WidgetIds { get; set; } = new();
+
+    /// <summary>
     /// Total token budget the owner allots to this service across all callers for its LIFETIME.
     /// 0 means unlimited. Enforced provider-side (the relay never sees the E2E-encrypted token spend),
     /// so this is the owner's own hard ceiling on the AI tokens their public service will ever consume.
