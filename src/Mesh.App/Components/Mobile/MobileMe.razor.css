@@ -391,3 +391,12 @@
 .reasoning-body :first-child { margin-top: 0; }
 .reasoning-body :last-child { margin-bottom: 0; }
 
+
+/* Completion indicator for a topic whose agent finished while another topic was open. */
+.topic-unread {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--brand);
+    flex: none;
+}

@@ -35,42 +35,102 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     /// them in one continuation turn (they are consecutive user turns in the history) batches
     /// the queued guidance in order without ever running two turns concurrently.
     /// </summary>
+    private static readonly TimeSpan ToolLoopResumeDelay = TimeSpan.FromMinutes(5);
+
     public async Task<string> ContinueAsOwnerAsync(string threadId, CancellationToken ct = default)
     {
-        var p = state.Profile;
         var thread = state.GetOrCreateOwnThread(threadId);
 
-        // Owner may use every connected source's tools, plus local tools and bundled MCP servers.
-        var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
-        agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
-        var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
-        var cfg = await ResolveModelConfigAsync(p.Model, ct);
-        var model = factory.Create(cfg);
-        var history = Window(thread.Lines, p.Model.Provider);
-
-        // Collect any images tools produce during the turn (screenshots, etc.) and append them so the
-        // chat displays them instead of the model narrating raw bytes it cannot see.
-        string answer;
-        string? reasoning;
-        state.BeginAgentSteps(thread.Id);
-        var progress = new Progress<AgentStep>(s => state.ReportAgentStep(thread.Id, s));
-        using (media.BeginScope(out var images))
+        // A tool loop gets one automatic continuation. The pause is visible in chat so the owner
+        // knows why the run stopped, when it will continue, and what was completed so far.
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            try
+            var p = state.Profile;
+            var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
+            agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
+            var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
+            var cfg = await ResolveModelConfigAsync(p.Model, ct);
+            var model = factory.Create(cfg);
+            var history = Window(thread.Lines, p.Model.Provider).ToList();
+            if (attempt > 0)
             {
-                answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct: ct);
+                history.Add(new ChatLine
+                {
+                    Role = "user",
+                    Text = "Automatically resume the interrupted task. First inspect the current state with the appropriate tools. " +
+                           "The task may have completed while paused, so do not repeat completed or destructive actions. " +
+                           "If it is complete, verify that and report the result. Otherwise continue from the checkpoint."
+                });
             }
-            finally
+
+            string answer;
+            string? reasoning;
+            var observedSteps = new List<AgentStep>();
+            state.BeginAgentSteps(thread.Id);
+            var progress = new Progress<AgentStep>(step =>
             {
-                state.EndAgentSteps(thread.Id);
+                lock (observedSteps) observedSteps.Add(step);
+                state.ReportAgentStep(thread.Id, step);
+            });
+
+            using (media.BeginScope(out var images))
+            {
+                try
+                {
+                    answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct: ct);
+                }
+                finally
+                {
+                    state.EndAgentSteps(thread.Id);
+                }
+
+                if (!ToolLoop.IsLimitReply(answer))
+                {
+                    (reasoning, answer) = ReasoningExtract.FromText(answer);
+                    answer = ExpandWidgets(answer, p.Widgets);
+                    answer = AppendImages(answer, images);
+                    state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer, Reasoning = reasoning });
+                    if (attempt > 0)
+                        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = "[automatic resume finished]" });
+                    return answer;
+                }
             }
-            (reasoning, answer) = ReasoningExtract.FromText(answer);
-            answer = ExpandWidgets(answer, p.Widgets);
-            answer = AppendImages(answer, images);
+
+            if (attempt > 0)
+            {
+                answer = "[automatic resume exited after reaching the tool-call safety limit again. Start a new message to continue.]";
+                state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer });
+                return answer;
+            }
+
+            string[] completed;
+            lock (observedSteps)
+            {
+                completed = observedSteps
+                    .Where(step => step.State == AgentStepState.Done)
+                    .Select(step => step.Label)
+                    .Distinct(StringComparer.Ordinal)
+                    .TakeLast(8)
+                    .ToArray();
+            }
+            var checkpoint = completed.Length == 0
+                ? "No completed tool steps were recorded."
+                : "Completed so far: " + string.Join("; ", completed) + ".";
+            state.AddOwnChatLine(thread.Id, new ChatLine
+            {
+                Role = "assistant",
+                Text = $"[paused after reaching the tool-call safety limit. {checkpoint} I will automatically resume in 5 minutes and check whether the task completed before continuing.]"
+            });
+
+            await Task.Delay(ToolLoopResumeDelay, ct);
+            state.AddOwnChatLine(thread.Id, new ChatLine
+            {
+                Role = "assistant",
+                Text = "[automatically resuming now. I will check the task's current state before taking further action.]"
+            });
         }
 
-        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer, Reasoning = reasoning });
-        return answer;
+        throw new InvalidOperationException("Unreachable owner continuation state.");
     }
 
     /// <summary>Appends any tool-produced images to a reply as renderable mesh-file blocks.</summary>
@@ -461,6 +521,17 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         return sb.ToString();
     }
 
+    private const string WidgetRuntimeContract = """
+Widget runtime restrictions:
+- The app runs in an opaque-origin sandboxed iframe.
+- Use only inline HTML, CSS and vanilla JavaScript.
+- Do not use localStorage, sessionStorage, IndexedDB, cookies, Cache Storage, fetch, XMLHttpRequest, WebSocket, EventSource, external scripts, styles, fonts, images, links or iframes.
+- Keep state in JavaScript memory. It resets when the widget reloads. For temporary key/value state, window.meshStorage is available, but it is also in-memory only.
+- Guard optional browser APIs with feature checks and try/catch.
+- Use pointer events so interaction works with mouse, touch and pen when appropriate.
+- Return a complete document, close every opened tag, and end with </html>.
+""";
+
     /// <summary>System prompt that makes the model output exactly one self-contained widget.</summary>
     private static string WidgetBuilderPrompt()
     {
@@ -474,8 +545,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         sb.AppendLine("- Close every tag. The document must end with </html>.");
         sb.AppendLine();
         sb.AppendLine("HARD CONSTRAINTS:");
-        sb.AppendLine("- Fully self-contained: all CSS in one <style> and all JS in one <script>, both inline. NO external network, links, scripts, fonts, images or CDNs.");
-        sb.AppendLine("- It runs in a sandboxed iframe with NO access to the user's data, cookies, storage or network. Do not use localStorage, fetch, XMLHttpRequest or cookies.");
+        sb.AppendLine("- Fully self-contained: all CSS in one <style> and all JS in one <script>, both inline.");
+        sb.AppendLine(WidgetRuntimeContract);
         sb.AppendLine("- Must be genuinely interactive: wire up real, working JavaScript for the behaviour the user asked for.");
         sb.AppendLine("- Size for a phone: content ~340px wide, responsive to the container, total height comfortably under ~500px. Use system fonts, generous spacing, rounded corners, a clean modern look.");
         sb.AppendLine();
@@ -528,11 +599,12 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         sb.AppendLine();
         if (compact)
         {
-            sb.AppendLine("You may include a self-contained interactive app in a ```html-app fenced block (inline CSS/JS only, no network). Only when clearly useful.");
+            sb.AppendLine("You may include one complete self-contained ```html-app when clearly useful. It runs in an opaque sandbox: inline vanilla JS/CSS only; no browser storage, network, cookies, external resources or iframes. Use in-memory state, window.meshStorage if needed, and pointer events.");
             return;
         }
         sb.AppendLine("You can include a small interactive HTML app when it genuinely helps (calculator, picker, tiny visual).");
-        sb.AppendLine("Put a complete self-contained document in a fenced block tagged html-app (inline CSS/JS only, no external network).");
+        sb.AppendLine("Put a complete self-contained document in a fenced block tagged html-app.");
+        sb.AppendLine(WidgetRuntimeContract);
         sb.AppendLine("Keep prose as markdown outside the block. Most replies need no app.");
     }
 

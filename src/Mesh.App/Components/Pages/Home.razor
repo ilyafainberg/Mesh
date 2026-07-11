@@ -18,6 +18,7 @@
         {
             <div class="conv-item @(t.Id == activeThread ? "active" : "")" @onclick="() => Select(t.Id)">
                 <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
             </div>
         }
         @if (State.Profile.OwnThreads.Count == 0)
@@ -214,6 +215,7 @@
     bool composerWired;
     int lastCount = -1;
     bool lastBusy;
+    bool disposed;
 
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
     bool ActiveBusy => Active is not null && State.IsThreadBusy(Active.Id);
@@ -278,6 +280,7 @@
             activeThread = wanted;
         else if (activeThread is null && State.Profile.OwnThreads.Count > 0)
             activeThread = State.Profile.OwnThreads[^1].Id;
+        if (activeThread is not null) State.MarkThreadSeen(activeThread);
     }
 
     static string? ParseQueryValue(string queryString, string key)
@@ -309,7 +312,7 @@
         // transition guarantees the final answer scrolls into view even if its line count collides
         // with an earlier render.
         var count = Active?.Lines.Count ?? 0;
-        if (firstRender || count != lastCount || ActiveBusy != lastBusy)
+        if (firstRender || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
         {
             lastCount = count;
             lastBusy = ActiveBusy;
@@ -342,7 +345,13 @@
         return InvokeAsync(StateHasChanged);
     }
 
-    void Select(string id) { activeThread = id; confirmDelete = false; renaming = false; }
+    void Select(string id)
+    {
+        activeThread = id;
+        confirmDelete = false;
+        renaming = false;
+        State.MarkThreadSeen(id);
+    }
 
     void OpenReport()
     {
@@ -515,6 +524,10 @@
         finally
         {
             State.EndThreadTurn(threadId);
+            if (disposed || activeThread != threadId)
+                State.MarkThreadCompleted(threadId);
+            else
+                State.MarkThreadSeen(threadId);
         }
     }
 
@@ -562,6 +575,7 @@
 
     public void Dispose()
     {
+        disposed = true;
         State.Changed -= Refresh;
         selfRef?.Dispose();
     }

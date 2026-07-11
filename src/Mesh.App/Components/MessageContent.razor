@@ -44,7 +44,7 @@
         {
             <div class="app-frame @(expanded.Contains(id) ? "expanded" : "")">
                 <iframe @ref="frameRefs[id]"
-                        sandbox="allow-scripts allow-forms allow-modals"
+                        sandbox="allow-scripts"
                         referrerpolicy="no-referrer"></iframe>
                 <div class="app-toolbar">
                     @if (OnPin.HasDelegate)

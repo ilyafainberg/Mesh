@@ -240,6 +240,7 @@ public sealed class AppState
     public void DeleteOwnThread(string threadId)
     {
         Profile.OwnThreads.RemoveAll(t => t.Id == threadId);
+        completedThreads.Remove(threadId);
         activeDb?.DeleteOwnThread(threadId);
         NotifyChanged();
     }
@@ -411,6 +412,7 @@ public sealed class AppState
     // second concurrent turn for a thread that is already running). Keyed by own-thread id.
     private readonly HashSet<string> busyThreads = new(StringComparer.Ordinal);
     private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
+    private readonly HashSet<string> completedThreads = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
 
     /// <summary>True while the given own-thread is running an agent turn.</summary>
@@ -418,6 +420,21 @@ public sealed class AppState
 
     /// <summary>True while the given own-thread is specifically building a widget (for the label text).</summary>
     public bool IsThreadBuilding(string threadId) => buildingThreads.Contains(threadId);
+
+    /// <summary>True when an own-thread's agent finished while that topic was not being viewed.</summary>
+    public bool IsThreadCompleted(string threadId) => completedThreads.Contains(threadId);
+
+    /// <summary>Marks an own-thread as needing attention because its agent run finished.</summary>
+    public void MarkThreadCompleted(string threadId)
+    {
+        if (completedThreads.Add(threadId)) NotifyChanged();
+    }
+
+    /// <summary>Clears a topic's completion indicator when the owner opens it.</summary>
+    public void MarkThreadSeen(string threadId)
+    {
+        if (completedThreads.Remove(threadId)) NotifyChanged();
+    }
 
     /// <summary>Marks a thread's turn as started (optionally a widget build).</summary>
     public void BeginThreadTurn(string threadId, bool building)

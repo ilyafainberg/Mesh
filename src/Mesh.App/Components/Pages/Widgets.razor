@@ -20,7 +20,7 @@
             </div>
             @if (draftHtml is not null)
             {
-                <div class="app-frame"><iframe @ref="draftFrame" sandbox="allow-scripts allow-forms allow-modals" referrerpolicy="no-referrer"></iframe></div>
+                <div class="app-frame"><iframe @ref="draftFrame" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe></div>
                 <div class="kn-row">
                     <input class="full" @bind="draftName" placeholder="Name this widget…" />
                     <button class="primary" @onclick="SaveDraft" disabled="@string.IsNullOrWhiteSpace(draftName)"><i class="bi bi-pin-angle"></i> Pin</button>
@@ -45,7 +45,7 @@
                     </select>
                     <button class="icon-btn" title="Delete" @onclick="() => Remove(w)"><i class="bi bi-trash"></i></button>
                 </div>
-                <div class="app-frame"><iframe @ref="widgetRefs[w]" sandbox="allow-scripts allow-forms allow-modals" referrerpolicy="no-referrer"></iframe></div>
+                <div class="app-frame"><iframe @ref="widgetRefs[w]" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe></div>
             </div>
         }
         @if (State.Profile.Widgets.Count == 0)

@@ -365,7 +365,7 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
         // building a whole widget document); clamp it to a sane server-side ceiling so the free tier
         // cannot be pushed into unbounded generations, and default to a reasonable size when unset.
         const int DefaultMaxTokens = 2048;
-        const int MaxAllowedTokens = 8192;
+        const int MaxAllowedTokens = 20480;
         var maxTokens = req.MaxTokens <= 0 ? DefaultMaxTokens : Math.Min(req.MaxTokens, MaxAllowedTokens);
 
         object payload = new { model, messages, max_tokens = maxTokens };

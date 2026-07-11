@@ -85,6 +85,10 @@ public static class ModelReply
 internal static class ToolLoop
 {
     public const int MaxRounds = 16;
+    public const string LimitMarker = "[stopped after too many tool calls]";
+
+    public static bool IsLimitReply(string? reply)
+        => string.Equals(reply?.Trim(), LimitMarker, StringComparison.Ordinal);
 }
 
 /// <summary>Extracts token usage from the various provider response shapes and reports it to the meter.</summary>
@@ -246,7 +250,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
-        return "[stopped after too many tool calls]";
+        return ToolLoop.LimitMarker;
     }
 
     internal static async Task<string> ExecuteToolAsync(IReadOnlyList<IAgentTool> tools, string name, string argsJson,
@@ -374,7 +378,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             }
             messages.Add(new { role = "user", content = results.ToArray() });
         }
-        return "[stopped after too many tool calls]";
+        return ToolLoop.LimitMarker;
     }
 
     private static object[] CloneContent(JsonElement arr)
@@ -487,7 +491,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
                 messages.Add(new HostedModelMessage("tool", toolResult, ToolCallId: id));
             }
         }
-        return "[stopped after too many tool calls]";
+        return ToolLoop.LimitMarker;
     }
 
     private static bool IsTruncated(HostedModelResponse? r)
@@ -628,7 +632,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
-        return "[stopped after too many tool calls]";
+        return ToolLoop.LimitMarker;
     }
 
     private static string MapRole(string r) => r is "assistant" ? "assistant" : r is "system" ? "system" : "user";
