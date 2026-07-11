@@ -342,6 +342,13 @@ input[type=checkbox]:not(.switch input):checked::after {
 .bubble.user .msg-tag { color: rgba(255,255,255,.85); }
 .bubble.assistant .msg-tag { color: var(--fg-3); }
 
+/* Service "thinking" indicator: shown while a service request is being processed. */
+.svc-thinking { display: inline-flex; align-items: baseline; gap: 2px; }
+.svc-thinking .dots span { animation: mesh-thinking 1.4s infinite both; }
+.svc-thinking .dots span:nth-child(2) { animation-delay: .2s; }
+.svc-thinking .dots span:nth-child(3) { animation-delay: .4s; }
+@keyframes mesh-thinking { 0%, 80%, 100% { opacity: .2; } 40% { opacity: 1; } }
+
 /* attachments inside message bubbles */
 .msg-img { max-width: 260px; max-height: 260px; border-radius: var(--radius-m); margin: 4px 0;
   display: block; cursor: pointer; border: 1px solid var(--stroke-1); }

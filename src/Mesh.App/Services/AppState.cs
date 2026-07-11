@@ -328,6 +328,36 @@ public sealed class AppState
         return k;
     }
 
+    // Conversations (keyed by their exact conversation key) that are waiting for a reply, e.g. a
+    // service request whose response arrives asynchronously. Used to show a "thinking" indicator.
+    // Each entry carries a timestamp so a lost/never-arriving reply cannot pin the indicator forever.
+    private readonly Dictionary<string, DateTimeOffset> awaiting = new(StringComparer.Ordinal);
+    private static readonly TimeSpan AwaitTimeout = TimeSpan.FromSeconds(120);
+
+    /// <summary>Marks a conversation as waiting for a reply (shows a processing indicator).</summary>
+    public void SetAwaiting(string key)
+    {
+        awaiting[key] = DateTimeOffset.UtcNow;
+        NotifyChanged();
+    }
+
+    /// <summary>Clears the waiting-for-reply state for a conversation.</summary>
+    public void ClearAwaiting(string key)
+    {
+        if (awaiting.Remove(key)) NotifyChanged();
+    }
+
+    /// <summary>True while a conversation is waiting for a reply (and the wait has not timed out).</summary>
+    public bool IsAwaiting(string key)
+    {
+        if (awaiting.TryGetValue(key, out var t))
+        {
+            if (DateTimeOffset.UtcNow - t < AwaitTimeout) return true;
+            awaiting.Remove(key);
+        }
+        return false;
+    }
+
     /// <summary>Clears the unread flag for a conversation (called when the owner opens it).</summary>
     public void MarkRead(string handle)
     {

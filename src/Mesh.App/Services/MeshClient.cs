@@ -505,6 +505,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             // consumer can keep a real multi-turn conversation with the service.
             var conv = state.FindConversation(AppState.ServiceKey(from, svcId))
                        ?? state.GetOrCreateServiceConversation(from, svcId, null);
+            state.ClearAwaiting(conv.Handle);
             state.AddChatLine(conv.Handle, new ChatLine { Role = "user", Text = answer, Via = "agent", AddressedToAgent = true });
             state.MarkUnread(conv.Handle);
             notifier.Notify($"{conv.ServiceName} replied", Preview(answer), NotifyKind.Message, "messages");
@@ -765,6 +766,9 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     public async Task<bool> SendServiceRequestAsync(Conversation conv)
     {
         if (conv.ServiceId is null || string.IsNullOrWhiteSpace(conv.ProviderHandle)) return false;
+        // Show a processing indicator on this thread until the reply arrives (the response is
+        // asynchronous for a remote service, or produced in-process for a service you own).
+        state.SetAwaiting(conv.Handle);
         // From the provider agent's point of view, my outgoing lines (Role "assistant") are the user,
         // and the service's prior answers (Role "user") are the assistant.
         var window = conv.Lines
@@ -784,7 +788,10 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         }
 
         var body = ServiceProtocol.RequestBody(conv.ServiceId, window);
-        return await SendAsync(conv.ProviderHandle!, MeshKinds.ServiceRequest, body);
+        var ok = await SendAsync(conv.ProviderHandle!, MeshKinds.ServiceRequest, body);
+        // If the request could not be sent, do not leave a stuck indicator.
+        if (!ok) state.ClearAwaiting(conv.Handle);
+        return ok;
     }
 
     /// <summary>
@@ -796,7 +803,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     private async Task AnswerOwnServiceLocallyAsync(Conversation conv, IReadOnlyList<ServiceTurn> window)
     {
         var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == conv.ServiceId);
-        if (svc is null) return;
+        if (svc is null) { state.ClearAwaiting(conv.Handle); return; }
         if (!agent.IsModelReady)
         {
             state.AddChatLine(conv.Handle, new ChatLine
@@ -806,6 +813,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
                 Via = "agent",
                 AddressedToAgent = true
             });
+            state.ClearAwaiting(conv.Handle);
             return;
         }
 
@@ -815,6 +823,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             .ToList();
 
         var reply = await agent.RespondAsServiceAsync(conv.ServiceId!, me, svcHistory, CancellationToken.None);
+        state.ClearAwaiting(conv.Handle);
         if (ModelReply.IsFailure(reply.Text)) return;
 
         state.AddChatLine(conv.Handle, new ChatLine { Role = "user", Text = reply.Text, Via = "agent", AddressedToAgent = true });
