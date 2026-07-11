@@ -99,6 +99,18 @@ else
                 @foreach (var line in Active.Lines)
                 {
                     <div class="bubble @(line.Role)">
+                        @if (!string.IsNullOrEmpty(line.Reasoning))
+                        {
+                            <button class="reasoning-toggle" @onclick="() => ToggleReasoning(line)" aria-label="Show reasoning">
+                                <i class="bi bi-lightbulb"></i>
+                                <span>Reasoning</span>
+                                <i class="bi @(expandedReasoning.Contains(line) ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                            </button>
+                            @if (expandedReasoning.Contains(line))
+                            {
+                                <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(line.Reasoning!))</div>
+                            }
+                        }
                         <MessageContent Text="@line.Text" OnPin="PinWidget" />
                         @if (IsQueued(line))
                         {
@@ -106,7 +118,25 @@ else
                         }
                     </div>
                 }
-                @if (busy) { <div class="bubble assistant"><div class="text muted">@(building ? "…building widget" : "…thinking")</div></div> }
+                @if (ActiveBusy)
+                {
+                    <div class="bubble assistant">
+                        @{ var steps = Active is null ? null : State.AgentStepsFor(Active.Id); }
+                        @if (steps is { Count: > 0 })
+                        {
+                            <div class="agent-steps">
+                                @foreach (var s in steps)
+                                {
+                                    <div class="agent-step @s.State.ToString().ToLowerInvariant()">
+                                        <i class="bi @StepIcon(s.State)"></i>
+                                        <span>@s.Label</span>
+                                    </div>
+                                }
+                            </div>
+                        }
+                        <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
+                    </div>
+                }
             </div>
         </div>
 
@@ -151,15 +181,15 @@ else
                     </div>
                 }
                 <div class="composer">
-                    <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget">
+                    <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@ActiveBusy" title="Create a widget (mini-app)" aria-label="Create a widget">
                         <i class="bi bi-plus-lg"></i>
                     </button>
-                    <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
+                    <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@ActiveBusy" title="Attach an image or document" aria-label="Attach an image or document">
                         <i class="bi bi-paperclip"></i>
                     </button>
                     @if (!IsDesktop)
                     {
-                        <button class="ghost icon-btn plus-btn @(homeMode ? "on" : "")" @onclick="() => homeMode = !homeMode" disabled="@busy"
+                        <button class="ghost icon-btn plus-btn @(homeMode ? "on" : "")" @onclick="() => homeMode = !homeMode" disabled="@ActiveBusy"
                                 title="Ask my home agent (runs on my desktop with full tools)" aria-label="Ask my home agent">
                             <i class="bi bi-house-gear"></i>
                         </button>
@@ -192,8 +222,11 @@ else
 @code {
     string input = "";
     ReportDialog? reportDialog;
-    bool busy;
-    bool building;
+    // Per-thread run state so Me topics are independent: a turn running in one thread does not make
+    // other threads look busy. A thread id is present in busyThreads while its turn runs, and in
+    // buildingThreads while it is specifically building a widget (for the label text).
+    readonly HashSet<string> busyThreads = new(StringComparer.Ordinal);
+    readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
     bool widgetMode;
     bool homeMode;
     bool confirmDelete;
@@ -209,14 +242,40 @@ else
     int lastCount = -1;
     bool lastBusy;
 
+    // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
+    bool ActiveBusy => Active is not null && busyThreads.Contains(Active.Id);
+    bool ActiveBuilding => Active is not null && buildingThreads.Contains(Active.Id);
+
     readonly List<StagedFile> attachments = new();
     string? attachError;
 
-    // Tier-1 steerable input: messages submitted while a turn is running are queued (shown
-    // immediately as a subtle "queued" line) and answered together in ONE follow-up turn after
-    // the current one finishes, in order. Never runs two agent turns concurrently.
-    readonly List<ChatLine> queued = new();
-    bool IsQueued(ChatLine line) => queued.Contains(line);
+    // Per-thread queue of messages the user sent while THAT thread's turn was still running. Each
+    // thread drains its own queue after its turn, so queued input never bleeds across threads.
+    readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
+    List<ChatLine> QueueFor(string threadId)
+        => queuedByThread.TryGetValue(threadId, out var l) ? l : (queuedByThread[threadId] = new());
+
+    // Tier-1 steerable input: messages submitted while a thread's turn is running are queued for that
+    // thread (shown immediately as a subtle "queued" line) and answered together in ONE follow-up turn
+    // after the current one finishes, in order. A thread never runs two of its own turns concurrently,
+    // but different threads run independently.
+    bool IsQueued(ChatLine line) => Active is not null && QueueFor(Active.Id).Contains(line);
+
+    // Assistant lines whose reasoning ("thinking") section is currently expanded.
+    readonly HashSet<ChatLine> expandedReasoning = new();
+
+    void ToggleReasoning(ChatLine line)
+    {
+        if (!expandedReasoning.Remove(line)) expandedReasoning.Add(line);
+    }
+
+    static string StepIcon(AgentStepState state) => state switch
+    {
+        AgentStepState.Started => "bi-arrow-repeat spin",
+        AgentStepState.Done => "bi-check2",
+        AgentStepState.Failed => "bi-exclamation-triangle",
+        _ => "bi-dot"
+    };
 
     sealed record StagedFile(string Name, string Path, long Size)
     {
@@ -276,16 +335,18 @@ else
             composerWired = true;
             selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
             try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
+            try { await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef); } catch { }
         }
 
-        // Scroll on first paint, when a line is added, AND when the agent finishes (busy true->false):
-        // the reply is added while busy is still true, so tracking busy transitions guarantees the
-        // final answer scrolls into view even if its line count collides with an earlier render.
+        // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
+        // (busy true->false): the reply is added while the thread is still busy, so tracking that
+        // transition guarantees the final answer scrolls into view even if its line count collides
+        // with an earlier render.
         var count = Active?.Lines.Count ?? 0;
-        if (firstRender || count != lastCount || busy != lastBusy)
+        if (firstRender || count != lastCount || ActiveBusy != lastBusy)
         {
             lastCount = count;
-            lastBusy = busy;
+            lastBusy = ActiveBusy;
             try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
         }
     }
@@ -293,6 +354,27 @@ else
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
     [Microsoft.JSInterop.JSInvokable]
     public Task SendFromComposer() => Send();
+
+    /// <summary>
+    /// Invoked from paste.js when a file is pasted into the composer. Writes the pasted bytes to a temp
+    /// file and stages it so it sends by path (the same flow as the attach button), then re-renders.
+    /// </summary>
+    [Microsoft.JSInterop.JSInvokable]
+    public Task OnPasteFile(string name, string mime, string base64)
+    {
+        attachError = null;
+        var staged = PasteFiles.SaveTemp(name, mime, base64);
+        if (staged is { } s)
+        {
+            LocalFiles.Allow(s.Path);
+            attachments.Add(new StagedFile(s.Name, s.Path, s.Size));
+        }
+        else
+        {
+            attachError = "Could not read the pasted file.";
+        }
+        return InvokeAsync(StateHasChanged);
+    }
 
     void Select(string id) { activeThread = id; confirmDelete = false; renaming = false; }
 
@@ -396,37 +478,51 @@ else
             State.RenameOwnThread(thread.Id, Titleize(text));
 
         var files = attachments.ToList();
+        // Capture the composer modes now, since they are reset immediately and the turn runs async.
+        var wasWidget = widgetMode;
+        var wasHome = homeMode;
         input = "";
         attachments.Clear();
+        widgetMode = false;
         _ = ResetComposer();
 
-        // A turn is already running: queue this input for the next turn instead of starting a
-        // second concurrent agent call. Show it immediately as a subtle "queued" user line; it is
-        // already in the thread history, so the drain turn below answers it in order.
-        if (busy)
+        // This thread is already running a turn: queue this input for its next turn instead of
+        // starting a second concurrent call in the SAME thread. Show it immediately as a subtle
+        // "queued" user line; it is already in the thread history, so the drain answers it in order.
+        // Other threads are unaffected and keep running independently.
+        if (busyThreads.Contains(thread.Id))
         {
             var qLine = new ChatLine { Role = "user", Text = ComposeOwnerPrompt(text, files) };
             State.AddOwnChatLine(thread.Id, qLine);
-            queued.Add(qLine);
+            QueueFor(thread.Id).Add(qLine);
             return;
         }
 
-        busy = true;
+        // Run this thread's turn WITHOUT awaiting it here, so sending in one Me topic never blocks
+        // (or visually freezes) another. Each thread manages its own busy state and queue drain.
+        _ = RunThreadTurnAsync(thread.Id, text, files, wasWidget, wasHome);
+    }
+
+    // Runs one owner turn for a single thread, then drains that thread's queue. Independent of any
+    // other thread's turn (service scopes flow via AsyncLocal, so concurrent turns do not mix).
+    async Task RunThreadTurnAsync(string threadId, string text, List<StagedFile> files, bool widget, bool home)
+    {
+        busyThreads.Add(threadId);
+        if (widget) buildingThreads.Add(threadId);
+        await InvokeAsync(StateHasChanged);
         try
         {
-            if (widgetMode)
+            if (widget)
             {
-                building = true;
-                widgetMode = false;
                 var html = await Agent.BuildWidgetAsync(text);
-                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
-                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = html });
+                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
+                State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = html });
             }
-            else if (homeMode)
+            else if (home)
             {
-                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "user", Text = text });
+                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = text });
                 var ok = await Mesh.AskHomeAgentAsync(text);
-                State.AddOwnChatLine(thread.Id, new ChatLine
+                State.AddOwnChatLine(threadId, new ChatLine
                 {
                     Role = "assistant",
                     Text = ok
@@ -436,21 +532,27 @@ else
             }
             else
             {
-                await Agent.AskAsOwnerAsync(thread.Id, ComposeOwnerPrompt(text, files));
+                await Agent.AskAsOwnerAsync(threadId, ComposeOwnerPrompt(text, files));
             }
 
-            // Drain anything queued while the turn above ran. Each drain answers ALL currently
-            // queued lines together in one continuation turn (they are consecutive user turns
-            // already in the history); loop in case more were queued while draining.
-            while (queued.Count > 0)
+            // Drain anything this thread queued while its turn ran. Each drain answers ALL of the
+            // thread's currently queued lines together in one continuation turn (they are consecutive
+            // user turns already in the history); loop in case more were queued while draining.
+            var queue = QueueFor(threadId);
+            while (queue.Count > 0)
             {
-                queued.Clear(); // they are now being answered, not waiting
-                building = false;
-                await Agent.ContinueAsOwnerAsync(thread.Id);
+                queue.Clear(); // they are now being answered, not waiting
+                buildingThreads.Remove(threadId);
+                await Agent.ContinueAsOwnerAsync(threadId);
             }
         }
-        catch (Exception ex) { State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
-        finally { busy = false; building = false; }
+        catch (Exception ex) { State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
+        finally
+        {
+            busyThreads.Remove(threadId);
+            buildingThreads.Remove(threadId);
+            await InvokeAsync(StateHasChanged);
+        }
     }
 
     // Builds the owner prompt, appending any staged local file paths the agent can open on request.

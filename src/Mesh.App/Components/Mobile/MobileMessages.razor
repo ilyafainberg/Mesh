@@ -330,6 +330,7 @@ else
             composerWired = true;
             selfRef ??= Microsoft.JSInterop.DotNetObjectReference.Create(this);
             try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
+            try { await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef); } catch { }
         }
 
         var count = State.GetOrCreateConversation(active).Lines.Count;
@@ -345,6 +346,32 @@ else
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
     [Microsoft.JSInterop.JSInvokable]
     public Task SendFromComposer() => Send();
+
+    /// <summary>
+    /// Invoked from paste.js when a file is pasted into the composer. Stages the pasted bytes the
+    /// same way the attach button does (base64, sent inline with the message), then re-renders.
+    /// </summary>
+    [Microsoft.JSInterop.JSInvokable]
+    public Task OnPasteFile(string name, string mime, string base64)
+    {
+        attachError = null;
+        try
+        {
+            var bytes = Convert.FromBase64String(base64);
+            if (bytes.LongLength == 0) { attachError = "That file is empty."; }
+            else if (bytes.LongLength > MaxAttachmentBytes)
+            {
+                attachError = $"\"{name}\" is {Human(bytes.LongLength)}, over the {Human(MaxAttachmentBytes)} limit.";
+            }
+            else
+            {
+                var m = string.IsNullOrWhiteSpace(mime) ? GuessMime(name) : mime;
+                attachments.Add(new StagedFile(name, m, base64, bytes.LongLength));
+            }
+        }
+        catch { attachError = "Could not read the pasted file."; }
+        return InvokeAsync(StateHasChanged);
+    }
 
     bool IsAllowed(string handle) => State.FindContact(handle)?.Allowed == true;
 

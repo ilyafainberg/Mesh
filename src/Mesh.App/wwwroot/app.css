@@ -442,6 +442,13 @@ input[type=checkbox]:not(.switch input):checked::after {
 .field-row .field-label { font-weight: 600; font-size: .88rem; }
 .field-row .field-sub { font-size: .78rem; color: var(--fg-3); }
 
+/* Home device picker: keep the select and Refresh button on one baseline.
+   The select carries the global .field class whose margin-bottom skews flex
+   centering, so reset it and match control heights here. */
+.home-device-row { display: flex; align-items: center; gap: 8px; }
+.home-device-row select.field { margin: 0; height: 34px; }
+.home-device-row .ghost { height: 34px; }
+
 .actions { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
 .ok-text { color: var(--ok); font-size: .85rem; }
 .err-text { color: var(--danger); font-size: .85rem; margin-top: 6px; }

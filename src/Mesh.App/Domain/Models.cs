@@ -385,8 +385,23 @@ public sealed class ChatLine
     public bool AddressedToAgent { get; set; }
     /// <summary>Delivery status for an outgoing line: "" | "sent" | "delivered" | "failed".</summary>
     public string Status { get; set; } = "";
+    /// <summary>
+    /// Optional model reasoning ("thinking") extracted from the reply, shown as a collapsible section
+    /// separate from the answer. Populated provider-agnostically (inline think tags or a provider
+    /// reasoning field); null when the model returned no reasoning.
+    /// </summary>
+    public string? Reasoning { get; set; }
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
 }
+
+/// <summary>State of one agent step surfaced to the UI while a turn runs.</summary>
+public enum AgentStepState { Started, Done, Failed }
+
+/// <summary>
+/// A single step the agent takes during a turn (a tool call), surfaced live so the user can see what
+/// the agent is doing. <see cref="Label"/> is a friendly description (e.g. "Ran Python").
+/// </summary>
+public sealed record AgentStep(string Tool, string Label, AgentStepState State);
 
 public sealed class Conversation
 {

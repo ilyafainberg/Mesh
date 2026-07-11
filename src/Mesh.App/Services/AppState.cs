@@ -358,6 +358,52 @@ public sealed class AppState
         return false;
     }
 
+    // Live agent step trace, keyed by conversation/thread id so independent threads each show only
+    // their own steps. The agent reports a step as each tool call starts and finishes; the Me chat
+    // renders the steps for the thread being viewed. Cleared per thread at the start and end of its turn.
+    private readonly Dictionary<string, List<AgentStep>> agentSteps = new(StringComparer.Ordinal);
+    private static readonly IReadOnlyList<AgentStep> NoSteps = Array.Empty<AgentStep>();
+
+    /// <summary>The steps taken so far in the given thread's current turn (most recent last).</summary>
+    public IReadOnlyList<AgentStep> AgentStepsFor(string key)
+        => agentSteps.TryGetValue(key, out var l) ? l : NoSteps;
+
+    /// <summary>Clears one thread's step trace at the start of a new turn.</summary>
+    public void BeginAgentSteps(string key)
+    {
+        if (agentSteps.TryGetValue(key, out var l) && l.Count == 0) return;
+        agentSteps[key] = new List<AgentStep>();
+        NotifyChanged();
+    }
+
+    /// <summary>
+    /// Records a step for a thread. A Started step is appended; a Done/Failed step updates the matching
+    /// pending step in place (so a tool shows as running then completed rather than twice).
+    /// </summary>
+    public void ReportAgentStep(string key, AgentStep step)
+    {
+        if (!agentSteps.TryGetValue(key, out var steps))
+            agentSteps[key] = steps = new List<AgentStep>();
+
+        if (step.State == AgentStepState.Started)
+        {
+            steps.Add(step);
+        }
+        else
+        {
+            var i = steps.FindLastIndex(s => s.Tool == step.Tool && s.State == AgentStepState.Started);
+            if (i >= 0) steps[i] = step;
+            else steps.Add(step);
+        }
+        NotifyChanged();
+    }
+
+    /// <summary>Clears one thread's step trace when its turn ends.</summary>
+    public void EndAgentSteps(string key)
+    {
+        if (agentSteps.Remove(key)) NotifyChanged();
+    }
+
     /// <summary>Clears the unread flag for a conversation (called when the owner opens it).</summary>
     public void MarkRead(string handle)
     {

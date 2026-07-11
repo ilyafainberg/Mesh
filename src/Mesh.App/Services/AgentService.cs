@@ -51,14 +51,25 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         // Collect any images tools produce during the turn (screenshots, etc.) and append them so the
         // chat displays them instead of the model narrating raw bytes it cannot see.
         string answer;
+        string? reasoning;
+        state.BeginAgentSteps(thread.Id);
+        var progress = new Progress<AgentStep>(s => state.ReportAgentStep(thread.Id, s));
         using (media.BeginScope(out var images))
         {
-            answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct);
+            try
+            {
+                answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct);
+            }
+            finally
+            {
+                state.EndAgentSteps(thread.Id);
+            }
+            (reasoning, answer) = ReasoningExtract.FromText(answer);
             answer = ExpandWidgets(answer, p.Widgets);
             answer = AppendImages(answer, images);
         }
 
-        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer });
+        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer, Reasoning = reasoning });
         return answer;
     }
 
@@ -94,7 +105,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         string answer;
         using (media.BeginScope(out var images))
         {
-            answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct);
+            answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct: ct);
             answer = ExpandWidgets(answer, p.Widgets);
             answer = AppendImages(answer, images);
         }
@@ -188,7 +199,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         // owner's global counter) so the owner can see per-contact spend in Messages.
         string reply;
         using (meter.BeginScope((pt, cc) => state.AddContactTokens(fromHandle, pt, cc)))
-            reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct);
+            reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct: ct);
         return ExpandWidgets(reply, widgets);
     }
 
@@ -244,7 +255,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             if (isContact) state.AddContactTokens(fromHandle, pt, cc);
         }))
         {
-            reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct);
+            reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct: ct);
         }
         return new ServiceReply(ExpandWidgets(reply, widgets), spent);
     }

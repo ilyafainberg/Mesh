@@ -277,7 +277,7 @@
                     <div class="field-label">Home device</div>
                     <div class="field-sub">Choose which device answers when you ask your home agent from another device. Requests go only to this device.</div>
                 </div>
-                <div style="display:flex;align-items:center;gap:8px;">
+                <div class="home-device-row">
                     <select class="field" value="@(State.Profile.HomeDeviceId ?? "")"
                             @onchange="e => { var val = e.Value?.ToString() ?? string.Empty; Toggle(p => p.HomeDeviceId = string.IsNullOrEmpty(val) ? null : val); }"
                             aria-label="Home device">

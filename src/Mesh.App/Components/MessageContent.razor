@@ -80,7 +80,7 @@
     private readonly HashSet<int> expanded = new();
 
     // Per-app iframe element (keyed by the app id) plus the HTML to load into it
-    // and the set of frames whose blob URL has already been set.
+    // and the set of frames whose content has already been set.
     private readonly Dictionary<int, ElementReference> frameRefs = new();
     private readonly Dictionary<int, string> appHtml = new();
     private readonly HashSet<int> mounted = new();
@@ -92,8 +92,8 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // For each freshly shown app frame, hand its HTML to the iframe as a blob
-        // URL so inline scripts run. Only set once per mount to avoid reloading.
+        // For each freshly shown app frame, hand its HTML to the iframe via
+        // srcdoc so inline scripts run. Only set once per mount to avoid reloading.
         foreach (var id in running.ToList())
         {
             if (mounted.Contains(id)) continue;
@@ -110,7 +110,7 @@
 
     private async Task Close(int id)
     {
-        // Revoke the blob URL while the iframe is still in the DOM, then remove it.
+        // Clear the iframe content while it is still in the DOM, then remove it.
         if (frameRefs.TryGetValue(id, out var el))
         {
             try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", el); }

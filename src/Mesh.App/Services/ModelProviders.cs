@@ -15,9 +15,11 @@ public interface IChatModel
     /// Completes with tool access. The model may call tools zero or more times;
     /// each call is executed and fed back until it produces a final text answer.
     /// Default implementation ignores tools (for models without tool support).
+    /// When <paramref name="progress"/> is supplied, an <see cref="AgentStep"/> is reported as each
+    /// tool call starts and finishes so the UI can show a live step trace.
     /// </summary>
     Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
         => CompleteAsync(systemPrompt, history, ct);
 }
 
@@ -144,14 +146,14 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
         Usage.ReportOpenAi(meter, doc.RootElement);
-        return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+        return ReasoningExtract.WithOpenAiReasoning(doc.RootElement.GetProperty("choices")[0].GetProperty("message"));
     }
 
     private static string MapRole(string r) => r is "assistant" ? "assistant" : r is "system" ? "system" : "user";
     private static string Trim(string s) => s.Length > 300 ? s[..300] : s;
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
 
@@ -187,7 +189,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
             var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
 
             if (!msg.TryGetProperty("tool_calls", out var toolCalls) || toolCalls.ValueKind != JsonValueKind.Array || toolCalls.GetArrayLength() == 0)
-                return msg.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
+                return ReasoningExtract.WithOpenAiReasoning(msg);
 
             // Echo the assistant tool-call message, then append each tool result.
             messages.Add(new { role = "assistant", content = (string?)null, tool_calls = CloneArray(toolCalls) });
@@ -197,23 +199,36 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var result = await ExecuteToolAsync(tools, name, argsJson, ct);
+                var result = await ExecuteToolAsync(tools, name, argsJson, ct, progress);
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
         return "[stopped after too many tool calls]";
     }
 
-    internal static async Task<string> ExecuteToolAsync(IReadOnlyList<IAgentTool> tools, string name, string argsJson, CancellationToken ct)
+    internal static async Task<string> ExecuteToolAsync(IReadOnlyList<IAgentTool> tools, string name, string argsJson,
+        CancellationToken ct, IProgress<AgentStep>? progress = null)
     {
+        var label = ReasoningExtract.Label(name);
+        progress?.Report(new AgentStep(name, label, AgentStepState.Started));
         var tool = tools.FirstOrDefault(t => t.Name == name);
-        if (tool is null) return $"ERROR: unknown tool '{name}'.";
+        if (tool is null)
+        {
+            progress?.Report(new AgentStep(name, label, AgentStepState.Failed));
+            return $"ERROR: unknown tool '{name}'.";
+        }
         try
         {
             using var argsDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
-            return await tool.ExecuteAsync(argsDoc.RootElement, ct);
+            var result = await tool.ExecuteAsync(argsDoc.RootElement, ct);
+            progress?.Report(new AgentStep(name, label, AgentStepState.Done));
+            return result;
         }
-        catch (Exception ex) { return "ERROR: " + ex.Message; }
+        catch (Exception ex)
+        {
+            progress?.Report(new AgentStep(name, label, AgentStepState.Failed));
+            return "ERROR: " + ex.Message;
+        }
     }
 
     private static object[] CloneArray(JsonElement arr)
@@ -251,7 +266,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
     private static string Trim(string s) => s.Length > 300 ? s[..300] : s;
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
 
@@ -283,11 +298,14 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             Usage.ReportAnthropic(meter, doc.RootElement);
 
             var text = new StringBuilder();
+            var thinking = new StringBuilder();
             var toolUses = new List<(string id, string name, string argsJson)>();
             foreach (var block in content.EnumerateArray())
             {
                 var type = block.GetProperty("type").GetString();
                 if (type == "text") text.Append(block.GetProperty("text").GetString());
+                else if (type == "thinking" && block.TryGetProperty("thinking", out var th))
+                    thinking.Append(th.GetString());
                 else if (type == "tool_use")
                     toolUses.Add((block.GetProperty("id").GetString() ?? "",
                         block.GetProperty("name").GetString() ?? "",
@@ -295,14 +313,14 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             }
 
             if (stopReason != "tool_use" || toolUses.Count == 0)
-                return text.ToString();
+                return ReasoningExtract.Wrap(thinking.ToString(), text.ToString());
 
             // Append the assistant's tool_use content, then a user turn with tool_result blocks.
             messages.Add(new { role = "assistant", content = CloneContent(content) });
             var results = new List<object>();
             foreach (var (id, name, argsJson) in toolUses)
             {
-                var result = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct);
+                var result = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct, progress);
                 results.Add(new { type = "tool_result", tool_use_id = id, content = result });
             }
             messages.Add(new { role = "user", content = results.ToArray() });
@@ -371,7 +389,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
     /// the requested tools locally, append the results, and continue until the model answers.
     /// </summary>
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
 
@@ -408,7 +426,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var toolResult = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct);
+                var toolResult = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct, progress);
                 messages.Add(new HostedModelMessage("tool", toolResult, ToolCallId: id));
             }
         }
@@ -496,7 +514,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
     }
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
         if (string.IsNullOrWhiteSpace(cfg.Endpoint) || string.IsNullOrWhiteSpace(cfg.Model))
@@ -530,7 +548,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
             var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
 
             if (!msg.TryGetProperty("tool_calls", out var toolCalls) || toolCalls.ValueKind != JsonValueKind.Array || toolCalls.GetArrayLength() == 0)
-                return msg.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
+                return ReasoningExtract.WithOpenAiReasoning(msg);
 
             messages.Add(new { role = "assistant", content = (string?)null, tool_calls = CloneArray(toolCalls) });
             foreach (var call in toolCalls.EnumerateArray())
@@ -539,7 +557,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var result = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct);
+                var result = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct, progress);
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
