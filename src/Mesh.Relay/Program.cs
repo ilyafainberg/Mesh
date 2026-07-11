@@ -361,9 +361,16 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
                 messages.Add(new { role = m.Role == "assistant" ? "assistant" : "user", content = m.Content });
         }
 
-        object payload = new { model, messages, max_tokens = 1024 };
+        // Output-token cap for the upstream call. The client may request a larger budget (e.g. for
+        // building a whole widget document); clamp it to a sane server-side ceiling so the free tier
+        // cannot be pushed into unbounded generations, and default to a reasonable size when unset.
+        const int DefaultMaxTokens = 2048;
+        const int MaxAllowedTokens = 8192;
+        var maxTokens = req.MaxTokens <= 0 ? DefaultMaxTokens : Math.Min(req.MaxTokens, MaxAllowedTokens);
+
+        object payload = new { model, messages, max_tokens = maxTokens };
         if (!string.IsNullOrWhiteSpace(req.ToolsJson))
-            payload = new { model, messages, max_tokens = 1024, tools = JsonDocument.Parse(req.ToolsJson!).RootElement.Clone() };
+            payload = new { model, messages, max_tokens = maxTokens, tools = JsonDocument.Parse(req.ToolsJson!).RootElement.Clone() };
 
         using var upstream = new HttpRequestMessage(HttpMethod.Post, $"{endpoint.TrimEnd('/')}/v1/chat/completions");
         upstream.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
@@ -385,8 +392,11 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
             return Results.Json(new { error = "hosted model temporarily unavailable" }, statusCode: StatusCodes.Status503ServiceUnavailable);
         }
         using var doc = JsonDocument.Parse(body);
-        var respMsg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        var choice0 = doc.RootElement.GetProperty("choices")[0];
+        var respMsg = choice0.GetProperty("message");
         var content = respMsg.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() ?? "" : "";
+        var finishReason = choice0.TryGetProperty("finish_reason", out var frEl) && frEl.ValueKind == JsonValueKind.String
+            ? frEl.GetString() : null;
         string? toolCallsJson = null;
         if (respMsg.TryGetProperty("tool_calls", out var tcs) && tcs.ValueKind == JsonValueKind.Array && tcs.GetArrayLength() > 0)
             toolCallsJson = tcs.GetRawText();
@@ -398,7 +408,7 @@ app.MapPost("/model/chat", async (HostedModelRequest req) =>
         await quota.AddDailyAsync(handleKey, totalTokens);
         metrics.HostedModelCall();
         app.Logger.LogInformation("hosted model call: {Handle} tokens={Tokens}", handleKey, totalTokens);
-        return Results.Ok(new HostedModelResponse(content, toolCallsJson, promptTokens, completionTokens, totalTokens));
+        return Results.Ok(new HostedModelResponse(content, toolCallsJson, promptTokens, completionTokens, totalTokens, finishReason));
     }
     catch (Exception ex)
     {

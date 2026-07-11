@@ -58,7 +58,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         {
             try
             {
-                answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct);
+                answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct: ct);
             }
             finally
             {
@@ -118,12 +118,47 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var cfg = await ResolveModelConfigAsync(state.Profile.Model, ct);
         var model = factory.Create(cfg);
         var sys = WidgetBuilderPrompt();
-        var reply = await model.CompleteAsync(sys, new[] { new ChatLine { Role = "user", Text = description } }, ct);
+        // A widget is a whole HTML+CSS+JS document, which easily exceeds the default output cap, so
+        // request the larger widget budget. A too-small cap truncates the document mid-JS and the
+        // partial code renders as a dead widget.
+        var reply = await model.CompleteAsync(sys, new[] { new ChatLine { Role = "user", Text = description } },
+            CompletionOptions.Widget, ct);
+
+        // If the model was cut off (or otherwise failed), do not wrap a partial document as a widget:
+        // surface the failure so the user can retry rather than see a broken, non-running widget.
+        if (ModelReply.IsFailure(reply))
+            return "[the widget could not be generated: the model's reply was cut off or failed. Please try again, or simplify the request.]";
 
         // Normalize whatever the model returned into a single clean html-app block,
         // so a chatty/small model that adds prose or extra fences still renders.
         var html = ExtractWidgetHtml(reply);
-        return LooksLikeHtml(html) ? $"```html-app\n{html}\n```" : reply;
+        if (!LooksLikeHtml(html)) return reply;
+        if (!IsCompleteWidget(html))
+            return "[the widget looks incomplete (its HTML did not finish). This usually means the model's reply was cut off. Please try again, or simplify the request.]";
+        return $"```html-app\n{html}\n```";
+    }
+
+    /// <summary>
+    /// A cheap structural completeness check for a generated widget: the document must close its
+    /// html/body, and any script it opens must be closed. A truncated document (cut off mid-JS)
+    /// fails this, so it is reported as incomplete rather than rendered as a dead widget.
+    /// </summary>
+    private static bool IsCompleteWidget(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html)) return false;
+        var lower = html.ToLowerInvariant();
+
+        // A full document must close its root element.
+        var hasHtmlOpen = lower.Contains("<html");
+        if (hasHtmlOpen && !lower.Contains("</html>")) return false;
+        if (lower.Contains("<body") && !lower.Contains("</body>")) return false;
+
+        // Every opened <script ...> (non self-closing) must have a matching </script>.
+        var scriptOpens = System.Text.RegularExpressions.Regex.Matches(lower, "<script(?![^>]*/>)[^>]*>").Count;
+        var scriptCloses = System.Text.RegularExpressions.Regex.Matches(lower, "</script>").Count;
+        if (scriptOpens != scriptCloses) return false;
+
+        return true;
     }
 
     /// <summary>Pulls the HTML document out of a model reply, tolerating prose and stray fences.</summary>
@@ -340,7 +375,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
 
             progress?.Report("Testing the model…");
             var model2 = factory.Create(effective);
-            var reply = await model2.CompleteAsync("You are a test.", new[] { new ChatLine { Role = "user", Text = "Reply with OK" } }, ct);
+            var reply = await model2.CompleteAsync("You are a test.", new[] { new ChatLine { Role = "user", Text = "Reply with OK" } }, ct: ct);
             if (reply.StartsWith("[model error", StringComparison.OrdinalIgnoreCase))
                 return (false, reply.Trim('[', ']'));
             if (string.IsNullOrWhiteSpace(reply))

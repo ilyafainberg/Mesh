@@ -196,11 +196,9 @@
 
 @code {
     string input = "";
-    // Per-thread run state so Me topics are independent: a turn running in one thread does not make
-    // other threads look busy. A thread id is present in busyThreads while its turn runs, and in
-    // buildingThreads while it is specifically building a widget (for the label text).
-    readonly HashSet<string> busyThreads = new(StringComparer.Ordinal);
-    readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
+    // Per-thread run state (busy/building/queue) lives in AppState (the singleton), NOT here, so a
+    // running turn and its thinking indicator survive navigating away from and back to the Me section,
+    // and a fresh page instance never starts a second concurrent turn for an already-running thread.
     bool widgetMode;
     bool homeMode;
     bool confirmDelete;
@@ -218,17 +216,11 @@
     bool lastBusy;
 
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
-    bool ActiveBusy => Active is not null && busyThreads.Contains(Active.Id);
-    bool ActiveBuilding => Active is not null && buildingThreads.Contains(Active.Id);
+    bool ActiveBusy => Active is not null && State.IsThreadBusy(Active.Id);
+    bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
-
-    // Per-thread queue of messages the user sent while THAT thread's turn was still running. Each
-    // thread drains its own queue after its turn, so queued input never bleeds across threads.
-    readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
-    List<ChatLine> QueueFor(string threadId)
-        => queuedByThread.TryGetValue(threadId, out var l) ? l : (queuedByThread[threadId] = new());
 
     // Assistant lines whose reasoning ("thinking") section is currently expanded.
     readonly HashSet<ChatLine> expandedReasoning = new();
@@ -250,7 +242,7 @@
     // thread (shown immediately as a subtle "queued" line) and answered together in ONE follow-up turn
     // after the current one finishes, in order. A thread never runs two of its own turns concurrently,
     // but different threads run independently.
-    bool IsQueued(ChatLine line) => Active is not null && QueueFor(Active.Id).Contains(line);
+    bool IsQueued(ChatLine line) => State.IsLineQueued(line);
 
     sealed record StagedFile(string Name, string Path, long Size)
     {
@@ -462,12 +454,13 @@
         // This thread is already running a turn: queue this input for its next turn instead of
         // starting a second concurrent call in the SAME thread. Show it immediately as a subtle
         // "queued" user line; it is already in the thread history, so the drain answers it in order.
-        // Other threads are unaffected and keep running independently.
-        if (busyThreads.Contains(thread.Id))
+        // Other threads are unaffected and keep running independently. The busy check is against the
+        // shared app state, so a page instance reopened mid-turn still queues instead of double-running.
+        if (State.IsThreadBusy(thread.Id))
         {
             var qLine = new ChatLine { Role = "user", Text = ComposeOwnerPrompt(text, files) };
             State.AddOwnChatLine(thread.Id, qLine);
-            QueueFor(thread.Id).Add(qLine);
+            State.EnqueueForThread(thread.Id, qLine);
             return;
         }
 
@@ -477,12 +470,12 @@
     }
 
     // Runs one owner turn for a single thread, then drains that thread's queue. Independent of any
-    // other thread's turn (service scopes flow via AsyncLocal, so concurrent turns do not mix).
+    // other thread's turn (service scopes flow via AsyncLocal, so concurrent turns do not mix). Run
+    // state lives in AppState, so this task keeps the indicator correct even if the Me page is closed
+    // (navigated away) mid-turn; it only touches singletons, so it is safe after component disposal.
     async Task RunThreadTurnAsync(string threadId, string text, List<StagedFile> files, bool widget, bool home)
     {
-        busyThreads.Add(threadId);
-        if (widget) buildingThreads.Add(threadId);
-        await InvokeAsync(StateHasChanged);
+        State.BeginThreadTurn(threadId, widget);
         try
         {
             if (widget)
@@ -511,20 +504,17 @@
             // Drain anything this thread queued while its turn ran. Each drain answers ALL of the
             // thread's currently queued lines together in one continuation turn (they are consecutive
             // user turns already in the history); loop in case more were queued while draining.
-            var queue = QueueFor(threadId);
-            while (queue.Count > 0)
+            while (State.QueuedCountForThread(threadId) > 0)
             {
-                queue.Clear(); // they are now being answered, not waiting
-                buildingThreads.Remove(threadId);
+                State.ClearThreadQueue(threadId); // they are now being answered, not waiting
+                State.ClearThreadBuilding(threadId);
                 await Agent.ContinueAsOwnerAsync(threadId);
             }
         }
         catch (Exception ex) { State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
         finally
         {
-            busyThreads.Remove(threadId);
-            buildingThreads.Remove(threadId);
-            await InvokeAsync(StateHasChanged);
+            State.EndThreadTurn(threadId);
         }
     }
 

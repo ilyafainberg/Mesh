@@ -9,7 +9,8 @@ namespace Mesh.App.Services;
 
 public interface IChatModel
 {
-    Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default);
+    Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        CompletionOptions? options = null, CancellationToken ct = default);
 
     /// <summary>
     /// Completes with tool access. The model may call tools zero or more times;
@@ -19,8 +20,42 @@ public interface IChatModel
     /// tool call starts and finishes so the UI can show a live step trace.
     /// </summary>
     Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
-        => CompleteAsync(systemPrompt, history, ct);
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        CompletionOptions? options = null, CancellationToken ct = default)
+        => CompleteAsync(systemPrompt, history, options, ct);
+}
+
+/// <summary>
+/// Per-call completion tuning. <see cref="MaxOutputTokens"/> caps the model's output: ordinary chat
+/// uses the default, while large generations (e.g. building a widget, which is a whole HTML+JS
+/// document) request a much higher cap so the reply is not truncated mid-code. A too-small cap was
+/// the root cause of widgets rendering as broken, dead documents.
+/// </summary>
+public sealed record CompletionOptions(int MaxOutputTokens = CompletionOptions.DefaultMaxOutputTokens)
+{
+    public const int DefaultMaxOutputTokens = 10240;
+
+    /// <summary>Generous cap for whole-document generations such as widgets.</summary>
+    public static readonly CompletionOptions Widget = new(20480);
+
+    /// <summary>The effective output cap for an options value that may be null (falls back to default).</summary>
+    public static int Resolve(CompletionOptions? options) => options?.MaxOutputTokens ?? DefaultMaxOutputTokens;
+}
+
+/// <summary>
+/// The reply text used when a provider stopped generating because it hit the output-token limit
+/// (finish_reason "length" / stop_reason "max_tokens" / finishReason "MAX_TOKENS"). Surfacing this
+/// instead of the partial text stops truncated code being rendered as if it were complete.
+/// </summary>
+public static class TruncationDetection
+{
+    public const string Marker = "[the model's answer was cut off because it hit the output length limit. Try again, or ask for something shorter.]";
+
+    /// <summary>True when an OpenAI/Azure-shape choice was truncated by the output-token limit.</summary>
+    public static bool IsLengthCappedOpenAi(JsonElement choice)
+        => choice.TryGetProperty("finish_reason", out var fr)
+           && fr.ValueKind == JsonValueKind.String
+           && string.Equals(fr.GetString(), "length", StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>
@@ -34,7 +69,8 @@ public static class ModelReply
     {
         "The free model ", "You've reached today's free-model limit",
         "[model error", "[free model", "[stopped after too many tool calls",
-        "[Azure OpenAI needs", "[set up your Mesh identity", "[the free model needs a relay"
+        "[Azure OpenAI needs", "[set up your Mesh identity", "[the free model needs a relay",
+        "[the model's answer was cut off"
     };
 
     public static bool IsFailure(string? reply)
@@ -130,7 +166,8 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
 /// <summary>Works for OpenAI, Groq, Mistral, Foundry Local, Ollama (OpenAI-compatible).</summary>
 public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
-    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
+    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
         var baseUrl = string.IsNullOrWhiteSpace(cfg.Endpoint) ? "https://api.openai.com" : cfg.Endpoint!.TrimEnd('/');
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
@@ -139,23 +176,26 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/v1/chat/completions");
         if (!string.IsNullOrWhiteSpace(cfg.ApiKey))
             req.Headers.Authorization = new("Bearer", cfg.ApiKey);
-        req.Content = JsonContent.Create(new { model = cfg.Model, messages, max_tokens = 1024 });
+        req.Content = JsonContent.Create(new { model = cfg.Model, messages, max_tokens = CompletionOptions.Resolve(options) });
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
         Usage.ReportOpenAi(meter, doc.RootElement);
-        return ReasoningExtract.WithOpenAiReasoning(doc.RootElement.GetProperty("choices")[0].GetProperty("message"));
+        var choice = doc.RootElement.GetProperty("choices")[0];
+        if (TruncationDetection.IsLengthCappedOpenAi(choice)) return TruncationDetection.Marker;
+        return ReasoningExtract.WithOpenAiReasoning(choice.GetProperty("message"));
     }
 
     private static string MapRole(string r) => r is "assistant" ? "assistant" : r is "system" ? "system" : "user";
     private static string Trim(string s) => s.Length > 300 ? s[..300] : s;
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
-        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
+        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
 
         var baseUrl = string.IsNullOrWhiteSpace(cfg.Endpoint) ? "https://api.openai.com" : cfg.Endpoint!.TrimEnd('/');
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
@@ -172,7 +212,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/v1/chat/completions");
             if (!string.IsNullOrWhiteSpace(cfg.ApiKey)) req.Headers.Authorization = new("Bearer", cfg.ApiKey);
-            req.Content = JsonContent.Create(new { model = cfg.Model, messages, tools = toolDefs, max_tokens = 1024 });
+            req.Content = JsonContent.Create(new { model = cfg.Model, messages, tools = toolDefs, max_tokens = CompletionOptions.Resolve(options) });
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
@@ -180,16 +220,19 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
             {
                 // Some local models reject the `tools` parameter, degrade to a plain
                 // completion so chat still works rather than surfacing an error.
-                if (round == 0) return await CompleteAsync(systemPrompt, history, ct);
+                if (round == 0) return await CompleteAsync(systemPrompt, history, options, ct);
                 return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
             }
 
             using var doc = JsonDocument.Parse(body);
             Usage.ReportOpenAi(meter, doc.RootElement);
-            var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+            var choice = doc.RootElement.GetProperty("choices")[0];
+            var msg = choice.GetProperty("message");
 
             if (!msg.TryGetProperty("tool_calls", out var toolCalls) || toolCalls.ValueKind != JsonValueKind.Array || toolCalls.GetArrayLength() == 0)
-                return ReasoningExtract.WithOpenAiReasoning(msg);
+                return TruncationDetection.IsLengthCappedOpenAi(choice)
+                    ? TruncationDetection.Marker
+                    : ReasoningExtract.WithOpenAiReasoning(msg);
 
             // Echo the assistant tool-call message, then append each tool result.
             messages.Add(new { role = "assistant", content = (string?)null, tool_calls = CloneArray(toolCalls) });
@@ -237,7 +280,8 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
 
 public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
-    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
+    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
         var messages = history
             .Where(l => l.Role is "user" or "assistant")
@@ -248,12 +292,14 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
         using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
         req.Headers.Add("x-api-key", cfg.ApiKey);
         req.Headers.Add("anthropic-version", "2023-06-01");
-        req.Content = JsonContent.Create(new { model = cfg.Model, max_tokens = 1024, system = systemPrompt, messages });
+        req.Content = JsonContent.Create(new { model = cfg.Model, max_tokens = CompletionOptions.Resolve(options), system = systemPrompt, messages });
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
+        var stopReason = doc.RootElement.TryGetProperty("stop_reason", out var sr0) ? sr0.GetString() : null;
+        if (string.Equals(stopReason, "max_tokens", StringComparison.OrdinalIgnoreCase)) return TruncationDetection.Marker;
         var content = doc.RootElement.GetProperty("content");
         var sb = new StringBuilder();
         foreach (var block in content.EnumerateArray())
@@ -266,9 +312,10 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
     private static string Trim(string s) => s.Length > 300 ? s[..300] : s;
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
-        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
+        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
 
         var messages = history
             .Where(l => l.Role is "user" or "assistant")
@@ -286,7 +333,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
             req.Headers.Add("x-api-key", cfg.ApiKey);
             req.Headers.Add("anthropic-version", "2023-06-01");
-            req.Content = JsonContent.Create(new { model = cfg.Model, max_tokens = 1024, system = systemPrompt, messages, tools = toolDefs });
+            req.Content = JsonContent.Create(new { model = cfg.Model, max_tokens = CompletionOptions.Resolve(options), system = systemPrompt, messages, tools = toolDefs });
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
@@ -313,7 +360,9 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             }
 
             if (stopReason != "tool_use" || toolUses.Count == 0)
-                return ReasoningExtract.Wrap(thinking.ToString(), text.ToString());
+                return string.Equals(stopReason, "max_tokens", StringComparison.OrdinalIgnoreCase)
+                    ? TruncationDetection.Marker
+                    : ReasoningExtract.Wrap(thinking.ToString(), text.ToString());
 
             // Append the assistant's tool_use content, then a user turn with tool_result blocks.
             messages.Add(new { role = "assistant", content = CloneContent(content) });
@@ -334,7 +383,8 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
 
 public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
-    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
+    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
         var contents = history
             .Where(l => l.Role is "user" or "assistant")
@@ -345,7 +395,8 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? me
         var payload = new
         {
             system_instruction = new { parts = new[] { new { text = systemPrompt } } },
-            contents
+            contents,
+            generationConfig = new { maxOutputTokens = CompletionOptions.Resolve(options) }
         };
 
         using var resp = await http.PostAsJsonAsync(url, payload, ct);
@@ -353,8 +404,10 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? me
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
         Usage.ReportGemini(meter, doc.RootElement);
-        return doc.RootElement.GetProperty("candidates")[0].GetProperty("content")
-            .GetProperty("parts")[0].GetProperty("text").GetString() ?? "";
+        var candidate = doc.RootElement.GetProperty("candidates")[0];
+        var finishReason = candidate.TryGetProperty("finishReason", out var frEl) ? frEl.GetString() : null;
+        if (string.Equals(finishReason, "MAX_TOKENS", StringComparison.OrdinalIgnoreCase)) return TruncationDetection.Marker;
+        return candidate.GetProperty("content").GetProperty("parts")[0].GetProperty("text").GetString() ?? "";
     }
 
     private static string Trim(string s) => s.Length > 300 ? s[..300] : s;
@@ -370,7 +423,8 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
 {
     private static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
 
-    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
+    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
         var messages = history
             .Where(l => l.Role is "user" or "assistant")
@@ -378,8 +432,9 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
             .ToList();
         if (messages.Count == 0) messages.Add(new HostedModelMessage("user", "Hello"));
 
-        var (result, error) = await PostAsync(systemPrompt, messages, toolsJson: null, ct);
+        var (result, error) = await PostAsync(systemPrompt, messages, toolsJson: null, CompletionOptions.Resolve(options), ct);
         if (error is not null) return error;
+        if (IsTruncated(result)) return TruncationDetection.Marker;
         return result?.Content ?? "";
     }
 
@@ -389,10 +444,12 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
     /// the requested tools locally, append the results, and continue until the model answers.
     /// </summary>
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
-        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
+        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
 
+        var maxTokens = CompletionOptions.Resolve(options);
         var toolDefs = tools.Select(t => new
         {
             type = "function",
@@ -408,14 +465,14 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
 
         for (var round = 0; round < ToolLoop.MaxRounds; round++)
         {
-            var (result, error) = await PostAsync(systemPrompt, messages, toolsJson, ct);
+            var (result, error) = await PostAsync(systemPrompt, messages, toolsJson, maxTokens, ct);
             if (error is not null)
                 // On the first round, degrade to a plain completion so chat still works even if
                 // the hosted model rejects tools; later rounds surface the error.
-                return round == 0 ? await CompleteAsync(systemPrompt, history, ct) : error;
+                return round == 0 ? await CompleteAsync(systemPrompt, history, options, ct) : error;
 
             if (string.IsNullOrWhiteSpace(result?.ToolCallsJson))
-                return result?.Content ?? "";
+                return IsTruncated(result) ? TruncationDetection.Marker : result?.Content ?? "";
 
             // Record the assistant's tool-call turn, then execute each tool locally and append results.
             messages.Add(new HostedModelMessage("assistant", result!.Content ?? "", ToolCallsJson: result.ToolCallsJson));
@@ -433,8 +490,11 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
         return "[stopped after too many tool calls]";
     }
 
+    private static bool IsTruncated(HostedModelResponse? r)
+        => r is not null && string.Equals(r.FinishReason, "length", StringComparison.OrdinalIgnoreCase);
+
     private async Task<(HostedModelResponse? result, string? error)> PostAsync(
-        string systemPrompt, IReadOnlyList<HostedModelMessage> messages, string? toolsJson, CancellationToken ct)
+        string systemPrompt, IReadOnlyList<HostedModelMessage> messages, string? toolsJson, int maxTokens, CancellationToken ct)
     {
         var p = state.Profile;
         if (string.IsNullOrWhiteSpace(p.RelayUrl))
@@ -444,7 +504,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
 
         var promptHash = HostedModelProtocol.PromptHash(systemPrompt, messages);
         var sig = IdentityService.Sign(p.PrivateKey, HostedModelProtocol.Message(p.Handle, promptHash));
-        var request = new HostedModelRequest(AppState.Norm(p.Handle), p.PublicKey, sig, systemPrompt, messages, toolsJson);
+        var request = new HostedModelRequest(AppState.Norm(p.Handle), p.PublicKey, sig, systemPrompt, messages, toolsJson, maxTokens);
         _ = cfg.Model; // the hosted model id is chosen server-side; cfg is kept for parity with other providers
 
         try
@@ -491,7 +551,8 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
         return $"{baseUrl}/openai/deployments/{cfg.Model}/chat/completions?api-version={version}";
     }
 
-    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history, CancellationToken ct = default)
+    public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(cfg.Endpoint)) return "[Azure OpenAI needs a resource endpoint in Settings]";
         if (string.IsNullOrWhiteSpace(cfg.Model)) return "[Azure OpenAI needs a deployment name in Settings]";
@@ -503,22 +564,25 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
         req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
         // The v1 API carries the deployment name in the body; the legacy URL carries it in the path
         // (and ignores an extra "model" field), so sending it is safe for both.
-        req.Content = JsonContent.Create(new { model = cfg.Model, messages, max_tokens = 1024 });
+        req.Content = JsonContent.Create(new { model = cfg.Model, messages, max_tokens = CompletionOptions.Resolve(options) });
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
         Usage.ReportOpenAi(meter, doc.RootElement);
-        return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+        var choice = doc.RootElement.GetProperty("choices")[0];
+        if (TruncationDetection.IsLengthCappedOpenAi(choice)) return TruncationDetection.Marker;
+        return choice.GetProperty("message").GetProperty("content").GetString() ?? "";
     }
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null, CancellationToken ct = default)
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        CompletionOptions? options = null, CancellationToken ct = default)
     {
-        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, ct);
+        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
         if (string.IsNullOrWhiteSpace(cfg.Endpoint) || string.IsNullOrWhiteSpace(cfg.Model))
-            return await CompleteAsync(systemPrompt, history, ct);
+            return await CompleteAsync(systemPrompt, history, options, ct);
 
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
         messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = l.Text }));
@@ -533,22 +597,25 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
             req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
-            req.Content = JsonContent.Create(new { model = cfg.Model, messages, tools = toolDefs, max_tokens = 1024 });
+            req.Content = JsonContent.Create(new { model = cfg.Model, messages, tools = toolDefs, max_tokens = CompletionOptions.Resolve(options) });
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
             if (!resp.IsSuccessStatusCode)
             {
-                if (round == 0) return await CompleteAsync(systemPrompt, history, ct);
+                if (round == 0) return await CompleteAsync(systemPrompt, history, options, ct);
                 return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
             }
 
             using var doc = JsonDocument.Parse(body);
             Usage.ReportOpenAi(meter, doc.RootElement);
-            var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+            var choice = doc.RootElement.GetProperty("choices")[0];
+            var msg = choice.GetProperty("message");
 
             if (!msg.TryGetProperty("tool_calls", out var toolCalls) || toolCalls.ValueKind != JsonValueKind.Array || toolCalls.GetArrayLength() == 0)
-                return ReasoningExtract.WithOpenAiReasoning(msg);
+                return TruncationDetection.IsLengthCappedOpenAi(choice)
+                    ? TruncationDetection.Marker
+                    : ReasoningExtract.WithOpenAiReasoning(msg);
 
             messages.Add(new { role = "assistant", content = (string?)null, tool_calls = CloneArray(toolCalls) });
             foreach (var call in toolCalls.EnumerateArray())

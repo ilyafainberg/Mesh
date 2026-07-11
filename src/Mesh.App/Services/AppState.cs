@@ -404,6 +404,78 @@ public sealed class AppState
         if (agentSteps.Remove(key)) NotifyChanged();
     }
 
+    // Per-thread owner-turn run state, held here (in the singleton app state) rather than in the Me
+    // page component so it SURVIVES NAVIGATION: a turn keeps running when the user leaves the Me
+    // section, and the busy/thinking indicator, the widget-building label, and the steerable-input
+    // queue must all still be correct when they return (and a fresh page instance must not start a
+    // second concurrent turn for a thread that is already running). Keyed by own-thread id.
+    private readonly HashSet<string> busyThreads = new(StringComparer.Ordinal);
+    private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
+
+    /// <summary>True while the given own-thread is running an agent turn.</summary>
+    public bool IsThreadBusy(string threadId) => busyThreads.Contains(threadId);
+
+    /// <summary>True while the given own-thread is specifically building a widget (for the label text).</summary>
+    public bool IsThreadBuilding(string threadId) => buildingThreads.Contains(threadId);
+
+    /// <summary>Marks a thread's turn as started (optionally a widget build).</summary>
+    public void BeginThreadTurn(string threadId, bool building)
+    {
+        busyThreads.Add(threadId);
+        if (building) buildingThreads.Add(threadId);
+        NotifyChanged();
+    }
+
+    /// <summary>Clears the widget-building flag (e.g. once the build step is done) while a turn continues.</summary>
+    public void ClearThreadBuilding(string threadId)
+    {
+        if (buildingThreads.Remove(threadId)) NotifyChanged();
+    }
+
+    /// <summary>Marks a thread's turn as finished (clears busy + building).</summary>
+    public void EndThreadTurn(string threadId)
+    {
+        var a = busyThreads.Remove(threadId);
+        var b = buildingThreads.Remove(threadId);
+        if (a || b) NotifyChanged();
+    }
+
+    /// <summary>
+    /// Queues a user line for a thread whose turn is already running (steerable input). The line is
+    /// also added to the thread history by the caller; this tracks that it is pending so the UI can
+    /// tag it and the running turn can drain it.
+    /// </summary>
+    public void EnqueueForThread(string threadId, ChatLine line)
+    {
+        if (!queuedByThread.TryGetValue(threadId, out var l))
+            queuedByThread[threadId] = l = new List<ChatLine>();
+        l.Add(line);
+        NotifyChanged();
+    }
+
+    /// <summary>True when a specific line is still waiting in some thread's queue (drives the "queued" tag).</summary>
+    public bool IsLineQueued(ChatLine line)
+    {
+        foreach (var l in queuedByThread.Values)
+            if (l.Contains(line)) return true;
+        return false;
+    }
+
+    /// <summary>Number of lines currently queued for a thread.</summary>
+    public int QueuedCountForThread(string threadId)
+        => queuedByThread.TryGetValue(threadId, out var l) ? l.Count : 0;
+
+    /// <summary>Clears a thread's queue (called when the running turn starts answering the queued lines).</summary>
+    public void ClearThreadQueue(string threadId)
+    {
+        if (queuedByThread.TryGetValue(threadId, out var l) && l.Count > 0)
+        {
+            l.Clear();
+            NotifyChanged();
+        }
+    }
+
     /// <summary>Clears the unread flag for a conversation (called when the owner opens it).</summary>
     public void MarkRead(string handle)
     {
