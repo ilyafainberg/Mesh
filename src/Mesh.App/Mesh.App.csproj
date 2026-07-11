@@ -40,10 +40,10 @@
         <ApplicationIcon>Platforms\Windows\appicon.ico</ApplicationIcon>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.5.6</ApplicationDisplayVersion>
-        <ApplicationVersion>31</ApplicationVersion>
+        <ApplicationDisplayVersion>1.5.7</ApplicationDisplayVersion>
+        <ApplicationVersion>32</ApplicationVersion>
         <!-- Drives AssemblyVersion/FileVersion/InformationalVersion, read by the self-updater. -->
-        <Version>1.5.6</Version>
+        <Version>1.5.7</Version>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
