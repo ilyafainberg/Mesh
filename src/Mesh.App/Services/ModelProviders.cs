@@ -33,10 +33,10 @@ public interface IChatModel
 /// </summary>
 public sealed record CompletionOptions(int MaxOutputTokens = CompletionOptions.DefaultMaxOutputTokens)
 {
-    public const int DefaultMaxOutputTokens = 10240;
+    public const int DefaultMaxOutputTokens = 20480;
 
     /// <summary>Generous cap for whole-document generations such as widgets.</summary>
-    public static readonly CompletionOptions Widget = new(20480);
+    public static readonly CompletionOptions Widget = new(40960);
 
     /// <summary>The effective output cap for an options value that may be null (falls back to default).</summary>
     public static int Resolve(CompletionOptions? options) => options?.MaxOutputTokens ?? DefaultMaxOutputTokens;

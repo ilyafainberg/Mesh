@@ -592,6 +592,7 @@ Widget runtime restrictions:
         sb.AppendLine(WidgetRuntimeContract);
         sb.AppendLine("- Must be genuinely interactive: wire up real, working JavaScript for the behaviour the user asked for.");
         sb.AppendLine("- Size for a phone: content ~340px wide, responsive to the container, total height comfortably under ~500px. Use system fonts, generous spacing, rounded corners, a clean modern look.");
+        sb.AppendLine($"- OUTPUT BUDGET: your entire response must fit within about {CompletionOptions.Widget.MaxOutputTokens} output tokens (roughly {CompletionOptions.Widget.MaxOutputTokens * 7 / 2} characters). A reply that exceeds this is CUT OFF and the widget is discarded as incomplete, so a FINISHED, smaller widget always beats an ambitious one that does not close its </html>. Scope the feature set to what fits: keep the code compact, avoid huge inline data or asset blobs, and if the request is large, implement a solid core rather than everything. Budget your remaining space as you write and make sure you reach </html>.");
         sb.AppendLine();
         sb.AppendLine("EXAMPLE of a complete, valid response (structure to mirror, do not copy its content):");
         sb.AppendLine("```html-app");
