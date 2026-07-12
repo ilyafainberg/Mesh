@@ -103,6 +103,14 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
                 return answer;
             }
 
+            // The run stopped at the tool-call safety limit and WILL resume. Persist the verbose tool
+            // transcript as an INTERNAL line (hidden from the chat) so the resumed turn reads back the
+            // exact execution record (what ran, with arguments and results) instead of only friendly
+            // step labels. This is the fix for context loss on "[stopped after too many tool calls]".
+            // Only done on the pause path (not on normal successful turns) to avoid bloating history and
+            // to keep the model's message sequence clean when no resume is needed.
+            PersistToolTranscript(thread.Id, observedSteps);
+
             string[] completed;
             lock (observedSteps)
             {
@@ -131,6 +139,41 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         }
 
         throw new InvalidOperationException("Unreachable owner continuation state.");
+    }
+
+    /// <summary>
+    /// Records the turn's tool calls (name, arguments, result) as a single INTERNAL transcript line so
+    /// the model can read back exactly what it did on a later turn or an automatic resume, without the
+    /// user seeing the raw tool output. Values are already clipped by the tool layer. Does nothing when
+    /// no tools ran. The line is hidden from the chat view (see the Internal flag) but included in the
+    /// history window sent to the model.
+    /// </summary>
+    private void PersistToolTranscript(string threadId, List<AgentStep> observedSteps)
+    {
+        List<AgentStep> finished;
+        lock (observedSteps)
+            finished = observedSteps.Where(s => s.State != AgentStepState.Started).ToList();
+        if (finished.Count == 0) return;
+
+        var sb = new StringBuilder(
+            "[internal tool transcript, not shown to the user. Use it to continue the task without repeating completed or destructive actions.]");
+        foreach (var s in finished)
+        {
+            sb.Append("\n\nTool: ").Append(s.Tool);
+            if (!string.IsNullOrEmpty(s.Arguments)) sb.Append("\nArguments: ").Append(s.Arguments);
+            sb.Append(s.State == AgentStepState.Failed ? "\nResult (failed): " : "\nResult: ")
+              .Append(string.IsNullOrEmpty(s.Result) ? "(no output)" : s.Result);
+        }
+
+        // Bound the whole transcript so it cannot crowd the original request and recent conversation
+        // out of the model's context window. The most recent steps matter most for continuing, so keep
+        // the tail when it is oversized.
+        var text = sb.ToString();
+        const int maxTranscript = 12000;
+        if (text.Length > maxTranscript)
+            text = "[internal tool transcript, truncated to the most recent activity.]\n...\n" + text[^maxTranscript..];
+
+        state.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = text, Internal = true });
     }
 
     /// <summary>Appends any tool-produced images to a reply as renderable mesh-file blocks.</summary>

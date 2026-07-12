@@ -93,6 +93,10 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("conversations", "service_name", "TEXT");
         AddColumnIfMissing("conversations", "provider_handle", "TEXT");
         AddColumnIfMissing("own_chat", "thread_id", "TEXT");
+        // Transcript + reasoning persistence: internal lines are the model's hidden execution record;
+        // reasoning is the collapsible "thinking" (previously not persisted, so lost on restart).
+        AddColumnIfMissing("own_chat", "internal", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("own_chat", "reasoning", "TEXT");
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)
@@ -222,7 +226,7 @@ public sealed class MeshDb : IDisposable
 
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT thread_id, role, text, via, at, line_id, status FROM own_chat WHERE thread_id IS NOT NULL ORDER BY id;";
+            cmd.CommandText = "SELECT thread_id, role, text, via, at, line_id, status, internal, reasoning FROM own_chat WHERE thread_id IS NOT NULL ORDER BY id;";
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -234,7 +238,9 @@ public sealed class MeshDb : IDisposable
                     Via = r.GetString(3),
                     At = ParseAt(r.GetString(4)),
                     Id = r.IsDBNull(5) ? Guid.NewGuid().ToString("n") : r.GetString(5),
-                    Status = r.IsDBNull(6) ? "" : r.GetString(6)
+                    Status = r.IsDBNull(6) ? "" : r.GetString(6),
+                    Internal = !r.IsDBNull(7) && r.GetInt64(7) != 0,
+                    Reasoning = r.IsDBNull(8) ? null : r.GetString(8)
                 });
             }
         }
@@ -302,7 +308,7 @@ public sealed class MeshDb : IDisposable
     public void AppendOwnChat(string threadId, ChatLine line)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO own_chat(line_id, thread_id, role, text, via, status, at) VALUES($lid, $tid, $r, $x, $v, $s, $a);";
+        cmd.CommandText = "INSERT INTO own_chat(line_id, thread_id, role, text, via, status, at, internal, reasoning) VALUES($lid, $tid, $r, $x, $v, $s, $a, $i, $rz);";
         cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$tid", threadId);
         cmd.Parameters.AddWithValue("$r", line.Role);
@@ -310,6 +316,8 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$v", line.Via);
         cmd.Parameters.AddWithValue("$s", line.Status);
         cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
+        cmd.Parameters.AddWithValue("$i", line.Internal ? 1 : 0);
+        cmd.Parameters.AddWithValue("$rz", (object?)line.Reasoning ?? DBNull.Value);
         cmd.ExecuteNonQuery();
     }
 
@@ -418,7 +426,7 @@ public sealed class MeshDb : IDisposable
             SELECT handle, role, text, at, NULL AS thread_id FROM chat_lines WHERE text LIKE $q COLLATE NOCASE
             UNION ALL
             SELECT '(me)' AS handle, role, text, at, thread_id FROM own_chat
-                WHERE thread_id IS NOT NULL AND text LIKE $q COLLATE NOCASE
+                WHERE thread_id IS NOT NULL AND internal = 0 AND text LIKE $q COLLATE NOCASE
             ORDER BY at DESC LIMIT $lim;";
         cmd.Parameters.AddWithValue("$q", like);
         cmd.Parameters.AddWithValue("$lim", limit);

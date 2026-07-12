@@ -330,6 +330,61 @@
     margin-bottom: 6px;
 }
 
+.agent-step-item {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.agent-step-detail {
+    margin: 2px 0 4px 21px;
+    border-left: 2px solid var(--stroke-1);
+    padding-left: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.step-detail-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--fg-3);
+}
+
+.step-detail-body {
+    margin: 0 0 4px;
+    padding: 6px 8px;
+    background: var(--bg-1);
+    border-radius: 6px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--fg-2, var(--fg-3));
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow: auto;
+}
+
+.step-details-toggle {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 6px;
+    padding: 3px 9px;
+    border: 1px solid var(--stroke-1);
+    border-radius: 999px;
+    background: var(--bg-1);
+    color: var(--fg-3);
+    font-size: 12px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.step-details-toggle:active { background: var(--bg-3); color: var(--fg-1); }
+
 .agent-step {
     display: flex;
     align-items: center;

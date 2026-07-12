@@ -391,6 +391,14 @@ public sealed class ChatLine
     /// reasoning field); null when the model returned no reasoning.
     /// </summary>
     public string? Reasoning { get; set; }
+    /// <summary>
+    /// Internal transcript line: part of the agent's own execution record (tool calls with their
+    /// arguments and results) that the MODEL sees on later turns and resumes so it never loses the
+    /// execution context, but which is NOT shown to the user as a chat bubble (the user sees the live
+    /// step trace and the final answer instead). Persisted encrypted with the thread, owner-only, and
+    /// never sent to peers.
+    /// </summary>
+    public bool Internal { get; set; }
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -400,8 +408,11 @@ public enum AgentStepState { Started, Done, Failed }
 /// <summary>
 /// A single step the agent takes during a turn (a tool call), surfaced live so the user can see what
 /// the agent is doing. <see cref="Label"/> is a friendly description (e.g. "Ran Python").
+/// <see cref="Arguments"/> is the raw tool input and <see cref="Result"/> the tool output (both may be
+/// truncated for display); they drive the expandable "details" view and the model's hidden transcript.
 /// </summary>
-public sealed record AgentStep(string Tool, string Label, AgentStepState State);
+public sealed record AgentStep(string Tool, string Label, AgentStepState State,
+    string? Arguments = null, string? Result = null);
 
 public sealed class Conversation
 {

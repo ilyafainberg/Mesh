@@ -97,7 +97,7 @@ else
                         and helps you manage what your public agent shares with others. Ask it anything.
                     </div>
                 }
-                @foreach (var line in Active.Lines)
+                @foreach (var line in Active.Lines.Where(l => !l.Internal))
                 {
                     <div class="bubble @(line.Role)">
                         @if (!string.IsNullOrEmpty(line.Reasoning))
@@ -128,12 +128,33 @@ else
                             <div class="agent-steps">
                                 @foreach (var s in steps)
                                 {
-                                    <div class="agent-step @s.State.ToString().ToLowerInvariant()">
-                                        <i class="bi @StepIcon(s.State)"></i>
-                                        <span>@s.Label</span>
+                                    <div class="agent-step-item">
+                                        <div class="agent-step @s.State.ToString().ToLowerInvariant()">
+                                            <i class="bi @StepIcon(s.State)"></i>
+                                            <span>@s.Label</span>
+                                        </div>
+                                        @if (showStepDetails && (!string.IsNullOrEmpty(s.Arguments) || !string.IsNullOrEmpty(s.Result)))
+                                        {
+                                            <div class="agent-step-detail">
+                                                @if (!string.IsNullOrEmpty(s.Arguments))
+                                                {
+                                                    <div class="step-detail-label">input</div>
+                                                    <pre class="step-detail-body">@s.Arguments</pre>
+                                                }
+                                                @if (!string.IsNullOrEmpty(s.Result))
+                                                {
+                                                    <div class="step-detail-label">output</div>
+                                                    <pre class="step-detail-body">@s.Result</pre>
+                                                }
+                                            </div>
+                                        }
                                     </div>
                                 }
                             </div>
+                            <button class="step-details-toggle" @onclick="() => showStepDetails = !showStepDetails">
+                                <i class="bi @(showStepDetails ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                                @(showStepDetails ? "Hide details" : "Show details")
+                            </button>
                         }
                         <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                     </div>
@@ -258,6 +279,9 @@ else
     // Assistant lines whose reasoning ("thinking") section is currently expanded.
     readonly HashSet<ChatLine> expandedReasoning = new();
 
+    // When true, the live step trace shows each tool's raw arguments and output (verbose mode).
+    bool showStepDetails;
+
     void ToggleReasoning(ChatLine line)
     {
         if (!expandedReasoning.Remove(line)) expandedReasoning.Add(line);
@@ -342,6 +366,9 @@ else
         {
             lastCount = count;
             lastBusy = ActiveBusy;
+            // autoScroll is idempotent: it attaches the sticky observer the first time scrollEl is real
+            // (mobile only mounts it when a thread overlay opens), then keeps the pane pinned to bottom.
+            try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl); } catch { }
             try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
         }
     }

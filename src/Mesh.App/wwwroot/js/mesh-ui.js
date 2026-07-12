@@ -11,6 +11,26 @@ window.meshUI = {
       });
     });
   },
+  // Keeps a scroll container pinned to the bottom as its content GROWS (streaming step trace, a long
+  // reply that lays out or loads images/iframes after the initial render). This is more reliable than
+  // a one-shot scroll: a ResizeObserver re-pins on every size change. It is "sticky" - if the user
+  // scrolls up to read, it stops auto-pinning until they return near the bottom. Idempotent per element.
+  autoScroll: function (el) {
+    if (!el || el._meshAuto) return;
+    el._meshAuto = true;
+    el._stick = true;
+    var nearBottom = function () {
+      return el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+    };
+    el.addEventListener('scroll', function () { el._stick = nearBottom(); });
+    var pin = function () { if (el._stick) el.scrollTop = el.scrollHeight; };
+    try {
+      var ro = new ResizeObserver(pin);
+      // Observe the inner content wrapper so its height changes fire; fall back to the container.
+      ro.observe(el.firstElementChild || el);
+      el._meshRo = ro;
+    } catch (e) { /* ResizeObserver unavailable: the per-render scrollToBottom still runs */ }
+  },
   downloadFile: function (name, mime, b64) {
     try {
       var bin = atob(b64);

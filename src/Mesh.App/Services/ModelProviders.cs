@@ -91,6 +91,27 @@ internal static class ToolLoop
         => string.Equals(reply?.Trim(), LimitMarker, StringComparison.Ordinal);
 }
 
+/// <summary>
+/// Clips tool arguments/results for the step trace and the model's hidden transcript. Keeps the head
+/// and tail (where the useful signal usually is) and marks the elided middle, so a huge tool output
+/// (a long file, a big command dump) cannot blow up the UI or the context budget while still leaving
+/// the model enough to understand what happened.
+/// </summary>
+internal static class ToolTrace
+{
+    public const int MaxChars = 4000;
+
+    public static string? Clip(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        if (text.Length <= MaxChars) return text;
+        var head = MaxChars * 2 / 3;
+        var tail = MaxChars - head;
+        var omitted = text.Length - head - tail;
+        return text[..head] + $"\n... [{omitted} characters omitted] ...\n" + text[^tail..];
+    }
+}
+
 /// <summary>Extracts token usage from the various provider response shapes and reports it to the meter.</summary>
 internal static class Usage
 {
@@ -257,24 +278,27 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
         CancellationToken ct, IProgress<AgentStep>? progress = null)
     {
         var label = ReasoningExtract.Label(name);
-        progress?.Report(new AgentStep(name, label, AgentStepState.Started));
+        var args = ToolTrace.Clip(argsJson);
+        progress?.Report(new AgentStep(name, label, AgentStepState.Started, Arguments: args));
         var tool = tools.FirstOrDefault(t => t.Name == name);
         if (tool is null)
         {
-            progress?.Report(new AgentStep(name, label, AgentStepState.Failed));
-            return $"ERROR: unknown tool '{name}'.";
+            var miss = $"ERROR: unknown tool '{name}'.";
+            progress?.Report(new AgentStep(name, label, AgentStepState.Failed, args, miss));
+            return miss;
         }
         try
         {
             using var argsDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
             var result = await tool.ExecuteAsync(argsDoc.RootElement, ct);
-            progress?.Report(new AgentStep(name, label, AgentStepState.Done));
+            progress?.Report(new AgentStep(name, label, AgentStepState.Done, args, ToolTrace.Clip(result)));
             return result;
         }
         catch (Exception ex)
         {
-            progress?.Report(new AgentStep(name, label, AgentStepState.Failed));
-            return "ERROR: " + ex.Message;
+            var err = "ERROR: " + ex.Message;
+            progress?.Report(new AgentStep(name, label, AgentStepState.Failed, args, ToolTrace.Clip(err)));
+            return err;
         }
     }
 

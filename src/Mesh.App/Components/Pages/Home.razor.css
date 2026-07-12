@@ -6,6 +6,64 @@
     margin-bottom: 6px;
 }
 
+.agent-step-item {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+/* Verbose per-step detail: raw tool arguments and output, shown when "Show details" is on. */
+.agent-step-detail {
+    margin: 2px 0 4px 21px;
+    border-left: 2px solid var(--border, #e2e5e9);
+    padding-left: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.step-detail-label {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-3, #8a929c);
+}
+
+.step-detail-body {
+    margin: 0 0 4px;
+    padding: 6px 8px;
+    background: var(--bg-2, #f6f7f9);
+    border-radius: 6px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 0.74rem;
+    line-height: 1.4;
+    color: var(--text-2, #5b6470);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 220px;
+    overflow: auto;
+}
+
+.step-details-toggle {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 6px;
+    padding: 2px 8px;
+    border: 1px solid var(--border, #e2e5e9);
+    border-radius: 999px;
+    background: var(--bg-2, #f6f7f9);
+    color: var(--text-2, #5b6470);
+    font-size: 0.74rem;
+    cursor: pointer;
+}
+
+.step-details-toggle:hover {
+    background: var(--bg-3, #eef0f3);
+    color: var(--text-1, #1b1f24);
+}
+
 .agent-step {
     display: flex;
     align-items: center;
