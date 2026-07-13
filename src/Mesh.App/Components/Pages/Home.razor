@@ -193,9 +193,18 @@
                     }
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
                               placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" aria-label="Message your assistant"></textarea>
-                    <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send">
-                        <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
-                    </button>
+                    @if (ActiveBusy)
+                    {
+                        <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop" aria-label="Stop">
+                            <i class="bi bi-stop-fill"></i>
+                        </button>
+                    }
+                    else
+                    {
+                        <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send">
+                            <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
+                        </button>
+                    }
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 @if (!Agent.IsModelReady)
@@ -467,6 +476,13 @@
         return $"{size:0.#} {units[u]}";
     }
 
+    // Stops the active thread's running turn. Cancellation flows into the agent call and the provider
+    // tool loop, so the in-flight model request is actually aborted (not just hidden).
+    void StopActive()
+    {
+        if (Active is not null) State.CancelThreadTurn(Active.Id);
+    }
+
     async Task Send()
     {
         if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0) return;
@@ -511,12 +527,12 @@
     // (navigated away) mid-turn; it only touches singletons, so it is safe after component disposal.
     async Task RunThreadTurnAsync(string threadId, string text, List<StagedFile> files, bool widget, bool home)
     {
-        State.BeginThreadTurn(threadId, widget);
+        var ct = State.BeginThreadTurn(threadId, widget);
         try
         {
             if (widget)
             {
-                var html = await Agent.BuildWidgetAsync(text);
+                var html = await Agent.BuildWidgetAsync(text, ct);
                 State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
                 State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = html });
             }
@@ -534,18 +550,24 @@
             }
             else
             {
-                await Agent.AskAsOwnerAsync(threadId, ComposeOwnerPrompt(text, files));
+                await Agent.AskAsOwnerAsync(threadId, ComposeOwnerPrompt(text, files), ct);
             }
 
             // Drain anything this thread queued while its turn ran. Each drain answers ALL of the
             // thread's currently queued lines together in one continuation turn (they are consecutive
             // user turns already in the history); loop in case more were queued while draining.
-            while (State.QueuedCountForThread(threadId) > 0)
+            while (!ct.IsCancellationRequested && State.QueuedCountForThread(threadId) > 0)
             {
                 State.ClearThreadQueue(threadId); // they are now being answered, not waiting
                 State.ClearThreadBuilding(threadId);
-                await Agent.ContinueAsOwnerAsync(threadId);
+                await Agent.ContinueAsOwnerAsync(threadId, ct);
             }
+        }
+        catch (OperationCanceledException)
+        {
+            // The user pressed Stop. Cancellation of the running turn (and of the tool-limit resume
+            // wait) is intentional, so record a clean stopped line rather than an error.
+            State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = "[stopped]" });
         }
         catch (Exception ex) { State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
         finally

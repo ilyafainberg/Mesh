@@ -414,6 +414,12 @@ public sealed class AppState
     private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
     private readonly HashSet<string> completedThreads = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
+    // Cancellation source per running thread, so the user can STOP an in-progress turn. The token is
+    // passed into the agent call and flows down through the provider tool loop (real cancellation of
+    // the HTTP request, not just a UI change). Threads that were cancelled (rather than finishing on
+    // their own) are tracked so the caller can skip the automatic tool-limit resume.
+    private readonly Dictionary<string, CancellationTokenSource> threadCts = new(StringComparer.Ordinal);
+    private readonly HashSet<string> cancelledThreads = new(StringComparer.Ordinal);
 
     /// <summary>True while the given own-thread is running an agent turn.</summary>
     public bool IsThreadBusy(string threadId) => busyThreads.Contains(threadId);
@@ -436,12 +442,21 @@ public sealed class AppState
         if (completedThreads.Remove(threadId)) NotifyChanged();
     }
 
-    /// <summary>Marks a thread's turn as started (optionally a widget build).</summary>
-    public void BeginThreadTurn(string threadId, bool building)
+    /// <summary>
+    /// Marks a thread's turn as started (optionally a widget build) and returns a CancellationToken the
+    /// caller must pass into the agent call, so the user can stop the turn. Replaces any prior source
+    /// for the thread.
+    /// </summary>
+    public CancellationToken BeginThreadTurn(string threadId, bool building)
     {
+        if (threadCts.Remove(threadId, out var old)) old.Dispose();
+        cancelledThreads.Remove(threadId);
+        var cts = new CancellationTokenSource();
+        threadCts[threadId] = cts;
         busyThreads.Add(threadId);
         if (building) buildingThreads.Add(threadId);
         NotifyChanged();
+        return cts.Token;
     }
 
     /// <summary>Clears the widget-building flag (e.g. once the build step is done) while a turn continues.</summary>
@@ -450,11 +465,28 @@ public sealed class AppState
         if (buildingThreads.Remove(threadId)) NotifyChanged();
     }
 
-    /// <summary>Marks a thread's turn as finished (clears busy + building).</summary>
+    /// <summary>
+    /// Requests cancellation of a thread's in-progress turn. Returns true if a turn was actually
+    /// running. The turn's task observes the token, stops, and the caller records it as cancelled.
+    /// </summary>
+    public bool CancelThreadTurn(string threadId)
+    {
+        if (!threadCts.TryGetValue(threadId, out var cts)) return false;
+        cancelledThreads.Add(threadId);
+        try { cts.Cancel(); } catch { }
+        NotifyChanged();
+        return true;
+    }
+
+    /// <summary>True when the thread's current/just-finished turn was cancelled by the user.</summary>
+    public bool WasThreadCancelled(string threadId) => cancelledThreads.Contains(threadId);
+
+    /// <summary>Marks a thread's turn as finished (clears busy + building + its cancellation source).</summary>
     public void EndThreadTurn(string threadId)
     {
         var a = busyThreads.Remove(threadId);
         var b = buildingThreads.Remove(threadId);
+        if (threadCts.Remove(threadId, out var cts)) cts.Dispose();
         if (a || b) NotifyChanged();
     }
 
