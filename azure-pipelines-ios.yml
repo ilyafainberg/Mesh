@@ -1,0 +1,158 @@
+# Mesh iOS signed IPA / optional TestFlight pipeline.
+#
+# Azure Pipelines setup (one time):
+# 1. Create a pipeline for the private GitHub repository ilyafainberg/Mesh and select this YAML file.
+# 2. Library -> Secure files:
+#      Mesh-Apple-Distribution.p12
+#      Mesh-AppStore.mobileprovision
+#      Mesh-AppStore-Connect.p8       (needed only for TestFlight uploads)
+#    Authorize this pipeline to use each secure file.
+#    On every Secure File, configure Approvals and Checks:
+#      - Branch control: refs/heads/main only
+#      - Approval: required before use
+# 3. Add pipeline variables:
+#      APPLE_CERT_PASSWORD  secret, required
+#      ASC_APP_ID           numeric App Store Connect app Apple ID, required for TestFlight
+#      ASC_KEY_ID           App Store Connect API key ID, required for TestFlight
+#      ASC_ISSUER_ID        App Store Connect issuer ID, required for TestFlight
+#
+# The workflow is manual-only. Pull requests and pushes cannot access the signing files.
+
+trigger: none
+pr: none
+
+name: ios-${{ parameters.version }}-$(Date:yyyyMMdd).$(Rev:r)
+
+parameters:
+- name: version
+  displayName: App version
+  type: string
+  default: '1.6.0'
+
+- name: buildNumber
+  displayName: Apple build number (0 uses the unique Azure Pipeline build ID)
+  type: number
+  default: 0
+
+- name: pushTestFlight
+  displayName: Validate and upload to TestFlight
+  type: boolean
+  default: false
+
+variables:
+  # Keep the .NET iOS workload and Xcode versions aligned. The macos-15 image
+  # currently carries both .NET 10.0.301 and Xcode 26.2.
+  DOTNET_VERSION: '10.0.301'
+  XCODE_PATH: '/Applications/Xcode_26.2.app/Contents/Developer'
+
+pool:
+  vmImage: macos-15
+
+workspace:
+  clean: all
+
+steps:
+- checkout: self
+  clean: true
+  fetchDepth: 0
+  persistCredentials: false
+
+- pwsh: |
+    if ('$(Build.SourceBranch)' -ne 'refs/heads/main') {
+      throw 'iOS signing is restricted to refs/heads/main.'
+    }
+  displayName: Enforce protected release branch
+
+- task: UseDotNet@2
+  displayName: Use .NET 10 SDK
+  inputs:
+    packageType: sdk
+    version: $(DOTNET_VERSION)
+
+- pwsh: |
+    $ErrorActionPreference = 'Stop'
+    sudo xcode-select --switch $(XCODE_PATH)
+    xcodebuild -version
+    dotnet --info
+    dotnet workload install maui-ios
+    dotnet workload list
+  displayName: Select Xcode and install MAUI iOS workload
+
+- task: InstallAppleCertificate@2
+  displayName: Install Apple Distribution certificate
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  inputs:
+    certSecureFile: Mesh-Apple-Distribution.p12
+    certPwd: $(APPLE_CERT_PASSWORD)
+    keychain: temp
+    setUpPartitionIdACLForPrivateKey: true
+
+- task: InstallAppleProvisioningProfile@1
+  displayName: Install App Store provisioning profile
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  inputs:
+    provisioningProfileLocation: secureFiles
+    provProfileSecureFile: Mesh-AppStore.mobileprovision
+    removeProfile: true
+
+- ${{ if eq(parameters.pushTestFlight, true) }}:
+  - task: DownloadSecureFile@1
+    name: appStoreKey
+    displayName: Download App Store Connect API key
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+    inputs:
+      secureFile: Mesh-AppStore-Connect.p8
+
+- pwsh: |
+    $ErrorActionPreference = 'Stop'
+    $buildNumber = [int]'${{ parameters.buildNumber }}'
+    if ($buildNumber -le 0) {
+      $buildNumber = [int]'$(Build.BuildId)'
+    }
+
+    $releaseArgs = @(
+      '-Version', '${{ parameters.version }}',
+      '-BuildNumber', "$buildNumber",
+      '-CodesignKey', '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)',
+      '-CodesignProvision', '$(APPLE_PROV_PROFILE_UUID)',
+      '-SkipPush'
+    )
+
+    if ('${{ parameters.pushTestFlight }}' -eq 'True') {
+      foreach ($name in 'ASC_APP_ID', 'ASC_KEY_ID', 'ASC_ISSUER_ID') {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+          throw "Pipeline variable $name is required when pushTestFlight=true."
+        }
+      }
+
+      $keyDirectory = Join-Path '$(Agent.TempDirectory)' 'appstoreconnect-private-keys'
+      New-Item -ItemType Directory -Force -Path $keyDirectory | Out-Null
+      $keyPath = Join-Path $keyDirectory ("AuthKey_{0}.p8" -f $env:ASC_KEY_ID)
+      Copy-Item '$(appStoreKey.secureFilePath)' $keyPath
+
+      $releaseArgs += @(
+        '-PushTestFlight',
+        '-AppStoreAppId', $env:ASC_APP_ID,
+        '-AppStoreKeyId', $env:ASC_KEY_ID,
+        '-AppStoreIssuerId', $env:ASC_ISSUER_ID,
+        '-AppStoreKeyPath', $keyPath
+      )
+    }
+
+    & '$(Build.SourcesDirectory)/_deploy/release-ios.ps1' @releaseArgs
+    if ($LASTEXITCODE -ne 0) {
+      throw "release-ios.ps1 failed with exit code $LASTEXITCODE."
+    }
+  displayName: Build, sign, verify, and optionally upload IPA
+  env:
+    ASC_APP_ID: $(ASC_APP_ID)
+    ASC_KEY_ID: $(ASC_KEY_ID)
+    ASC_ISSUER_ID: $(ASC_ISSUER_ID)
+
+- task: PublishPipelineArtifact@1
+  displayName: Publish signed IPA and manifest
+  inputs:
+    targetPath: $(Build.SourcesDirectory)/_deploy/artifacts
+    artifactName: Mesh-iOS-${{ parameters.version }}-$(Build.BuildId)
+    publishLocation: pipeline
