@@ -375,7 +375,7 @@ function Build-Ios {
   if ($UseInterpreter) {
     # Hosted Azure jobs have a 60-minute free-tier cap. Interpret framework/dependency
     # assemblies to reduce AOT time, while keeping Mesh.App and Mesh.Shared native.
-    $arguments += "-p:MtouchInterpreter=all,-Mesh.App,-Mesh.Shared"
+    $arguments += "-p:MtouchInterpreter=all%2c-Mesh.App%2c-Mesh.Shared"
   }
   if (-not $script:IsMacHost) {
     $arguments += @(
