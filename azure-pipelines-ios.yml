@@ -43,7 +43,7 @@ variables:
   # Keep the .NET iOS workload and Xcode versions aligned. Do not let workload
   # install update to a newer manifest that requires an Xcode absent from the image.
   DOTNET_VERSION: '10.0.301'
-  XCODE_PATH: '/Applications/Xcode_26.3.app/Contents/Developer'
+  XCODE_PATH: '/Applications/Xcode_26.0.1.app/Contents/Developer'
 
 pool:
   vmImage: macos-15
