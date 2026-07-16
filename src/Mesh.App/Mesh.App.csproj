@@ -57,7 +57,7 @@
 
     <ItemGroup>
         <!-- App Icon: the Mesh logo (single flattened image, already has its own background) -->
-        <MauiIcon Include="Resources\AppIcon\meshicon.png" />
+        <MauiIcon Include="Resources\AppIcon\meshicon.png" BaseSize="1024,1024" Color="#131316" />
 
         <!-- Splash Screen -->
         <MauiSplashScreen Include="Resources\AppIcon\meshicon.png" Color="#131316" BaseSize="180,180" />
