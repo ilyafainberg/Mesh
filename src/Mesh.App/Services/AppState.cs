@@ -217,6 +217,20 @@ public sealed class AppState
     }
 
     /// <summary>Renames a "Me" thread.</summary>
+    /// <summary>Moves one private topic to the requested list position and persists the order.</summary>
+    public void ReorderOwnThread(string threadId, int newIndex)
+    {
+        var oldIndex = Profile.OwnThreads.FindIndex(t => t.Id == threadId);
+        if (oldIndex < 0 || Profile.OwnThreads.Count < 2) return;
+        newIndex = Math.Clamp(newIndex, 0, Profile.OwnThreads.Count - 1);
+        if (oldIndex == newIndex) return;
+        var thread = Profile.OwnThreads[oldIndex];
+        Profile.OwnThreads.RemoveAt(oldIndex);
+        Profile.OwnThreads.Insert(newIndex, thread);
+        activeDb?.ReorderOwnThreads(Profile.OwnThreads.Select(t => t.Id).ToList());
+        NotifyChanged();
+    }
+
     public void RenameOwnThread(string threadId, string title)
     {
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
@@ -411,18 +425,41 @@ public sealed class AppState
     // queue must all still be correct when they return (and a fresh page instance must not start a
     // second concurrent turn for a thread that is already running). Keyed by own-thread id.
     private readonly HashSet<string> busyThreads = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, AgentRunState> agentRuns = new(StringComparer.Ordinal);
     private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
     private readonly HashSet<string> completedThreads = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
     // Cancellation source per running thread, so the user can STOP an in-progress turn. The token is
     // passed into the agent call and flows down through the provider tool loop (real cancellation of
     // the HTTP request, not just a UI change). Threads that were cancelled (rather than finishing on
-    // their own) are tracked so the caller can skip the automatic tool-limit resume.
+    // their own) are tracked so the caller can distinguish cancellation from failure.
     private readonly Dictionary<string, CancellationTokenSource> threadCts = new(StringComparer.Ordinal);
     private readonly HashSet<string> cancelledThreads = new(StringComparer.Ordinal);
 
     /// <summary>True while the given own-thread is running an agent turn.</summary>
     public bool IsThreadBusy(string threadId) => busyThreads.Contains(threadId);
+
+    public AgentRunState? AgentRunFor(string threadId)
+        => agentRuns.TryGetValue(threadId, out var run) ? run : null;
+
+    public void SetAgentRun(AgentRunState run)
+    {
+        agentRuns[run.ThreadId] = run;
+        NotifyChanged();
+    }
+
+    public void ClearAgentRun(string threadId)
+    {
+        if (agentRuns.Remove(threadId)) NotifyChanged();
+    }
+
+    public void UpdateAgentRun(string threadId, AgentRunPhase phase,
+        IReadOnlyList<AgentSubtaskState>? subtasks = null)
+    {
+        if (!agentRuns.TryGetValue(threadId, out var run)) return;
+        agentRuns[threadId] = run with { Phase = phase, Subtasks = subtasks ?? run.Subtasks };
+        NotifyChanged();
+    }
 
     /// <summary>True while the given own-thread is specifically building a widget (for the label text).</summary>
     public bool IsThreadBuilding(string threadId) => buildingThreads.Contains(threadId);
@@ -487,6 +524,9 @@ public sealed class AppState
         var a = busyThreads.Remove(threadId);
         var b = buildingThreads.Remove(threadId);
         if (threadCts.Remove(threadId, out var cts)) cts.Dispose();
+        if (agentRuns.TryGetValue(threadId, out var run) &&
+            run.Phase is not (AgentRunPhase.Completed or AgentRunPhase.Failed or AgentRunPhase.Cancelled))
+            agentRuns[threadId] = run with { Phase = AgentRunPhase.Completed };
         if (a || b) NotifyChanged();
     }
 

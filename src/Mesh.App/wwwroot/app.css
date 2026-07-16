@@ -353,6 +353,8 @@ input[type=checkbox]:not(.switch input):checked::after {
 @keyframes mesh-thinking { 0%, 80%, 100% { opacity: .2; } 40% { opacity: 1; } }
 
 /* attachments inside message bubbles */
+.message-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+.message-attachments .msg-img { margin: 0; object-fit: cover; }
 .msg-img { max-width: 260px; max-height: 260px; border-radius: var(--radius-m); margin: 4px 0;
   display: block; cursor: pointer; border: 1px solid var(--stroke-1); }
 .bubble.user .msg-img { border-color: rgba(255,255,255,.35); }

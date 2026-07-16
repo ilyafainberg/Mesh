@@ -49,6 +49,8 @@
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     transition: background .12s ease;
+    text-align: left;
+    user-select: none;
 }
 
 .new-chat-row:active { background: var(--brand-tint); }
@@ -79,21 +81,58 @@
 }
 
 .thread-row {
+    position: relative;
     display: flex;
-    align-items: center;
-    gap: 12px;
+    align-items: stretch;
     width: 100%;
-    padding: 12px 16px;
     background: var(--bg-1);
-    border: none;
     border-bottom: 1px solid var(--stroke-1);
-    text-align: left;
-    cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
     transition: background .12s ease;
 }
 
-.thread-row:active { background: var(--bg-3); }
+.thread-open {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    flex: 1;
+    padding: 12px 16px 12px 4px;
+    background: transparent;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.thread-open:active { background: var(--bg-3); }
+
+.thread-grip {
+    flex: none;
+    width: 38px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--fg-3);
+    font-size: 19px;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+.thread-grip:active { cursor: grabbing; color: var(--brand); }
+.thread-dragging { opacity: .52; }
+.thread-drop-before::before, .thread-drop-after::after {
+    content: "";
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--brand);
+    z-index: 2;
+}
+.thread-drop-before::before { top: -2px; }
+.thread-drop-after::after { bottom: -2px; }
 
 .row-avatar {
     display: flex;

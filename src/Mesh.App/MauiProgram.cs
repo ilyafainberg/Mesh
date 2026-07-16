@@ -67,6 +67,7 @@ public static class MauiProgram
 #endif
 		builder.Services.AddSingleton<AppState>();
 		builder.Services.AddSingleton<TokenMeter>();
+		builder.Services.AddSingleton<BrowserModelService>();
 		builder.Services.AddSingleton<ModelFactory>();
 		builder.Services.AddSingleton<FoundryLocalService>();
 		builder.Services.AddSingleton<MsalAuthService>();
@@ -81,6 +82,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<DocumentExtractor>();
 		builder.Services.AddSingleton<SourceBrowser>();
 		builder.Services.AddSingleton<FileImporter>();
+		builder.Services.AddSingleton<AgentRunCoordinator>();
 		builder.Services.AddSingleton<AgentService>();
 		builder.Services.AddSingleton<SkillMarketplaceService>();
 		builder.Services.AddSingleton<ModelSetupService>();
@@ -103,3 +105,4 @@ public static class MauiProgram
 		return app;
 	}
 }
+

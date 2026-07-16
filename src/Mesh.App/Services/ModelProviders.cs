@@ -7,6 +7,44 @@ using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
+internal static class MultimodalContent
+{
+    public static object OpenAi(ChatLine line)
+    {
+        if (line.Attachments.Count == 0) return line.Text;
+        var parts = new List<object> { new { type = "text", text = line.Text } };
+        parts.AddRange(line.Attachments.Where(a => a.IsImage).Select(a => (object)new
+        {
+            type = "image_url",
+            image_url = new { url = $"data:{a.MimeType};base64,{Convert.ToBase64String(a.Data)}" }
+        }));
+        return parts.ToArray();
+    }
+
+    public static object Anthropic(ChatLine line)
+    {
+        if (line.Attachments.Count == 0) return line.Text;
+        var parts = new List<object>();
+        parts.AddRange(line.Attachments.Where(a => a.IsImage).Select(a => (object)new
+        {
+            type = "image",
+            source = new { type = "base64", media_type = a.MimeType, data = Convert.ToBase64String(a.Data) }
+        }));
+        parts.Add(new { type = "text", text = line.Text });
+        return parts.ToArray();
+    }
+
+    public static object[] Gemini(ChatLine line)
+    {
+        var parts = new List<object> { new { text = line.Text } };
+        parts.AddRange(line.Attachments.Where(a => a.IsImage).Select(a => (object)new
+        {
+            inlineData = new { mimeType = a.MimeType, data = Convert.ToBase64String(a.Data) }
+        }));
+        return parts.ToArray();
+    }
+}
+
 public interface IChatModel
 {
     Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
@@ -68,7 +106,7 @@ public static class ModelReply
     private static readonly string[] FailureMarkers =
     {
         "The free model ", "You've reached today's free-model limit",
-        "[model error", "[free model", "[stopped after too many tool calls",
+        "[model error", "[free model",
         "[Azure OpenAI needs", "[set up your Mesh identity", "[the free model needs a relay",
         "[the model's answer was cut off"
     };
@@ -79,16 +117,6 @@ public static class ModelReply
         var t = reply.TrimStart();
         return FailureMarkers.Any(m => t.StartsWith(m, StringComparison.Ordinal));
     }
-}
-
-/// <summary>Shared limit on how many rounds of tool calls a model may make before being forced to answer.</summary>
-internal static class ToolLoop
-{
-    public const int MaxRounds = 16;
-    public const string LimitMarker = "[stopped after too many tool calls]";
-
-    public static bool IsLimitReply(string? reply)
-        => string.Equals(reply?.Trim(), LimitMarker, StringComparison.Ordinal);
 }
 
 /// <summary>
@@ -140,8 +168,55 @@ internal static class Usage
     }
 }
 
+internal static class ReasoningControls
+{
+    public static Dictionary<string, object?> OpenAi(ModelConfig cfg, object[] messages, int maxTokens, object[]? tools = null)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["model"] = cfg.Model, ["messages"] = messages, ["max_tokens"] = maxTokens
+        };
+        if (tools is not null) payload["tools"] = tools;
+        if (cfg.ReasoningEffort != ReasoningEffort.Auto)
+        {
+            var effort = cfg.ReasoningEffort.ToString().ToLowerInvariant();
+            if (cfg.Provider == ModelProvider.OpenRouter)
+                payload["reasoning"] = new { effort };
+            else
+                payload["reasoning_effort"] = effort;
+        }
+        return payload;
+    }
+
+    public static Dictionary<string, object?> Anthropic(ModelConfig cfg, string systemPrompt,
+        List<object> messages, int maxTokens, object[]? tools = null)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["model"] = cfg.Model, ["max_tokens"] = maxTokens,
+            ["system"] = systemPrompt, ["messages"] = messages
+        };
+        if (tools is not null) payload["tools"] = tools;
+        if (cfg.ReasoningEffort != ReasoningEffort.Auto)
+        {
+            payload["thinking"] = new { type = "adaptive" };
+            payload["output_config"] = new { effort = cfg.ReasoningEffort.ToString().ToLowerInvariant() };
+        }
+        return payload;
+    }
+
+    public static object GeminiGeneration(ModelConfig cfg, int maxTokens)
+        => cfg.ReasoningEffort == ReasoningEffort.Auto
+            ? new { maxOutputTokens = maxTokens }
+            : (object)new
+            {
+                maxOutputTokens = maxTokens,
+                thinkingConfig = new { thinkingLevel = cfg.ReasoningEffort.ToString().ToUpperInvariant() }
+            };
+}
+
 /// <summary>Builds an <see cref="IChatModel"/> for the configured provider.</summary>
-public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state, TokenMeter meter)
+public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state, TokenMeter meter, BrowserModelService browserModel)
 {
     public IChatModel Create(ModelConfig cfg) => cfg.Provider switch
     {
@@ -156,6 +231,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
         ModelProvider.OpenRouter => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), OpenRouterConfig(cfg), meter),
         ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg, meter),
         ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg, meter),
+        ModelProvider.Browser => new BrowserChatModel(browserModel, cfg),
         _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg, meter),
     };
 
@@ -163,7 +239,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
     private static ModelConfig WithEndpoint(ModelConfig cfg, string defaultEndpoint)
     {
         if (!string.IsNullOrWhiteSpace(cfg.Endpoint)) return cfg;
-        return new ModelConfig { Provider = cfg.Provider, Model = cfg.Model, ApiKey = cfg.ApiKey, Endpoint = defaultEndpoint };
+        return new ModelConfig { Provider = cfg.Provider, Model = cfg.Model, ApiKey = cfg.ApiKey, Endpoint = defaultEndpoint, ReasoningEffort = cfg.ReasoningEffort };
     }
 
     /// <summary>
@@ -171,7 +247,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
     /// the actual model/provider, so the client never pins a model. The endpoint is fixed.
     /// </summary>
     private static ModelConfig OpenRouterConfig(ModelConfig cfg)
-        => new ModelConfig { Provider = cfg.Provider, Model = "openrouter/auto", ApiKey = cfg.ApiKey, Endpoint = "https://openrouter.ai/api" };
+        => new ModelConfig { Provider = cfg.Provider, Model = "openrouter/auto", ApiKey = cfg.ApiKey, Endpoint = "https://openrouter.ai/api", ReasoningEffort = cfg.ReasoningEffort };
 
     /// <summary>Foundry Local exposes an OpenAI-compatible endpoint on a dynamic port.</summary>
     private static ModelConfig WithFoundryDefault(ModelConfig cfg)
@@ -183,6 +259,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
             Provider = cfg.Provider,
             Model = cfg.Model,
             ApiKey = cfg.ApiKey,
+            ReasoningEffort = cfg.ReasoningEffort,
             Endpoint = "http://127.0.0.1:5273" // last-resort fallback for older Foundry builds
         };
     }
@@ -196,12 +273,12 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
     {
         var baseUrl = string.IsNullOrWhiteSpace(cfg.Endpoint) ? "https://api.openai.com" : cfg.Endpoint!.TrimEnd('/');
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
-        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = l.Text }));
+        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = MultimodalContent.OpenAi(l) }));
 
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/v1/chat/completions");
         if (!string.IsNullOrWhiteSpace(cfg.ApiKey))
             req.Headers.Authorization = new("Bearer", cfg.ApiKey);
-        req.Content = JsonContent.Create(new { model = cfg.Model, messages, max_tokens = CompletionOptions.Resolve(options) });
+        req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options)));
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
@@ -224,7 +301,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
 
         var baseUrl = string.IsNullOrWhiteSpace(cfg.Endpoint) ? "https://api.openai.com" : cfg.Endpoint!.TrimEnd('/');
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
-        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = l.Text }));
+        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = MultimodalContent.OpenAi(l) }));
 
         var toolDefs = tools.Select(t => (object)new
         {
@@ -232,12 +309,13 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
             function = new { name = t.Name, description = t.Description, parameters = t.ParametersSchema }
         }).ToArray();
 
-        // Up to 4 rounds of tool calls before forcing an answer.
-        for (var round = 0; round < ToolLoop.MaxRounds; round++)
+        // Continue tool calls until the model answers or the user cancels the turn.
+        for (var round = 0; ; round++)
         {
+            ct.ThrowIfCancellationRequested();
             using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/v1/chat/completions");
             if (!string.IsNullOrWhiteSpace(cfg.ApiKey)) req.Headers.Authorization = new("Bearer", cfg.ApiKey);
-            req.Content = JsonContent.Create(new { model = cfg.Model, messages, tools = toolDefs, max_tokens = CompletionOptions.Resolve(options) });
+            req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options), toolDefs));
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
@@ -271,7 +349,6 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
-        return ToolLoop.LimitMarker;
     }
 
     internal static async Task<string> ExecuteToolAsync(IReadOnlyList<IAgentTool> tools, string name, string argsJson,
@@ -313,14 +390,14 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
     {
         var messages = history
             .Where(l => l.Role is "user" or "assistant")
-            .Select(l => (object)new { role = l.Role, content = l.Text })
+            .Select(l => (object)new { role = l.Role, content = MultimodalContent.Anthropic(l) })
             .ToList();
         if (messages.Count == 0) messages.Add(new { role = "user", content = "Hello" });
 
         using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
         req.Headers.Add("x-api-key", cfg.ApiKey);
         req.Headers.Add("anthropic-version", "2023-06-01");
-        req.Content = JsonContent.Create(new { model = cfg.Model, max_tokens = CompletionOptions.Resolve(options), system = systemPrompt, messages });
+        req.Content = JsonContent.Create(ReasoningControls.Anthropic(cfg, systemPrompt, messages, CompletionOptions.Resolve(options)));
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
@@ -347,7 +424,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
 
         var messages = history
             .Where(l => l.Role is "user" or "assistant")
-            .Select(l => (object)new { role = l.Role, content = (object)l.Text })
+            .Select(l => (object)new { role = l.Role, content = MultimodalContent.Anthropic(l) })
             .ToList();
         if (messages.Count == 0) messages.Add(new { role = "user", content = (object)"Hello" });
 
@@ -356,12 +433,13 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             name = t.Name, description = t.Description, input_schema = t.ParametersSchema
         }).ToArray();
 
-        for (var round = 0; round < ToolLoop.MaxRounds; round++)
+        for (var round = 0; ; round++)
         {
+            ct.ThrowIfCancellationRequested();
             using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
             req.Headers.Add("x-api-key", cfg.ApiKey);
             req.Headers.Add("anthropic-version", "2023-06-01");
-            req.Content = JsonContent.Create(new { model = cfg.Model, max_tokens = CompletionOptions.Resolve(options), system = systemPrompt, messages, tools = toolDefs });
+            req.Content = JsonContent.Create(ReasoningControls.Anthropic(cfg, systemPrompt, messages, CompletionOptions.Resolve(options), toolDefs));
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
@@ -402,7 +480,6 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             }
             messages.Add(new { role = "user", content = results.ToArray() });
         }
-        return ToolLoop.LimitMarker;
     }
 
     private static object[] CloneContent(JsonElement arr)
@@ -416,7 +493,7 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? me
     {
         var contents = history
             .Where(l => l.Role is "user" or "assistant")
-            .Select(l => (object)new { role = l.Role == "assistant" ? "model" : "user", parts = new[] { new { text = l.Text } } })
+            .Select(l => (object)new { role = l.Role == "assistant" ? "model" : "user", parts = MultimodalContent.Gemini(l) })
             .ToList();
 
         var url = $"https://generativelanguage.googleapis.com/v1beta/models/{cfg.Model}:generateContent?key={cfg.ApiKey}";
@@ -424,7 +501,7 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? me
         {
             system_instruction = new { parts = new[] { new { text = systemPrompt } } },
             contents,
-            generationConfig = new { maxOutputTokens = CompletionOptions.Resolve(options) }
+            generationConfig = ReasoningControls.GeminiGeneration(cfg, CompletionOptions.Resolve(options))
         };
 
         using var resp = await http.PostAsJsonAsync(url, payload, ct);
@@ -491,8 +568,9 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
             .ToList();
         if (messages.Count == 0) messages.Add(new HostedModelMessage("user", "Hello"));
 
-        for (var round = 0; round < ToolLoop.MaxRounds; round++)
+        for (var round = 0; ; round++)
         {
+            ct.ThrowIfCancellationRequested();
             var (result, error) = await PostAsync(systemPrompt, messages, toolsJson, maxTokens, ct);
             if (error is not null)
                 // On the first round, degrade to a plain completion so chat still works even if
@@ -515,7 +593,6 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
                 messages.Add(new HostedModelMessage("tool", toolResult, ToolCallId: id));
             }
         }
-        return ToolLoop.LimitMarker;
     }
 
     private static bool IsTruncated(HostedModelResponse? r)
@@ -586,13 +663,13 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
         if (string.IsNullOrWhiteSpace(cfg.Model)) return "[Azure OpenAI needs a deployment name in Settings]";
 
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
-        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = l.Text }));
+        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = MultimodalContent.OpenAi(l) }));
 
         using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
         req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
         // The v1 API carries the deployment name in the body; the legacy URL carries it in the path
         // (and ignores an extra "model" field), so sending it is safe for both.
-        req.Content = JsonContent.Create(new { model = cfg.Model, messages, max_tokens = CompletionOptions.Resolve(options) });
+        req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options)));
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
@@ -613,7 +690,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
             return await CompleteAsync(systemPrompt, history, options, ct);
 
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
-        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = l.Text }));
+        messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = MultimodalContent.OpenAi(l) }));
 
         var toolDefs = tools.Select(t => (object)new
         {
@@ -621,11 +698,12 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
             function = new { name = t.Name, description = t.Description, parameters = t.ParametersSchema }
         }).ToArray();
 
-        for (var round = 0; round < ToolLoop.MaxRounds; round++)
+        for (var round = 0; ; round++)
         {
+            ct.ThrowIfCancellationRequested();
             using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
             req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
-            req.Content = JsonContent.Create(new { model = cfg.Model, messages, tools = toolDefs, max_tokens = CompletionOptions.Resolve(options) });
+            req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options), toolDefs));
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);
@@ -656,7 +734,6 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
-        return ToolLoop.LimitMarker;
     }
 
     private static string MapRole(string r) => r is "assistant" ? "assistant" : r is "system" ? "system" : "user";

@@ -97,6 +97,9 @@ public sealed class MeshDb : IDisposable
         // reasoning is the collapsible "thinking" (previously not persisted, so lost on restart).
         AddColumnIfMissing("own_chat", "internal", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("own_chat", "reasoning", "TEXT");
+        // User-defined topic order. Existing rows retain their creation order through the fallback sort.
+        AddColumnIfMissing("own_threads", "sort_order", "INTEGER");
+        NormalizeOwnThreadOrder();
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)
@@ -214,7 +217,7 @@ public sealed class MeshDb : IDisposable
         var byId = new Dictionary<string, OwnThread>();
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT id, title, created_at FROM own_threads ORDER BY created_at, id;";
+            cmd.CommandText = "SELECT id, title, created_at FROM own_threads ORDER BY sort_order, created_at, id;";
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -330,6 +333,46 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$t", title);
         cmd.Parameters.AddWithValue("$c", createdAt.ToString("O"));
         cmd.ExecuteNonQuery();
+    }
+
+    private void NormalizeOwnThreadOrder()
+    {
+        using var count = conn.CreateCommand();
+        count.CommandText = "SELECT COUNT(*) FROM own_threads WHERE sort_order IS NULL;";
+        if (Convert.ToInt64(count.ExecuteScalar()) == 0) return;
+
+        using var tx = conn.BeginTransaction();
+        using var read = conn.CreateCommand();
+        read.Transaction = tx;
+        read.CommandText = "SELECT id FROM own_threads ORDER BY COALESCE(sort_order, 2147483647), created_at, id;";
+        var ids = new List<string>();
+        using (var reader = read.ExecuteReader()) while (reader.Read()) ids.Add(reader.GetString(0));
+        for (var i = 0; i < ids.Count; i++)
+        {
+            using var update = conn.CreateCommand();
+            update.Transaction = tx;
+            update.CommandText = "UPDATE own_threads SET sort_order = $o WHERE id = $id;";
+            update.Parameters.AddWithValue("$o", i);
+            update.Parameters.AddWithValue("$id", ids[i]);
+            update.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    /// <summary>Persists the complete user-defined order of "Me" threads atomically.</summary>
+    public void ReorderOwnThreads(IReadOnlyList<string> orderedIds)
+    {
+        using var tx = conn.BeginTransaction();
+        for (var i = 0; i < orderedIds.Count; i++)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "UPDATE own_threads SET sort_order = $o WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$o", i);
+            cmd.Parameters.AddWithValue("$id", orderedIds[i]);
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
     }
 
     /// <summary>Renames a "Me" thread.</summary>

@@ -21,10 +21,15 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         || !string.IsNullOrWhiteSpace(state.Profile.Model.Endpoint); // local endpoints need no key
 
     /// <summary>Owner chat: the user talking to their own agent with full access.</summary>
-    public async Task<string> AskAsOwnerAsync(string threadId, string userText, CancellationToken ct = default)
+    public async Task<string> AskAsOwnerAsync(string threadId, string userText,
+        IReadOnlyList<ChatAttachment>? attachments = null, CancellationToken ct = default)
     {
         var thread = state.GetOrCreateOwnThread(threadId);
-        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "user", Text = userText });
+        state.AddOwnChatLine(thread.Id, new ChatLine
+        {
+            Role = "user", Text = userText,
+            Attachments = attachments?.ToList() ?? new List<ChatAttachment>()
+        });
         return await ContinueAsOwnerAsync(thread.Id, ct);
     }
 
@@ -35,145 +40,82 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     /// them in one continuation turn (they are consecutive user turns in the history) batches
     /// the queued guidance in order without ever running two turns concurrently.
     /// </summary>
-    private static readonly TimeSpan ToolLoopResumeDelay = TimeSpan.FromMinutes(5);
-
     public async Task<string> ContinueAsOwnerAsync(string threadId, CancellationToken ct = default)
     {
         var thread = state.GetOrCreateOwnThread(threadId);
+        var p = state.Profile;
+        var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
+        agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
+        var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
+        var cfg = await ResolveModelConfigAsync(p.Model, ct);
+        var model = factory.Create(cfg);
+        var history = Window(thread.Lines, p.Model.Provider).ToList();
 
-        // A tool loop gets one automatic continuation. The pause is visible in chat so the owner
-        // knows why the run stopped, when it will continue, and what was completed so far.
-        for (var attempt = 0; attempt < 2; attempt++)
+        // In Hyperscale mode, spawn read-only specialist agents in parallel. They cannot call tools
+        // or mutate files, so their workstreams cannot conflict. Their findings become private
+        // orchestration context for the main agent, which alone executes tools and integrates the result.
+        if (state.AgentRunFor(thread.Id)?.Phase == AgentRunPhase.Hyperscaling)
         {
-            var p = state.Profile;
-            var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
-            agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
-            var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
-            var cfg = await ResolveModelConfigAsync(p.Model, ct);
-            var model = factory.Create(cfg);
-            var history = Window(thread.Lines, p.Model.Provider).ToList();
-            if (attempt > 0)
+            var request = history.LastOrDefault(l => l.Role == "user")?.Text ?? "";
+            var specialistPrompt = "You are a read-only specialist subagent. Do not use tools and do not claim to have changed anything. Return concise findings for the orchestrator.";
+            var jobs = new Func<CancellationToken, Task<string>>[]
             {
-                history.Add(new ChatLine
-                {
-                    Role = "user",
-                    Text = "Automatically resume the interrupted task. First inspect the current state with the appropriate tools. " +
-                           "The task may have completed while paused, so do not repeat completed or destructive actions. " +
-                           "If it is complete, verify that and report the result. Otherwise continue from the checkpoint."
-                });
-            }
-
-            string answer;
-            string? reasoning;
-            var observedSteps = new List<AgentStep>();
-            state.BeginAgentSteps(thread.Id);
-            var progress = new Progress<AgentStep>(step =>
+                token => model.CompleteAsync(specialistPrompt + " Inspect the request and any attached images for relevant components, risks, constraints, and likely root causes.",
+                    SpecialistInput(history, request), ct: token),
+                token => model.CompleteAsync(specialistPrompt + " Inspect the request and any attached images, then propose an implementation and verification strategy. Identify independent workstreams and dependencies.",
+                    SpecialistInput(history, request), ct: token)
+            };
+            var findings = await AgentRunCoordinator.HyperscaleAsync(jobs, ct);
+            history.Add(new ChatLine
             {
-                lock (observedSteps) observedSteps.Add(step);
-                state.ReportAgentStep(thread.Id, step);
+                Role = "assistant", Internal = true,
+                Text = "[internal Hyperscale specialist reports. Validate them; they are advice, not proof.]\n\n" +
+                       "Specialist 1 - inspection:\n" + findings[0] + "\n\nSpecialist 2 - strategy:\n" + findings[1]
             });
-
-            using (media.BeginScope(out var images))
+            state.UpdateAgentRun(thread.Id, AgentRunPhase.Integrating, new[]
             {
-                try
-                {
-                    answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct: ct);
-                }
-                finally
-                {
-                    state.EndAgentSteps(thread.Id);
-                }
-
-                if (!ToolLoop.IsLimitReply(answer))
-                {
-                    (reasoning, answer) = ReasoningExtract.FromText(answer);
-                    answer = ExpandWidgets(answer, p.Widgets);
-                    answer = AppendImages(answer, images);
-                    state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer, Reasoning = reasoning });
-                    if (attempt > 0)
-                        state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = "[automatic resume finished]" });
-                    return answer;
-                }
-            }
-
-            if (attempt > 0)
-            {
-                answer = "[automatic resume exited after reaching the tool-call safety limit again. Start a new message to continue.]";
-                state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = answer });
-                return answer;
-            }
-
-            // The run stopped at the tool-call safety limit and WILL resume. Persist the verbose tool
-            // transcript as an INTERNAL line (hidden from the chat) so the resumed turn reads back the
-            // exact execution record (what ran, with arguments and results) instead of only friendly
-            // step labels. This is the fix for context loss on "[stopped after too many tool calls]".
-            // Only done on the pause path (not on normal successful turns) to avoid bloating history and
-            // to keep the model's message sequence clean when no resume is needed.
-            PersistToolTranscript(thread.Id, observedSteps);
-
-            string[] completed;
-            lock (observedSteps)
-            {
-                completed = observedSteps
-                    .Where(step => step.State == AgentStepState.Done)
-                    .Select(step => step.Label)
-                    .Distinct(StringComparer.Ordinal)
-                    .TakeLast(8)
-                    .ToArray();
-            }
-            var checkpoint = completed.Length == 0
-                ? "No completed tool steps were recorded."
-                : "Completed so far: " + string.Join("; ", completed) + ".";
-            state.AddOwnChatLine(thread.Id, new ChatLine
-            {
-                Role = "assistant",
-                Text = $"[paused after reaching the tool-call safety limit. {checkpoint} I will automatically resume in 5 minutes and check whether the task completed before continuing.]"
-            });
-
-            await Task.Delay(ToolLoopResumeDelay, ct);
-            state.AddOwnChatLine(thread.Id, new ChatLine
-            {
-                Role = "assistant",
-                Text = "[automatically resuming now. I will check the task's current state before taking further action.]"
+                new AgentSubtaskState("inspect", "Inspect inputs and relevant components", AgentStepState.Done, findings[0]),
+                new AgentSubtaskState("strategy", "Design independent implementation workstreams", AgentStepState.Done, findings[1]),
+                new AgentSubtaskState("integrate", "Execute, integrate, and verify", AgentStepState.Started)
             });
         }
 
-        throw new InvalidOperationException("Unreachable owner continuation state.");
+        state.BeginAgentSteps(thread.Id);
+        var progress = new Progress<AgentStep>(step => state.ReportAgentStep(thread.Id, step));
+        using (media.BeginScope(out var images))
+        {
+            string answer;
+            try
+            {
+                // Tool execution is intentionally unbounded. The user's Stop button cancels ct,
+                // which aborts model requests and tool execution at any point in the loop.
+                answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct: ct);
+            }
+            finally
+            {
+                state.EndAgentSteps(thread.Id);
+            }
+
+            var (reasoning, finalAnswer) = ReasoningExtract.FromText(answer);
+            finalAnswer = ExpandWidgets(finalAnswer, p.Widgets);
+            finalAnswer = AppendImages(finalAnswer, images);
+            state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = finalAnswer, Reasoning = reasoning });
+            return finalAnswer;
+        }
     }
 
-    /// <summary>
-    /// Records the turn's tool calls (name, arguments, result) as a single INTERNAL transcript line so
-    /// the model can read back exactly what it did on a later turn or an automatic resume, without the
-    /// user seeing the raw tool output. Values are already clipped by the tool layer. Does nothing when
-    /// no tools ran. The line is hidden from the chat view (see the Internal flag) but included in the
-    /// history window sent to the model.
-    /// </summary>
-    private void PersistToolTranscript(string threadId, List<AgentStep> observedSteps)
+    private static IReadOnlyList<ChatLine> SpecialistInput(IReadOnlyList<ChatLine> history, string request)
     {
-        List<AgentStep> finished;
-        lock (observedSteps)
-            finished = observedSteps.Where(s => s.State != AgentStepState.Started).ToList();
-        if (finished.Count == 0) return;
-
-        var sb = new StringBuilder(
-            "[internal tool transcript, not shown to the user. Use it to continue the task without repeating completed or destructive actions.]");
-        foreach (var s in finished)
+        var source = history.LastOrDefault(l => l.Role == "user");
+        return new[]
         {
-            sb.Append("\n\nTool: ").Append(s.Tool);
-            if (!string.IsNullOrEmpty(s.Arguments)) sb.Append("\nArguments: ").Append(s.Arguments);
-            sb.Append(s.State == AgentStepState.Failed ? "\nResult (failed): " : "\nResult: ")
-              .Append(string.IsNullOrEmpty(s.Result) ? "(no output)" : s.Result);
-        }
-
-        // Bound the whole transcript so it cannot crowd the original request and recent conversation
-        // out of the model's context window. The most recent steps matter most for continuing, so keep
-        // the tail when it is oversized.
-        var text = sb.ToString();
-        const int maxTranscript = 12000;
-        if (text.Length > maxTranscript)
-            text = "[internal tool transcript, truncated to the most recent activity.]\n...\n" + text[^maxTranscript..];
-
-        state.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = text, Internal = true });
+            new ChatLine
+            {
+                Role = "user", Text = request,
+                // Specialists receive their own list while sharing immutable byte arrays for this run.
+                Attachments = source?.Attachments.ToList() ?? new List<ChatAttachment>()
+            }
+        };
     }
 
     /// <summary>Appends any tool-produced images to a reply as renderable mesh-file blocks.</summary>
@@ -450,7 +392,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             Provider = cfg.Provider,
             ApiKey = cfg.ApiKey,
             Model = model,
-            Endpoint = endpoint
+            Endpoint = endpoint,
+            ReasoningEffort = cfg.ReasoningEffort
         };
     }
 
@@ -469,7 +412,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             {
                 var (ok, endpoint, model, error) = await foundry.EnsureReadyAsync(cfg.Model, progress, ct);
                 if (!ok) return (false, error ?? "Foundry Local setup failed.");
-                effective = new ModelConfig { Provider = cfg.Provider, ApiKey = cfg.ApiKey, Model = model ?? cfg.Model, Endpoint = endpoint };
+                effective = new ModelConfig { Provider = cfg.Provider, ApiKey = cfg.ApiKey, Model = model ?? cfg.Model, Endpoint = endpoint, ReasoningEffort = cfg.ReasoningEffort };
             }
             else if (!cfg.IsConfigured)
             {
@@ -497,6 +440,12 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var sb = new StringBuilder();
         sb.AppendLine($"You are the personal AI agent for {p.DisplayName} (@{p.Handle}), speaking privately with your owner.");
         sb.AppendLine("Be helpful and concise. You may use all knowledge, skills and tools below.");
+        sb.AppendLine("EXECUTION PROTOCOL:");
+        sb.AppendLine("- Before the first tool call, tell the owner the concise plan you intend to execute. Do not reveal private chain-of-thought.");
+        sb.AppendLine("- For a trivial answer requiring no tools, a separate plan is unnecessary.");
+        sb.AppendLine("- For a complicated task with independent workstreams, you may declare 'Plan - Hyperscale', split it into non-conflicting subtasks, run independent tool calls in parallel where supported, then integrate and verify one result.");
+        sb.AppendLine("- You remain responsible for the integrated answer. Report important deviations and verification at the end.");
+        sb.AppendLine("- Images attached to a user message are already loaded in memory and visible to you. Analyze them directly. Never open them in another app or take a screenshot merely to inspect them.");
         AppendAppCapability(sb, compact);
         AppendTools(sb, agentTools, compact);
         AppendWidgets(sb, p.Widgets, "insert");

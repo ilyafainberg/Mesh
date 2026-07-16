@@ -20,8 +20,8 @@
     - Signing toolchain under _deploy/signing (auto-restored from the bundled nuget zips).
     - Android keystore under _deploy/android-signing (password read from env
       MESH_KEYSTORE_PASS, else from CREDENTIALS.txt).
-    - Store push (-PushStores) additionally needs the Phase 2 creds; the script tells
-      you exactly which env vars are missing and skips that step if they are not set.
+    - Store push (-PushStores) additionally needs the Store credentials documented in
+      publish-store.ps1. Missing credentials fail the requested Store submission.
 
   This script contains no em-dash (U+2014) characters, per project rule.
 #>
@@ -81,7 +81,6 @@ $BlobBase    = "https://$BlobAccount.blob.core.windows.net/$BlobCtr"
 
 # Store identifiers (used only with -PushStores).
 $PlayPackage = "net.meshrelay.mesh"
-$MsStoreApp  = "cd4a1e7a-b612-419e-9503-f3c17e32bcc0"      # Partner Center Win32 app id
 
 # --------------------------------------------------------------- utilities ----
 function Say($m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
@@ -349,26 +348,17 @@ function Push-GooglePlay([string]$aab) {
 
 function Push-MicrosoftStore([string]$exe) {
   Say "Microsoft Store: update package"
-  $need = @("MS_STORE_TENANT_ID","MS_STORE_CLIENT_ID","MS_STORE_CLIENT_SECRET")
-  $missing = $need | Where-Object { -not (Get-Item "env:$_" -ErrorAction SilentlyContinue) }
-  if ($missing) { Warn "skipped: set $($missing -join ', ') (Entra app with Manager role) to enable."; return }
-  if ($DryRun) { Warn "DryRun: skipping Store submission"; return }
-
+  $publisher = Join-Path $Deploy "publish-store.ps1"
+  if (-not (Test-Path $publisher)) { Die "Store publisher not found at $publisher." }
   $blobUrl = "$BlobBase/Mesh-Setup-v$Version.exe"
-  $tok = (Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($env:MS_STORE_TENANT_ID)/oauth2/token" -Body @{
-    grant_type="client_credentials"; client_id=$env:MS_STORE_CLIENT_ID; client_secret=$env:MS_STORE_CLIENT_SECRET; resource="https://api.partner.microsoft.com"
-  }).access_token
-  $H = @{ Authorization = "Bearer $tok"; "Content-Type"="application/json" }
-  $base = "https://api.partner.microsoft.com/v1.0/ingestion/products/$MsStoreApp"
-  # Create a new submission, point its package at the signed Blob URL, then commit.
-  # The exact package-schema call is app-specific; kept explicit so the first supervised
-  # run can confirm the payload before this becomes fully unattended.
-  Note "auth ok; submitting package $blobUrl"
-  $sub = Invoke-RestMethod -Method Post -Uri "$base/submissions" -Headers $H
-  $pkg = @{ packages = @(@{ packageUrl = $blobUrl; languages=@("en-US"); architecture="x64"; installerParameters="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" }) } | ConvertTo-Json -Depth 8
-  Invoke-RestMethod -Method Put -Uri "$base/submissions/$($sub.id)/packages" -Headers $H -Body $pkg | Out-Null
-  Invoke-RestMethod -Method Post -Uri "$base/submissions/$($sub.id)/commit" -Headers $H | Out-Null
-  Ok "Store submission $($sub.id) committed (validation runs server-side)."
+  $args = @{
+    Version = $Version
+    InstallerUrl = $blobUrl
+    SkipBuild = $true
+  }
+  if ($DryRun) { $args.DryRun = $true }
+  & $publisher @args
+  if ($LASTEXITCODE -ne 0) { Die "Microsoft Store publish failed (exit $LASTEXITCODE)." }
 }
 
 # --------------------------------------------------------------------- main ---

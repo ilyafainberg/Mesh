@@ -3,7 +3,10 @@ using Mesh.Shared;
 
 namespace Mesh.App.Domain;
 
-public enum ModelProvider { Anthropic, OpenAI, Gemini, FoundryLocal, Grok, Groq, MeshHosted, AzureOpenAI, OpenRouter }
+public enum ModelProvider { Anthropic, OpenAI, Gemini, FoundryLocal, Grok, Groq, MeshHosted, AzureOpenAI, OpenRouter, Browser }
+
+/// <summary>Provider-native reasoning intensity. Auto omits the control and uses the model default.</summary>
+public enum ReasoningEffort { Auto, Low, Medium, High }
 
 /// <summary>Where a knowledge item's content came from.</summary>
 public enum KnowledgeSource { Manual, File }
@@ -116,10 +119,27 @@ public sealed class ModelConfig
     public ModelProvider Provider { get; set; } = ModelProvider.Anthropic;
     public string ApiKey { get; set; } = "";
     public string Model { get; set; } = "claude-sonnet-4-6";
+    /// <summary>Requested reasoning intensity. Auto leaves the choice to the provider.</summary>
+    public ReasoningEffort ReasoningEffort { get; set; } = ReasoningEffort.Auto;
     /// <summary>Optional base URL override for OpenAI-compatible endpoints, or the Azure OpenAI resource URL.</summary>
     public string? Endpoint { get; set; }
     /// <summary>Azure OpenAI REST api-version (Azure only). Falls back to a sane default when unset.</summary>
     public string? ApiVersion { get; set; }
+
+    /// <summary>Browser engine for the Windows scripted provider: Chrome, Edge, or Firefox.</summary>
+    public string BrowserEngine { get; set; } = "Firefox";
+    /// <summary>Browser prompt context: CurrentTurn or FullPrompt.</summary>
+    public string BrowserContextMode { get; set; } = "FullPrompt";
+    /// <summary>Windows browser-provider start page.</summary>
+    public string? BrowserUrl { get; set; }
+    /// <summary>JavaScript async function invoked with the rendered Mesh request.</summary>
+    public string? BrowserExecuteScript { get; set; }
+    /// <summary>JavaScript async function polled until it reports completion.</summary>
+    public string? BrowserPollScript { get; set; }
+    /// <summary>JavaScript async function that extracts the completed response.</summary>
+    public string? BrowserResultScript { get; set; }
+    public int BrowserPollSeconds { get; set; } = 5;
+    public int BrowserTimeoutMinutes { get; set; } = 10;
 
     /// <summary>
     /// Configured when there is a usable key, an on-device provider, a custom endpoint, or
@@ -127,6 +147,7 @@ public sealed class ModelConfig
     /// </summary>
     public bool IsConfigured =>
         Provider == ModelProvider.MeshHosted
+        || (Provider == ModelProvider.Browser && OperatingSystem.IsWindows() && !string.IsNullOrWhiteSpace(BrowserUrl))
         || Provider == ModelProvider.FoundryLocal
         || !string.IsNullOrWhiteSpace(ApiKey)
         || !string.IsNullOrWhiteSpace(Endpoint);
@@ -363,12 +384,24 @@ public sealed class Contact
     public bool Blocked { get; set; }
 }
 
+/// <summary>
+/// A file supplied directly to a model turn. Data is deliberately transient and is never written to
+/// the encrypted chat database: the original bytes live in memory only for the active run.
+/// </summary>
+public sealed record ChatAttachment(string Name, string MimeType, byte[] Data)
+{
+    public bool IsImage => MimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase);
+}
+
 public sealed class ChatLine
 {
     /// <summary>Stable id so delivery receipts can update the right outgoing line.</summary>
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Role { get; set; } = "user"; // user | assistant | system
     public string Text { get; set; } = "";
+    /// <summary>Transient multimodal inputs for this turn. Never persisted or sent to peers.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public List<ChatAttachment> Attachments { get; set; } = new();
     /// <summary>
     /// Who this line was addressed to / came from: "agent" (routed through an agent)
     /// or "person" (a direct human-to-human message). Used to tag bubbles so the owner
@@ -404,6 +437,17 @@ public sealed class ChatLine
 
 /// <summary>State of one agent step surfaced to the UI while a turn runs.</summary>
 public enum AgentStepState { Started, Done, Failed }
+
+public enum AgentRunPhase
+{
+    Planning, Executing, Hyperscaling, Integrating, Verifying, Completed, Failed, Cancelled
+}
+
+public sealed record AgentSubtaskState(string Id, string Title, AgentStepState State, string? Result = null);
+
+public sealed record AgentRunState(
+    string RunId, string ThreadId, AgentRunPhase Phase, string Plan,
+    IReadOnlyList<AgentSubtaskState> Subtasks, DateTimeOffset StartedAt);
 
 /// <summary>
 /// A single step the agent takes during a turn (a tool call), surfaced live so the user can see what

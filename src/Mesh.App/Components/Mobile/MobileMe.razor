@@ -6,6 +6,7 @@
 @page "/m/me"
 @inject AppState State
 @inject AgentService Agent
+@inject AgentRunCoordinator Runs
 @inject MeshClient Mesh
 @inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
@@ -36,15 +37,20 @@
         }
         else
         {
-            <div class="thread-rows">
+            <div class="thread-rows" @ref="threadListEl">
                 @foreach (var t in Threads)
                 {
-                    <button class="thread-row" @onclick="() => Select(t.Id)">
-                        <span class="row-avatar"><i class="bi bi-chat-text"></i></span>
-                        <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                        @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
-                        <i class="bi bi-chevron-right row-chevron"></i>
-                    </button>
+                    <div class="thread-row" data-thread-id="@t.Id" @key="t.Id">
+                        <button class="thread-grip" data-thread-grip type="button" title="Drag to reorder" aria-label="Drag @(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title) to reorder">
+                            <i class="bi bi-grip-vertical"></i>
+                        </button>
+                        <button class="thread-open" @onclick="() => Select(t.Id)">
+                            <span class="row-avatar"><i class="bi bi-chat-text"></i></span>
+                            <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                            @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                            <i class="bi bi-chevron-right row-chevron"></i>
+                        </button>
+                    </div>
                 }
             </div>
         }
@@ -112,7 +118,7 @@ else
                                 <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(line.Reasoning!))</div>
                             }
                         }
-                        <MessageContent Text="@line.Text" OnPin="PinWidget" />
+                        <MessageContent Text="@line.Text" Attachments="@line.Attachments" OnPin="PinWidget" />
                         @if (IsQueued(line))
                         {
                             <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
@@ -122,6 +128,12 @@ else
                 @if (ActiveBusy)
                 {
                     <div class="bubble assistant">
+                        @{ var run = Active is null ? null : State.AgentRunFor(Active.Id); }
+                        @if (run is not null)
+                        {
+                            <div class="text md">@((MarkupString)Markdown.ToHtml(run.Plan))</div>
+                            <div class="msg-tag"><i class="bi bi-diagram-3"></i> @run.Phase.ToString().ToLowerInvariant()</div>
+                        }
                         @{ var steps = Active is null ? null : State.AgentStepsFor(Active.Id); }
                         @if (steps is { Count: > 0 })
                         {
@@ -266,6 +278,7 @@ else
     string pinName = "";
     ElementReference scrollEl;
     ElementReference composerEl;
+    ElementReference threadListEl;
     Microsoft.JSInterop.DotNetObjectReference<MobileMe>? selfRef;
     bool composerWired;
     int lastCount = -1;
@@ -358,12 +371,24 @@ else
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (firstRender && !composerWired)
-        {
-            composerWired = true;
+        if (firstRender)
             selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
-            try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
-            try { await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef); } catch { }
+
+        // Wire each helper when its element actually exists. On mobile the list and composer are
+        // mutually exclusive, so firstRender alone cannot initialize both.
+        if (selfRef is not null)
+        {
+            if (!composerWired)
+            {
+                try
+                {
+                    await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5);
+                    await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef);
+                    composerWired = true;
+                }
+                catch { }
+            }
+            try { await JS.InvokeVoidAsync("meshUI.threadReorder", threadListEl, selfRef); } catch { }
         }
 
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
@@ -404,6 +429,18 @@ else
         {
             attachError = "Could not read the pasted file.";
         }
+        return InvokeAsync(StateHasChanged);
+    }
+
+    [Microsoft.JSInterop.JSInvokable]
+    public Task ReorderThread(string draggedId, string targetId, bool before)
+    {
+        var from = State.Profile.OwnThreads.FindIndex(t => t.Id == draggedId);
+        var target = State.Profile.OwnThreads.FindIndex(t => t.Id == targetId);
+        if (from < 0 || target < 0 || from == target) return Task.CompletedTask;
+        var destination = target + (before ? 0 : 1);
+        if (from < destination) destination--;
+        State.ReorderOwnThread(draggedId, destination);
         return InvokeAsync(StateHasChanged);
     }
 
@@ -537,7 +574,11 @@ else
         // shared app state, so a page instance reopened mid-turn still queues instead of double-running.
         if (State.IsThreadBusy(thread.Id))
         {
-            var qLine = new ChatLine { Role = "user", Text = ComposeOwnerPrompt(text, files) };
+            var queuedImages = await LoadImageAttachmentsAsync(files, CancellationToken.None);
+            var qLine = new ChatLine
+            {
+                Role = "user", Text = ComposeOwnerPrompt(text, files, queuedImages), Attachments = queuedImages
+            };
             State.AddOwnChatLine(thread.Id, qLine);
             State.EnqueueForThread(thread.Id, qLine);
             return;
@@ -557,6 +598,9 @@ else
         var ct = State.BeginThreadTurn(threadId, widget);
         try
         {
+            var imageFiles = await LoadImageAttachmentsAsync(files, ct);
+            Runs.Start(threadId, text, imageFiles.Count > 0, widget);
+            Runs.Executing(threadId);
             if (widget)
             {
                 var html = await Agent.BuildWidgetAsync(text, ct);
@@ -577,7 +621,7 @@ else
             }
             else
             {
-                await Agent.AskAsOwnerAsync(threadId, ComposeOwnerPrompt(text, files), ct);
+                await Agent.AskAsOwnerAsync(threadId, ComposeOwnerPrompt(text, files, imageFiles), imageFiles, ct);
             }
 
             // Drain anything this thread queued while its turn ran. Each drain answers ALL of the
@@ -592,13 +636,19 @@ else
         }
         catch (OperationCanceledException)
         {
-            // The user pressed Stop. Cancellation of the running turn (and of the tool-limit resume
-            // wait) is intentional, so record a clean stopped line rather than an error.
+            Runs.Complete(threadId, cancelled: true);
+            // The user pressed Stop. Cancellation of the running model request and tool loop is
+            // intentional, so record a clean stopped line rather than an error.
             State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = "[stopped]" });
         }
-        catch (Exception ex) { State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }); }
+        catch (Exception ex)
+        {
+            Runs.Complete(threadId, failed: true);
+            State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" });
+        }
         finally
         {
+            Runs.Complete(threadId);
             State.EndThreadTurn(threadId);
             if (disposed || activeThread != threadId)
                 State.MarkThreadCompleted(threadId);
@@ -607,16 +657,39 @@ else
         }
     }
 
-    // Builds the owner prompt, appending any staged local file paths the agent can open on request.
-    static string ComposeOwnerPrompt(string? text, List<StagedFile> files)
+    private static readonly Dictionary<string, string> ImageMimes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        [".png"] = "image/png", [".jpg"] = "image/jpeg", [".jpeg"] = "image/jpeg",
+        [".gif"] = "image/gif", [".webp"] = "image/webp", [".bmp"] = "image/bmp"
+    };
+
+    static async Task<List<ChatAttachment>> LoadImageAttachmentsAsync(List<StagedFile> files, CancellationToken ct)
+    {
+        const long maxImageBytes = 20 * 1024 * 1024;
+        var images = new List<ChatAttachment>();
+        foreach (var file in files)
+        {
+            if (!ImageMimes.TryGetValue(System.IO.Path.GetExtension(file.Path), out var mime)) continue;
+            if (file.Size > maxImageBytes) throw new InvalidOperationException($"{file.Name} is larger than the 20 MB image limit.");
+            var bytes = await System.IO.File.ReadAllBytesAsync(file.Path, ct);
+            images.Add(new ChatAttachment(file.Name, mime, bytes));
+        }
+        return images;
+    }
+
+    // Non-images remain tool-readable paths. Images are sent as original bytes to the model and are
+    // intentionally omitted here, preventing the agent from launching Photos and taking a screenshot.
+    static string ComposeOwnerPrompt(string? text, List<StagedFile> files, IReadOnlyList<ChatAttachment>? images = null)
     {
         var prompt = text ?? "";
-        if (files.Count > 0)
+        var imageNames = images?.Select(i => i.Name).ToHashSet(StringComparer.OrdinalIgnoreCase) ?? new();
+        var documents = files.Where(f => !imageNames.Contains(f.Name)).ToList();
+        if (documents.Count > 0)
         {
             var sb = new System.Text.StringBuilder(prompt);
             if (sb.Length > 0) sb.Append("\n\n");
             sb.Append("Attached local files (use the read_local_file tool to open any you need):");
-            foreach (var f in files) sb.Append($"\n- {f.Path}");
+            foreach (var f in documents) sb.Append($"\n- {f.Path}");
             prompt = sb.ToString();
         }
         return prompt;

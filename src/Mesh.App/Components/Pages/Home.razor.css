@@ -156,3 +156,47 @@
     box-shadow: 0 0 0 2px var(--bg-1, #fff);
     flex: none;
 }
+
+
+/* Mouse, pen, and touch topic reordering. Drag starts only from the grip so rows remain clickable. */
+.thread-order-list { display: flex; flex-direction: column; }
+.conv-item {
+    position: relative;
+    justify-content: flex-start;
+    text-align: left;
+    user-select: none;
+}
+.conv-item .conv-name {
+    flex: 1 1 auto;
+    text-align: left;
+}
+.thread-grip {
+    flex: none;
+    width: 24px;
+    min-width: 24px;
+    height: 30px;
+    padding: 0;
+    margin-left: -7px;
+    border: 0;
+    background: transparent;
+    color: var(--fg-3, #777);
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    opacity: .55;
+}
+.thread-grip:hover, .thread-grip:focus-visible { opacity: 1; color: var(--brand); }
+.thread-grip:active { cursor: grabbing; }
+.thread-dragging { opacity: .52; }
+.thread-drop-before::before, .thread-drop-after::after {
+    content: "";
+    position: absolute;
+    left: 6px;
+    right: 6px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--brand);
+    z-index: 2;
+}
+.thread-drop-before::before { top: -2px; }
+.thread-drop-after::after { bottom: -2px; }

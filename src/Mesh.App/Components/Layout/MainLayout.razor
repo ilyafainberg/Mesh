@@ -1,4 +1,4 @@
-﻿@inherits LayoutComponentBase
+@inherits LayoutComponentBase
 @using Mesh.App.Domain
 @inject AppState State
 @inject MeshClient Mesh
@@ -9,6 +9,7 @@
 @inject IAppControl AppControl
 @inject UpdateService Updater
 @inject ConnectorCatalogService Catalog
+@inject IJSRuntime JS
 @implements IDisposable
 
 @if (!State.IsOnboarded)
@@ -83,6 +84,7 @@ else
 
 @code {
     bool navOpen;
+    DotNetObjectReference<MainLayout>? fileLinkRef;
 
     string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
         ? State.Profile.Handle : State.Profile.DisplayName;
@@ -135,6 +137,16 @@ else
         Updater.StartAutoChecks();
     }
 
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        fileLinkRef = DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("meshUI.initFileLinks", fileLinkRef);
+    }
+
+    [JSInvokable]
+    public Task OpenLocalFile(string uri) => LocalFileLauncher.OpenAsync(uri);
+
     private void Refresh() => InvokeAsync(StateHasChanged);
 
     // Routes a mesh:// deep link: ensure the target conversation exists, bring the window forward,
@@ -164,5 +176,6 @@ else
         global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = null;
 #endif
         DeepLinkDispatch.SetHandler(null);
+        fileLinkRef?.Dispose();
     }
 }

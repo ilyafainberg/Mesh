@@ -1,6 +1,20 @@
 @inject AppState State
 @inject IJSRuntime JS
 
+@if (Attachments is { Count: > 0 })
+{
+    <div class="message-attachments">
+        @foreach (var attachment in Attachments.Where(a => a.IsImage))
+        {
+            <img class="msg-img attached-preview"
+                 src="@DataUri(attachment)"
+                 alt="@attachment.Name"
+                 title="@attachment.Name"
+                 @onclick="() => Download(attachment)" />
+        }
+    </div>
+}
+
 @foreach (var seg in Markdown.Parse(Text))
 {
     if (seg.IsFile)
@@ -73,6 +87,7 @@
 
 @code {
     [Parameter] public string Text { get; set; } = "";
+    [Parameter] public IReadOnlyList<ChatAttachment>? Attachments { get; set; }
     [Parameter] public string? From { get; set; }
     [Parameter] public EventCallback<string> OnPin { get; set; }
 
@@ -126,6 +141,19 @@
         try { await JS.InvokeVoidAsync("meshUI.downloadFile", seg.FileName, seg.FileMime, seg.Content); }
         catch { /* ignore download failures */ }
     }
+
+    private async Task Download(ChatAttachment attachment)
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("meshUI.downloadFile", attachment.Name, attachment.MimeType,
+                Convert.ToBase64String(attachment.Data));
+        }
+        catch { /* ignore download failures */ }
+    }
+
+    private static string DataUri(ChatAttachment attachment)
+        => $"data:{attachment.MimeType};base64,{Convert.ToBase64String(attachment.Data)}";
 
     private static string SizeLabel(string base64)
     {

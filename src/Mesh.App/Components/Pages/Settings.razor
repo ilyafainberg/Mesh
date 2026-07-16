@@ -74,6 +74,10 @@
                     @if (!PlatformCaps.IsMobile)
                     {
                         <option value="FoundryLocal">On Device</option>
+                        @if (OperatingSystem.IsWindows())
+                        {
+                            <option value="Browser">Browser model (scripted)</option>
+                        }
                     }
                 </select>
             </div>
@@ -124,6 +128,64 @@
                             <span>Couldn't list on-device models yet. Foundry Local will be installed and started when you Save; smaller models load fastest.</span>
                         </div>
                     }
+                </div>
+            }
+            else if (provider == "Browser")
+            {
+                <div class="field">
+                    <div class="connector-note">
+                        <i class="bi bi-window"></i>
+                        <span>Windows only. Mesh opens a dedicated persistent browser on first use in every Mesh session. Sign in, return to Mesh, and select OK. Scripts run inside the provider page and can read anything rendered there.</span>
+                    </div>
+                </div>
+                <div class="field">
+                    <label>Browser</label>
+                    <select class="full" @bind="browserEngine">
+                        <option value="Firefox">Firefox (recommended)</option>
+                        <option value="Chrome">Chrome</option>
+                        <option value="Edge">Edge</option>
+                    </select>
+                    <div class="field-hint">Firefox uses Playwright Firefox. Chrome and Edge use their installed Playwright channels.</div>
+                </div>
+                <div class="field">
+                    <label>Preset file</label>
+                    <InputFile OnChange="LoadBrowserPreset" accept=".json,application/json" />
+                    <div class="field-hint">Load a .json browser-provider preset. Review its scripts before saving because presets contain executable JavaScript.</div>
+                    @if (!string.IsNullOrWhiteSpace(browserPresetStatus))
+                    {
+                        <div class="field-hint">@browserPresetStatus</div>
+                    }
+                </div>
+                <div class="field">
+                    <label>Start URL</label>
+                    <input class="full" @bind="browserUrl" placeholder="https://example.com/chat" />
+                </div>
+                <div class="field">
+                    <label>Context sent to website</label>
+                    <select class="full" @bind="browserContextMode">
+                        <option value="CurrentTurn">Current user message only</option>
+                        <option value="FullPrompt">Full Mesh prompt and history</option>
+                    </select>
+                    <div class="field-hint">Current turn keeps context separately in Mesh and in the website conversation. Use one website conversation per Mesh thread to avoid mixing contexts.</div>
+                </div>
+                <div class="field">
+                    <label>Execute prompt</label>
+                    <textarea class="full" rows="7" @bind="browserExecuteScript" spellcheck="false"></textarea>
+                    <div class="field-hint">Async JavaScript function accepting request: prompt, systemPrompt, messages, skills, tools, metadata.</div>
+                </div>
+                <div class="field">
+                    <label>Poll for response</label>
+                    <textarea class="full" rows="6" @bind="browserPollScript" spellcheck="false"></textarea>
+                    <div class="field-hint">Runs every 5 seconds by default. Return true/false or status: pending, complete, authentication-required, error.</div>
+                </div>
+                <div class="field">
+                    <label>Get result</label>
+                    <textarea class="full" rows="6" @bind="browserResultScript" spellcheck="false"></textarea>
+                    <div class="field-hint">Return a string or an object such as { text: "reply" }.</div>
+                </div>
+                <div class="field-row">
+                    <div class="field"><label>Poll seconds</label><input type="number" min="1" max="60" @bind="browserPollSeconds" /></div>
+                    <div class="field"><label>Timeout minutes</label><input type="number" min="1" max="120" @bind="browserTimeoutMinutes" /></div>
                 </div>
             }
             else if (provider == "OpenRouter")
@@ -188,6 +250,20 @@
                 <div class="field">
                     <label>API key</label>
                     <input class="full" type="password" @bind="apiKey" placeholder="(unchanged)" />
+                </div>
+            }
+
+            @if (provider is not "MeshHosted" and not "Browser" and not "FoundryLocal")
+            {
+                <div class="field">
+                    <label>Reasoning effort</label>
+                    <select class="full" @bind="reasoningEffort">
+                        <option value="Auto">Auto (model default)</option>
+                        <option value="Low">Low (faster)</option>
+                        <option value="Medium">Medium (balanced)</option>
+                        <option value="High">High (deeper reasoning)</option>
+                    </select>
+                    <div class="field-hint">Controls reasoning intensity separately from the response length. The selected model must support this setting.</div>
                 </div>
             }
 
@@ -677,6 +753,16 @@
     string endpoint = "";
     string apiKey = "";
     string apiVersion = "";
+    string reasoningEffort = "Auto";
+    string browserEngine = "Firefox";
+    string browserContextMode = "FullPrompt";
+    string browserPresetStatus = "";
+    string browserUrl = "";
+    string browserExecuteScript = "async request => {\n  // Enter request.prompt and submit it.\n  throw new Error('Configure Execute prompt');\n}";
+    string browserPollScript = "async state => {\n  // Return true when generation is complete.\n  return false;\n}";
+    string browserResultScript = "async state => {\n  // Return the final response text.\n  return { text: '' };\n}";
+    int browserPollSeconds = 5;
+    int browserTimeoutMinutes = 10;
     string approvalMode = "PerCircle";
     bool allowApps = true;
     int replyBudget = 100;
@@ -922,6 +1008,15 @@
         model = p.Model.Model;
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
+        reasoningEffort = p.Model.ReasoningEffort.ToString();
+        browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
+        browserContextMode = string.Equals(p.Model.BrowserContextMode, "CurrentTurn", StringComparison.OrdinalIgnoreCase) ? "CurrentTurn" : "FullPrompt";
+        browserUrl = p.Model.BrowserUrl ?? "";
+        browserExecuteScript = p.Model.BrowserExecuteScript ?? browserExecuteScript;
+        browserPollScript = p.Model.BrowserPollScript ?? browserPollScript;
+        browserResultScript = p.Model.BrowserResultScript ?? browserResultScript;
+        browserPollSeconds = p.Model.BrowserPollSeconds;
+        browserTimeoutMinutes = p.Model.BrowserTimeoutMinutes;
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
@@ -975,6 +1070,14 @@
         model = p.Model.Model;
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
+        reasoningEffort = p.Model.ReasoningEffort.ToString();
+        browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
+        browserUrl = p.Model.BrowserUrl ?? "";
+        browserExecuteScript = p.Model.BrowserExecuteScript ?? browserExecuteScript;
+        browserPollScript = p.Model.BrowserPollScript ?? browserPollScript;
+        browserResultScript = p.Model.BrowserResultScript ?? browserResultScript;
+        browserPollSeconds = p.Model.BrowserPollSeconds;
+        browserTimeoutMinutes = p.Model.BrowserTimeoutMinutes;
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
@@ -1030,6 +1133,10 @@
         {
             model = ""; // the free model's id is chosen server-side
         }
+        else if (provider == "Browser")
+        {
+            model = "browser";
+        }
         else if (provider == "OpenRouter")
         {
             model = "openrouter/auto"; // OpenRouter routes by the user's account settings; client never pins a model
@@ -1068,6 +1175,53 @@
         finally { loadingModels = false; await InvokeAsync(StateHasChanged); }
     }
 
+    async Task LoadBrowserPreset(InputFileChangeEventArgs e)
+    {
+        browserPresetStatus = "";
+        try
+        {
+            await using var stream = e.File.OpenReadStream(2 * 1024 * 1024);
+            using var document = await System.Text.Json.JsonDocument.ParseAsync(stream);
+            var root = document.RootElement;
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Object)
+                throw new InvalidOperationException("Preset root must be a JSON object.");
+
+            static string? Text(System.Text.Json.JsonElement root, string name)
+                => root.TryGetProperty(name, out var value) && value.ValueKind == System.Text.Json.JsonValueKind.String
+                    ? value.GetString() : null;
+            static int? Number(System.Text.Json.JsonElement root, string name)
+                => root.TryGetProperty(name, out var value) && value.TryGetInt32(out var number) ? number : null;
+
+            var url = Text(root, "startUrl") ?? Text(root, "url");
+            var execute = Text(root, "executePrompt");
+            var poll = Text(root, "pollForResponse");
+            var result = Text(root, "getResult");
+            if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(execute)
+                || string.IsNullOrWhiteSpace(poll) || string.IsNullOrWhiteSpace(result))
+                throw new InvalidOperationException("Preset requires startUrl, executePrompt, pollForResponse, and getResult.");
+
+            browserUrl = url;
+            browserExecuteScript = execute;
+            browserPollScript = poll;
+            browserResultScript = result;
+            var engine = Text(root, "browser");
+            if (engine is not null && new[] { "Chrome", "Edge", "Firefox" }.Contains(engine, StringComparer.OrdinalIgnoreCase))
+                browserEngine = char.ToUpperInvariant(engine[0]) + engine[1..].ToLowerInvariant();
+            var contextMode = Text(root, "contextMode");
+            if (string.Equals(contextMode, "CurrentTurn", StringComparison.OrdinalIgnoreCase))
+                browserContextMode = "CurrentTurn";
+            else if (string.Equals(contextMode, "FullPrompt", StringComparison.OrdinalIgnoreCase))
+                browserContextMode = "FullPrompt";
+            browserPollSeconds = Math.Clamp(Number(root, "pollSeconds") ?? browserPollSeconds, 1, 60);
+            browserTimeoutMinutes = Math.Clamp(Number(root, "timeoutMinutes") ?? browserTimeoutMinutes, 1, 120);
+            browserPresetStatus = $"Loaded {e.File.Name}. Review the scripts, then select Change model.";
+        }
+        catch (Exception ex)
+        {
+            browserPresetStatus = "Could not load preset: " + ex.Message;
+        }
+    }
+
     async Task ChangeModel()
     {
         var apiKeyToSet = apiKey;
@@ -1085,6 +1239,15 @@
             p.Model.Model = model.Trim();
             p.Model.Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim();
             p.Model.ApiVersion = string.IsNullOrWhiteSpace(apiVersion) ? null : apiVersion.Trim();
+            p.Model.ReasoningEffort = Enum.TryParse<ReasoningEffort>(reasoningEffort, out var effort) ? effort : ReasoningEffort.Auto;
+            p.Model.BrowserEngine = browserEngine;
+            p.Model.BrowserContextMode = browserContextMode;
+            p.Model.BrowserUrl = string.IsNullOrWhiteSpace(browserUrl) ? null : browserUrl.Trim();
+            p.Model.BrowserExecuteScript = browserExecuteScript;
+            p.Model.BrowserPollScript = browserPollScript;
+            p.Model.BrowserResultScript = browserResultScript;
+            p.Model.BrowserPollSeconds = Math.Clamp(browserPollSeconds, 1, 60);
+            p.Model.BrowserTimeoutMinutes = Math.Clamp(browserTimeoutMinutes, 1, 120);
             if (!string.IsNullOrWhiteSpace(apiKeyToSet)) p.Model.ApiKey = apiKeyToSet.Trim();
             p.ApprovalMode = Enum.Parse<ApprovalMode>(approvalMode);
             p.AllowInteractiveApps = allowApps;
