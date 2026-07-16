@@ -74,7 +74,9 @@ steps:
     sudo xcode-select --switch $(XCODE_PATH)
     xcodebuild -version
     dotnet --info
-    dotnet workload install maui-ios
+    # Mesh.App targets Android, iOS, and Mac Catalyst on macOS. Restore evaluates all
+    # declared TFMs even when publish selects iOS, so install all declared MAUI workloads.
+    dotnet workload install maui-ios maui-android maui-maccatalyst
     dotnet workload list
   displayName: Select Xcode and install MAUI iOS workload
 
