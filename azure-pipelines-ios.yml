@@ -40,10 +40,10 @@ parameters:
   default: false
 
 variables:
-  # Keep the .NET iOS workload and Xcode versions aligned. The macos-15 image
-  # currently carries both .NET 10.0.301 and Xcode 26.2.
+  # Keep the .NET iOS workload and Xcode versions aligned. Do not let workload
+  # install update to a newer manifest that requires an Xcode absent from the image.
   DOTNET_VERSION: '10.0.301'
-  XCODE_PATH: '/Applications/Xcode_26.2.app/Contents/Developer'
+  XCODE_PATH: '/Applications/Xcode_26.3.app/Contents/Developer'
 
 pool:
   vmImage: macos-15
@@ -76,7 +76,7 @@ steps:
     dotnet --info
     # Mesh.App targets Android, iOS, and Mac Catalyst on macOS. Restore evaluates all
     # declared TFMs even when publish selects iOS, so install all declared MAUI workloads.
-    dotnet workload install maui-ios maui-android maui-maccatalyst
+    dotnet workload install maui-ios maui-android maui-maccatalyst --skip-manifest-update
     dotnet workload list
   displayName: Select Xcode and install MAUI iOS workload
 
