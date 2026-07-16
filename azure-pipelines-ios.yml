@@ -110,13 +110,13 @@ steps:
       $buildNumber = [int]'$(Build.BuildId)'
     }
 
-    $releaseArgs = @(
-      '-Version', '${{ parameters.version }}',
-      '-BuildNumber', "$buildNumber",
-      '-CodesignKey', '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)',
-      '-CodesignProvision', '$(APPLE_PROV_PROFILE_UUID)',
-      '-SkipPush'
-    )
+    $releaseArgs = @{
+      Version = '${{ parameters.version }}'
+      BuildNumber = $buildNumber
+      CodesignKey = '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)'
+      CodesignProvision = '$(APPLE_PROV_PROFILE_UUID)'
+      SkipPush = $true
+    }
 
     if ('${{ parameters.pushTestFlight }}' -eq 'True') {
       foreach ($name in 'ASC_APP_ID', 'ASC_KEY_ID', 'ASC_ISSUER_ID') {
@@ -131,13 +131,11 @@ steps:
       $keyPath = Join-Path $keyDirectory ("AuthKey_{0}.p8" -f $env:ASC_KEY_ID)
       Copy-Item '$(appStoreKey.secureFilePath)' $keyPath
 
-      $releaseArgs += @(
-        '-PushTestFlight',
-        '-AppStoreAppId', $env:ASC_APP_ID,
-        '-AppStoreKeyId', $env:ASC_KEY_ID,
-        '-AppStoreIssuerId', $env:ASC_ISSUER_ID,
-        '-AppStoreKeyPath', $keyPath
-      )
+      $releaseArgs['PushTestFlight'] = $true
+      $releaseArgs['AppStoreAppId'] = $env:ASC_APP_ID
+      $releaseArgs['AppStoreKeyId'] = $env:ASC_KEY_ID
+      $releaseArgs['AppStoreIssuerId'] = $env:ASC_ISSUER_ID
+      $releaseArgs['AppStoreKeyPath'] = $keyPath
     }
 
     & '$(Build.SourcesDirectory)/_deploy/release-ios.ps1' @releaseArgs
