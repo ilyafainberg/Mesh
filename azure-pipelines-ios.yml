@@ -117,6 +117,7 @@ steps:
       BuildNumber = $buildNumber
       CodesignKey = '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)'
       CodesignProvision = '$(APPLE_PROV_PROFILE_UUID)'
+      UseInterpreter = $true
       SkipPush = $true
     }
 

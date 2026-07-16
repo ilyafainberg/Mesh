@@ -70,6 +70,7 @@ param(
   [string]$CodesignKey = $env:MESH_IOS_CODESIGN_KEY,
   [string]$CodesignProvision = $env:MESH_IOS_PROVISION,
   [string]$CodesignEntitlements = "",
+  [switch]$UseInterpreter,
 
   [string]$MacAddress = $env:MESH_MAC_ADDRESS,
   [string]$MacUser = $env:MESH_MAC_USER,
@@ -370,6 +371,11 @@ function Build-Ios {
   )
   if ($CodesignEntitlements) {
     $arguments += "-p:CodesignEntitlements=$((Resolve-Path $CodesignEntitlements).Path)"
+  }
+  if ($UseInterpreter) {
+    # Hosted Azure jobs have a 60-minute free-tier cap. Interpret framework/dependency
+    # assemblies to reduce AOT time, while keeping Mesh.App and Mesh.Shared native.
+    $arguments += "-p:MtouchInterpreter=all,-Mesh.App,-Mesh.Shared"
   }
   if (-not $script:IsMacHost) {
     $arguments += @(
