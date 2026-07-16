@@ -359,6 +359,7 @@ function Build-Ios {
     "publish", $Csproj,
     "-f", $IosTfm,
     "-c", "Release",
+    "-p:TargetFrameworks=$IosTfm",
     "-p:ArchiveOnBuild=true",
     "-p:RuntimeIdentifier=$RuntimeId",
     "-p:ApplicationId=net.meshrelay.mesh",
