@@ -55,6 +55,12 @@
         <TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
     </PropertyGroup>
 
+    <!-- MainPage references the Razor-generated Routes component. On iOS, runtime inflation
+         defers that type lookup until Razor components have been generated and loaded. -->
+    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">
+        <MauiXaml Update="MainPage.xaml" Inflator="Runtime" />
+    </ItemGroup>
+
     <ItemGroup>
         <!-- App Icon: the Mesh logo (single flattened image, already has its own background) -->
         <MauiIcon Include="Resources\AppIcon\meshicon.png" BaseSize="1024,1024" Color="#131316" />
