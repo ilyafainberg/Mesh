@@ -17,9 +17,13 @@ namespace Mesh.App.Services;
 public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFactory httpFactory, INotifier notifier)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    private static readonly TimeSpan GroupKeyCacheLifetime = TimeSpan.FromMinutes(5);
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> keyCacheUpdated = new(StringComparer.OrdinalIgnoreCase);
     private HubConnection? hub;
     private volatile bool authenticated;
+    private volatile bool supportsSendResults;
+    private volatile bool supportsFanout;
     private volatile bool wantConnected;   // the user intends to be connected; drives auto-recovery
     private int reconnectScheduled;         // 0/1 guard so only one recovery loop runs at a time
 
@@ -256,6 +260,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         wantConnected = true;
         var p = state.Profile;
         if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
+        await DetectRelayCapabilitiesAsync(p.RelayUrl);
 
         var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}";
         var connection = new HubConnectionBuilder()
@@ -318,6 +323,28 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         }
     }
 
+    private async Task DetectRelayCapabilitiesAsync(string relayUrl)
+    {
+        supportsSendResults = false;
+        supportsFanout = false;
+        try
+        {
+            var http = httpFactory.CreateClient("relay");
+            using var response = await http.GetAsync($"{relayUrl.TrimEnd('/')}/health");
+            if (!response.IsSuccessStatusCode) return;
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            if (!doc.RootElement.TryGetProperty("capabilities", out var capabilities)) return;
+            supportsSendResults = capabilities.TryGetProperty("sendResults", out var results)
+                && results.ValueKind == JsonValueKind.True;
+            supportsFanout = capabilities.TryGetProperty("fanout", out var fanout)
+                && fanout.ValueKind == JsonValueKind.True;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"relay capability detection failed: {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Guards the auth handshake: if the connection is up but the challenge/response never completes
     /// (a mid-handshake hiccup leaves us connected-but-not-authenticated, with no Closed event to
@@ -374,6 +401,11 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     private async Task HandleInboundAsync(MeshEnvelope env, CancellationToken ct)
     {
         var from = AppState.Norm(env.From);
+        var isGroupKind = env.Kind is MeshKinds.GroupControl or MeshKinds.GroupMessage or MeshKinds.Fanout;
+        if (env.Kind == MeshKinds.Fanout
+            && env.ToDevice is not null
+            && !string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
+            return;
 
         // A delivery receipt: mark our matching outgoing line as delivered. Receipts are plaintext
         // (they carry only a message id, no content) and are verified below like any other envelope.
@@ -393,6 +425,11 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var pinned = state.FindContact(from)?.SigningKeys.ToList() ?? new List<string>();
         if (pinned.Count == 0)
             pinned = (await ResolveDeviceKeysAsync(from)).ToList();
+        if (isGroupKind && pinned.Count == 0)
+        {
+            Log?.Invoke($"dropped {env.Kind} from @{from}: no sender keys available for signature verification");
+            return;
+        }
         if (pinned.Count > 0 && !MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? ""))
         {
             // The sender's keys no longer match what we pinned: the contact's identity may have
@@ -400,6 +437,17 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             // of silently dropping, and do not auto-repin (that would defeat trust on first use).
             state.FlagContactKeyChanged(from);
             Log?.Invoke($"identity change: message from @{from} did not match pinned keys (re-verify)");
+            return;
+        }
+
+        if (isGroupKind)
+        {
+            if (env.Kind == MeshKinds.Fanout)
+            {
+                HandleInboundFanout(env, from);
+                return;
+            }
+            await HandleInboundGroupAsync(env, from);
             return;
         }
 
@@ -626,14 +674,201 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         StateChanged?.Invoke();
     }
 
+    private Task HandleInboundGroupAsync(MeshEnvelope env, string from)
+    {
+        if (!MessageCrypto.IsEncrypted(env.Body))
+        {
+            Log?.Invoke($"dropped {env.Kind} from @{from}: group body was not encrypted");
+            return Task.CompletedTask;
+        }
+
+        var (decrypted, plaintext) = MessageCrypto.TryDecrypt(
+            env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
+        if (!decrypted || plaintext is null)
+        {
+            Log?.Invoke($"dropped {env.Kind} from @{from}: group body could not be decrypted");
+            return Task.CompletedTask;
+        }
+
+        if (env.Kind == MeshKinds.GroupControl)
+            HandleInboundGroupControl(plaintext, from);
+        else
+            HandleInboundGroupMessage(plaintext, from);
+        return Task.CompletedTask;
+    }
+
+    private void HandleInboundFanout(MeshEnvelope env, string from)
+    {
+        if (!MessageCrypto.IsEncrypted(env.Body))
+        {
+            Log?.Invoke($"dropped fanout from @{from}: body was not encrypted");
+            return;
+        }
+
+        var (decrypted, plaintext) = MessageCrypto.TryDecrypt(
+            env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
+        if (!decrypted || plaintext is null)
+        {
+            Log?.Invoke($"dropped fanout from @{from}: body could not be decrypted");
+            return;
+        }
+
+        try
+        {
+            var content = JsonSerializer.Deserialize<MeshFanoutContent>(plaintext, Json)
+                ?? throw new JsonException("Fan-out content was null.");
+            if (content.Kind == MeshKinds.GroupControl)
+                HandleInboundGroupControl(content.Payload, from);
+            else if (content.Kind == MeshKinds.GroupMessage)
+                HandleInboundGroupMessage(content.Payload, from);
+            else
+                Log?.Invoke($"dropped fanout from @{from}: unsupported inner kind '{content.Kind}'");
+        }
+        catch (JsonException ex)
+        {
+            Log?.Invoke($"dropped fanout from @{from}: invalid content ({ex.Message})");
+        }
+    }
+
+    private void HandleInboundGroupControl(string plaintext, string from)
+    {
+        try
+        {
+            var snapshot = JsonSerializer.Deserialize<GroupSnapshotPayload>(plaintext, Json)
+                ?? throw new JsonException("Group snapshot was null.");
+            ValidateGroupSnapshotShape(snapshot);
+
+            var owner = AppState.Norm(snapshot.OwnerHandle);
+            var me = AppState.Norm(state.Profile.Handle);
+            if (!string.Equals(owner, from, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The group snapshot sender is not its owner.");
+            if (!snapshot.MemberHandles.Any(h =>
+                    string.Equals(AppState.Norm(h), me, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException("The current user is not a group member.");
+
+            var existing = state.FindGroupConversation(snapshot.GroupId);
+            if (existing is not null && snapshot.Version > existing.GroupVersion)
+                throw new InvalidOperationException("Group membership updates are not supported in the MVP.");
+
+            var group = state.ApplyGroupSnapshot(snapshot);
+            if (existing is null && ShouldNotify(state.FindContact(from)))
+                notifier.Notify($"Added to {group.GroupName}", $"Group created by @{from}.",
+                    NotifyKind.Message, "messages");
+        }
+        catch (JsonException ex)
+        {
+            Log?.Invoke($"dropped group control from @{from}: invalid JSON ({ex.Message})");
+        }
+        catch (ArgumentException ex)
+        {
+            Log?.Invoke($"dropped group control from @{from}: invalid snapshot ({ex.Message})");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log?.Invoke($"dropped group control from @{from}: {ex.Message}");
+        }
+    }
+
+    private void HandleInboundGroupMessage(string plaintext, string from)
+    {
+        try
+        {
+            var payload = JsonSerializer.Deserialize<GroupMessagePayload>(plaintext, Json)
+                ?? throw new JsonException("Group message was null.");
+            ValidateGroupMessageShape(payload);
+
+            var sender = AppState.Norm(payload.SenderHandle);
+            if (!string.Equals(sender, from, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The group message sender does not match its envelope.");
+
+            var group = state.FindGroupConversation(payload.GroupId)
+                ?? throw new InvalidOperationException("The group is not known locally.");
+            ValidateLocalGroup(group);
+
+            var me = AppState.Norm(state.Profile.Handle);
+            if (!group.GroupMembers.Contains(sender, StringComparer.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The sender is not a current group member.");
+            if (!group.GroupMembers.Contains(me, StringComparer.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The current user is not a current group member.");
+            if (!string.Equals(payload.GroupId, group.GroupId, StringComparison.Ordinal)
+                || payload.MembershipVersion != group.GroupVersion)
+                throw new InvalidOperationException("The group metadata version does not match local state.");
+            if (group.Lines.Any(l => string.Equals(l.Id, payload.MessageId, StringComparison.Ordinal)))
+                return;
+
+            state.AddChatLine(group.Handle, new ChatLine
+            {
+                Id = payload.MessageId,
+                Role = "user",
+                Text = payload.Text,
+                Via = "person",
+                SenderHandle = sender,
+                At = payload.SentAt
+            });
+            state.MarkUnread(group.Handle);
+            if (ShouldNotify(state.FindContact(sender)))
+                notifier.Notify(group.GroupName!, $"@{sender}: {Preview(payload.Text)}",
+                    NotifyKind.Message, "messages");
+        }
+        catch (JsonException ex)
+        {
+            Log?.Invoke($"dropped group message from @{from}: invalid JSON ({ex.Message})");
+        }
+        catch (ArgumentException ex)
+        {
+            Log?.Invoke($"dropped group message from @{from}: invalid payload ({ex.Message})");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log?.Invoke($"dropped group message from @{from}: {ex.Message}");
+        }
+    }
+
+    private static void ValidateGroupSnapshotShape(GroupSnapshotPayload snapshot)
+    {
+        if (string.IsNullOrWhiteSpace(snapshot.GroupId)
+            || string.IsNullOrWhiteSpace(snapshot.Name)
+            || string.IsNullOrWhiteSpace(snapshot.OwnerHandle)
+            || snapshot.MemberHandles is null
+            || snapshot.Version < 1)
+            throw new ArgumentException("Required group snapshot fields are missing.");
+        if (snapshot.MemberHandles.Count is < 2 or > FanoutProtocol.MaxRecipients)
+            throw new ArgumentException(
+                $"A group must contain between 2 and {FanoutProtocol.MaxRecipients} members.");
+        if (snapshot.MemberHandles.Any(string.IsNullOrWhiteSpace))
+            throw new ArgumentException("Group member handles cannot be empty.");
+    }
+
+    private static void ValidateGroupMessageShape(GroupMessagePayload payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload.GroupId)
+            || string.IsNullOrWhiteSpace(payload.MessageId)
+            || string.IsNullOrWhiteSpace(payload.SenderHandle)
+            || string.IsNullOrWhiteSpace(payload.Text)
+            || payload.MembershipVersion < 1
+            || payload.SentAt == default)
+            throw new ArgumentException("Required group message fields are missing.");
+    }
+
+    private static void ValidateLocalGroup(Conversation group)
+    {
+        if (!group.IsGroup
+            || string.IsNullOrWhiteSpace(group.GroupId)
+            || string.IsNullOrWhiteSpace(group.GroupName)
+            || string.IsNullOrWhiteSpace(group.GroupOwnerHandle)
+            || group.GroupMembers.Count is < 2 or > FanoutProtocol.MaxRecipients
+            || group.GroupVersion < 1)
+            throw new InvalidOperationException("The local group metadata is incomplete.");
+    }
+
     /// <summary>
     /// Resolves (and caches) a handle's device public keys from the relay directory. Used both
     /// to encrypt outbound messages to that handle and to pin its signing keys for verification.
     /// </summary>
-    private async Task<IReadOnlyList<string>> ResolveDeviceKeysAsync(string handle)
+    private async Task<IReadOnlyList<string>> ResolveDeviceKeysAsync(string handle, bool refresh = false)
     {
         var h = AppState.Norm(handle);
-        if (keyCache.TryGetValue(h, out var cached)) return cached;
+        if (!refresh && keyCache.TryGetValue(h, out var cached)) return cached;
         try
         {
             var http = httpFactory.CreateClient("relay");
@@ -642,12 +877,104 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             var keys = info?.DevicePublicKeys?.ToList() ?? new List<string>();
             if (keys.Count > 0)
             {
-                keyCache[h] = keys;
-                state.PinAndGetKeys(h, keys); // trust on first use
+                var trusted = state.PinAndGetKeys(h, keys);
+                if (!trusted.ToHashSet(StringComparer.Ordinal).SetEquals(keys))
+                    state.FlagContactKeyChanged(h);
+                keyCache[h] = trusted;
+                keyCacheUpdated[h] = DateTimeOffset.UtcNow;
+                return trusted;
             }
             return keys;
         }
         catch { return Array.Empty<string>(); }
+    }
+
+    private async Task<IReadOnlyDictionary<string, IReadOnlyList<string>>> ResolveDeviceKeysBatchAsync(
+        IEnumerable<string> recipients)
+    {
+        ArgumentNullException.ThrowIfNull(recipients);
+        var handles = recipients
+            .Where(h => !string.IsNullOrWhiteSpace(h))
+            .Select(AppState.Norm)
+            .Where(h => h.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (handles.Count is < 1 or > FanoutProtocol.MaxRecipients)
+            throw new ArgumentException(
+                $"Fan-out requires between 1 and {FanoutProtocol.MaxRecipients} distinct recipients.",
+                nameof(recipients));
+
+        var resolved = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        var now = DateTimeOffset.UtcNow;
+        var toResolve = new List<string>();
+        foreach (var handle in handles)
+        {
+            var pinned = state.FindContact(handle)?.SigningKeys;
+            if (pinned is { Count: > 0 }
+                && keyCache.TryGetValue(handle, out var cached)
+                && keyCacheUpdated.TryGetValue(handle, out var updated)
+                && now - updated < GroupKeyCacheLifetime
+                && pinned.ToHashSet(StringComparer.Ordinal).SetEquals(cached))
+            {
+                resolved[handle] = pinned.ToList();
+            }
+            else
+            {
+                toResolve.Add(handle);
+            }
+        }
+
+        if (toResolve.Count > 0)
+        {
+            var http = httpFactory.CreateClient("relay");
+            using var response = await http.PostAsJsonAsync(
+                $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/resolve",
+                new HandleKeysBatchRequest(toResolve));
+            if (!response.IsSuccessStatusCode)
+            {
+                var detail = await response.Content.ReadAsStringAsync();
+                throw new InvalidOperationException(
+                    $"Device-key resolution failed: relay {(int)response.StatusCode}: {detail}");
+            }
+
+            var batch = await response.Content.ReadFromJsonAsync<HandleKeysBatchResponse>(Json)
+                ?? throw new InvalidOperationException("Device-key resolution returned an empty response.");
+            var returned = batch.Handles
+                .GroupBy(entry => AppState.Norm(entry.Handle), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => (IReadOnlyList<string>)group
+                        .SelectMany(entry => entry.DevicePublicKeys ?? Array.Empty<string>())
+                        .Where(key => !string.IsNullOrWhiteSpace(key))
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            var missing = toResolve
+                .Where(handle => !returned.TryGetValue(handle, out var keys) || keys.Count == 0)
+                .Select(handle => $"@{handle}")
+                .ToList();
+            if (missing.Count > 0)
+                throw new InvalidOperationException(
+                    $"Cannot send encrypted group traffic: no usable device keys for {string.Join(", ", missing)}.");
+
+            foreach (var handle in toResolve)
+            {
+                var observed = returned[handle];
+                var trusted = state.PinAndGetKeys(handle, observed);
+                if (!trusted.ToHashSet(StringComparer.Ordinal).SetEquals(observed))
+                {
+                    state.FlagContactKeyChanged(handle);
+                    throw new InvalidOperationException(
+                        $"Cannot send group traffic to @{handle}: identity keys changed; re-verify first.");
+                }
+                keyCache[handle] = trusted;
+                keyCacheUpdated[handle] = now;
+                resolved[handle] = trusted.ToList();
+            }
+        }
+
+        return handles.ToDictionary(handle => handle, handle => resolved[handle], StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -666,6 +993,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             var keys = info?.DevicePublicKeys?.ToList() ?? new List<string>();
             if (keys.Count == 0) return false;
             keyCache[h] = keys;
+            keyCacheUpdated[h] = DateTimeOffset.UtcNow;
             state.ReverifyContact(h, keys);
             StateChanged?.Invoke();
             return true;
@@ -830,6 +1158,119 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         state.MarkRead(conv.Handle);
     }
 
+    public async Task<Conversation> CreateGroupAsync(string name, IEnumerable<string> memberHandles)
+    {
+        if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
+            throw new InvalidOperationException("Cannot create a group while disconnected or unauthenticated.");
+        if (!supportsFanout)
+            throw new InvalidOperationException("The connected relay does not support stateless fan-out.");
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("Group name is required.", nameof(name));
+        ArgumentNullException.ThrowIfNull(memberHandles);
+
+        var me = AppState.Norm(state.Profile.Handle);
+        if (string.IsNullOrWhiteSpace(me))
+            throw new InvalidOperationException("An authenticated handle is required to create a group.");
+
+        var members = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var requested in memberHandles)
+        {
+            if (string.IsNullOrWhiteSpace(requested)) continue;
+            var normalized = AppState.Norm(requested);
+            if (normalized.Length > 0 && seen.Add(normalized)) members.Add(normalized);
+        }
+        if (seen.Add(me)) members.Add(me);
+        if (members.Count < 2)
+            throw new ArgumentException("A group requires at least two distinct members.", nameof(memberHandles));
+        if (members.Count > FanoutProtocol.MaxRecipients)
+            throw new ArgumentException(
+                $"A group cannot contain more than {FanoutProtocol.MaxRecipients} members.",
+                nameof(memberHandles));
+
+        var snapshot = new GroupSnapshotPayload(
+            Guid.NewGuid().ToString("n"), name.Trim(), me, members, 1);
+        var group = state.ApplyGroupSnapshot(snapshot);
+        var body = JsonSerializer.Serialize(snapshot, Json);
+        var request = await BuildEncryptedGroupFanoutAsync(
+            members, MeshKinds.GroupControl, body);
+
+        try
+        {
+            var result = await hub.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendFanout, request);
+            if (!result.Accepted)
+                throw new InvalidOperationException($"relay rejected fan-out ({DescribeResult(result)})");
+            return group;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"group creation send failed for '{group.GroupName}': {ex.Message}");
+            throw new InvalidOperationException(
+                $"The group was saved locally, but its encrypted invitations were not sent: {ex.Message}", ex);
+        }
+    }
+
+    public async Task<bool> SendGroupMessageAsync(Conversation group, string text, string? lineId = null)
+    {
+        var messageId = string.IsNullOrWhiteSpace(lineId) ? Guid.NewGuid().ToString("n") : lineId;
+        try
+        {
+            ArgumentNullException.ThrowIfNull(group);
+            ValidateLocalGroup(group);
+            if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
+                throw new InvalidOperationException("Not connected or authenticated.");
+            if (!supportsFanout)
+                throw new InvalidOperationException("The connected relay does not support stateless fan-out.");
+            if (string.IsNullOrWhiteSpace(text))
+                throw new ArgumentException("Group message text is required.", nameof(text));
+
+            var me = AppState.Norm(state.Profile.Handle);
+            if (!group.GroupMembers.Contains(me, StringComparer.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The current user is not a group member.");
+
+            var payload = new GroupMessagePayload(
+                group.GroupId!, messageId, me, text, group.GroupVersion, DateTimeOffset.UtcNow);
+            var body = JsonSerializer.Serialize(payload, Json);
+            var recipients = group.GroupMembers
+                .Select(AppState.Norm)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var request = await BuildEncryptedGroupFanoutAsync(
+                recipients, MeshKinds.GroupMessage, body);
+
+            var result = await hub.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendFanout, request);
+            if (!result.Accepted)
+                throw new InvalidOperationException($"relay rejected fan-out ({DescribeResult(result)})");
+            state.SetLineStatus(messageId, "sent");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"group message send failed: {ex.Message}");
+            state.SetLineStatus(messageId, "failed");
+            return false;
+        }
+    }
+
+    private async Task<MeshFanoutRequest> BuildEncryptedGroupFanoutAsync(
+        IReadOnlyList<string> recipients, string kind, string plaintext)
+    {
+        var keysByRecipient = await ResolveDeviceKeysBatchAsync(recipients);
+        var normalizedRecipients = keysByRecipient.Keys.ToList();
+        var allKeys = keysByRecipient.Values
+            .SelectMany(keys => keys)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var content = JsonSerializer.Serialize(new MeshFanoutContent(kind, plaintext), Json);
+        var ciphertext = MessageCrypto.Encrypt(content, allKeys)
+            ?? throw new InvalidOperationException(
+                "Cannot send encrypted group traffic: no usable recipient device keys.");
+        var p = state.Profile;
+        var signature = IdentityService.Sign(p.PrivateKey, ciphertext);
+        return new MeshFanoutRequest(
+            Guid.NewGuid().ToString("n"), normalizedRecipients, ciphertext, signature, DateTimeOffset.UtcNow);
+    }
+
 
     public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null, string? toDevice = null)
     {
@@ -857,7 +1298,21 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig, toDevice: toDevice);
         try
         {
-            await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
+            if (supportsSendResults)
+            {
+                var result = await hub.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, env);
+                if (!result.Accepted)
+                {
+                    Log?.Invoke($"send rejected: {DescribeResult(result)}");
+                    if (lineId is not null) state.SetLineStatus(lineId, "failed");
+                    return false;
+                }
+            }
+            else
+            {
+                // Legacy relays route SendEnvelope but return no acknowledgement payload.
+                await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
+            }
             if (lineId is not null) state.SetLineStatus(lineId, "sent");
             return true;
         }
@@ -882,10 +1337,16 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             var body = ReceiptProtocol.Body(messageId);
             var sig = IdentityService.Sign(p.PrivateKey, body);
             var env = MeshEnvelope.Create(p.Handle, AppState.Norm(toHandle), MeshKinds.Receipt, body, sig);
-            await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
+            if (supportsSendResults)
+                _ = await hub.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, env);
+            else
+                await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
         }
         catch { /* receipts are best-effort */ }
     }
+
+    private static string DescribeResult(MeshSendResult result)
+        => $"code={result.Code}, retryAfterMs={result.RetryAfterMs}";
 
     private static string Preview(string text)
     {
@@ -901,6 +1362,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         wantConnected = false;
         authenticated = false;
         keyCache.Clear();
+        keyCacheUpdated.Clear();
         var current = hub;
         hub = null;
         if (current is not null)

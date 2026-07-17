@@ -399,6 +399,8 @@ public sealed class ChatLine
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Role { get; set; } = "user"; // user | assistant | system
     public string Text { get; set; } = "";
+    /// <summary>The actual group-message author. Direct messages may leave this null.</summary>
+    public string? SenderHandle { get; set; }
     /// <summary>Transient multimodal inputs for this turn. Never persisted or sent to peers.</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public List<ChatAttachment> Attachments { get; set; } = new();
@@ -462,6 +464,19 @@ public sealed class Conversation
 {
     public string Handle { get; set; } = "";
     public List<ChatLine> Lines { get; set; } = new();
+
+    /// <summary>
+    /// Client-only group metadata. Group threads use <c>grp:{normalizedGroupId}</c> as their
+    /// synthetic <see cref="Handle"/> and never expose these values to the relay.
+    /// </summary>
+    public string? GroupId { get; set; }
+    public string? GroupName { get; set; }
+    public string? GroupOwnerHandle { get; set; }
+    public List<string> GroupMembers { get; set; } = new();
+    public int GroupVersion { get; set; }
+
+    /// <summary>True when this conversation is a client-side group thread.</summary>
+    public bool IsGroup => GroupId is not null;
 
     /// <summary>
     /// Service-thread metadata (null for a normal person DM). When set, this conversation is a thread

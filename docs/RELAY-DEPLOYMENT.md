@@ -48,6 +48,13 @@ moves sealed payloads it cannot open.
 | The handle directory (handle -> device public keys) | Message contents (they are end-to-end encrypted to recipient device keys) |
 | Presence (which handles are currently connected) | Anything that would let it decrypt traffic |
 | Traffic metadata (who talks to whom, and when) | Plaintext of any message, attachment, or payload |
+| For fan-out: sender, transient recipient cohort, timing, and ciphertext size | Group ID, name, membership metadata, inner control/message type, or group-message plaintext |
+
+One generic fan-out request carries one ciphertext and 1 to 128 transient recipient
+handles. The relay clones ordinary envelopes and routes online recipients concurrently,
+queueing ordinary per-recipient inbox records for offline recipients. It does not create
+or persist a group or fan-out object. Repeated recipient cohorts may still permit group
+inference, so Mesh makes no traffic-analysis-resistance claim.
 
 On every message the relay stamps the authenticated sender: it verifies a
 device-key signature and asserts the real origin handle. It cannot forge or read
@@ -99,8 +106,8 @@ You need one of the following, depending on the deployment method you choose.
 **Optional, only for durable or multi-replica deployments:**
 
 - An Azure Cosmos DB account (for durable storage).
-- A Redis instance (for presence and cross-replica routing at more than one
-  replica).
+- A Redis instance (for presence, shared live rate buckets, and cross-replica routing
+  at more than one replica).
 
 With none of the optional pieces, the relay runs fully in-memory as a single node
 with no hosted model. That is a valid, working configuration for personal and test
@@ -334,7 +341,7 @@ with no hosted model. Only the settings you actually provide change behaviour.
 | --- | --- | --- | --- |
 | `COSMOS_CONNECTION` | `Cosmos:Connection` | Azure Cosmos DB connection string. When set, the handle registry, invites, and offline inbox become durable. | in-memory |
 | `COSMOS_DB` | `Cosmos:Database` | Cosmos database name. | `mesh` |
-| `REDIS_CONNECTION` | `Redis:Connection` | Redis connection string. When set, presence, per-handle quota, and cross-node message routing use Redis, so you can run multiple replicas. | in-memory |
+| `REDIS_CONNECTION` | `Redis:Connection` | Redis connection string. When set, presence, live Direct/Group token buckets, per-handle quota, and cross-node routing are shared across replicas. | in-memory |
 
 ### Hosted model (optional free model)
 
@@ -355,6 +362,41 @@ the code carries a default base URL.
 | --- | --- | --- | --- |
 | `MESH_MSG_RATE_PER_MIN` | `Mesh:MessageRatePerMinute` | Per-handle steady message rate limit. | `120` |
 | `MESH_MSG_BURST` | `Mesh:MessageBurst` | Per-handle burst capacity. | `30` |
+| `MESH_GROUP_RATE_PER_MIN` | `Mesh:GroupMessageRatePerMinute` | Per-handle Group logical-message refill rate. | `120` (falls back to Direct rate if no Group setting exists) |
+| `MESH_GROUP_BURST` | `Mesh:GroupMessageBurst` | Per-handle Group bucket capacity. | `30` (falls back to Direct burst if no Group setting exists) |
+| `MESH_MAX_FANOUT_RECIPIENTS` | `Mesh:MaxFanoutRecipients` | Default fan-out recipient limit; values are clamped to the hard cap of 128. | `128` |
+| `MESH_RATE_POLICY_CACHE_SECONDS` | `Mesh:RatePolicyCacheSeconds` | Per-replica effective-policy cache duration. | `60` |
+| `MESH_ADMIN_KEY` | `Mesh:AdminKey` | Secret required in `X-Mesh-Admin-Key` for rate-policy admin endpoints. | none |
+
+Rate limits count **logical sends**, not physical recipient envelopes. An ordinary send
+consumes one Direct token. One fan-out consumes one Group token whether it addresses 1
+or 128 handles. Direct and Group buckets are independent. With a 120/minute refill and
+burst 30, a full bucket permits 30 immediate sends and then refills at 2 tokens per
+second. Rejections return explicit `rate_limited` results with a retry delay; accepted,
+validation, and other rejection outcomes are also explicit rather than silently dropped.
+
+Configured defaults apply unless an administrative per-handle override exists. A policy
+object contains `messagesPerMinute`, `burstCapacity`, `groupMessagesPerMinute`,
+`groupBurstCapacity`, `maxFanoutRecipients`, and `enabled`. The complete override takes
+precedence over defaults, is stored durably in Cosmos `rate-policies` (or non-durably in
+the in-memory store), and is cached per replica for
+`MESH_RATE_POLICY_CACHE_SECONDS`. Live bucket balances are atomic Redis state across
+replicas, or local in-memory state when Redis is absent.
+
+### Rate-policy administration
+
+| Method | Path | Effect |
+| --- | --- | --- |
+| `GET` | `/admin/handles/{handle}/rate-policy` | Read the effective policy and whether an override exists. |
+| `PUT` | `/admin/handles/{handle}/rate-policy` | Create or replace the complete override and invalidate its local cache entry. |
+| `DELETE` | `/admin/handles/{handle}/rate-policy` | Remove the override, invalidate cache, and restore configured defaults. |
+
+All three endpoints are admin-only and require the exact `X-Mesh-Admin-Key` value from
+`MESH_ADMIN_KEY` / `Mesh:AdminKey`; if no key is configured, every request is
+unauthorized. Do not expose them without TLS. Keep the key in a
+secret manager, use a high-entropy value, restrict network access, and rotate it. There
+is currently no user endpoint for changing policy; user-controlled lower limits may be
+added later.
 
 ### Connector OAuth (optional)
 
@@ -390,6 +432,7 @@ never expire.
 Cosmos containers used (created and managed for you, no pre-creation needed):
 
 - handle directory
+- administrative per-handle policies (`rate-policies`)
 - invites (native per-item TTL)
 - offline inbox (14-day default TTL)
 - services directory
@@ -402,8 +445,9 @@ load balancer. Two requirements:
 1. **Sticky sessions are mandatory.** The SignalR WebSocket must stay on one
    replica for the life of the connection. Configure your load balancer for
    session affinity.
-2. **Redis carries presence and cross-replica routing.** Redis tracks who is
-   connected and forwards directed messages to the replica that holds the
+2. **Redis carries presence, live rate buckets, and cross-replica routing.** Redis
+   atomically shares each handle's Direct and Group bucket balances, tracks who is
+   connected, and forwards directed messages to the replica that holds the
    recipient's connection. Because forwarding is directed rather than broadcast,
    load stays proportional to delivered messages rather than to replica count.
 
@@ -467,6 +511,11 @@ The relay exposes plain HTTP endpoints for status and observability.
 - hosted-model calls
 - rate-limit rejections
 - connected count
+
+Normal and fan-out hub sends return explicit accepted or rejected results. An accepted
+fan-out means the relay admitted the logical request and began routing or queueing its
+per-recipient envelopes. Online work is concurrent and offline users receive later;
+there is no atomic simultaneous physical-delivery guarantee.
 
 The metrics endpoint contains no handles and no PII, so it is safe to scrape.
 
@@ -539,15 +588,15 @@ contents. Self-hosting keeps that metadata on your infrastructure instead of a
 third party's. Treat it as sensitive: it reveals communication patterns even
 though it never reveals content.
 
-**Manage secrets properly.** Cosmos and Redis connection strings, any
+**Manage secrets properly.** Cosmos and Redis connection strings, `MESH_ADMIN_KEY`, any
 `MODEL_API_KEY`, and any connector secrets should come from your platform secret
 store (for example, environment injection from a secrets manager, Docker
 secrets, or your orchestrator's secret mechanism). Never commit them to version
 control and never inline them in a compose file that is checked in.
 
 **Back up Cosmos if you rely on durable delivery or recovery.** If you use Cosmos
-for durable storage, its data (handle directory, invites, offline inbox, services
-directory) is your source of truth for recovery. Enable backups on the Cosmos
+for durable storage, its data (handle directory, rate policies, invites, offline inbox,
+services directory) is your source of truth for recovery. Enable backups on the Cosmos
 account according to your recovery objectives.
 
 **Honor the AGPL-3.0 obligations.** The relay is licensed AGPL-3.0. If you modify

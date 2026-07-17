@@ -30,7 +30,7 @@ Welcome to Mesh. This guide explains what the Mesh app does and how to use it, s
 
 Mesh is a private messenger with a personal AI agent built in. It combines three ideas that usually live in separate apps:
 
-- **A secure messenger.** You talk to other people using a simple handle (like a username). Your conversations are end-to-end encrypted, which means only you and the person you are talking to can read them.
+- **A secure messenger.** You talk to other people using a simple handle (like a username). Your conversations are end-to-end encrypted, which means only the intended people can read them.
 - **A personal AI agent.** Every Mesh identity comes with its own agent: a private assistant that can chat with you, remember the knowledge you give it, run skills you define, build small apps for you, and (with your permission) talk to other people's agents on your behalf.
 - **An open relay.** Messages travel through a relay server whose only job is to route sealed, encrypted messages between devices. The relay cannot read your messages. It never sees the contents.
 
@@ -102,7 +102,7 @@ The **relay** is the server that routes messages between devices. It only moves 
 
 ### End-to-end encryption (E2EE), in one paragraph
 
-Every message you send is encrypted on your device before it leaves, and it can only be decrypted by the person you sent it to. The relay in the middle only sees a sealed envelope, never the contents. Your private keys never leave your device, and your data is kept in encrypted storage on the device. In short: your conversations are for you and the people you are talking to, and nobody else, including the relay operator.
+Every message you send is encrypted on your device before it leaves, and it can only be decrypted by its intended recipient devices. The relay in the middle only sees a sealed envelope, never the contents. Your private keys never leave your device, and your data is kept in encrypted storage on the device. In short: your conversations are for you and the people you are talking to, and nobody else, including the relay operator.
 
 ---
 
@@ -149,8 +149,10 @@ This toggle is powerful: it lets you get a quick answer from someone's agent (fo
 
 Messages show delivery status so you know what happened:
 
-- **Sent:** your device has sent the message to the relay.
+- **Sent:** the relay explicitly accepted the message for routing or offline queueing.
 - **Delivered:** the message reached the recipient's device.
+
+The relay does not silently report success. If it rejects a send, for example because your handle is temporarily rate limited, the app receives an explicit result and can tell you to retry. Direct messages and group messages have separate per-handle allowances. One group send consumes one group-message allowance regardless of whether it has 2 or 128 recipients.
 
 ### Unread markers
 
@@ -159,6 +161,36 @@ Conversations show **unread markers** so you can quickly see where there are new
 ### Trust on first use and re-verification
 
 Mesh uses **trust-on-first-use**. The first time you talk to someone, your app remembers their identity keys. If a contact's identity keys ever **change** (for example, they moved to a brand new device, or in the rare case something is wrong), Mesh **holds your messages** and asks you to **re-verify** before continuing. This protects you from someone impersonating a contact. When this happens, review the prompt and re-verify to resume the conversation.
+
+### Creating and using a group
+
+Groups are private, human-to-human conversations created from **Messages**:
+
+1. Select **New group**.
+2. Enter a **group name**.
+3. Enter the other members' Mesh handles, separated by commas, spaces, semicolons, or new lines. You are included automatically.
+4. Select **Create**.
+
+A group must contain you and at least one other person. It can contain at most **128 people total**. Duplicate handles and your own handle in the member box are ignored.
+
+Group conversations are always **Person** conversations. There is no Agent / Person toggle, group agents, or automatic agent reply. Every message shows which member sent it. Your client resolves all members' device keys, encrypts the group content once to the union of those keys, and sends one generic fan-out request containing that ciphertext and the transient recipient handles. The relay has no persistent group object or membership list. It clones ordinary sealed envelopes for routing and queues only the unavoidable per-recipient inbox record for an offline member.
+
+Online dispatch is concurrent, while offline members receive their sealed envelope after they reconnect. A successful send means the relay accepted the logical message for routing or queueing. It does not guarantee atomic or physically simultaneous delivery to every member.
+
+If Mesh cannot find usable device keys for every member, group creation or sending fails rather than sending any group data as plaintext.
+
+### Clearing or deleting a group locally
+
+- **Clear** removes the group's message history from this device but keeps the group and its member list.
+- **Delete** removes the group, its local metadata, and its history from this device.
+
+These actions are **local only**. They do not clear another member's history, remove anyone from the group, or send a deletion notice. Because the MVP has no rejoin or history-backfill flow, deleting a group can prevent later messages for that group from being accepted on that device.
+
+### Group MVP limitations
+
+Groups are create-only in this MVP. The creator is the owner, but there are no owner controls after creation. You cannot add or remove members, leave or dissolve a group for everyone, rename it for everyone, use invite links, backfill earlier history, or see per-member read receipts. Group messaging is human-only.
+
+The relay sees the sender, transient recipient cohort, timing, and ciphertext size. Repeated cohorts may let a relay operator infer that the same people form a group even though the group name, ID, membership metadata, control type, and message contents remain encrypted. Mesh does not claim traffic-analysis resistance.
 
 ---
 
@@ -482,6 +514,7 @@ Only in the ways you allow. Approved contacts see only what their **circle** can
 | **Me** | Your private chat with your own agent. |
 | **Thread** | A separate topic chat within Me. |
 | **Agent / Person toggle** | Chooses whether a message goes to a contact's agent or to them directly. |
+| **Group** | A create-only, human-to-human conversation whose state is stored on members' devices. |
 | **Contact** | Someone you have added by handle. |
 | **Circle** | A named group of contacts that scopes what you share. |
 | **Privacy by binding** | What a contact can access is bound to their circle. |

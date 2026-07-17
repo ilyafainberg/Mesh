@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Mesh.App.Domain;
+using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
@@ -141,7 +142,9 @@ public sealed class AppState
             // Persist any history the fresh profile already carries (normally none at onboarding).
             foreach (var conv in Profile.Conversations)
             {
+                conv.Handle = PrepareConversationForPersistence(conv);
                 activeDb.EnsureConversation(conv.Handle);
+                PersistConversationMetadata(activeDb, conv);
                 foreach (var line in conv.Lines) activeDb.AppendChatLine(Norm(conv.Handle), line);
             }
             foreach (var thread in Profile.OwnThreads)
@@ -586,6 +589,18 @@ public sealed class AppState
         NotifyChanged();
     }
 
+    /// <summary>Updates an outgoing line after widget/file content is finalized and persists it.</summary>
+    public void SetLineText(string lineId, string text)
+    {
+        foreach (var conv in Profile.Conversations)
+        {
+            var line = conv.Lines.FirstOrDefault(l => l.Id == lineId);
+            if (line is not null) { line.Text = text; break; }
+        }
+        activeDb?.UpdateLineText(lineId, text);
+        NotifyChanged();
+    }
+
     /// <summary>Searches all chat history for a query string. Empty when no active database.</summary>
     public IReadOnlyList<MeshDb.SearchHit> SearchHistory(string query)
         => activeDb is not null ? activeDb.Search(query) : new List<MeshDb.SearchHit>();
@@ -649,7 +664,9 @@ public sealed class AppState
         var db = OpenDb(id);
         foreach (var conv in imported.Conversations)
         {
+            conv.Handle = PrepareConversationForPersistence(conv);
             db.EnsureConversation(conv.Handle);
+            PersistConversationMetadata(db, conv);
             foreach (var line in conv.Lines) db.AppendChatLine(Norm(conv.Handle), line);
         }
         // Migrate a legacy single OwnChat (older exports) into a thread so nothing is lost.
@@ -770,11 +787,79 @@ public sealed class AppState
     public static string ServiceKey(string providerHandle, string serviceId)
         => "svc:" + Norm(providerHandle) + ":" + serviceId;
 
+    /// <summary>Synthetic conversation key for a group thread: <c>grp:{normalizedGroupId}</c>.</summary>
+    public static string GroupKey(string groupId)
+    {
+        var normalized = NormalizeGroupId(groupId);
+        return "grp:" + normalized;
+    }
+
     /// <summary>Finds a conversation by its (already-known) key, or null.</summary>
     public Conversation? FindConversation(string handle)
     {
         var h = Norm(handle);
         return Profile.Conversations.FirstOrDefault(c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>Finds a group conversation by its group identifier, or null.</summary>
+    public Conversation? FindGroupConversation(string groupId) => FindConversation(GroupKey(groupId));
+
+    /// <summary>
+    /// Creates a group conversation from a complete snapshot or applies the snapshot to the existing
+    /// group thread. Metadata is normalized, validated, persisted, and never sent to the relay here.
+    /// </summary>
+    public Conversation GetOrCreateGroupConversation(GroupSnapshotPayload snapshot)
+        => ApplyGroupSnapshot(snapshot);
+
+    /// <summary>Convenience overload for locally creating a complete group snapshot.</summary>
+    public Conversation GetOrCreateGroupConversation(
+        string groupId,
+        string name,
+        string ownerHandle,
+        IEnumerable<string> memberHandles,
+        int version = 1)
+    {
+        ArgumentNullException.ThrowIfNull(memberHandles);
+        return ApplyGroupSnapshot(new GroupSnapshotPayload(
+            groupId, name, ownerHandle, memberHandles.ToList(), version));
+    }
+
+    /// <summary>Validates and applies a complete group metadata snapshot.</summary>
+    public Conversation ApplyGroupSnapshot(GroupSnapshotPayload snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var normalized = NormalizeGroupSnapshot(snapshot);
+        var key = GroupKey(normalized.GroupId);
+        var conv = FindConversation(key);
+
+        if (conv is not null && !conv.IsGroup)
+            throw new InvalidOperationException($"Conversation key '{key}' is not a group thread.");
+        if (conv is not null && normalized.Version < conv.GroupVersion)
+            throw new InvalidOperationException("A group snapshot cannot roll membership back to an older version.");
+        if (conv is not null && normalized.Version == conv.GroupVersion)
+        {
+            if (!string.Equals(conv.GroupName, normalized.Name, StringComparison.Ordinal)
+                || !string.Equals(conv.GroupOwnerHandle, normalized.OwnerHandle, StringComparison.OrdinalIgnoreCase)
+                || !conv.GroupMembers.SequenceEqual(normalized.MemberHandles, StringComparer.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Conflicting group metadata has the same membership version.");
+            return conv;
+        }
+
+        if (conv is null)
+        {
+            conv = new Conversation { Handle = key };
+            Profile.Conversations.Add(conv);
+        }
+
+        conv.GroupId = normalized.GroupId;
+        conv.GroupName = normalized.Name;
+        conv.GroupOwnerHandle = normalized.OwnerHandle;
+        conv.GroupMembers = normalized.MemberHandles.ToList();
+        conv.GroupVersion = normalized.Version;
+        activeDb?.SetConversationGroup(
+            key, conv.GroupId, conv.GroupName, conv.GroupOwnerHandle, conv.GroupMembers, conv.GroupVersion);
+        NotifyChanged();
+        return conv;
     }
 
     /// <summary>
@@ -842,14 +927,89 @@ public sealed class AppState
 
     public static string Norm(string handle) => handle.Trim().TrimStart('@').ToLowerInvariant();
 
-    /// <summary>Friendly display name for a handle (service name for a service thread, contact's name, else the handle).</summary>
+    /// <summary>Friendly display name for a group/service thread, contact, or handle.</summary>
     public string DisplayNameFor(string handle)
     {
         var conv = FindConversation(handle);
+        if (conv?.IsGroup == true) return string.IsNullOrWhiteSpace(conv.GroupName) ? Norm(handle) : conv.GroupName!;
         if (conv?.IsService == true) return string.IsNullOrWhiteSpace(conv.ServiceName) ? Norm(handle) : conv.ServiceName!;
         var c = FindContact(handle);
         if (c is not null && !string.IsNullOrWhiteSpace(c.DisplayName)) return c.DisplayName!;
         return Norm(handle);
+    }
+
+    private static string NormalizeGroupId(string groupId)
+    {
+        if (string.IsNullOrWhiteSpace(groupId))
+            throw new ArgumentException("Group ID is required.", nameof(groupId));
+        return groupId.Trim().ToLowerInvariant();
+    }
+
+    private static GroupSnapshotPayload NormalizeGroupSnapshot(GroupSnapshotPayload snapshot)
+    {
+        var groupId = NormalizeGroupId(snapshot.GroupId);
+        if (string.IsNullOrWhiteSpace(snapshot.Name))
+            throw new ArgumentException("Group name is required.", nameof(snapshot));
+        if (string.IsNullOrWhiteSpace(snapshot.OwnerHandle))
+            throw new ArgumentException("Group owner handle is required.", nameof(snapshot));
+        if (snapshot.MemberHandles is null)
+            throw new ArgumentException("Group members are required.", nameof(snapshot));
+        if (snapshot.Version < 1)
+            throw new ArgumentException("Group version must be at least 1.", nameof(snapshot));
+
+        var owner = Norm(snapshot.OwnerHandle);
+        if (owner.Length == 0)
+            throw new ArgumentException("Group owner handle is invalid after normalization.", nameof(snapshot));
+        var members = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var member in snapshot.MemberHandles)
+        {
+            if (string.IsNullOrWhiteSpace(member))
+                throw new ArgumentException("Group member handles cannot be empty.", nameof(snapshot));
+            var normalized = Norm(member);
+            if (normalized.Length == 0)
+                throw new ArgumentException("Group member handles must be valid after normalization.", nameof(snapshot));
+            if (seen.Add(normalized)) members.Add(normalized);
+        }
+
+        if (members.Count < 2)
+            throw new ArgumentException("A group requires at least two distinct members.", nameof(snapshot));
+        if (!seen.Contains(owner))
+            throw new ArgumentException("The group owner must be included in the member list.", nameof(snapshot));
+
+        return new GroupSnapshotPayload(groupId, snapshot.Name.Trim(), owner, members, snapshot.Version);
+    }
+
+    private static string PrepareConversationForPersistence(Conversation conversation)
+    {
+        if (!conversation.IsGroup) return conversation.Handle;
+
+        var normalized = NormalizeGroupSnapshot(new GroupSnapshotPayload(
+            conversation.GroupId!,
+            conversation.GroupName ?? "",
+            conversation.GroupOwnerHandle ?? "",
+            conversation.GroupMembers,
+            conversation.GroupVersion));
+        conversation.GroupId = normalized.GroupId;
+        conversation.GroupName = normalized.Name;
+        conversation.GroupOwnerHandle = normalized.OwnerHandle;
+        conversation.GroupMembers = normalized.MemberHandles.ToList();
+        conversation.GroupVersion = normalized.Version;
+        return GroupKey(normalized.GroupId);
+    }
+
+    private static void PersistConversationMetadata(MeshDb db, Conversation conversation)
+    {
+        if (conversation.IsGroup)
+            db.SetConversationGroup(
+                conversation.Handle,
+                conversation.GroupId!,
+                conversation.GroupName
+                    ?? throw new InvalidOperationException($"Group conversation '{conversation.Handle}' has no name."),
+                conversation.GroupOwnerHandle
+                    ?? throw new InvalidOperationException($"Group conversation '{conversation.Handle}' has no owner."),
+                conversation.GroupMembers,
+                conversation.GroupVersion);
     }
 
     // ---- circles ----------------------------------------------------------

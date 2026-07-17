@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.RateLimiting;
@@ -37,9 +38,32 @@ IQuotaStore quota = string.IsNullOrWhiteSpace(redisConn)
     ? new InMemoryQuotaStore()
     : new RedisQuotaStore(redisConn);
 
+var msgRatePerMin = int.TryParse(Config(builder.Configuration, "MESH_MSG_RATE_PER_MIN", "Mesh:MessageRatePerMinute"), out var rpm) ? rpm : 120;
+var msgBurst = int.TryParse(Config(builder.Configuration, "MESH_MSG_BURST", "Mesh:MessageBurst"), out var mb) ? mb : 30;
+var groupRatePerMin = int.TryParse(Config(builder.Configuration, "MESH_GROUP_RATE_PER_MIN", "Mesh:GroupMessageRatePerMinute"), out var grpm) ? grpm : msgRatePerMin;
+var groupBurst = int.TryParse(Config(builder.Configuration, "MESH_GROUP_BURST", "Mesh:GroupMessageBurst"), out var gb) ? gb : msgBurst;
+var maxFanoutRecipients = int.TryParse(Config(builder.Configuration, "MESH_MAX_FANOUT_RECIPIENTS", "Mesh:MaxFanoutRecipients"), out var mfr)
+    ? Math.Clamp(mfr, 1, FanoutProtocol.MaxRecipients)
+    : FanoutProtocol.MaxRecipients;
+var policyCacheSeconds = int.TryParse(Config(builder.Configuration, "MESH_RATE_POLICY_CACHE_SECONDS", "Mesh:RatePolicyCacheSeconds"), out var pcs)
+    ? Math.Max(1, pcs)
+    : 60;
+var defaultRatePolicy = new HandleRatePolicy(
+    msgRatePerMin, msgBurst, groupRatePerMin, groupBurst, maxFanoutRecipients);
+IRateLimitStore rateLimitStore = string.IsNullOrWhiteSpace(redisConn)
+    ? new InMemoryRateLimitStore()
+    : new RedisRateLimitStore(redisConn);
+var ratePolicyProvider = new HandleRatePolicyProvider(
+    store, defaultRatePolicy, TimeSpan.FromSeconds(policyCacheSeconds));
+IMessageRateLimiter messageRateLimiter = new PerHandleRateLimiter(ratePolicyProvider, rateLimitStore);
+var adminKey = Config(builder.Configuration, "MESH_ADMIN_KEY", "Mesh:AdminKey");
+
 builder.Services.AddSingleton(store);
 builder.Services.AddSingleton(backplane);
 builder.Services.AddSingleton(quota);
+builder.Services.AddSingleton<IRateLimitStore>(rateLimitStore);
+builder.Services.AddSingleton<IHandleRatePolicyProvider>(ratePolicyProvider);
+builder.Services.AddSingleton<IMessageRateLimiter>(messageRateLimiter);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
 builder.Services.AddSingleton<Mesh.Relay.RelayConnectorCatalog>();
@@ -48,13 +72,6 @@ builder.Services.AddHostedService<PresenceRenewer>();
 // Aggregate ops counters (no PII): scraped via GET /metrics.
 var metrics = new RelayMetrics();
 builder.Services.AddSingleton(metrics);
-
-// Per-handle message rate limiter for the hub (in-memory, no external service required).
-// MESH_MSG_RATE_PER_MIN: steady messages/minute per handle (default 120).
-// MESH_MSG_BURST:        back-to-back burst capacity per handle (default 30).
-var msgRatePerMin = int.TryParse(Config(builder.Configuration, "MESH_MSG_RATE_PER_MIN", "Mesh:MessageRatePerMinute"), out var rpm) ? rpm : 120;
-var msgBurst = int.TryParse(Config(builder.Configuration, "MESH_MSG_BURST", "Mesh:MessageBurst"), out var mb) ? mb : 30;
-builder.Services.AddSingleton(new PerHandleRateLimiter(msgRatePerMin, msgBurst));
 
 // SignalR provides the transport (connection, framing, keepalive, reconnection). Cross-node
 // routing is done by MeshRouter + the directed backplane, NOT by a SignalR fan-out backplane,
@@ -73,6 +90,15 @@ builder.Services.AddRateLimiter(o =>
         RateLimitPartition.GetFixedWindowLimiter(
             ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             _ => new FixedWindowRateLimiterOptions { PermitLimit = 120, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    o.AddPolicy("handle-key-batch", ctx =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
 });
 
 var app = builder.Build();
@@ -103,8 +129,26 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
 });
 
 // ---- Health ---------------------------------------------------------------
-app.MapGet("/", () => Results.Ok(new { service = "Mesh.Relay", status = "ok", instance = backplane.InstanceId }));
-app.MapGet("/health", () => Results.Ok(new { status = "ok", time = DateTimeOffset.UtcNow }));
+var transportCapabilities = new
+{
+    protocolVersion = 2,
+    sendResults = true,
+    fanout = true,
+    maxFanoutRecipients = FanoutProtocol.MaxRecipients
+};
+app.MapGet("/", () => Results.Ok(new
+{
+    service = "Mesh.Relay",
+    status = "ok",
+    instance = backplane.InstanceId,
+    capabilities = transportCapabilities
+}));
+app.MapGet("/health", () => Results.Ok(new
+{
+    status = "ok",
+    time = DateTimeOffset.UtcNow,
+    capabilities = transportCapabilities
+}));
 
 // ---- Metrics (aggregate counts only, no handles/PII) ----------------------
 // Unauthenticated read so ops can scrape it; exposes only process-wide totals + a live gauge.
@@ -123,6 +167,36 @@ app.MapGet("/metrics", () =>
 });
 
 // ---- Handle registry (REST) ----------------------------------------------
+app.MapPost("/handles/resolve", async (HandleKeysBatchRequest req) =>
+{
+    if (req?.Handles is null || req.Handles.Count == 0)
+        return Results.BadRequest(new { error = "at least one handle is required" });
+    if (req.Handles.Count > FanoutProtocol.MaxRecipients)
+        return Results.BadRequest(new { error = $"at most {FanoutProtocol.MaxRecipients} handles are allowed" });
+
+    var handles = new List<string>(req.Handles.Count);
+    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var raw in req.Handles)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return Results.BadRequest(new { error = "handles cannot be empty" });
+        var handle = Normalize(raw);
+        if (handle.Length == 0)
+            return Results.BadRequest(new { error = "handles cannot be empty" });
+        if (seen.Add(handle)) handles.Add(handle);
+    }
+
+    var resolved = await Task.WhenAll(handles.Select(async handle =>
+    {
+        var record = await store.GetHandleAsync(handle);
+        return record is null
+            ? null
+            : new HandleKeysBatchEntry(handle, record.DevicePublicKeys);
+    }));
+    return Results.Ok(new HandleKeysBatchResponse(
+        resolved.Where(x => x is not null).Cast<HandleKeysBatchEntry>().ToList()));
+}).RequireRateLimiting("handle-key-batch");
+
 app.MapPost("/handles", async (RegisterHandleRequest req) =>
 {
     var handle = Normalize(req.Handle);
@@ -473,6 +547,41 @@ app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.M
     return removed ? Results.Ok(new { deleted = key }) : Results.NotFound();
 });
 
+// Administrative rate-policy overrides. The configured key is never stored in Cosmos or logged.
+app.MapGet("/admin/handles/{handle}/rate-policy", async (HttpContext ctx, string handle) =>
+{
+    if (!IsAdmin(ctx, adminKey)) return Results.Unauthorized();
+    var key = Normalize(handle);
+    if (string.IsNullOrEmpty(key)) return Results.BadRequest(new { error = "handle is required" });
+    var configured = await store.GetHandleRatePolicyAsync(key);
+    var effective = await ratePolicyProvider.GetPolicyAsync(key);
+    return Results.Ok(new { handle = key, overridden = configured is not null, policy = effective });
+});
+
+app.MapPut("/admin/handles/{handle}/rate-policy", async (HttpContext ctx, string handle, HandleRatePolicy policy) =>
+{
+    if (!IsAdmin(ctx, adminKey)) return Results.Unauthorized();
+    var key = Normalize(handle);
+    if (string.IsNullOrEmpty(key)) return Results.BadRequest(new { error = "handle is required" });
+    if (await store.GetHandleAsync(key) is null) return Results.NotFound(new { error = "handle not found" });
+    var validationError = ValidateRatePolicy(policy);
+    if (validationError is not null) return Results.BadRequest(new { error = validationError });
+
+    await store.SetHandleRatePolicyAsync(key, policy);
+    ratePolicyProvider.Invalidate(key);
+    return Results.Ok(new { handle = key, policy });
+});
+
+app.MapDelete("/admin/handles/{handle}/rate-policy", async (HttpContext ctx, string handle) =>
+{
+    if (!IsAdmin(ctx, adminKey)) return Results.Unauthorized();
+    var key = Normalize(handle);
+    if (string.IsNullOrEmpty(key)) return Results.BadRequest(new { error = "handle is required" });
+    var removed = await store.DeleteHandleRatePolicyAsync(key);
+    ratePolicyProvider.Invalidate(key);
+    return removed ? Results.NoContent() : Results.NotFound(new { error = "rate policy not found" });
+});
+
 // ---- Capability directory + reputation (REST) -----------------------------
 // A public directory of published services with usage-gated up/down voting. Publishing, unpublishing,
 // voting, and usage attestation are all authenticated with a device key registered under the acting
@@ -689,6 +798,29 @@ static string Normalize(string handle)
     => handle.Trim().TrimStart('@').ToLowerInvariant();
 
 static string Trim(string s) => s.Length > 300 ? s[..300] : s;
+
+static bool IsAdmin(HttpContext context, string? configuredKey)
+{
+    if (string.IsNullOrWhiteSpace(configuredKey)
+        || !context.Request.Headers.TryGetValue("X-Mesh-Admin-Key", out var supplied))
+        return false;
+    var expectedBytes = Encoding.UTF8.GetBytes(configuredKey);
+    var suppliedBytes = Encoding.UTF8.GetBytes(supplied.ToString());
+    return expectedBytes.Length == suppliedBytes.Length
+        && CryptographicOperations.FixedTimeEquals(expectedBytes, suppliedBytes);
+}
+
+static string? ValidateRatePolicy(HandleRatePolicy policy)
+{
+    const int maximumRate = 1_000_000;
+    if (policy.MessagesPerMinute is < 1 or > maximumRate) return "messagesPerMinute must be between 1 and 1000000";
+    if (policy.BurstCapacity is < 1 or > maximumRate) return "burstCapacity must be between 1 and 1000000";
+    if (policy.GroupMessagesPerMinute is < 1 or > maximumRate) return "groupMessagesPerMinute must be between 1 and 1000000";
+    if (policy.GroupBurstCapacity is < 1 or > maximumRate) return "groupBurstCapacity must be between 1 and 1000000";
+    if (policy.MaxFanoutRecipients is < 1 or > FanoutProtocol.MaxRecipients)
+        return $"maxFanoutRecipients must be between 1 and {FanoutProtocol.MaxRecipients}";
+    return null;
+}
 
 // Minimal HTML-entity escaper for values interpolated into the public landing pages, so untrusted
 // service metadata cannot break the markup or inject script.

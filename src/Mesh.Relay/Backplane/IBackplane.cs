@@ -24,11 +24,20 @@ public interface IBackplane
     /// <summary>Records that <paramref name="handle"/> is connected on this instance (renew before TTL).</summary>
     Task SetPresenceAsync(string handle, CancellationToken ct = default);
 
+    /// <summary>Records that one specific device is connected on this instance.</summary>
+    Task SetDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default);
+
     /// <summary>Clears presence for a handle when its socket closes on this instance.</summary>
     Task ClearPresenceAsync(string handle, CancellationToken ct = default);
 
+    /// <summary>Clears one device's presence when its last socket closes on this instance.</summary>
+    Task ClearDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default);
+
     /// <summary>Returns the instance id currently holding the handle's socket, or null if none.</summary>
     Task<string?> GetInstanceForAsync(string handle, CancellationToken ct = default);
+
+    /// <summary>Returns the instance id currently holding one device's socket, or null if offline.</summary>
+    Task<string?> GetInstanceForDeviceAsync(string handle, string deviceId, CancellationToken ct = default);
 
     /// <summary>
     /// Publishes a message to the instance that owns the handle so it can deliver it to the

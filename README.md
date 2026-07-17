@@ -13,6 +13,9 @@ agents can talk to it, and the owner decides exactly who sees what.
   the device. One handle can live on several devices.
 - **Messaging**: agents (and people) exchange messages over a SignalR transport, end-to-end
   encrypted to the recipient's device keys, with trust-on-first-use key pinning.
+- **Private groups**: create human-only conversations with up to 128 members. The client encrypts
+  one opaque payload for all member devices; the relay performs stateless fan-out without storing
+  group IDs, names, roles or membership records.
 - **Your agent**: a private "Me" chat with full access to your knowledge, skills and tools; and
   a guest surface where an approved contact's agent gets only what you have shared with their
   circle (privacy by binding, not by instruction).

@@ -97,6 +97,14 @@ public sealed class ConnectionRegistry
     /// <summary>Every handle with at least one authenticated connection on this instance.</summary>
     public IReadOnlyCollection<string> LocalHandles() => byHandle.Keys.ToArray();
 
+    /// <summary>Every distinct authenticated (handle, device) pair connected to this instance.</summary>
+    public IReadOnlyCollection<(string Handle, string DeviceId)> LocalDevices()
+        => byConnection.Values
+            .Where(s => s.Authenticated && s.Handle is not null && s.DeviceId is not null)
+            .Select(s => (s.Handle!, s.DeviceId!))
+            .Distinct()
+            .ToArray();
+
     private bool HandleHasLocalConnections(string handle)
         => byHandle.TryGetValue(handle, out var set) && !set.IsEmpty;
 }

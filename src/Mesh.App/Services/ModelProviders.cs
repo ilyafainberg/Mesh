@@ -170,11 +170,12 @@ internal static class Usage
 
 internal static class ReasoningControls
 {
-    public static Dictionary<string, object?> OpenAi(ModelConfig cfg, object[] messages, int maxTokens, object[]? tools = null)
+    public static Dictionary<string, object?> OpenAi(ModelConfig cfg, object[] messages, int maxTokens, object[]? tools = null, bool useMaxCompletionTokens = false)
     {
         var payload = new Dictionary<string, object?>
         {
-            ["model"] = cfg.Model, ["messages"] = messages, ["max_tokens"] = maxTokens
+            ["model"] = cfg.Model, ["messages"] = messages,
+            [useMaxCompletionTokens ? "max_completion_tokens" : "max_tokens"] = maxTokens
         };
         if (tools is not null) payload["tools"] = tools;
         if (cfg.ReasoningEffort != ReasoningEffort.Auto)
@@ -634,7 +635,8 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
 /// Azure OpenAI (bring-your-own-resource). Uses the same chat-completions request/response
 /// shape as OpenAI, but targets an Azure deployment URL
 /// (<c>{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...</c>) and
-/// authenticates with the <c>api-key</c> header instead of a Bearer token. The user's
+/// authenticates with the <c>api-key</c> header instead of a Bearer token. Azure requests use
+/// <c>max_completion_tokens</c>, required by current reasoning models such as GPT-5. The user's
 /// <see cref="ModelConfig.Model"/> is the Azure deployment name and
 /// <see cref="ModelConfig.Endpoint"/> is the resource URL. Supports tool calls.
 /// </summary>
@@ -669,7 +671,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
         req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
         // The v1 API carries the deployment name in the body; the legacy URL carries it in the path
         // (and ignores an extra "model" field), so sending it is safe for both.
-        req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options)));
+        req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options), useMaxCompletionTokens: true));
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
@@ -703,7 +705,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
             ct.ThrowIfCancellationRequested();
             using var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl());
             req.Headers.TryAddWithoutValidation("api-key", cfg.ApiKey);
-            req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options), toolDefs));
+            req.Content = JsonContent.Create(ReasoningControls.OpenAi(cfg, messages.ToArray(), CompletionOptions.Resolve(options), toolDefs, useMaxCompletionTokens: true));
 
             using var resp = await http.SendAsync(req, ct);
             var body = await resp.Content.ReadAsStringAsync(ct);

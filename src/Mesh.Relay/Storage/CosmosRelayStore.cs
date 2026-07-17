@@ -2,22 +2,27 @@ using System.IO;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Mesh.Relay.RateLimiting;
 using Microsoft.Azure.Cosmos;
 
 namespace Mesh.Relay.Storage;
 
 /// <summary>
 /// Azure Cosmos DB (serverless) backed implementation of <see cref="IRelayStore"/>.
-/// Persists the handle registry, pending device-link invites, and the offline inbox so
-/// relay state survives restarts and can be shared across scaled-out instances.
+/// Persists the handle registry, pending device-link invites, offline inbox, capability
+/// directory, and administrative rate-policy overrides so relay state survives restarts
+/// and can be shared across scaled-out instances.
 ///
-/// Three containers are provisioned idempotently on first use:
+/// Five containers are provisioned idempotently on first use:
 /// <list type="bullet">
 ///   <item>"handles" (partition key "/handle"): one document per registered handle.</item>
+///   <item>"rate-policies" (partition key "/handle"): administrative per-handle rate-policy
+///   overrides, stored separately from public handle registrations.</item>
 ///   <item>"invites" (partition key "/handle"): single-use link invites, expired automatically
 ///   via native per-item TTL (container DefaultTimeToLive = -1).</item>
 ///   <item>"inbox" (partition key "/to"): queued envelopes for offline recipients, expired
 ///   after 14 days via a container DefaultTimeToLive of 1209600 seconds.</item>
+///   <item>"services" (partition key "/serviceId"): published capabilities and reputation.</item>
 /// </list>
 /// </summary>
 public sealed class CosmosRelayStore : IRelayStore
@@ -32,6 +37,7 @@ public sealed class CosmosRelayStore : IRelayStore
     private Container invitesContainer = null!;
     private Container inboxContainer = null!;
     private Container servicesContainer = null!;
+    private Container ratePoliciesContainer = null!;
     private volatile bool initialized;
 
     /// <summary>
@@ -52,7 +58,7 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <summary>
-    /// Provisions the database and the three containers once, behind a semaphore so
+    /// Provisions the database and its containers once, behind a semaphore so
     /// concurrent callers do not race. A transient setup failure is allowed to propagate
     /// so the caller sees a clear error instead of a silently broken store.
     /// </summary>
@@ -70,6 +76,12 @@ public sealed class CosmosRelayStore : IRelayStore
 
             handlesContainer = await db
                 .CreateContainerIfNotExistsAsync(new ContainerProperties("handles", "/handle"), cancellationToken: ct)
+                .ConfigureAwait(false);
+
+            ratePoliciesContainer = await db
+                .CreateContainerIfNotExistsAsync(
+                    new ContainerProperties("rate-policies", "/handle"),
+                    cancellationToken: ct)
                 .ConfigureAwait(false);
 
             // DefaultTimeToLive = -1 enables TTL but expires items only when they carry a per-item ttl.
@@ -196,6 +208,9 @@ public sealed class CosmosRelayStore : IRelayStore
             await handlesContainer
                 .DeleteItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
                 .ConfigureAwait(false);
+            // Remove the override only after the identity is gone. If handle deletion fails, a
+            // restrictive policy must remain in force rather than silently falling back to defaults.
+            await DeleteHandleRatePolicyAsync(handle, ct).ConfigureAwait(false);
             return true;
         }
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -440,6 +455,77 @@ public sealed class CosmosRelayStore : IRelayStore
         }
 
         return result;
+    }
+
+    /// <inheritdoc />
+    public async Task<HandleRatePolicy?> GetHandleRatePolicyAsync(
+        string handle, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var normalizedHandle = NormalizeHandle(handle);
+        try
+        {
+            var response = await ratePoliciesContainer
+                .ReadItemAsync<RatePolicyDoc>(
+                    normalizedHandle, new PartitionKey(normalizedHandle), cancellationToken: ct)
+                .ConfigureAwait(false);
+            var doc = response.Resource;
+            return new HandleRatePolicy(
+                doc.MessagesPerMinute,
+                doc.BurstCapacity,
+                doc.GroupMessagesPerMinute,
+                doc.GroupBurstCapacity,
+                doc.MaxFanoutRecipients,
+                doc.Enabled);
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task SetHandleRatePolicyAsync(
+        string handle, HandleRatePolicy policy, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var normalizedHandle = NormalizeHandle(handle);
+        var doc = new RatePolicyDoc
+        {
+            Id = normalizedHandle,
+            Handle = normalizedHandle,
+            MessagesPerMinute = policy.MessagesPerMinute,
+            BurstCapacity = policy.BurstCapacity,
+            GroupMessagesPerMinute = policy.GroupMessagesPerMinute,
+            GroupBurstCapacity = policy.GroupBurstCapacity,
+            MaxFanoutRecipients = policy.MaxFanoutRecipients,
+            Enabled = policy.Enabled,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+
+        await ratePoliciesContainer
+            .UpsertItemAsync(doc, new PartitionKey(normalizedHandle), cancellationToken: ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> DeleteHandleRatePolicyAsync(
+        string handle, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var normalizedHandle = NormalizeHandle(handle);
+        try
+        {
+            await ratePoliciesContainer
+                .DeleteItemAsync<RatePolicyDoc>(
+                    normalizedHandle, new PartitionKey(normalizedHandle), cancellationToken: ct)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return false;
+        }
     }
 
     // ---- Capability directory + reputation ----------------------------------
@@ -721,6 +807,9 @@ public sealed class CosmosRelayStore : IRelayStore
         DeviceNames = doc.DeviceNames is null ? new Dictionary<string, string>() : new Dictionary<string, string>(doc.DeviceNames)
     };
 
+    private static string NormalizeHandle(string handle)
+        => handle.Trim().TrimStart('@').ToLowerInvariant();
+
     /// <summary>Cosmos document for a handle registration. Uses lowercase "handle" as the partition key.</summary>
     private sealed class HandleDoc
     {
@@ -744,6 +833,40 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("deviceNames")]
         public Dictionary<string, string>? DeviceNames { get; set; }
+    }
+
+    /// <summary>
+    /// Administrative per-handle rate-policy override. This document intentionally contains
+    /// policy configuration only and is not projected through the public handle model.
+    /// </summary>
+    private sealed class RatePolicyDoc
+    {
+        [JsonPropertyName("id")]
+        public string Id { get; set; } = "";
+
+        [JsonPropertyName("handle")]
+        public string Handle { get; set; } = "";
+
+        [JsonPropertyName("messagesPerMinute")]
+        public int MessagesPerMinute { get; set; }
+
+        [JsonPropertyName("burstCapacity")]
+        public int BurstCapacity { get; set; }
+
+        [JsonPropertyName("groupMessagesPerMinute")]
+        public int GroupMessagesPerMinute { get; set; }
+
+        [JsonPropertyName("groupBurstCapacity")]
+        public int GroupBurstCapacity { get; set; }
+
+        [JsonPropertyName("maxFanoutRecipients")]
+        public int MaxFanoutRecipients { get; set; }
+
+        [JsonPropertyName("enabled")]
+        public bool Enabled { get; set; }
+
+        [JsonPropertyName("updatedAt")]
+        public DateTimeOffset UpdatedAt { get; set; }
     }
 
     /// <summary>Cosmos document for a link invite, carrying a per-item "ttl" for native expiry.</summary>

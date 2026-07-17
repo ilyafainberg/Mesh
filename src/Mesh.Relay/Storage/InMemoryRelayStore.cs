@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Mesh.Relay.RateLimiting;
 
 namespace Mesh.Relay.Storage;
 
@@ -14,6 +15,7 @@ public sealed class InMemoryRelayStore : IRelayStore
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DateTimeOffset>> invites = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> inboxes = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, StoredService> services = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, HandleRatePolicy> ratePolicies = new(StringComparer.OrdinalIgnoreCase);
 
     public Task<StoredHandle?> GetHandleAsync(string handle, CancellationToken ct = default)
         => Task.FromResult(handles.TryGetValue(handle, out var rec) ? Clone(rec) : null);
@@ -49,6 +51,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         var removed = handles.TryRemove(handle, out _);
         invites.TryRemove(handle, out _);
         inboxes.TryRemove(handle, out _);
+        ratePolicies.TryRemove(NormalizeHandle(handle), out _);
         return Task.FromResult(removed);
     }
 
@@ -104,6 +107,21 @@ public sealed class InMemoryRelayStore : IRelayStore
             while (q.TryDequeue(out var item)) result.Add(item);
         return Task.FromResult<IReadOnlyList<string>>(result);
     }
+
+    public Task<HandleRatePolicy?> GetHandleRatePolicyAsync(string handle, CancellationToken ct = default)
+        => Task.FromResult(ratePolicies.TryGetValue(NormalizeHandle(handle), out var policy)
+            ? policy with { }
+            : null);
+
+    public Task SetHandleRatePolicyAsync(
+        string handle, HandleRatePolicy policy, CancellationToken ct = default)
+    {
+        ratePolicies[NormalizeHandle(handle)] = policy with { };
+        return Task.CompletedTask;
+    }
+
+    public Task<bool> DeleteHandleRatePolicyAsync(string handle, CancellationToken ct = default)
+        => Task.FromResult(ratePolicies.TryRemove(NormalizeHandle(handle), out _));
 
     // ---- Capability directory + reputation ----------------------------------
 
@@ -201,6 +219,9 @@ public sealed class InMemoryRelayStore : IRelayStore
         foreach (var kv in map)
             if (kv.Value <= now) map.TryRemove(kv.Key, out _);
     }
+
+    private static string NormalizeHandle(string handle)
+        => handle.Trim().TrimStart('@').ToLowerInvariant();
 
     private static StoredHandle Clone(StoredHandle r)
     {

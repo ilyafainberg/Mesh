@@ -16,6 +16,7 @@ namespace Mesh.Relay.Backplane;
 public sealed class RedisBackplane : IBackplane
 {
     private const string PresenceKeyPrefix = "mesh:presence:";
+    private const string DevicePresenceKeyPrefix = "mesh:presence-device:";
     private const string InstanceChannelPrefix = "mesh:inst:";
     private static readonly TimeSpan PresenceTtl = TimeSpan.FromSeconds(30);
 
@@ -64,6 +65,14 @@ public sealed class RedisBackplane : IBackplane
             .ConfigureAwait(false);
     }
 
+    public async Task SetDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default)
+    {
+        var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+        await mux.GetDatabase()
+            .StringSetAsync(DevicePresenceKey(handle, deviceId), InstanceId, PresenceTtl)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Clears presence for a handle, but only if this instance still owns it.</summary>
     public async Task ClearPresenceAsync(string handle, CancellationToken ct = default)
     {
@@ -76,12 +85,33 @@ public sealed class RedisBackplane : IBackplane
             .ConfigureAwait(false);
     }
 
+    public async Task ClearDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default)
+    {
+        var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+        await mux.GetDatabase()
+            .ScriptEvaluateAsync(
+                ClearIfOwnerScript,
+                new RedisKey[] { DevicePresenceKey(handle, deviceId) },
+                new RedisValue[] { InstanceId })
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Returns the instance id currently holding the handle's socket, or null if absent/expired.</summary>
     public async Task<string?> GetInstanceForAsync(string handle, CancellationToken ct = default)
     {
         var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
         var value = await mux.GetDatabase()
             .StringGetAsync(PresenceKeyPrefix + handle)
+            .ConfigureAwait(false);
+        return value.IsNullOrEmpty ? null : value.ToString();
+    }
+
+    public async Task<string?> GetInstanceForDeviceAsync(
+        string handle, string deviceId, CancellationToken ct = default)
+    {
+        var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+        var value = await mux.GetDatabase()
+            .StringGetAsync(DevicePresenceKey(handle, deviceId))
             .ConfigureAwait(false);
         return value.IsNullOrEmpty ? null : value.ToString();
     }
@@ -153,6 +183,9 @@ public sealed class RedisBackplane : IBackplane
             connectGate.Release();
         }
     }
+
+    private static string DevicePresenceKey(string handle, string deviceId)
+        => $"{DevicePresenceKeyPrefix}{handle}:{deviceId}";
 
     /// <summary>Tiny wire payload carried over the per-instance routing channel.</summary>
     private sealed record RoutedMessage(

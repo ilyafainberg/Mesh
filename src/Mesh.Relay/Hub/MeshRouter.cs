@@ -78,6 +78,32 @@ public sealed class MeshRouter(
     }
 
     /// <summary>
+    /// Routes an envelope to exactly one device. If that device is offline, its envelope is queued
+    /// under a device-specific inbox key so an online sibling cannot consume or discard it.
+    /// </summary>
+    public async Task RouteToDeviceAsync(MeshEnvelope env, string? excludeConnectionId = null)
+    {
+        if (string.IsNullOrWhiteSpace(env.ToDevice))
+            throw new ArgumentException("A strict device route requires ToDevice.", nameof(env));
+
+        var to = Normalize(env.To);
+        var envelopeJson = JsonSerializer.Serialize(env, Json);
+        if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId, env.ToDevice)) return;
+
+        var owner = await backplane.GetInstanceForDeviceAsync(to, env.ToDevice);
+        if (owner is not null && owner != backplane.InstanceId)
+        {
+            // Keep a device-specific offline copy as a reliability fallback for stale pub/sub
+            // presence. The recipient deduplicates by the encrypted message id after reconnect.
+            await store.EnqueueAsync(DeviceInboxKey(to, env.ToDevice), envelopeJson);
+            await backplane.PublishToOwnerAsync(owner, to, envelopeJson);
+            return;
+        }
+
+        await store.EnqueueAsync(DeviceInboxKey(to, env.ToDevice), envelopeJson);
+    }
+
+    /// <summary>
     /// Delivers an envelope JSON to every local connection for a handle (optionally excluding one
     /// connection). Returns true if at least one local connection received it. Used both by the
     /// local fast path and by the backplane when another instance forwards a message to this one.
@@ -103,4 +129,7 @@ public sealed class MeshRouter(
     }
 
     private static string Normalize(string handle) => handle.Trim().TrimStart('@').ToLowerInvariant();
+
+    public static string DeviceInboxKey(string handle, string deviceId)
+        => $"{Normalize(handle)}\u001f{deviceId}";
 }

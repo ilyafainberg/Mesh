@@ -19,6 +19,8 @@ public sealed class PresenceRenewer(ConnectionRegistry registry, IBackplane back
                 await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken);
                 foreach (var handle in registry.LocalHandles())
                     await backplane.SetPresenceAsync(handle, stoppingToken);
+                foreach (var (handle, deviceId) in registry.LocalDevices())
+                    await backplane.SetDevicePresenceAsync(handle, deviceId, stoppingToken);
             }
             catch (OperationCanceledException) { break; }
             catch { /* transient backplane hiccup: try again next tick */ }

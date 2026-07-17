@@ -110,6 +110,80 @@ button:disabled {
     box-shadow: var(--shadow-2);
 }
 
+.new-group-btn {
+    align-self: stretch;
+    justify-content: center;
+    margin: -4px 16px 12px;
+}
+
+.group-create {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin: 0 16px 14px;
+    padding: 14px;
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-2);
+}
+
+.group-create h3 {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0 0 3px;
+    color: var(--fg-1);
+    font-size: 1rem;
+}
+
+.group-create label {
+    color: var(--fg-2);
+    font-size: .78rem;
+    font-weight: 600;
+}
+
+.group-create input,
+.group-create textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 11px;
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-l);
+    background: var(--bg-1);
+    color: var(--fg-1);
+    font: inherit;
+    resize: vertical;
+}
+
+.group-create-note {
+    margin: 1px 0;
+    color: var(--fg-3);
+    font-size: .76rem;
+    line-height: 1.35;
+}
+
+.group-create-error {
+    display: flex;
+    align-items: flex-start;
+    gap: 5px;
+    margin: 1px 0;
+    color: var(--danger);
+    font-size: .8rem;
+    line-height: 1.35;
+}
+
+.group-create-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 3px;
+}
+
+.group-create-actions button {
+    flex: 1;
+    justify-content: center;
+}
+
 /* WhatsApp-style chat rows: white cards on canvas, hairline separators */
 .chat-rows {
     display: flex;
@@ -138,6 +212,10 @@ button:disabled {
     background: var(--brand-tint);
 }
 
+.chat-row.active {
+    background: var(--brand-tint);
+}
+
 .avatar {
     width: 44px;
     height: 44px;
@@ -161,12 +239,28 @@ button:disabled {
     gap: 8px;
 }
 
+.chat-title {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+}
+
 .chat-name {
     font-weight: 600;
     color: var(--fg-1);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.group-count {
+    color: var(--fg-3);
+    font-size: .72rem;
+}
+
+.group-chat-row .avatar {
+    font-size: 1.1rem;
 }
 
 .chat-unread {
@@ -308,6 +402,12 @@ button:disabled {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.group-thread-sub {
+    display: flex;
+    align-items: center;
+    gap: 4px;
 }
 
 .head-actions {

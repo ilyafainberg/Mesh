@@ -243,13 +243,73 @@ The envelope is the unit of routing:
 | `direct` | Direct message. |
 | agent request / agent response | Agent invocation request and its response. |
 | remote-agent request / remote-agent response | Cross-handle (remote) agent invocation and response. |
+| `fanout` | Generic relay-visible fan-out wrapper; the semantic type remains encrypted. |
+| `group.control` | Inner `MeshFanoutContent.Kind` for a complete client-side group snapshot. |
+| `group.message` | Inner `MeshFanoutContent.Kind` for a human-authored group message. |
 | `service.request` | Invoke a published service (capability). |
 | `service.response` | Response to a service request. |
 | `report` | Report message (see `ReservedHandles`, e.g. the system report handle). |
 
 > The exact string values live in `MeshKinds`. Treat that class as the source of truth; do not hard-code kind strings if you can reference the constants.
 
-#### 4.2.3 Registration, linking, and recovery
+#### 4.2.3 Stateless fan-out and client-side group payloads
+
+Groups are client-side state carried through a generic relay fan-out, not relay resources. The relevant shared contracts are:
+
+```csharp
+public sealed record MeshFanoutRequest(
+    string Id,
+    IReadOnlyList<string> Recipients,
+    string Body,
+    string? Signature,
+    DateTimeOffset SentAt);
+
+public sealed record MeshFanoutContent(string Kind, string Payload);
+
+public sealed record MeshSendResult(
+    bool Accepted,
+    string Code,
+    int RetryAfterMs = 0,
+    int RecipientCount = 0);
+
+public sealed record HandleKeysBatchRequest(IReadOnlyList<string> Handles);
+public sealed record HandleKeysBatchEntry(string Handle, IReadOnlyList<string> DevicePublicKeys);
+public sealed record HandleKeysBatchResponse(IReadOnlyList<HandleKeysBatchEntry> Handles);
+```
+
+`FanoutProtocol.MaxRecipients` is the protocol hard cap of **128**. A request must contain 1 to 128 distinct normalized recipient handles. `MeshSendResult.Code` is machine-readable, including `accepted`, `rate_limited`, and validation/authentication rejection codes; callers must check `Accepted` and must not treat a missing result as success.
+
+`GroupSnapshotPayload` and `GroupMessagePayload` retain the group fields shown by their shared record definitions. Serialize the selected payload into `MeshFanoutContent.Payload`, set the inner `Kind` to `MeshKinds.GroupControl` or `MeshKinds.GroupMessage`, then serialize and E2E-encrypt the complete `MeshFanoutContent`. Group ID, metadata, semantic type, and message content must never be copied into relay-visible fields.
+
+Before encryption, call `POST /handles/resolve` once with all member handles. Missing handles are omitted from the response, so a group client must verify that every requested handle returned at least one usable device key. The reference client caches trusted key sets for five minutes, but freshly observed keys must exactly match TOFU pins; a mismatch blocks fan-out until explicit re-verification. Deduplicate the trusted union, call `MessageCrypto.Encrypt` **once** for that union, sign that ciphertext once, and invoke `MeshHubProtocol.SendFanout` once. There is no plaintext fallback.
+
+The reference client stores a group conversation under `grp:{normalizedGroupId}` in SQLCipher. Its local columns are:
+
+| Table | Columns | Purpose |
+|-------|---------|---------|
+| `conversations` | `group_id`, `group_name`, `group_owner_handle`, `group_members_json`, `group_version` | Complete client-only group snapshot. |
+| `chat_lines` | `sender_handle` | Actual author of a group message. |
+
+The reference `MeshClient` entry points are:
+
+```csharp
+Task<Conversation> CreateGroupAsync(string name, IEnumerable<string> memberHandles)
+Task<bool> SendGroupMessageAsync(Conversation group, string text, string? lineId = null)
+```
+
+`CreateGroupAsync` normalizes and deduplicates handles, includes the current handle, enforces 2 to 128 total members, creates version 1 with the creator as owner, stores it locally, and sends the encrypted snapshot through one fan-out. If relay submission fails after local creation, it reports that the group remains saved locally. `SendGroupMessageAsync` validates local state, includes every member (including the sender's handle for other linked devices), and treats only an accepted result as success.
+
+Inbound processing must fail closed:
+
+1. Verify the envelope signature against pinned/resolved sender device keys; group traffic with no verifiable sender key is dropped.
+2. Require an encrypted body and successful decryption.
+3. For a snapshot, require all fields, 2 to 128 members, `OwnerHandle == envelope.From`, inclusion of the receiver, and no unsupported membership update. Existing same-version state must be identical; older versions and conflicting snapshots are rejected by local state validation.
+4. For a message, require `SenderHandle == envelope.From`, a known local group, sender and receiver membership, exact group ID and membership-version agreement, and a non-empty payload.
+5. Deduplicate by `MessageId` before persisting the line and its `sender_handle`.
+
+The relay must remain group-agnostic. Do not add group IDs, membership, roles, group storage, group endpoints, or group-aware routing to `Mesh.Relay`. It validates a generic `MeshFanoutRequest`, consumes one Group token, expands each transient handle to its registered device IDs, clones device-targeted envelopes with the same opaque ciphertext, dispatches online devices concurrently, and queues device-specific inbox records for offline devices. The transient cohort is not persisted as a fan-out object. Acceptance is not an atomic transaction or a simultaneous physical-delivery guarantee.
+
+#### 4.2.4 Registration, linking, and recovery
 
 | Type | Role |
 |------|------|
@@ -261,7 +321,7 @@ The envelope is the unit of routing:
 | `RecoverHandleRequest` | Recover a handle using the recovery key. |
 | `LinkProtocol` | Canonical pairing invite/redeem messages plus a `Normalize` helper. |
 
-#### 4.2.4 Devices and directory
+#### 4.2.5 Devices and directory
 
 | Type | Role |
 |------|------|
@@ -269,7 +329,7 @@ The envelope is the unit of routing:
 | `DeviceProtocol.DeviceId` | Computes the per-device routing id (consistent with `MeshCrypto.DeviceId`). |
 | `HandleInfo` | Public directory view of a handle. |
 
-#### 4.2.5 Connectors and hosted model
+#### 4.2.6 Connectors and hosted model
 
 | Type | Role |
 |------|------|
@@ -278,7 +338,7 @@ The envelope is the unit of routing:
 | `HostedModelRequest` | Request to the hosted free-model proxy. |
 | `HostedModelMessage` | A message in a hosted-model conversation. |
 
-#### 4.2.6 Capability directory (services)
+#### 4.2.7 Capability directory (services)
 
 | Type | Role |
 |------|------|
@@ -290,14 +350,14 @@ The envelope is the unit of routing:
 | `ServiceDirectoryProtocol` | Directory helpers, including `WilsonScore` (ranking/scoring). |
 | `ServiceCategories` | The fixed list of service categories. |
 
-#### 4.2.7 System handles and links
+#### 4.2.8 System handles and links
 
 | Type | Role |
 |------|------|
 | `ReservedHandles` | System handles (for example the report handle `meshreport`) with `IsReserved` and `Coerce` helpers. |
 | `DeepLink` | Parser/builders for `mesh://service` and `mesh://user` deep links. |
 | `UniversalLink` | Builders/parsers for HTTPS universal links: `/s/{handle}/{serviceId}` (service) and `/u/{handle}` (user). |
-| `MeshHubProtocol` | SignalR hub contract: the hub `Route` path and the method names `Challenge`, `Ready`, and `Receive`. |
+| `MeshHubProtocol` | SignalR hub contract: `Route`; client calls `Authenticate`, `SendEnvelope`, and `SendFanout`; server events `Challenge`, `Ready`, and `Receive`. |
 
 ---
 
@@ -330,7 +390,7 @@ Mesh.Relay is AGPL-3.0. It is a minimal-API ASP.NET Core application (`Program.c
      - CosmosRelayStore                       - Redis
 ```
 
-`Program.cs` reads configuration, chooses storage (in-memory vs Cosmos) and backplane (in-memory vs Redis), sets up the rate limiter and connector catalog, and maps all endpoints and the hub. A small config helper reads an environment variable first and then falls back to the matching appsettings key (see the [config table](#54-configuration)).
+`Program.cs` reads configuration, chooses storage (in-memory vs Cosmos) and backplane (in-memory vs Redis), sets up the rate limiter and connector catalog, and maps all endpoints and the hub. A small config helper reads an environment variable first and then falls back to the matching appsettings key (see the [config table](#56-configuration)).
 
 ### 5.2 REST endpoints
 
@@ -347,7 +407,11 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 | POST | `/handles/{handle}/recover` | Recover a handle using the recovery key. | Signed (recovery) |
 | GET | `/handles/{handle}` | Public handle info. | Public |
 | GET | `/handles/{handle}/devices` | Device directory for a handle. | Public |
+| POST | `/handles/resolve` | Batch-resolve device public keys. Body: `HandleKeysBatchRequest`; missing handles are omitted. Limited to 10 requests/minute per IP in addition to the global REST limit. | Public |
 | DELETE | `/handles/{handle}` | Delete a handle. | Signed |
+| GET | `/admin/handles/{handle}/rate-policy` | Read the effective policy and whether an override exists. | `X-Mesh-Admin-Key` |
+| PUT | `/admin/handles/{handle}/rate-policy` | Create or replace the complete per-handle policy override and invalidate its cache entry. | `X-Mesh-Admin-Key` |
+| DELETE | `/admin/handles/{handle}/rate-policy` | Remove the override, invalidate its cache entry, and restore configured defaults. | `X-Mesh-Admin-Key` |
 | GET | `/connectors` | Public OAuth connector catalog. | Public |
 | POST | `/connectors/{provider}/token` | Brokered OAuth token exchange; the relay holds the provider secret. | See connector policy |
 | POST | `/model/chat` | Hosted free-model proxy. Per-handle daily token limit. | Device-key auth |
@@ -363,7 +427,7 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 
 ### 5.3 SignalR hub: connect, auth handshake, and routing
 
-The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol` (`Challenge`, `Ready`, `Receive`).
+The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, and `SendFanout`; the server emits `Challenge`, `Ready`, and `Receive`.
 
 #### 5.3.1 Connect and auth handshake
 
@@ -373,7 +437,7 @@ The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubPro
 
 #### 5.3.2 Message routing
 
-For every routed message the hub:
+`SendEnvelope` and `SendFanout` return `MeshSendResult`. For every routed message the hub:
 
 1. **Verifies the signature** on the message.
 2. **Stamps** the authenticated `From` and `FromDevice` (clients cannot spoof these; the relay overwrites them from the authenticated connection).
@@ -381,6 +445,8 @@ For every routed message the hub:
    - **Local delivery** if the recipient is connected to this instance.
    - **Redis directed cross-instance forward** if the recipient is connected to another instance (owner lookup via the backplane).
    - **Offline enqueue** (inbox) otherwise.
+
+For fan-out, the hub additionally validates 1 to 128 distinct normalized recipients, checks the effective per-handle fan-out limit, consumes one Group token, resolves the registered device IDs for each transient handle, clones device-targeted envelopes, and dispatches devices concurrently. It does not persist the request cohort. Offline devices get device-specific inbox entries that only they drain; accepted fan-out is not an atomic or simultaneous physical-delivery guarantee.
 
 Per-device routing honors `ToDevice`: if set, the message targets that device, with **broadcast fallback** to all of the handle's devices when appropriate. A device sending to its own handle is **excluded from its own connection** (you do not receive an echo of your own send).
 
@@ -398,21 +464,33 @@ Delivery to clients uses the **`Receive`** method.
 | Container | Contents | TTL behavior |
 |-----------|----------|--------------|
 | handles / directory | Handle registrations and public directory. | - |
+| rate-policies | Administrative per-handle logical-message policy overrides. | - |
 | invites | Device-link invites. | Native TTL. |
 | inbox | Offline message queue. | `DefaultTimeToLive` of **14 days**. Reserved handles get a per-item **ttl of -1** (never expire). |
 | services directory | Published capability/service listings. | - |
 
 #### 5.4.2 Backplane
 
-The backplane abstracts presence and cross-instance forwarding. A **Redis** implementation provides:
+The backplane and live rate-limit store use **Redis** to provide:
 
 - **Presence keys** with a ~**30s TTL**.
+- **Atomic per-handle Direct and Group token buckets** shared by all replicas.
 - **Per-handle quota** tracking.
 - **Cross-instance publish** to the owner instance for directed forwarding.
 
-With no Redis configured the relay uses an in-memory backplane (single-instance).
+With no Redis configured the relay uses in-memory presence, routing, quota, and rate buckets. That fallback is local to one process and is suitable only when a global multi-replica limit is not required.
 
-### 5.5 Configuration
+### 5.5 Logical-message rate limiting
+
+Rate limiting is keyed by normalized authenticated sender handle and has independent **Direct** and **Group** buckets. `SendEnvelope` consumes one Direct token. `SendFanout` consumes one Group token for the entire logical request, never one token per recipient. The effective `MaxFanoutRecipients` separately bounds amplification and is clamped to the `FanoutProtocol.MaxRecipients` hard cap of 128.
+
+Each bucket is a token bucket with a steady per-minute refill and burst capacity. For example, a rate of **120/minute** and burst **30** permits 30 immediate sends from a full bucket, then replenishes 2 tokens per second. A denied acquisition produces an explicit `MeshSendResult` with `Code = "rate_limited"` and `RetryAfterMs`; normal validation failures also return explicit result codes rather than silent success.
+
+Configured defaults apply unless a complete administrative `HandleRatePolicy` exists for the handle. Its JSON fields are `messagesPerMinute`, `burstCapacity`, `groupMessagesPerMinute`, `groupBurstCapacity`, `maxFanoutRecipients`, and `enabled`. Durable overrides live in Cosmos `rate-policies` and take precedence over all corresponding defaults; the in-memory store provides a non-durable local fallback. Effective policies are cached per relay replica for the configured cache duration; admin PUT/DELETE invalidates the local entry. Redis stores live shared bucket balances, not policy definitions.
+
+The admin API is deliberately not user-writable. Every GET/PUT/DELETE request under `/admin/handles/{handle}/rate-policy` must present the exact `X-Mesh-Admin-Key` configured by `MESH_ADMIN_KEY` / `Mesh:AdminKey`; when no key is configured, all requests are unauthorized. Use TLS, a high-entropy secret from a secret manager, restricted network access, and key rotation. A future client API may allow users to lower their own limits, but the current API is admin-only.
+
+### 5.6 Configuration
 
 `Program.cs` reads each setting from an environment variable first, then the matching appsettings key, then a default.
 
@@ -425,8 +503,13 @@ With no Redis configured the relay uses an in-memory backplane (single-instance)
 | `MODEL_API_KEY` | `Model:ApiKey` | none | Hosted-model upstream API key. |
 | `MODEL_NAME` | `Model:Model` | `openrouter/auto` | Hosted-model model id. |
 | `MODEL_DAILY_TOKEN_LIMIT` | `Model:DailyTokenLimit` | `100000` | Per-handle daily token cap for `/model/chat`. |
-| `MESH_MSG_RATE_PER_MIN` | `Mesh:MessageRatePerMinute` | `120` | Message rate limit per minute. |
-| `MESH_MSG_BURST` | `Mesh:MessageBurst` | `30` | Message burst allowance. |
+| `MESH_MSG_RATE_PER_MIN` | `Mesh:MessageRatePerMinute` | `120` | Default Direct logical-message refill rate per minute. |
+| `MESH_MSG_BURST` | `Mesh:MessageBurst` | `30` | Default Direct bucket capacity. |
+| `MESH_GROUP_RATE_PER_MIN` | `Mesh:GroupMessageRatePerMinute` | `120` (falls back to Direct rate if no Group setting exists) | Default Group logical-message refill rate per minute. |
+| `MESH_GROUP_BURST` | `Mesh:GroupMessageBurst` | `30` (falls back to Direct burst if no Group setting exists) | Default Group bucket capacity. |
+| `MESH_MAX_FANOUT_RECIPIENTS` | `Mesh:MaxFanoutRecipients` | `128` | Default per-handle fan-out limit, clamped to the hard cap of 128. |
+| `MESH_RATE_POLICY_CACHE_SECONDS` | `Mesh:RatePolicyCacheSeconds` | `60` | Per-replica effective-policy cache duration. |
+| `MESH_ADMIN_KEY` | `Mesh:AdminKey` | none | Secret required in `X-Mesh-Admin-Key` for rate-policy administration. |
 | `ASPNETCORE_URLS` | (ASP.NET Core) | (host default) | Listen URLs. Container default `http://+:8080`. |
 | `CONNECTOR_{KEY}_CLIENT_ID` | `Connectors:{key}:clientId` | none | Per-connector OAuth client id. |
 | `CONNECTOR_{KEY}_SECRET` | `Connectors:{key}:secret` | none | Per-connector OAuth secret (held only by the relay). |
@@ -480,9 +563,9 @@ Open a SignalR connection to `MeshHubProtocol.Route` on the relay base URL.
 
 ### 6.5 Step 5: Send an end-to-end-encrypted envelope
 
-1. Fetch the recipient's device public keys from `GET /handles/{handle}/devices`.
+1. Fetch the direct recipient's device public keys from `GET /handles/{handle}`. Use the batch `POST /handles/resolve` contract for fan-out as described in [Section 6.8](#68-implement-client-side-groups).
 2. Encrypt the plaintext to those keys:
-   - `MeshCrypto.Encrypt(plaintext, recipientDeviceKeysB64)` returns the self-describing JSON payload (see [4.1.2](#412-encryption-ecies-p256-aesgcm)) or `null` if no keys are usable.
+   - `MessageCrypto.Encrypt(plaintext, recipientDeviceKeysB64)` returns the self-describing JSON payload (see [4.1.2](#412-encryption-ecies-p256-aesgcm)) or `null` if no keys are usable.
 3. Put that payload in the envelope `Body`, set `To`, `Kind` (for example the chat kind), and optionally `ToDevice`:
 
 ```jsonc
@@ -505,6 +588,18 @@ Do not set `From`/`FromDevice` yourself; the relay stamps the authenticated valu
 ### 6.7 Multi-recipient and multi-device
 
 `Encrypt` supports multiple recipient keys, producing one wrapped content key per deviceId in the `keys` map. This is how a message reaches all of a handle's devices. When a specific device is targeted with `ToDevice`, the relay routes to that device with broadcast fallback.
+
+### 6.8 Implement client-side groups
+
+Use the contracts and validation rules in [Section 4.2.3](#423-stateless-fan-out-and-client-side-group-payloads). A group send is one logical fan-out:
+
+1. Build one snapshot or message payload from local state.
+2. Batch-resolve every member handle with `POST /handles/resolve`.
+3. Abort before sending if any member lacks usable keys.
+4. Encrypt one `MeshFanoutContent` to the union of all returned device keys and sign that ciphertext.
+5. Invoke `MeshHubProtocol.SendFanout` once with 1 to 128 recipient handles and require an accepted `MeshSendResult`.
+
+Do not place group IDs, membership, or the inner group kind in relay-visible fields. A compatible client must retain enough local state to reject unknown groups, non-members, mismatched versions, and duplicate message IDs.
 
 ---
 
@@ -541,7 +636,7 @@ Key points:
 
 ### 7.2 docker compose
 
-Each public repo ships its own `docker-compose`. A minimal local run maps port 8080 and, if desired, wires Cosmos/Redis via the env vars in [Section 5.5](#54-configuration). With no `COSMOS_CONNECTION` or `REDIS_CONNECTION` set, the relay runs fully in-memory.
+Each public repo ships its own `docker-compose`. A minimal local run maps port 8080 and, if desired, wires Cosmos/Redis via the env vars in [Section 5.6](#56-configuration). With no `COSMOS_CONNECTION` or `REDIS_CONNECTION` set, the relay runs fully in-memory.
 
 Build and run the image directly:
 
@@ -576,7 +671,7 @@ Two harnesses live in the monorepo:
 
 | Project | Purpose | Command |
 |---------|---------|---------|
-| `_smoke` | SignalR end-to-end checks (connect, auth, route). | `dotnet run --project _smoke -- <relayUrl>` |
+| `_smoke` | SignalR end-to-end checks (connect, auth, explicit direct results, single-ciphertext fan-out, rate policy, and ordinary offline-inbox delivery). | `dotnet run --project _smoke -- <relayUrl>` |
 | `_hostedtest` | Hosted-model tool-calling checks. | `dotnet run --project _hostedtest -- <relayUrl>` |
 
 These are monorepo projects, but contributors to the public relay can still run the **smoke checks** against any running relay by passing its URL:
@@ -584,6 +679,14 @@ These are monorepo projects, but contributors to the public relay can still run 
 ```bash
 dotnet run --project _smoke -- http://localhost:8080
 ```
+
+Build the complete monorepo, including the reference client and smoke harness, with:
+
+```bash
+dotnet build Mesh.slnx -c Release
+```
+
+The group smoke checks cover generic fan-out, one shared ciphertext, signatures, explicit results, the 128 cap, online delivery, and offline queue drain. They do not replace reference-client tests for inbound membership/version validation, deduplication, or local SQLCipher persistence.
 
 ### 8.2 Coding conventions
 
@@ -602,13 +705,15 @@ dotnet run --project _smoke -- http://localhost:8080
 
 Extend the relay only through the abstractions it already defines. Do not assume backends or hooks beyond what is listed here.
 
+Client-side groups are a deliberate invariant: **relay extensions must not acquire group concepts**. A relay backend may store an opaque per-recipient fan-out clone in the ordinary inbox, but it must not persist the request cohort, parse encrypted bodies, or add group IDs, membership lists, roles, group indexes, group APIs, or group-aware delivery behavior.
+
 ### 9.1 Add a storage backend
 
-Implement **`IRelayStore`** and wire it in `Program.cs` alongside the existing `InMemoryRelayStore` and `CosmosRelayStore` selection. The storage selection is driven by configuration (`COSMOS_CONNECTION` presence chooses Cosmos vs in-memory today). A new backend should honor the same responsibilities: handles/directory, invites (with TTL), inbox (offline queue with the 14-day default TTL and the reserved-handle never-expire rule), and the services directory.
+Implement **`IRelayStore`** and wire it in `Program.cs` alongside the existing `InMemoryRelayStore` and `CosmosRelayStore` selection. The storage selection is driven by configuration (`COSMOS_CONNECTION` presence chooses Cosmos vs in-memory today). A new backend should honor the same responsibilities: handles/directory, administrative rate policies, invites (with TTL), inbox (offline queue with the 14-day default TTL and the reserved-handle never-expire rule), and the services directory.
 
 ### 9.2 Add a backplane backend
 
-Implement the backplane abstraction (the Redis implementation is the reference) to provide presence (short TTL, ~30s), per-handle quota, and cross-instance publish to the owner instance. Selection is configuration-driven (`REDIS_CONNECTION` presence chooses Redis vs in-memory).
+Implement the backplane and rate-limit store abstractions (the Redis implementations are the reference) to provide presence (short TTL, ~30s), atomic shared Direct/Group buckets, per-handle quota, and cross-instance publish to the owner instance. Selection is configuration-driven (`REDIS_CONNECTION` presence chooses Redis vs in-memory).
 
 ### 9.3 Configure the hosted-model endpoint
 

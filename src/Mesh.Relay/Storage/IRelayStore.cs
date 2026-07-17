@@ -1,3 +1,5 @@
+using Mesh.Relay.RateLimiting;
+
 namespace Mesh.Relay.Storage;
 
 /// <summary>
@@ -103,6 +105,15 @@ public interface IRelayStore
 
     /// <summary>Drains and returns all queued messages for a handle (FIFO), removing them.</summary>
     Task<IReadOnlyList<string>> DrainInboxAsync(string toHandle, CancellationToken ct = default);
+
+    /// <summary>Loads an administrative per-handle rate-policy override, or null for defaults.</summary>
+    Task<HandleRatePolicy?> GetHandleRatePolicyAsync(string handle, CancellationToken ct = default);
+
+    /// <summary>Creates or replaces the administrative rate-policy override for a handle.</summary>
+    Task SetHandleRatePolicyAsync(string handle, HandleRatePolicy policy, CancellationToken ct = default);
+
+    /// <summary>Deletes a per-handle override so configured defaults apply again.</summary>
+    Task<bool> DeleteHandleRatePolicyAsync(string handle, CancellationToken ct = default);
 
     // ---- Capability directory + reputation ----------------------------------
 

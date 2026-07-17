@@ -20,8 +20,11 @@ public sealed class RelayMetrics
     /// <summary>A new handle was claimed via REST registration.</summary>
     public void HandleRegistered() => Interlocked.Increment(ref handlesRegistered);
 
-    /// <summary>An authenticated envelope was routed by the hub.</summary>
-    public void MessageRouted() => Interlocked.Increment(ref messagesRouted);
+    /// <summary>Authenticated recipient envelopes routed by the hub.</summary>
+    public void MessageRouted(int count = 1)
+    {
+        if (count > 0) Interlocked.Add(ref messagesRouted, count);
+    }
 
     /// <summary>A hosted free-model completion was served.</summary>
     public void HostedModelCall() => Interlocked.Increment(ref hostedModelCalls);

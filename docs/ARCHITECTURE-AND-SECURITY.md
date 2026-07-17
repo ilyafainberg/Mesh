@@ -297,6 +297,46 @@ sequenceDiagram
     Rcv->>Rcv: Zero content key
 ```
 
+### 4.6 Stateless Relay Fan-Out and Client-Side Groups
+
+Group messaging uses a stateless relay fan-out, not a relay group resource. The relay has no group record, group API, membership table, role table, group-specific inbox, or persisted fan-out recipient list.
+
+The client places a `GroupSnapshotPayload` (`GroupControl`) or `GroupMessagePayload` (`GroupMessage`) inside `MeshFanoutContent`, then E2E-encrypts that complete content once. Group ID, name, owner, membership, version, message type, sender, and text therefore remain inside the ciphertext. The outer `MeshFanoutRequest` is generic and carries one ciphertext plus **1 to 128** normalized recipient handles.
+
+For each logical group operation, the client:
+
+1. Resolves all recipient handles in one `POST /handles/resolve` request, including its own handle for linked-device sync.
+2. Forms the union of all returned device public keys and fails before sending if any required handle or usable key is missing.
+3. Encrypts `MeshFanoutContent` once to that union of device keys and signs the ciphertext once.
+4. Invokes `SendFanout` once and checks the explicit `MeshSendResult`.
+
+The relay authenticates the sender, verifies the signature, enforces the 128-recipient hard cap and the sender's effective policy, consumes **one Group token**, and clones ordinary envelopes with the same opaque ciphertext. It expands each handle to its registered device IDs, dispatches online devices concurrently, and creates device-specific offline inbox records only where unavoidable. An online sibling therefore cannot consume an offline device's pending group state. The transient request recipient list is not stored as a group or fan-out object.
+
+```mermaid
+sequenceDiagram
+    participant S as Sending client
+    participant R as Relay
+    participant B as Member B devices
+    participant C as Member C devices
+
+    S->>R: POST /handles/resolve { handles: [B, C, S] }
+    R-->>S: Device keys for B, C, and S
+    Note over S: Encrypt one MeshFanoutContent<br/>to the union of all device keys
+    S->>R: SendFanout(ciphertext, recipients=[B,C,S])
+    R->>R: Verify, consume one Group token,<br/>clone ordinary envelopes
+    par Online dispatch
+        R->>B: Deliver sealed envelope
+        R->>C: Deliver sealed envelope
+    end
+    R-->>S: MeshSendResult (accepted or explicit rejection)
+```
+
+An accepted result means the logical send was admitted for routing or queueing. Online dispatch is concurrent, and offline users receive their copies later when they reconnect. There is no atomic transaction across recipient inboxes and no guarantee of physically simultaneous delivery.
+
+Inbound group traffic is accepted only after sender-signature verification and successful E2E decryption. A control snapshot must be well formed, contain 2 to 128 members, be sent by its declared owner, include the receiving user, and agree with any existing group ID/version state. The MVP rejects membership updates. A message must name the same sender as the authenticated envelope, target a known local group, come from a listed member, include the receiver in that group, match the local group ID and membership version, and have a message ID not already stored.
+
+The MVP is create-only: the creator is the owner, membership cannot be edited, and there are no invite links, leave/removal protocol, history backfill, per-member read receipts, or group agents. Local clear/delete operations do not propagate. In particular, deleting local group state is not a cryptographic removal of that user from copies already held by other members.
+
 ---
 
 ## 5. Transport and Relay Architecture
@@ -338,6 +378,8 @@ After the handshake, the relay knows the authenticated handle (and device) behin
 
 Because `From`/`FromDevice` are relay-stamped from the authenticated connection, a sender **cannot spoof identity**. A device sending to its **own** handle is **not echoed back** to the sending connection.
 
+`MeshFanoutRequest` is the logical fan-out unit. It carries `Id`, `Recipients` (1 to 128 transient handles), one encrypted `Body`, `Signature`, and `SentAt`. The relay converts it to ordinary per-recipient `MeshEnvelope` instances; it does not persist the request or recipient cohort. Both `SendEnvelope` and `SendFanout` return `MeshSendResult`, with `Accepted`, a machine-readable `Code` such as `accepted` or `rate_limited`, optional `RetryAfterMs`, and the accepted `RecipientCount`. A missing or rejected send is never represented as silent success.
+
 ### 5.3 Routing
 
 The relay chooses a delivery path based on where the recipient's sockets live and whether the recipient is online:
@@ -346,6 +388,7 @@ The relay chooses a delivery path based on where the recipient's sockets live an
 - **Directed cross-instance forward**: if the target socket is on another instance, forward via the **Redis backplane** to the instance holding that socket.
 - **Directed device routing**: if `ToDevice` is set (for example home-device routing) and that device is online, route to it; **fall back to broadcast** to all the handle's devices if the target device is offline.
 - **Offline**: if the recipient has no live connection anywhere, **queue** the message (see [Section 5.5](#55-offline-queue-and-ttl)).
+- **Fan-out**: clone the generic request into device-targeted ordinary envelopes, dispatch online devices concurrently, and enqueue a device-specific inbox record for each offline device. Acceptance is logical, not an atomic or simultaneous physical-delivery guarantee.
 
 ```mermaid
 flowchart TD
@@ -367,20 +410,25 @@ flowchart TD
 ### 5.5 Offline Queue and TTL
 
 - Messages for an offline recipient are **queued** in a durable **Cosmos DB inbox** and **drained on connect**, ordered by **queue time**.
+- Fan-out uses a device-specific inbox partition value and drains it only after that device authenticates. Legacy direct envelopes continue using the handle-wide inbox.
 - Default retention is a **14-day TTL**.
 - **Reserved handles** (for example `meshreport`) get **no expiry** (per-item TTL of -1), so platform-critical messages are not dropped.
 
 ### 5.6 Rate Limiting
 
-- The relay applies a **per-handle token bucket** with a steady refill rate plus a burst allowance, to bound abuse and protect capacity.
+The relay applies token buckets to **logical messages per authenticated sender handle**. Direct and Group are separate buckets, so a direct-message burst does not consume group capacity and vice versa. An ordinary send consumes one Direct token. One accepted fan-out consumes one Group token regardless of recipient count; `MaxFanoutRecipients` independently limits amplification and can never exceed the protocol hard cap of 128.
+
+Each bucket has a steady refill rate and a burst capacity. For example, **120 messages/minute with burst 30** allows 30 immediate logical messages from a full bucket, then refills at 2 tokens per second. Rejection returns `MeshSendResult` with `Code = "rate_limited"` and `RetryAfterMs`; it is not silently dropped.
+
+Default direct rate/burst, group rate/burst, and maximum fan-out recipients come from relay configuration. An administrative per-handle policy, when present, takes precedence as the complete effective policy. Durable deployments store policies in the Cosmos `rate-policies` container; in-memory deployments keep non-durable local overrides. Effective policies are cached per replica for `Mesh:RatePolicyCacheSeconds`; PUT and DELETE invalidate the local cache. Live token-bucket balances are shared atomically through Redis across replicas, or kept in local memory as a single-replica fallback.
 
 ### 5.7 Storage Backends
 
 | Backend | Purpose | Notes |
 | --- | --- | --- |
 | **In-memory** | Default, single node | Simplest deployment; no external dependencies |
-| **Cosmos DB** | Durable directory, invites, inbox | Handle directory (handle to device public keys), device-linking invites, offline inbox |
-| **Redis** | Presence, per-handle quota, cross-replica directed routing | Short-TTL presence; backplane for multi-instance routing |
+| **Cosmos DB** | Durable directory, invites, inbox, rate-policy overrides | Handle directory, device-linking invites, offline inbox, and administrative per-handle policies in `rate-policies` |
+| **Redis** | Presence, live rate buckets, per-handle quota, cross-replica routing | Shared atomic bucket balances and short-TTL operational state for multi-instance deployments |
 
 In all cases, **message bodies remain ciphertext**. Durable storage holds sealed payloads and metadata, never plaintext.
 
@@ -488,14 +536,17 @@ This section describes client storage as **externally observable security proper
   - **Keychain** on iOS,
   - **Keystore** on Android.
 - **Backups** are **passphrase-encrypted** and carry the **handle recovery key** but **never the device signing keys**. This means a stolen backup plus its passphrase can support recovery of a handle, but does not directly yield device signing keys.
+- Client-only group records persist the group ID, name, owner handle, member list, and membership version. Group chat lines also persist the actual sender handle so the UI can attribute each message.
 
 ### 8.2 Relay
 
 - The relay stores **only ciphertext and metadata**:
-  - Sealed message bodies (ciphertext) in the offline inbox until delivered or expired.
+  - Sealed message bodies (ciphertext) in ordinary per-recipient offline inbox records until delivered or expired.
   - The **handle directory** (handle to device public keys).
   - Device-linking invites (codes stored **hashed**).
-  - Presence, quota, and routing state (Redis).
+  - Administrative per-handle overrides in the Cosmos `rate-policies` container.
+  - Presence, live token buckets, quota, and routing state (Redis).
+- A fan-out recipient list exists transiently while routing but is not persisted as a fan-out or group object. Offline delivery necessarily leaves separate recipient-addressed inbox records.
 - The relay **never** stores plaintext message bodies and **never** holds any device private key.
 
 ### 8.3 Data-at-Rest Summary
@@ -504,8 +555,8 @@ This section describes client storage as **externally observable security proper
 | --- | --- | --- |
 | Client local store | SQLCipher-encrypted; master key in secure enclave | Device signing + recovery keys (private material) |
 | Client backup | Passphrase-encrypted; includes recovery key, excludes device signing keys | Recovery key only |
-| Relay durable store (Cosmos) | Ciphertext bodies + metadata; hashed invite codes | No private keys; only device public keys in the directory |
-| Relay Redis | Presence/quota/routing state (short TTL) | No private keys |
+| Relay durable store (Cosmos) | Per-recipient ciphertext inbox records, directory metadata, hashed invite codes, administrative rate policies | No private keys; only device public keys in the directory |
+| Relay Redis | Presence, live rate buckets, quota, and routing state | No private keys |
 
 ---
 
@@ -519,7 +570,9 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 | --- | --- | --- |
 | **Handle directory** (handle to device public keys) | Yes | Needed for routing and multi-recipient encryption target resolution |
 | **Presence** (who is online) | Yes | Short-TTL entries in Redis |
-| **Traffic metadata** (who talks to whom, and when) | Yes | Envelope `To`/`From`/timestamps; the key privacy tradeoff |
+| **Traffic metadata** (who talks to whom, and when) | Yes | Direct envelope metadata; for fan-out, sender, transient recipient cohort, timing, and ciphertext size |
+| **Inner fan-out type** | No | `GroupControl` / `GroupMessage` is inside encrypted `MeshFanoutContent`; the outer request is generic fan-out |
+| **Group ID, name, membership metadata, roles, or version** | No explicit protocol field | These values exist only inside E2E-encrypted content; the relay has no group-state schema |
 | **Message contents** | No | Bodies are ciphertext (`ECIES-P256-AESGCM`); relay holds no device private key |
 | **Device private keys** | No | Private keys never leave the device |
 | **Capability content** (what a published service actually does at invocation) | No | Capabilities run on the provider's client; relay stores only public metadata |
@@ -539,6 +592,8 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 
 The relay operator can observe communication metadata. This is inherent to a routed transport that resolves handles and enforces presence, quota, and rate limits. Mesh's answer is transparency plus self-hosting: the relay is **open source (AGPL-3.0)**, and anyone can **run their own relay** so that the metadata stays under their control.
 
+For fan-out, the relay necessarily observes the sender, transient recipient cohort, timing, and ciphertext size while routing. Repeated recipient cohorts can permit group inference or correlation even though the inner type and explicit group metadata remain encrypted. The recipient list is not persisted as a group object, but ordinary per-recipient offline inbox records may remain until delivery or expiry. Mesh does **not** claim traffic-analysis resistance or that the relay learns nothing about group activity.
+
 ---
 
 ## 10. Security Assumptions, Limitations, and Non-Goals
@@ -556,6 +611,8 @@ The relay operator can observe communication metadata. This is inherent to a rou
 | **Federation** | Relay-to-relay federation is **not implemented**. Both parties must share a relay. |
 | **Forward secrecy** | The E2EE scheme is **ephemeral-static ECIES with a per-message content key**. The ephemeral ECDH key is per message (sender-side ephemerality), but **device keys are long-lived**. This is **not** a Double Ratchet; Mesh does **not** claim ratchet-grade forward secrecy. Compromise of a long-lived device private key can expose messages wrapped to that device. |
 | **Metadata privacy** | Traffic metadata (who talks to whom, and when), the handle directory, and presence are **visible to the relay operator**. Self-hosting is the mitigation. |
+| **Group metadata inference** | The relay stores no explicit group state and cannot read group IDs, names, membership snapshots, inner control/message type, or messages. It does see each transient recipient cohort, sender, timing, and size, so repeated cohorts may permit group inference. |
+| **Group membership and history** | Groups are create-only in the MVP. There is no membership editing, invite-link, leave/removal, or history-backfill protocol. Local deletion does not revoke another member's existing history. |
 | **TOFU dependence** | TOFU pinning is only as strong as the user's **out-of-band verification** when keys change. A user who blindly accepts key changes loses the protection. |
 | **Hosted model proxy** | Content sent through the optional hosted model proxy is, by design, visible on that request path. It is opt-in convenience, not an E2EE channel. Users can configure their own provider in the client. |
 | **Availability** | The relay is trusted for availability and honest routing. A relay can drop or delay messages (denial of service); it cannot read them. |
@@ -575,7 +632,9 @@ As a stated client security property (not an implementation description): **publ
 | **TOFU** | Trust On First Use; pin a contact's keys on first contact, hold and re-verify on change |
 | **ECIES-P256-AESGCM** | Mesh's ephemeral-static ECIES: per-message AES-256-GCM content key, wrapped per recipient device via P-256 ECDH + SHA-256 KEK derivation |
 | **MeshEnvelope** | Routing unit with `To`, relay-stamped `From`, `Kind`, ciphertext `Body`, optional `FromDevice`/`ToDevice` |
-| **Backplane** | Redis layer providing presence, per-handle quota, and cross-replica directed routing |
+| **MeshFanoutRequest** | Generic logical send containing one ciphertext and 1 to 128 transient recipient handles |
+| **MeshSendResult** | Explicit accepted/rejected result for a normal send or fan-out, including code and retry delay |
+| **Backplane** | Redis layer providing presence, shared live rate buckets, per-handle quota, and cross-replica routing |
 | **Wilson score lower bound** | Conservative ranking metric for the capability directory that accounts for sample size |
 
 ## Appendix B: Algorithm Summary

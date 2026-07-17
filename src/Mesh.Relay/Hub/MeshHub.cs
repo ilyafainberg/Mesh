@@ -25,7 +25,8 @@ public sealed class MeshHub(
     MeshRouter router,
     IRelayStore store,
     IBackplane backplane,
-    PerHandleRateLimiter rateLimiter,
+    IMessageRateLimiter rateLimiter,
+    IHandleRatePolicyProvider ratePolicies,
     RelayMetrics metrics,
     ILogger<MeshHub> logger) : Microsoft.AspNetCore.SignalR.Hub
 {
@@ -71,32 +72,43 @@ public sealed class MeshHub(
         }
 
         registry.MarkAuthenticated(Context.ConnectionId, publicKey);
+        var deviceId = DeviceProtocol.DeviceId(publicKey);
         await backplane.SetPresenceAsync(state.Handle);
+        await backplane.SetDevicePresenceAsync(state.Handle, deviceId);
         await Clients.Caller.SendAsync(MeshHubProtocol.Ready);
 
-        // Flush any messages queued while the recipient was offline.
+        // Device-targeted fan-out must drain only on the intended device. Legacy handle-wide
+        // messages are drained afterward for backward compatibility.
+        foreach (var pending in await store.DrainInboxAsync(MeshRouter.DeviceInboxKey(state.Handle, deviceId)))
+            await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
         foreach (var pending in await store.DrainInboxAsync(state.Handle))
             await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
     }
 
     /// <summary>Receives an envelope from an authenticated connection and routes it.</summary>
-    public async Task SendEnvelope(MeshEnvelope env)
+    public async Task<MeshSendResult> SendEnvelope(MeshEnvelope env)
     {
         var state = registry.Get(Context.ConnectionId);
         if (state is null || !state.Authenticated || state.Handle is null || state.PublicKey is null)
-            return; // not authenticated: drop
+            return MeshSendResult.Reject("unauthenticated");
 
         // Verify the message signature against the connection's authenticated key.
         if (!MeshCrypto.Verify(state.PublicKey, env.Body, env.Signature ?? ""))
-            return; // forged or tampered: drop
+            return MeshSendResult.Reject("invalid_signature");
 
-        // Per-handle message rate limit: drop (do not route) when the sender is over its limit.
-        // A single over-limit message is dropped, not disconnected, so a bursty client recovers.
-        if (!rateLimiter.TryAcquire(state.Handle))
+        var (decision, policy) = await rateLimiter.TryAcquireAsync(
+            state.Handle, MessageRateBucket.Direct, Context.ConnectionAborted);
+        if (!policy.Enabled)
+        {
+            metrics.RateLimitRejected();
+            logger.LogWarning("message disabled by policy: {Handle}", state.Handle);
+            return MeshSendResult.Reject("disabled");
+        }
+        if (!decision.Allowed)
         {
             metrics.RateLimitRejected();
             logger.LogWarning("message rate limited: {Handle}", state.Handle);
-            return;
+            return MeshSendResult.Reject("rate_limited", decision.RetryAfterMs);
         }
 
         var stamped = env with { From = state.Handle }; // relay asserts the authenticated sender
@@ -114,18 +126,115 @@ public sealed class MeshHub(
         var exclude = Normalize(stamped.To) == state.Handle ? Context.ConnectionId : null;
         await router.RouteAsync(stamped, exclude);
         metrics.MessageRouted();
+        return MeshSendResult.Ok();
+    }
+
+    /// <summary>
+    /// Routes one opaque ciphertext to a transient recipient list. The relay never inspects the
+    /// encrypted dispatch metadata and never creates a durable group or membership record.
+    /// </summary>
+    public async Task<MeshSendResult> SendFanout(MeshFanoutRequest request)
+    {
+        var state = registry.Get(Context.ConnectionId);
+        if (state is null || !state.Authenticated || state.Handle is null || state.PublicKey is null)
+            return MeshSendResult.Reject("unauthenticated");
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.Id)
+            || string.IsNullOrWhiteSpace(request.Body)
+            || string.IsNullOrWhiteSpace(request.Signature)
+            || request.Recipients is null)
+            return MeshSendResult.Reject("invalid_fanout");
+        if (request.Recipients.Count > FanoutProtocol.MaxRecipients)
+            return MeshSendResult.Reject("too_many_recipients");
+        if (!MeshCrypto.Verify(state.PublicKey, request.Body, request.Signature))
+            return MeshSendResult.Reject("invalid_signature");
+
+        var recipients = new List<string>(request.Recipients.Count);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in request.Recipients)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                return MeshSendResult.Reject("invalid_fanout");
+            var normalized = Normalize(raw);
+            if (normalized.Length == 0)
+                return MeshSendResult.Reject("invalid_fanout");
+            if (seen.Add(normalized)) recipients.Add(normalized);
+        }
+        if (recipients.Count == 0)
+            return MeshSendResult.Reject("invalid_fanout");
+
+        var policy = await ratePolicies.GetPolicyAsync(state.Handle, Context.ConnectionAborted);
+        if (!policy.Enabled)
+        {
+            metrics.RateLimitRejected();
+            return MeshSendResult.Reject("disabled");
+        }
+        var maxRecipients = Math.Min(FanoutProtocol.MaxRecipients, Math.Max(1, policy.MaxFanoutRecipients));
+        if (recipients.Count > maxRecipients)
+            return MeshSendResult.Reject("too_many_recipients");
+
+        // One accepted fan-out is one logical group message, regardless of recipient count.
+        var (decision, effectivePolicy) = await rateLimiter.TryAcquireAsync(
+            state.Handle, MessageRateBucket.Group, Context.ConnectionAborted);
+        if (!effectivePolicy.Enabled)
+        {
+            metrics.RateLimitRejected();
+            return MeshSendResult.Reject("disabled");
+        }
+        if (!decision.Allowed)
+        {
+            metrics.RateLimitRejected();
+            logger.LogWarning("fan-out rate limited: {Handle}", state.Handle);
+            return MeshSendResult.Reject("rate_limited", decision.RetryAfterMs);
+        }
+
+        var registrations = await Task.WhenAll(
+            recipients.Select(handle => store.GetHandleAsync(handle)));
+        if (registrations.Any(record => record is null || record.DevicePublicKeys.Count == 0))
+            return MeshSendResult.Reject("invalid_recipient");
+
+        var targets = registrations
+            .SelectMany(record => record!.DevicePublicKeys
+                .Select(publicKey => (record.Handle, DeviceId: DeviceProtocol.DeviceId(publicKey))))
+            .Where(target => !(target.Handle == state.Handle && target.DeviceId == state.DeviceId))
+            .Distinct()
+            .ToList();
+
+        var sentAt = request.SentAt == default ? DateTimeOffset.UtcNow : request.SentAt;
+        var tasks = targets.Select(target =>
+        {
+            var envelope = new MeshEnvelope(
+                request.Id,
+                state.Handle,
+                target.Handle,
+                MeshKinds.Fanout,
+                request.Body,
+                request.Signature,
+                sentAt,
+                state.DeviceId,
+                target.DeviceId);
+            return router.RouteToDeviceAsync(envelope);
+        });
+
+        await Task.WhenAll(tasks);
+        metrics.MessageRouted(targets.Count);
+        return MeshSendResult.Ok(recipients.Count);
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
         // Only count a close for a connection we counted on open (present in the registry).
-        var counted = registry.Get(Context.ConnectionId) is not null;
+        var connection = registry.Get(Context.ConnectionId);
+        var counted = connection is not null;
         var handle = registry.Remove(Context.ConnectionId);
         if (counted)
         {
             metrics.ConnectionClosed();
             logger.LogInformation("hub connection closed: {Handle}", handle ?? "unknown");
         }
+        if (connection is { Authenticated: true, Handle: not null, DeviceId: not null }
+            && registry.ConnectionsForDevice(connection.Handle, connection.DeviceId).Count == 0)
+            await backplane.ClearDevicePresenceAsync(connection.Handle, connection.DeviceId);
         if (handle is not null)
             await backplane.ClearPresenceAsync(handle); // only when it was the last local connection
         await base.OnDisconnectedAsync(exception);

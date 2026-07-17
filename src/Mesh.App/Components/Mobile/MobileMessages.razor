@@ -23,18 +23,50 @@
             </datalist>
             <button class="primary round-add" @onclick="StartConversation" title="Start conversation" aria-label="Start conversation"><i class="bi bi-plus-lg"></i></button>
         </div>
+        <button class="ghost new-group-btn" @onclick="ShowGroupCreator" aria-expanded="@showGroupCreator">
+            <i class="bi bi-people"></i> New group
+        </button>
+        @if (showGroupCreator)
+        {
+            <section class="group-create" role="dialog" aria-labelledby="mobile-group-create-title" aria-describedby="mobile-group-create-note">
+                <h3 id="mobile-group-create-title"><i class="bi bi-people"></i> Create group</h3>
+                <label for="mobile-group-name">Group name</label>
+                <input id="mobile-group-name" @bind="groupName" @bind:event="oninput" placeholder="Project team" disabled="@creatingGroup" />
+                <label for="mobile-group-members">Member handles</label>
+                <textarea id="mobile-group-members" @bind="groupMembers" @bind:event="oninput" rows="2"
+                          placeholder="alex, sam" disabled="@creatingGroup"></textarea>
+                <p id="mobile-group-create-note" class="group-create-note">You are included. Add 1–@MaxOtherGroupMembers other people (@FanoutProtocol.MaxRecipients members maximum).</p>
+                @if (groupCreateError is not null)
+                {
+                    <p class="group-create-error" role="alert"><i class="bi bi-exclamation-circle"></i> @groupCreateError</p>
+                }
+                <div class="group-create-actions">
+                    <button class="primary" @onclick="CreateGroup" disabled="@creatingGroup">
+                        @if (creatingGroup) { <i class="bi bi-hourglass-split"></i> <span>Creating…</span> }
+                        else { <i class="bi bi-people"></i> <span>Create</span> }
+                    </button>
+                    <button class="ghost" @onclick="CancelGroupCreator" disabled="@creatingGroup">Cancel</button>
+                </div>
+            </section>
+        }
 
         <div class="chat-rows">
             @foreach (var c in State.Profile.Conversations)
             {
                 var nm = State.DisplayNameFor(c.Handle);
                 var initial = string.IsNullOrEmpty(nm) ? "?" : nm.Substring(0, 1).ToUpperInvariant();
-                <div class="chat-row" @onclick="() => Select(c.Handle)">
-                    <span class="avatar">@initial</span>
+                <div class="chat-row @(c.Handle == active ? "active" : "") @(c.IsGroup ? "group-chat-row" : "")" @onclick="() => Select(c.Handle)">
+                    <span class="avatar">
+                        @if (c.IsGroup) { <i class="bi bi-people-fill" aria-hidden="true"></i> }
+                        else { @initial }
+                    </span>
                     <div class="chat-main">
-                        <span class="chat-name">@nm</span>
+                        <div class="chat-title">
+                            <span class="chat-name">@nm</span>
+                            @if (c.IsGroup) { <span class="group-count">@MemberCount(c) members</span> }
+                        </div>
                         @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
-                        @if (!c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
+                        @if (!c.IsGroup && !c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
                     </div>
                     @if (State.IsUnread(c.Handle)) { <span class="chat-unread" title="Unread message"></span> }
                 </div>
@@ -93,7 +125,11 @@ else
             <button class="ghost icon-btn back-btn" @onclick="() => active = null" title="Back" aria-label="Back to conversations"><i class="bi bi-chevron-left"></i></button>
             <div class="thread-id">
                 <span class="thread-name">@State.DisplayNameFor(active)</span>
-                @if (conv.IsService)
+                @if (conv.IsGroup)
+                {
+                    <span class="thread-sub group-thread-sub"><i class="bi bi-people-fill"></i> @GroupMemberSummary(conv)</span>
+                }
+                else if (conv.IsService)
                 {
                     var svc = State.Profile.PublishedServices.FirstOrDefault(s => s.Id == conv.ServiceId);
                     <span class="thread-sub">
@@ -124,7 +160,7 @@ else
             </div>
         </header>
 
-        @if (State.FindContact(active)?.KeyChanged == true)
+        @if (!conv.IsGroup && State.FindContact(active)?.KeyChanged == true)
         {
             <div class="key-change-banner">
                 <i class="bi bi-shield-exclamation"></i>
@@ -144,19 +180,21 @@ else
                 @foreach (var line in conv.Lines)
                 {
                     <div class="bubble @(line.Role == "user" ? "assistant" : "user")">
-                        <MessageContent Text="@line.Text" From="@(line.Role == "user" ? State.DisplayNameFor(active) : null)"
+                        <MessageContent Text="@line.Text" From="@InboundAuthor(conv, line)"
                                         OnPin="PinWidget" />
                         <div class="msg-tag">
-                            <i class="bi @(line.Via == "person" ? "bi-person" : "bi-robot")"></i> @TagLabel(line)
+                            <i class="bi @(conv.IsGroup || line.Via == "person" ? "bi-person" : "bi-robot")"></i> @TagLabel(conv, line)
                             @if (queuedIds.Contains(line.Id))
                             {
                                 <span class="msg-status" title="Queued - will send after the current turn"><i class="bi bi-hourglass-split"></i> queued</span>
                             }
                             @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status))
                             {
-                                <span class="msg-status @line.Status" title="@line.Status">
-                                    @if (line.Status == "delivered") { <i class="bi bi-check2-all"></i> }
+                                var shownStatus = conv.IsGroup && line.Status == "delivered" ? "sent" : line.Status;
+                                <span class="msg-status @shownStatus" title="@shownStatus">
+                                    @if (!conv.IsGroup && line.Status == "delivered") { <i class="bi bi-check2-all"></i> }
                                     else if (line.Status == "sent") { <i class="bi bi-check2"></i> }
+                                    else if (conv.IsGroup && line.Status == "delivered") { <i class="bi bi-check2"></i> }
                                     else if (line.Status == "failed") { <i class="bi bi-exclamation-circle"></i> }
                                 </span>
                             }
@@ -181,7 +219,7 @@ else
                         <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
                     </div>
                 }
-                @if (widgetMode)
+                @if (widgetMode && !conv.IsGroup)
                 {
                     <div class="mode-chip">
                         <i class="bi bi-window-stack"></i> widget
@@ -210,7 +248,7 @@ else
                         }
                     </div>
                 }
-                @if (!ActiveIsService)
+                @if (!ActiveIsService && !conv.IsGroup)
                 {
                     <div class="target-toggle" role="group" aria-label="Message target" title="Choose who receives this message">
                         <button class="@(directMode ? "" : "on")" @onclick="() => directMode = false" disabled="@busy"
@@ -224,9 +262,12 @@ else
                     </div>
                 }
                 <div class="composer">
-                    <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="() => widgetMode = !widgetMode" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget (mini-app)">
-                        <i class="bi bi-plus-lg"></i>
-                    </button>
+                    @if (!conv.IsGroup)
+                    {
+                        <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="() => widgetMode = !widgetMode" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget (mini-app)">
+                            <i class="bi bi-plus-lg"></i>
+                        </button>
+                    }
                     <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
                         <i class="bi bi-paperclip"></i>
                     </button>
@@ -248,6 +289,11 @@ else
     string? confirmDelete;
     string input = "";
     string newHandle = "";
+    bool showGroupCreator;
+    bool creatingGroup;
+    string groupName = "";
+    string groupMembers = "";
+    string? groupCreateError;
     bool busy;
     bool widgetMode;
     bool directMode;
@@ -271,7 +317,9 @@ else
     readonly Queue<PendingMsg> pending = new();
     readonly HashSet<string> queuedIds = new();
 
-    sealed record PendingMsg(string Handle, ChatLine Line, string Text, List<StagedFile> Files, bool Direct, bool Widget);
+    sealed record PendingMsg(
+        string Handle, ChatLine Line, string Text, List<StagedFile> Files, bool Direct, bool Widget,
+        bool ExpectedGroup, bool ExpectedService);
 
     sealed record StagedFile(string Name, string Mime, string Base64, long Size)
     {
@@ -281,9 +329,12 @@ else
     bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
     bool ActiveIsService => active is not null && State.FindConversation(active)?.IsService == true;
+    bool ActiveIsGroup => active is not null && State.FindConversation(active)?.IsGroup == true;
 
-    string Placeholder => widgetMode
+    string Placeholder => widgetMode && !ActiveIsGroup
         ? "Describe a widget to send…"
+        : ActiveIsGroup
+            ? $"Message {State.DisplayNameFor(active!)}…"
         : ActiveIsService
             ? $"Message {State.DisplayNameFor(active!)}…"
             : directMode
@@ -377,7 +428,7 @@ else
 
     // Handles offered for autocomplete when starting a conversation: contacts + existing threads.
     IEnumerable<string> KnownHandles => State.Profile.Contacts.Select(c => c.Handle)
-        .Concat(State.Profile.Conversations.Select(c => c.Handle))
+        .Concat(State.Profile.Conversations.Where(c => !c.IsGroup).Select(c => c.Handle))
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .OrderBy(h => h);
 
@@ -414,7 +465,13 @@ else
     {
         if (active is null) return;
         var conv = State.GetOrCreateConversation(active);
-        if (conv.IsService)
+        if (conv.IsGroup)
+        {
+            reportDialog?.Show($"group {State.DisplayNameFor(active)}", conv.Lines,
+                l => l.Role == "assistant" ? "me" : InboundAuthor(conv, l) ?? State.DisplayNameFor(active),
+                State.CurrentModelKey());
+        }
+        else if (conv.IsService)
         {
             reportDialog?.Show($"service {conv.ServiceName}", conv.Lines,
                 l => l.Role == "assistant" ? "me" : State.DisplayNameFor(active), State.CurrentModelKey(), conv.ServiceId);
@@ -450,8 +507,10 @@ else
     // Bubble tag: whether a line was addressed to / came from the peer's AGENT or the peer person.
     // Uses AddressedToAgent (addressee/author) rather than Via (routing channel), so an agent
     // auto-reply that answers the human reads "to them" even though it travels on the agent channel.
-    string TagLabel(ChatLine line)
+    string TagLabel(Conversation conv, ChatLine line)
     {
+        if (conv.IsGroup)
+            return line.Role != "user" ? "me" : InboundAuthor(conv, line) ?? "member";
         var mine = line.Role != "user"; // "assistant" role = my own message
         var agent = line.AddressedToAgent;
         if (mine) return agent ? "to their agent" : "to them";
@@ -529,12 +588,18 @@ else
         var widget = widgetMode;
         if (widgetMode) widgetMode = false;
 
-        // Service threads always route through the sandboxed service channel (no direct/widget modes).
-        var isService = State.FindConversation(active)?.IsService == true;
-        if (isService) { direct = false; widget = false; }
+        var activeConv = State.FindConversation(active);
+        var isGroup = activeConv?.IsGroup == true;
+        var isService = activeConv?.IsService == true;
+        if (isGroup) { direct = true; widget = false; }
+        else if (isService) { direct = false; widget = false; }
 
         var via = direct ? "person" : "agent";
-        var line = new ChatLine { Role = "assistant", Text = text, Via = via, AddressedToAgent = !direct };
+        var line = new ChatLine
+        {
+            Role = "assistant", Text = text, Via = via, AddressedToAgent = !direct,
+            SenderHandle = isGroup ? AppState.Norm(State.Profile.Handle) : null
+        };
         State.AddChatLine(active, line);
 
         // A send is already running: queue this one for the next turn instead of starting a
@@ -542,21 +607,23 @@ else
         if (busy)
         {
             queuedIds.Add(line.Id);
-            pending.Enqueue(new PendingMsg(active, line, text, files, direct, widget));
+            pending.Enqueue(new PendingMsg(active, line, text, files, direct, widget, isGroup, isService));
             return;
         }
 
         busy = true;
         try
         {
-            await DeliverAsync(active, line, text, files, direct, widget);
+            await DeliverAsync(active, line, text, files, direct, widget, isGroup, isService);
 
             // Drain anything queued while the turn(s) above ran, in order, one at a time.
             while (pending.Count > 0)
             {
                 var next = pending.Dequeue();
                 queuedIds.Remove(next.Line.Id);
-                await DeliverAsync(next.Handle, next.Line, next.Text, next.Files, next.Direct, next.Widget);
+                await DeliverAsync(
+                    next.Handle, next.Line, next.Text, next.Files, next.Direct, next.Widget,
+                    next.ExpectedGroup, next.ExpectedService);
             }
         }
         catch (Exception ex)
@@ -568,16 +635,25 @@ else
 
     // Finalizes a bubble's text (widget build + attachments) and sends it to the peer, reusing
     // the line's stable id so delivery receipts update the right bubble.
-    async Task DeliverAsync(string handle, ChatLine line, string text, List<StagedFile> files, bool direct, bool widget)
+    async Task DeliverAsync(
+        string handle, ChatLine line, string text, List<StagedFile> files, bool direct, bool widget,
+        bool expectedGroup, bool expectedService)
     {
-        // Service thread: send a ServiceRequest with transcript context to the provider's sandboxed
-        // agent, instead of a normal person/agent message.
-        var svcConv = State.FindConversation(handle);
-        if (svcConv?.IsService == true)
+        var conv = State.FindConversation(handle);
+        if (expectedGroup && conv?.IsGroup != true)
         {
-            line.Text = text;
+            State.SetLineStatus(line.Id, "failed");
+            return;
+        }
+        if (expectedService && conv?.IsService != true)
+        {
+            State.SetLineStatus(line.Id, "failed");
+            return;
+        }
+        if (conv?.IsService == true)
+        {
             line.Status = "sent";
-            await Mesh.SendServiceRequestAsync(svcConv);
+            await Mesh.SendServiceRequestAsync(conv);
             return;
         }
 
@@ -596,10 +672,87 @@ else
             toSend = sb.ToString();
         }
 
-        line.Text = toSend; // "assistant" = me, rendered right
+        State.SetLineText(line.Id, toSend); // "assistant" = me, rendered right
+        if (conv?.IsGroup == true)
+        {
+            var ok = await Mesh.SendGroupMessageAsync(conv, toSend, line.Id);
+            line.Status = ok ? "sent" : "failed";
+            State.Save();
+            return;
+        }
         var kind = direct ? MeshKinds.DirectMessage : MeshKinds.Chat;
         await Mesh.SendAsync(handle, kind, toSend, line.Id);
     }
+
+    int MemberCount(Conversation conv) => conv.GroupMembers.Count;
+
+    string GroupMemberSummary(Conversation conv)
+    {
+        var members = conv.GroupMembers
+            .Take(5)
+            .Select(h => "@" + AppState.Norm(h))
+            .ToList();
+        var remaining = MemberCount(conv) - members.Count;
+        var more = remaining > 0 ? $" · +{remaining} more" : "";
+        return $"{MemberCount(conv)} members · {string.Join(", ", members)}{more}";
+    }
+
+    string? InboundAuthor(Conversation conv, ChatLine line)
+    {
+        if (line.Role != "user") return null;
+        if (!conv.IsGroup) return State.DisplayNameFor(conv.Handle);
+        return string.IsNullOrWhiteSpace(line.SenderHandle)
+            ? "Group member"
+            : State.DisplayNameFor(AppState.Norm(line.SenderHandle));
+    }
+
+    void ShowGroupCreator()
+    {
+        showGroupCreator = true;
+        groupCreateError = null;
+    }
+
+    void CancelGroupCreator()
+    {
+        if (creatingGroup) return;
+        showGroupCreator = false;
+        groupName = "";
+        groupMembers = "";
+        groupCreateError = null;
+    }
+
+    async Task CreateGroup()
+    {
+        groupCreateError = null;
+        var name = groupName.Trim();
+        var members = ParseGroupMembers().ToList();
+        if (name.Length == 0) { groupCreateError = "Enter a group name."; return; }
+        if (members.Count == 0) { groupCreateError = "Add at least one other person."; return; }
+        if (members.Count > MaxOtherGroupMembers) { groupCreateError = $"A group can include at most {MaxOtherGroupMembers} other people."; return; }
+
+        creatingGroup = true;
+        try
+        {
+            var conv = await Mesh.CreateGroupAsync(name, members);
+            active = conv.Handle;
+            composerWired = false;
+            State.MarkRead(conv.Handle);
+        }
+        catch (Exception ex) { groupCreateError = ex.Message; }
+        finally { creatingGroup = false; }
+        if (groupCreateError is null) CancelGroupCreator();
+    }
+
+    IEnumerable<string> ParseGroupMembers()
+    {
+        var me = AppState.Norm(State.Profile.Handle);
+        return groupMembers.Split(new[] { ',', ';', ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(h => AppState.Norm(h.Trim().TrimStart('@')))
+            .Where(h => h.Length > 0 && !string.Equals(h, me, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    int MaxOtherGroupMembers => FanoutProtocol.MaxRecipients - 1;
 
     void PinWidget(string html) { pinHtml = html; pinName = ""; }
     void OnPinKey(KeyboardEventArgs e) { if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(pinName)) ConfirmPin(); }

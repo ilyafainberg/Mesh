@@ -519,12 +519,28 @@ input[type=checkbox]:not(.switch input):checked::after {
 .new-conv { display: flex; gap: 6px; margin-bottom: 14px; }
 .new-conv input { flex: 1; min-width: 0; }
 .new-conv .icon-primary { width: 36px; height: 36px; padding: 0; justify-content: center; flex-shrink: 0; }
+.new-group-btn { width: 100%; justify-content: center; margin: -6px 0 12px; }
+.group-create { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; padding: 12px;
+  background: var(--bg-2); border: 1px solid var(--stroke-1); border-radius: var(--radius-l); }
+.group-create h3 { display: flex; align-items: center; gap: 6px; margin: 0 0 4px; font-size: .92rem; }
+.group-create label { color: var(--fg-2); font-size: .76rem; font-weight: 600; }
+.group-create input, .group-create textarea { width: 100%; box-sizing: border-box; font: inherit; resize: vertical; }
+.group-create-note { margin: 2px 0; color: var(--fg-3); font-size: .76rem; line-height: 1.35; }
+.group-create-error { display: flex; align-items: flex-start; gap: 5px; margin: 2px 0; color: var(--danger);
+  font-size: .78rem; line-height: 1.35; }
+.group-create-actions { display: flex; gap: 6px; margin-top: 4px; }
+.group-create-actions button { flex: 1; justify-content: center; }
 .conv-item { padding: 10px 12px; border-radius: var(--radius-m); cursor: pointer;
   display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .conv-item:hover { background: var(--bg-hover); }
 .conv-item.active { background: var(--brand-tint); color: var(--brand); font-weight: 600; }
 .conv-item .conv-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-item .conv-unread { width: 8px; height: 8px; border-radius: 50%; background: var(--danger, #d13438); flex: none; margin-left: 6px; }
+.conv-item .conv-kind { color: var(--brand); flex: none; }
+.conv-item .group-count { color: var(--fg-3); font-size: .7rem; white-space: nowrap; }
+.conv-item.active .group-count { color: var(--brand); opacity: .8; }
+.group-head-meta { display: inline-flex; align-items: center; gap: 5px; color: var(--fg-3); font-size: .8rem;
+  min-width: 0; max-width: min(52vw, 620px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-status { margin-left: 6px; }
 .msg-status.delivered i.bi { color: var(--brand); }
 .msg-status.sent i.bi { color: var(--fg-3); }

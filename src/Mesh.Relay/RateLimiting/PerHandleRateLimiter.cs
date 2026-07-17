@@ -1,70 +1,36 @@
-using System.Collections.Concurrent;
-
 namespace Mesh.Relay.RateLimiting;
 
-/// <summary>
-/// In-memory, thread-safe, per-handle message rate limiter (token bucket). Protects the hub from
-/// a single authenticated handle flooding the relay. Keyed by handle in a ConcurrentDictionary so
-/// it needs no external service and works on the in-memory (no Redis/Cosmos) fallback path.
-///
-/// The steady rate is <c>ratePerMinute</c> messages per minute; the bucket capacity is
-/// <c>burst</c>, which is how many messages a handle may send back-to-back before being throttled
-/// to the steady refill rate. Limits are read once at construction via the relay's Config helper.
-///
-/// Privacy: this stores only per-handle token state (a count and a timestamp), never message
-/// bodies or crypto material.
-/// </summary>
-public sealed class PerHandleRateLimiter
+/// <summary>Applies the effective per-handle policy to one logical message.</summary>
+public sealed class PerHandleRateLimiter : IMessageRateLimiter
 {
-    private sealed class Bucket
+    private readonly IHandleRatePolicyProvider policies;
+    private readonly IRateLimitStore store;
+
+    public PerHandleRateLimiter(IHandleRatePolicyProvider policies, IRateLimitStore store)
     {
-        public double Tokens;
-        public long LastRefillTicks;
+        this.policies = policies ?? throw new ArgumentNullException(nameof(policies));
+        this.store = store ?? throw new ArgumentNullException(nameof(store));
     }
 
-    private readonly ConcurrentDictionary<string, Bucket> buckets = new(StringComparer.OrdinalIgnoreCase);
-    private readonly double capacity;
-    private readonly double refillPerSecond;
-
-    public PerHandleRateLimiter(int ratePerMinute, int burst)
+    public async Task<(RateLimitDecision Decision, HandleRatePolicy Policy)> TryAcquireAsync(
+        string handle,
+        MessageRateBucket bucket,
+        CancellationToken ct = default)
     {
-        if (ratePerMinute < 1) ratePerMinute = 1;
-        if (burst < 1) burst = 1;
-        capacity = burst;
-        refillPerSecond = ratePerMinute / 60.0;
-    }
+        var policy = await policies.GetPolicyAsync(handle, ct).ConfigureAwait(false);
+        if (!policy.Enabled)
+            return (new RateLimitDecision(false, 0, 0), policy);
 
-    /// <summary>The configured steady rate, messages per minute per handle.</summary>
-    public int RatePerMinute => (int)Math.Round(refillPerSecond * 60.0);
-
-    /// <summary>The configured burst capacity, messages per handle.</summary>
-    public int Burst => (int)capacity;
-
-    /// <summary>
-    /// Attempts to spend one message token for a handle. Returns true when the message is allowed,
-    /// false when the handle is over its rate limit and the message should be dropped.
-    /// </summary>
-    public bool TryAcquire(string handle)
-    {
-        var now = DateTimeOffset.UtcNow.UtcTicks;
-        var bucket = buckets.GetOrAdd(handle, _ => new Bucket { Tokens = capacity, LastRefillTicks = now });
-
-        lock (bucket)
+        var (rate, burst) = bucket switch
         {
-            var elapsedSeconds = (now - bucket.LastRefillTicks) / (double)TimeSpan.TicksPerSecond;
-            if (elapsedSeconds > 0)
-            {
-                bucket.Tokens = Math.Min(capacity, bucket.Tokens + elapsedSeconds * refillPerSecond);
-                bucket.LastRefillTicks = now;
-            }
+            MessageRateBucket.Direct => (policy.MessagesPerMinute, policy.BurstCapacity),
+            MessageRateBucket.Group => (policy.GroupMessagesPerMinute, policy.GroupBurstCapacity),
+            _ => throw new ArgumentOutOfRangeException(nameof(bucket), bucket, null)
+        };
 
-            if (bucket.Tokens >= 1.0)
-            {
-                bucket.Tokens -= 1.0;
-                return true;
-            }
-
-            return false;
-        }
+        var decision = await store
+            .TryAcquireAsync(handle, bucket, rate, burst, ct)
+            .ConfigureAwait(false);
+        return (decision, policy);
     }
 }

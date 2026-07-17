@@ -92,6 +92,12 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("conversations", "service_id", "TEXT");
         AddColumnIfMissing("conversations", "service_name", "TEXT");
         AddColumnIfMissing("conversations", "provider_handle", "TEXT");
+        AddColumnIfMissing("conversations", "group_id", "TEXT");
+        AddColumnIfMissing("conversations", "group_name", "TEXT");
+        AddColumnIfMissing("conversations", "group_owner_handle", "TEXT");
+        AddColumnIfMissing("conversations", "group_members_json", "TEXT");
+        AddColumnIfMissing("conversations", "group_version", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("chat_lines", "sender_handle", "TEXT");
         AddColumnIfMissing("own_chat", "thread_id", "TEXT");
         // Transcript + reasoning persistence: internal lines are the model's hidden execution record;
         // reasoning is the collapsible "thinking" (previously not persisted, so lost on restart).
@@ -161,7 +167,11 @@ public sealed class MeshDb : IDisposable
 
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT handle, service_id, service_name, provider_handle FROM conversations ORDER BY created_at, handle;";
+            cmd.CommandText = """
+                SELECT handle, service_id, service_name, provider_handle,
+                       group_id, group_name, group_owner_handle, group_members_json, group_version
+                FROM conversations ORDER BY created_at, handle;
+                """;
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -169,12 +179,19 @@ public sealed class MeshDb : IDisposable
                 if (!r.IsDBNull(1)) c.ServiceId = r.GetString(1);
                 if (!r.IsDBNull(2)) c.ServiceName = r.GetString(2);
                 if (!r.IsDBNull(3)) c.ProviderHandle = r.GetString(3);
+                if (!r.IsDBNull(4)) c.GroupId = r.GetString(4);
+                if (!r.IsDBNull(5)) c.GroupName = r.GetString(5);
+                if (!r.IsDBNull(6)) c.GroupOwnerHandle = r.GetString(6);
+                if (!r.IsDBNull(7))
+                    c.GroupMembers = JsonSerializer.Deserialize<List<string>>(r.GetString(7), JsonOpts)
+                        ?? throw new InvalidOperationException($"Group members are invalid for conversation '{c.Handle}'.");
+                c.GroupVersion = r.GetInt32(8);
             }
         }
 
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT handle, role, text, via, at, line_id, status FROM chat_lines ORDER BY id;";
+            cmd.CommandText = "SELECT handle, role, text, via, at, line_id, status, sender_handle FROM chat_lines ORDER BY id;";
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -186,7 +203,8 @@ public sealed class MeshDb : IDisposable
                     Via = r.GetString(3),
                     At = ParseAt(r.GetString(4)),
                     Id = r.IsDBNull(5) ? Guid.NewGuid().ToString("n") : r.GetString(5),
-                    Status = r.IsDBNull(6) ? "" : r.GetString(6)
+                    Status = r.IsDBNull(6) ? "" : r.GetString(6),
+                    SenderHandle = r.IsDBNull(7) ? null : r.GetString(7)
                 });
             }
         }
@@ -291,12 +309,44 @@ public sealed class MeshDb : IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>Persists the complete client-side metadata for a group conversation.</summary>
+    public void SetConversationGroup(
+        string handle,
+        string groupId,
+        string groupName,
+        string groupOwnerHandle,
+        IReadOnlyList<string> groupMembers,
+        int groupVersion)
+    {
+        EnsureConversation(handle);
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE conversations
+            SET group_id = $gid,
+                group_name = $gname,
+                group_owner_handle = $owner,
+                group_members_json = $members,
+                group_version = $version
+            WHERE handle = $h;
+            """;
+        cmd.Parameters.AddWithValue("$gid", groupId);
+        cmd.Parameters.AddWithValue("$gname", groupName);
+        cmd.Parameters.AddWithValue("$owner", groupOwnerHandle);
+        cmd.Parameters.AddWithValue("$members", JsonSerializer.Serialize(groupMembers, JsonOpts));
+        cmd.Parameters.AddWithValue("$version", groupVersion);
+        cmd.Parameters.AddWithValue("$h", handle);
+        cmd.ExecuteNonQuery();
+    }
+
     /// <summary>Appends a single line to a conversation's history (one insert, not a full rewrite).</summary>
     public void AppendChatLine(string handle, ChatLine line)
     {
         EnsureConversation(handle);
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO chat_lines(line_id, handle, role, text, via, status, at) VALUES($lid, $h, $r, $x, $v, $s, $a);";
+        cmd.CommandText = """
+            INSERT INTO chat_lines(line_id, handle, role, text, via, status, at, sender_handle)
+            VALUES($lid, $h, $r, $x, $v, $s, $a, $sender);
+            """;
         cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$h", handle);
         cmd.Parameters.AddWithValue("$r", line.Role);
@@ -304,6 +354,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$v", line.Via);
         cmd.Parameters.AddWithValue("$s", line.Status);
         cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
+        cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
         cmd.ExecuteNonQuery();
     }
 
@@ -421,6 +472,16 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "UPDATE chat_lines SET status = $s WHERE line_id = $lid;";
         cmd.Parameters.AddWithValue("$s", status);
+        cmd.Parameters.AddWithValue("$lid", lineId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Updates the finalized text of an outgoing line by its stable id.</summary>
+    public void UpdateLineText(string lineId, string text)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE chat_lines SET text = $t WHERE line_id = $lid;";
+        cmd.Parameters.AddWithValue("$t", text);
         cmd.Parameters.AddWithValue("$lid", lineId);
         cmd.ExecuteNonQuery();
     }
