@@ -132,6 +132,18 @@ function Invoke-NativeOutput([string]$exe, [string[]]$arguments, [string]$what) 
   return $output
 }
 
+function Invoke-Altool([string[]]$arguments, [string]$what) {
+  $captured = @()
+  & xcrun @arguments 2>&1 | Tee-Object -Variable captured
+  $exitCode = $LASTEXITCODE
+  $text = ($captured | Out-String)
+  if ($exitCode -ne 0 -or
+      $text -match '(?im)^\s*(UPLOAD|VERIFY) FAILED\b' -or
+      $text -match '(?im)"product-errors"\s*:') {
+    Fail "$what failed (exit $exitCode). Review the Apple validation output above."
+  }
+}
+
 function Get-BytesHash([byte[]]$bytes) {
   $sha = [System.Security.Cryptography.SHA256]::Create()
   try {
@@ -422,6 +434,13 @@ function Test-Ipa {
     if (-not (Test-Path $infoPlist)) { Fail "IPA app bundle has no Info.plist." }
     if (-not (Test-Path $profile)) { Fail "IPA app bundle has no embedded.mobileprovision." }
     if ($privacyFiles.Count -lt 1) { Fail "IPA app bundle has no PrivacyInfo.xcprivacy." }
+    if (Test-Path (Join-Path $app.FullName ".playwright")) {
+      Fail "IPA contains the desktop-only .playwright runtime payload."
+    }
+    $rootDylibs = @(Get-ChildItem $app.FullName -File -Filter *.dylib)
+    if ($rootDylibs.Count -gt 0) {
+      Fail "IPA contains standalone root dylib(s), which App Store Connect rejects: $($rootDylibs.Name -join ', ')"
+    }
 
     if ($script:IsMacHost) {
       function Read-PlistValue([string]$key) {
@@ -608,12 +627,12 @@ function Publish-TestFlight {
     "--api-issuer", $AppStoreIssuerId,
     "--output-format", "json"
   )
-  Invoke-Native "xcrun" (@("altool", "--validate-app", $script:IpaPath) + $auth) `
+  Invoke-Altool (@("altool", "--validate-app", $script:IpaPath) + $auth) `
     "App Store Connect validation"
   Ok "App Store Connect validation passed"
 
   Say "App Store Connect: upload build (TestFlight)"
-  Invoke-Native "xcrun" (@(
+  Invoke-Altool (@(
     "altool", "--upload-package", $script:IpaPath
   ) + $auth + @("--wait", "--show-progress")) "App Store Connect upload"
   $script:TestFlightUploaded = $true
