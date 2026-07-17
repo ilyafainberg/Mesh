@@ -3,7 +3,7 @@
 
   Runs the full chain that used to be done by hand:
     version bump -> em-dash lint -> Windows publish -> stage -> Inno installer ->
-    Azure Trusted Signing -> zip -> signed Android AAB -> git commit+push ->
+    Azure Trusted Signing -> signed Android AAB -> git commit+push ->
     Azure Blob upload -> GitHub release -> (optional) Microsoft Store + Google Play push.
 
   USAGE
@@ -225,15 +225,9 @@ function Build-Windows {
   if ($sig.Status -ne "Valid") { Die "signature not valid (status: $($sig.Status))." }
   Ok "signed: $($sig.SignerCertificate.Subject)"
 
-  Say "Windows: zip signed installer"
-  $zip = Join-Path $Artifacts "Mesh-Setup-v$Version.zip"
-  if (Test-Path $zip) { Remove-Item $zip -Force }
-  Compress-Archive -Path $exe -DestinationPath $zip -Force
-  Ok "zipped: $([math]::Round((Get-Item $zip).Length/1MB,1)) MB"
   # Use script scope (not a return value): external tool stdout from Invoke-Native would otherwise
   # pollute the function's output stream and turn the returned object into an array.
   $script:WinExe = $exe
-  $script:WinZip = $zip
 }
 
 # ------------------------------------------------------------- android build --
@@ -294,18 +288,18 @@ function Get-ReleaseNotes {
     $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
     $log = & git -c core.longpaths=true log --pretty=format:"- %s" -n 30 $range
   } finally { Pop-Location }
-  "## Mesh v$Version`n`nSigned Windows installer (CN=Feincraft, Azure Trusted Signing).`n`n### Changes`n$($log -join "`n")`n`n### Install`nDownload Mesh-Setup-v$Version.zip, extract, run Mesh-Setup-v$Version.exe." |
+  "## Mesh v$Version`n`nSigned Windows installer (CN=Feincraft, Azure Trusted Signing).`n`n### Changes`n$($log -join "`n")`n`n### Install`nDownload and run Mesh-Setup-v$Version.exe. The EXE is Authenticode-signed by Feincraft using Azure Trusted Signing." |
     Set-Content $tmp -NoNewline
   return $tmp
 }
 
-function Publish-GitHubRelease([string]$zip) {
+function Publish-GitHubRelease([string]$exe) {
   Say "GitHub: create release v$Version on $ReleaseRepo"
   $notes = Get-ReleaseNotes
   if ($DryRun) { Warn "DryRun: skipping gh release create (notes at $notes)"; return }
   Invoke-Native "gh" @(
     "release","create","v$Version","--repo",$ReleaseRepo,
-    "--title","Mesh v$Version","--notes-file",$notes,$zip
+    "--title","Mesh v$Version","--notes-file",$notes,$exe
   ) "gh release create"
   Ok "released: https://github.com/$ReleaseRepo/releases/tag/v$Version"
 }
@@ -373,13 +367,19 @@ Set-ProjectVersion
 Invoke-EmDashLint
 
 $win = $null; $aab = $null
-$script:WinExe = $null; $script:WinZip = $null; $script:AndroidAab = $null
+$script:WinExe = $null; $script:AndroidAab = $null
 if (-not $SkipWindows) { Build-Windows } else { Warn "skipping Windows build" }
 if (-not $SkipAndroid) { Build-Android } else { Warn "skipping Android build" }
 
 if (-not $SkipPush)   { Invoke-GitCommitPush }
 if ($script:WinExe -and -not $SkipBlob)   { Publish-Blob   $script:WinExe }
-if ($script:WinZip -and -not $SkipGitHub) { Publish-GitHubRelease $script:WinZip }
+if ($script:WinExe -and -not $SkipGitHub) {
+  $sig = Get-AuthenticodeSignature $script:WinExe
+  if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "CN=Feincraft") {
+    Die "refusing GitHub upload: installer signature is not valid or is not from Feincraft."
+  }
+  Publish-GitHubRelease $script:WinExe
+}
 
 if ($PushStores) {
   if ($script:WinExe)     { Push-MicrosoftStore $script:WinExe }
@@ -390,5 +390,5 @@ if ($PushStores) {
 
 $sw.Stop()
 Say "Done in $([math]::Round($sw.Elapsed.TotalMinutes,1)) min"
-if ($script:WinExe) { Ok "installer: $script:WinExe"; Ok "zip: $script:WinZip" }
+if ($script:WinExe) { Ok "installer: $script:WinExe" }
 if ($script:AndroidAab) { Ok "aab: $script:AndroidAab" }

@@ -4,7 +4,7 @@
   Runs the full release pipeline but SKIPS the Android AAB build, which is the slow
   part (AOT compile of every assembly takes the bulk of the wall-clock time). Use this
   for the common case where only client/relay code changed and you want a quick Windows
-  drop: version bump -> em-dash lint -> Windows publish + sign + installer + zip ->
+  drop: version bump -> em-dash lint -> Windows publish + sign + installer ->
   git commit+push -> Azure Blob upload -> GitHub release.
 
   USAGE
