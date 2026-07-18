@@ -1,4 +1,4 @@
-﻿@page "/widgets"
+@page "/widgets"
 @inject AppState State
 @inject AgentService Agent
 @inject IJSRuntime JS
@@ -6,159 +6,814 @@
 
 <div class="pane-scroll">
     <div class="pane-narrow">
-        <div class="pane-head" style="padding-left:0;padding-right:0;">
-            <h2><i class="bi bi-window-stack"></i> Widgets</h2>
-            <span class="muted">reusable mini-apps · your agent can send shared ones to allowed contacts</span>
+
+        <SectionHeader Title="Widgets"
+                       Description="Build reusable mini-apps your agent can share with allowed contacts.">
+            <Action>
+                @if (phase != PagePhase.Ready || draftHtml is not null || selectedWidget is not null)
+                {
+                    <button class="ghost" type="button" @onclick="TryNewWidget" disabled="@busy">
+                        <i class="bi bi-plus-lg"></i> New widget
+                    </button>
+                }
+            </Action>
+        </SectionHeader>
+
+        <div role="status" aria-live="polite" aria-atomic="true" class="wgt-status-row">
+            <StatusBadge Text="@StatusText" Tone="@StatusTone" Icon="@StatusIcon" />
         </div>
 
-        <div class="card-panel">
-            <div class="kn-row">
-                <input class="full" @bind="desc" @bind:event="oninput" @onkeydown="OnKey" placeholder="Describe a new widget (e.g. a tip calculator)…" disabled="@busy" />
-                <button class="primary" @onclick="Build" disabled="@(busy || string.IsNullOrWhiteSpace(desc))">
-                    <i class="bi bi-magic"></i> @(busy ? "Building…" : "Build")
-                </button>
-            </div>
-            @if (draftHtml is not null)
-            {
-                <div class="app-frame"><iframe @ref="draftFrame" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe></div>
-                <div class="kn-row">
-                    <input class="full" @bind="draftName" placeholder="Name this widget…" />
-                    <button class="primary" @onclick="SaveDraft" disabled="@string.IsNullOrWhiteSpace(draftName)"><i class="bi bi-pin-angle"></i> Pin</button>
-                    <button class="ghost" @onclick="DiscardDraft"><i class="bi bi-x-lg"></i> Discard</button>
-                </div>
-            }
-            @if (error is not null) { <p class="err">@error</p> }
-        </div>
-
-        @foreach (var w in State.Profile.Widgets)
+        @* ===== Creation / edit form ===== *@
+        @if (formOpen)
         {
-            <div class="widget-card">
-                <div class="widget-head">
-                    <input class="widget-name" value="@w.Name" @onchange="e => Rename(w, e)" aria-label="Widget name" />
-                    <select value="@w.Visibility" @onchange="e => SetVisibility(w, e)" title="Who your agent may send this to">
-                        <option value="private">Only me</option>
-                        <option value="public">Public</option>
-                        @foreach (var c in State.Profile.Circles)
+            <div class="card-panel">
+                <div class="field">
+                    <label for="wgt-name">
+                        Widget name
+                        <span class="wgt-optional">(optional - AI will suggest one if blank)</span>
+                    </label>
+                    <input id="wgt-name" class="full" type="text"
+                           @bind="widgetName" @bind:event="oninput"
+                           placeholder="e.g. Tip Calculator"
+                           disabled="@busy"
+                           autocomplete="off"
+                           aria-describedby="@(nameError is not null ? "wgt-name-err" : null)" />
+                    @if (nameError is not null)
+                    {
+                        <p id="wgt-name-err" class="err-text" role="alert">@nameError</p>
+                    }
+                </div>
+
+                <div class="field">
+                    <label for="wgt-desc">
+                        Describe what this widget should do
+                        <span class="wgt-required" aria-label="required">*</span>
+                    </label>
+                    <textarea id="wgt-desc" class="full" rows="3"
+                              @bind="desc" @bind:event="oninput"
+                              @onkeydown="OnDescKey"
+                              placeholder="e.g. a Flappy Bird game with scoring and tap controls"
+                              disabled="@busy"
+                              aria-required="true"></textarea>
+                </div>
+
+                <div class="wgt-samples" role="group" aria-label="Sample descriptions">
+                    <span class="wgt-samples-label" aria-hidden="true">Samples:</span>
+                    <button class="ghost small wgt-sample-btn" type="button" disabled="@busy"
+                            aria-label="Use Flappy Bird sample description"
+                            @onclick='() => desc = "Build a Flappy Bird game with pipes, scoring, and tap-to-flap controls"'>
+                        Flappy Bird
+                    </button>
+                    <button class="ghost small wgt-sample-btn" type="button" disabled="@busy"
+                            aria-label="Use Paint app sample description"
+                            @onclick='() => desc = "Build a paint app with a color picker, adjustable brush sizes, and an eraser tool"'>
+                        Paint app
+                    </button>
+                    <button class="ghost small wgt-sample-btn" type="button" disabled="@busy"
+                            aria-label="Use Weather app sample description"
+                            @onclick='() => desc = "Build a weather dashboard with current conditions, a 5-day forecast, and city search"'>
+                        Weather app
+                    </button>
+                    <button class="ghost small wgt-sample-btn" type="button" disabled="@busy"
+                            aria-label="Use Pomodoro focus timer sample description"
+                            @onclick='() => desc = "Build a Pomodoro focus timer with 25-minute work sessions, 5-minute breaks, and a session counter"'>
+                        Pomodoro focus timer
+                    </button>
+                </div>
+
+                @if (phase == PagePhase.Failed && error is not null)
+                {
+                    <p class="err-text" role="alert">@error</p>
+                }
+
+                <div class="wgt-form-actions">
+                    <button class="primary" type="button" @onclick="Generate"
+                            disabled="@(busy || string.IsNullOrWhiteSpace(desc))">
+                        <i class="bi bi-magic" aria-hidden="true"></i>
+                        @(busy && phase == PagePhase.Generating ? "Generating..." : "Generate")
+                    </button>
+                    @if (draftHtml is not null)
+                    {
+                        <button class="ghost" type="button" @onclick='() => formOpen = false' disabled="@busy">
+                            <i class="bi bi-eye" aria-hidden="true"></i> Back to preview
+                        </button>
+                    }
+                </div>
+            </div>
+        }
+
+        @* ===== Preview / draft panel ===== *@
+        @if (draftHtml is not null)
+        {
+            <div class="card-panel">
+                @if (!formOpen)
+                {
+                    <div class="field">
+                        <label for="wgt-name-preview">
+                            Widget name
+                            <span class="wgt-required" aria-label="required">*</span>
+                        </label>
+                        <input id="wgt-name-preview" class="full" type="text"
+                               @bind="widgetName" @bind:event="oninput"
+                               placeholder="Widget name (required to save)"
+                               disabled="@busy"
+                               autocomplete="off"
+                               aria-describedby="@(nameError is not null ? "wgt-name-preview-err" : null)" />
+                        @if (nameError is not null)
                         {
-                            <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                            <p id="wgt-name-preview-err" class="err-text" role="alert">@nameError</p>
                         }
-                    </select>
-                    <button class="icon-btn" title="Delete" @onclick="() => Remove(w)"><i class="bi bi-trash"></i></button>
+                    </div>
+                }
+
+                <div class="app-frame">
+                    <iframe @ref="draftFrameRef"
+                            sandbox="allow-scripts"
+                            referrerpolicy="no-referrer"
+                            title="Widget preview"
+                            aria-label="Widget preview"></iframe>
                 </div>
-                <div class="app-frame"><iframe @ref="widgetRefs[w]" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe></div>
+
+                @if (error is not null && phase != PagePhase.Failed)
+                {
+                    <p class="err-text" role="alert">@error</p>
+                }
+
+                @* Refine panel *@
+                @if (showRefinePanel)
+                {
+                    <div class="wgt-refine-panel">
+                        <div class="field">
+                            <label for="wgt-refine">What would you like to change?</label>
+                            <textarea id="wgt-refine" class="full" rows="2"
+                                      @bind="refineRequest" @bind:event="oninput"
+                                      placeholder="e.g. Make the bird green and increase the scroll speed"
+                                      disabled="@busy"></textarea>
+                        </div>
+                        <div class="wgt-refine-actions">
+                            <button class="primary" type="button" @onclick="Refine"
+                                    disabled="@(busy || string.IsNullOrWhiteSpace(refineRequest))">
+                                <i class="bi bi-arrow-repeat" aria-hidden="true"></i>
+                                @(busy && phase == PagePhase.Generating ? "Refining..." : "Apply changes")
+                            </button>
+                            <button class="ghost" type="button" disabled="@busy" @onclick="CancelRefine">Cancel</button>
+                        </div>
+                    </div>
+                }
+
+                @if (prevDraftHtml is not null)
+                {
+                    <div class="wgt-undo-row">
+                        <button class="ghost small" type="button" @onclick="UndoDraft" disabled="@busy">
+                            <i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i> Undo last change
+                        </button>
+                    </div>
+                }
+
+                @* Action bar *@
+                <div class="wgt-preview-actions" role="toolbar" aria-label="Widget actions">
+                    @if (!showRefinePanel)
+                    {
+                        <button class="ghost" type="button" @onclick="() => showRefinePanel = true" disabled="@busy"
+                                aria-label="Refine this widget">
+                            <i class="bi bi-magic" aria-hidden="true"></i> Refine
+                        </button>
+                    }
+                    <button class="ghost" type="button" @onclick="EditInstructions" disabled="@busy"
+                            aria-label="Edit the description and regenerate">
+                        <i class="bi bi-pencil" aria-hidden="true"></i> Edit instructions
+                    </button>
+                    <button class="ghost" type="button" @onclick="Regenerate" disabled="@busy"
+                            aria-label="Regenerate from the original description">
+                        <i class="bi bi-arrow-clockwise" aria-hidden="true"></i> Regenerate
+                    </button>
+                    <button class="primary" type="button" @onclick="Save"
+                            disabled="@(busy || string.IsNullOrWhiteSpace(widgetName))"
+                            aria-label="Save this widget">
+                        <i class="bi bi-pin-angle" aria-hidden="true"></i> Save
+                    </button>
+
+                    @if (confirmDiscard)
+                    {
+                        <span class="wgt-confirm-prompt">Discard this draft?</span>
+                        <button class="danger small" type="button" @onclick="ConfirmDiscard">Yes, discard</button>
+                        <button class="ghost small" type="button" @onclick="() => confirmDiscard = false">Cancel</button>
+                    }
+                    else
+                    {
+                        <button class="ghost" type="button" @onclick="TryDiscard" disabled="@busy"
+                                aria-label="Discard draft">
+                            <i class="bi bi-x-lg" aria-hidden="true"></i> Discard
+                        </button>
+                    }
+                </div>
+
+                @if (successMessage is not null)
+                {
+                    <p class="wgt-success" role="status">@successMessage</p>
+                }
             </div>
         }
-        @if (State.Profile.Widgets.Count == 0)
+
+        @* ===== Saved widget list ===== *@
+        @if (State.Profile.Widgets.Count > 0)
         {
-            <div class="empty">No widgets yet. Build one above, or tap the + in Me / Messages and pin the result.</div>
+            <div class="wgt-saved-section">
+                <h3 class="wgt-saved-heading">
+                    <i class="bi bi-window-stack" aria-hidden="true"></i> Saved widgets
+                </h3>
+                <div class="wgt-list">
+                    @foreach (var w in State.Profile.Widgets)
+                    {
+                        <div class="wgt-card @(selectedWidget?.Id == w.Id ? "wgt-card--active" : "")">
+                            <div class="wgt-card-head">
+                                <span class="wgt-card-name">@w.Name</span>
+                                <div class="wgt-card-actions">
+                                    <button class="ghost small" type="button" @onclick="() => SelectWidget(w)"
+                                            title="@(selectedWidget?.Id == w.Id ? "Currently editing" : "Preview or edit this widget")"
+                                            aria-label="@(selectedWidget?.Id == w.Id ? $"Editing {w.Name}" : $"Preview and edit {w.Name}")">
+                                        <i class="bi @(selectedWidget?.Id == w.Id ? "bi-pencil-fill" : "bi-eye")" aria-hidden="true"></i>
+                                        @(selectedWidget?.Id == w.Id ? "Editing" : "Preview / Edit")
+                                    </button>
+                                    @if (w.PreviousHtml is not null)
+                                    {
+                                        <button class="ghost small" type="button" @onclick="() => UndoSavedWidget(w)"
+                                                aria-label="@($"Undo last save for {w.Name}")">
+                                            <i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i> Undo
+                                        </button>
+                                    }
+                                    @if (confirmDeleteWidget?.Id == w.Id)
+                                    {
+                                        <span class="wgt-confirm-prompt">Remove?</span>
+                                        <button class="danger small" type="button" @onclick="() => Remove(w)"
+                                                aria-label="@($"Confirm remove {w.Name}")">
+                                            Yes
+                                        </button>
+                                        <button class="ghost small" type="button"
+                                                @onclick="() => confirmDeleteWidget = null"
+                                                aria-label="Cancel remove">
+                                            Cancel
+                                        </button>
+                                    }
+                                    else
+                                    {
+                                        <button class="icon-btn" type="button"
+                                                @onclick="() => confirmDeleteWidget = w"
+                                                title="@($"Remove {w.Name}")"
+                                                aria-label="@($"Remove {w.Name}")">
+                                            <i class="bi bi-trash" aria-hidden="true"></i>
+                                        </button>
+                                    }
+                                </div>
+                            </div>
+
+                            <div class="wgt-visibility">
+                                <label for="@($"vis-{w.Id}")" class="wgt-vis-label">Visibility</label>
+                                <select id="@($"vis-{w.Id}")"
+                                        value="@w.Visibility"
+                                        @onchange="e => SetVisibility(w, e)"
+                                        aria-label="@($"Visibility for {w.Name}")">
+                                    <option value="private">Only me</option>
+                                    <option value="public">Public</option>
+                                    @foreach (var c in State.Profile.Circles)
+                                    {
+                                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
+                                    }
+                                </select>
+                            </div>
+
+                            <div class="app-frame">
+                                <iframe @ref="widgetFrameRefs[w.Id]"
+                                        sandbox="allow-scripts"
+                                        referrerpolicy="no-referrer"
+                                        title="@($"{w.Name} preview")"
+                                        aria-label="@($"{w.Name} preview")"></iframe>
+                            </div>
+                        </div>
+                    }
+                </div>
+            </div>
         }
+        else if (draftHtml is null && phase == PagePhase.Ready)
+        {
+            <EmptyState Icon="bi-window-stack"
+                        Title="No widgets yet"
+                        Description="Generate one above, or build one in chat and pin the result." />
+        }
+
     </div>
 </div>
 
 @code {
-    string desc = "";
-    bool busy;
-    string? error;
-    string? draftHtml;
-    string draftName = "";
+    enum PagePhase { Ready, Generating, PreviewReady, Saved, Failed }
 
-    // Blob-URL plumbing: the draft preview frame plus one frame per pinned widget.
-    ElementReference draftFrame;
+    // ---- Form fields ----
+    string desc = "";
+    string widgetName = "";
+    string? nameError;
+    bool formOpen = true;
+
+    // ---- Draft state ----
+    string? draftHtml;
+    string draftPrompt = "";
+    string? prevDraftHtml;
+    string? prevDraftPrompt;
+
+    // ---- Editor context ----
+    Widget? selectedWidget;
+    PagePhase phase = PagePhase.Ready;
+    string? error;
+    string? successMessage;
+    bool busy;
+
+    // ---- Refine panel ----
+    bool showRefinePanel;
+    string refineRequest = "";
+
+    // ---- Confirmations ----
+    bool confirmDiscard;
+    Widget? confirmDeleteWidget;
+
+    // ---- Frame lifecycle ----
+    ElementReference draftFrameRef;
     string? draftMountedHtml;
-    readonly Dictionary<Widget, ElementReference> widgetRefs = new();
-    readonly HashSet<Widget> widgetMounted = new();
+    readonly Dictionary<string, ElementReference> widgetFrameRefs = new();
+    readonly Dictionary<string, string> widgetMountedHtmls = new();
+
+    // ---- Cancellation ----
+    CancellationTokenSource _cts = new();
+
+    // ---- Status badge ----
+    string StatusText => phase switch
+    {
+        PagePhase.Generating => "Generating...",
+        PagePhase.PreviewReady => "Preview ready",
+        PagePhase.Saved => "Saved",
+        PagePhase.Failed => "Generation failed",
+        _ => "Ready"
+    };
+    string StatusTone => phase switch
+    {
+        PagePhase.Saved => "ready",
+        PagePhase.Failed => "error",
+        _ => "neutral"
+    };
+    string StatusIcon => phase switch
+    {
+        PagePhase.Generating => "bi-hourglass-split",
+        PagePhase.PreviewReady => "bi-eye",
+        PagePhase.Saved => "bi-check-circle",
+        PagePhase.Failed => "bi-x-circle",
+        _ => "bi-circle"
+    };
 
     protected override void OnInitialized() => State.Changed += Refresh;
     void Refresh() => InvokeAsync(StateHasChanged);
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // Load the draft HTML via a blob URL whenever it appears or changes.
+        // Mount or remount the draft iframe whenever the HTML changes.
         if (draftHtml is not null && draftMountedHtml != draftHtml)
         {
             try
             {
-                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", draftFrame, draftHtml);
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", draftFrameRef, draftHtml);
                 draftMountedHtml = draftHtml;
             }
-            catch { /* frame not ready yet; retry on the next render */ }
+            catch { /* frame not in DOM yet; retry on the next render */ }
         }
 
-        // Load each newly rendered pinned widget frame once.
+        // Mount or remount each saved widget iframe when its HTML changes.
         foreach (var w in State.Profile.Widgets)
         {
-            if (widgetMounted.Contains(w)) continue;
-            if (!widgetRefs.TryGetValue(w, out var el)) continue;
+            if (!widgetFrameRefs.TryGetValue(w.Id, out var el)) continue;
+            if (widgetMountedHtmls.TryGetValue(w.Id, out var mounted) && mounted == w.Html) continue;
             try
             {
                 await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, w.Html);
-                widgetMounted.Add(w);
+                widgetMountedHtmls[w.Id] = w.Html;
             }
-            catch { /* frame not ready yet; retry on the next render */ }
+            catch { /* retry on next render */ }
         }
     }
 
-    async Task OnKey(KeyboardEventArgs e)
+    // ---- Ctrl+Enter shortcut on description textarea ----
+    async Task OnDescKey(KeyboardEventArgs e)
     {
-        if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(desc) && !busy) await Build();
+        if (e.Key == "Enter" && e.CtrlKey && !string.IsNullOrWhiteSpace(desc) && !busy)
+            await Generate();
     }
 
-    async Task Build()
+    // ---- Generate (from form description) ----
+    async Task Generate()
     {
         if (string.IsNullOrWhiteSpace(desc) || busy) return;
+        nameError = null;
         error = null;
+        successMessage = null;
+
+        var enteredName = widgetName.Trim();
+
+        // Validate uniqueness of a user-supplied name before making the API call.
+        if (!string.IsNullOrEmpty(enteredName) && IsDuplicateName(enteredName, selectedWidget?.Id))
+        {
+            nameError = $"A widget named \"{enteredName}\" already exists. Choose a different name.";
+            return;
+        }
+
         busy = true;
+        phase = PagePhase.Generating;
+        formOpen = false;
+        showRefinePanel = false;
+
+        _cts.Cancel();
+        _cts.Dispose();
+        _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
+
         try
         {
-            var reply = await Agent.BuildWidgetAsync(desc);
+            var reply = await Agent.BuildWidgetAsync(desc.Trim(), ct);
             var seg = Markdown.Parse(reply).FirstOrDefault(s => s.IsApp);
-            if (seg is null) { error = "The model didn't return a widget. Try rephrasing."; return; }
-            draftHtml = seg.Content;
-            draftName = desc.Length > 40 ? desc[..40] : desc;
+
+            if (seg is null)
+            {
+                error = !string.IsNullOrWhiteSpace(reply)
+                    ? reply
+                    : "The model did not return a widget. Try rephrasing the description.";
+                phase = draftHtml is not null ? PagePhase.PreviewReady : PagePhase.Failed;
+                formOpen = draftHtml is null;
+                return;
+            }
+
+            var newHtml = seg.Content;
+
+            // Resolve widget name: use user entry or ask AI.
+            string resolvedName;
+            if (!string.IsNullOrEmpty(enteredName))
+            {
+                resolvedName = enteredName;
+            }
+            else
+            {
+                resolvedName = await Agent.GenerateWidgetNameAsync(desc.Trim(), ct);
+                resolvedName = MakeUniqueName(resolvedName, selectedWidget?.Id);
+            }
+
+            // Preserve previous draft for one-step in-editor undo.
+            if (draftHtml is not null)
+            {
+                prevDraftHtml = draftHtml;
+                prevDraftPrompt = draftPrompt;
+            }
+
+            draftHtml = newHtml;
+            draftPrompt = desc.Trim();
+            widgetName = resolvedName;
+            draftMountedHtml = null; // force iframe remount
+            phase = PagePhase.PreviewReady;
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (OperationCanceledException) { /* user navigated away or disposed */ }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            phase = draftHtml is not null ? PagePhase.PreviewReady : PagePhase.Failed;
+            formOpen = draftHtml is null;
+        }
         finally { busy = false; }
     }
 
-    async Task SaveDraft()
+    // ---- Regenerate (from canonical draftPrompt) ----
+    async Task Regenerate()
     {
-        if (draftHtml is null || string.IsNullOrWhiteSpace(draftName)) return;
-        State.Mutate(p => p.Widgets.Add(new Widget { Name = draftName.Trim(), Prompt = desc, Html = draftHtml!, Visibility = "private" }));
-        await RevokeDraft();
-        draftHtml = null; draftName = ""; desc = "";
-    }
+        if (busy || draftHtml is null) return;
+        error = null;
+        successMessage = null;
+        busy = true;
+        phase = PagePhase.Generating;
+        showRefinePanel = false;
 
-    async Task DiscardDraft()
-    {
-        await RevokeDraft();
-        draftHtml = null;
-    }
+        _cts.Cancel();
+        _cts.Dispose();
+        _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
 
-    async Task RevokeDraft()
-    {
-        if (draftMountedHtml is not null)
+        try
         {
-            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", draftFrame); }
-            catch { /* ignore revoke failures */ }
+            var reply = await Agent.BuildWidgetAsync(draftPrompt, ct);
+            var seg = Markdown.Parse(reply).FirstOrDefault(s => s.IsApp);
+
+            if (seg is null)
+            {
+                error = !string.IsNullOrWhiteSpace(reply)
+                    ? reply
+                    : "Regeneration did not produce a widget. The previous preview is preserved.";
+                phase = PagePhase.PreviewReady;
+                return;
+            }
+
+            prevDraftHtml = draftHtml;
+            prevDraftPrompt = draftPrompt;
+
+            draftHtml = seg.Content;
             draftMountedHtml = null;
+            phase = PagePhase.PreviewReady;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            phase = PagePhase.PreviewReady;
+        }
+        finally { busy = false; }
+    }
+
+    // ---- Refine ----
+    async Task Refine()
+    {
+        if (string.IsNullOrWhiteSpace(refineRequest) || busy) return;
+        error = null;
+        busy = true;
+        phase = PagePhase.Generating;
+
+        _cts.Cancel();
+        _cts.Dispose();
+        _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
+
+        var request = refineRequest.Trim();
+
+        try
+        {
+            var reply = await Agent.RefineWidgetAsync(draftPrompt, request, ct);
+            var seg = Markdown.Parse(reply).FirstOrDefault(s => s.IsApp);
+
+            if (seg is null)
+            {
+                error = !string.IsNullOrWhiteSpace(reply)
+                    ? reply
+                    : "Refinement did not return a valid widget. The current preview is preserved.";
+                phase = PagePhase.PreviewReady;
+                return;
+            }
+
+            prevDraftHtml = draftHtml;
+            prevDraftPrompt = draftPrompt;
+
+            draftHtml = seg.Content;
+            draftPrompt = string.IsNullOrWhiteSpace(draftPrompt)
+                ? request
+                : $"{draftPrompt}; {request}";
+            draftMountedHtml = null;
+            refineRequest = "";
+            showRefinePanel = false;
+            phase = PagePhase.PreviewReady;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            phase = PagePhase.PreviewReady;
+        }
+        finally { busy = false; }
+    }
+
+    void CancelRefine()
+    {
+        showRefinePanel = false;
+        refineRequest = "";
+    }
+
+    // ---- Edit instructions (show form without destroying preview) ----
+    void EditInstructions()
+    {
+        desc = draftPrompt;
+        formOpen = true;
+    }
+
+    // ---- Draft undo (one step) ----
+    void UndoDraft()
+    {
+        if (prevDraftHtml is null) return;
+        (draftHtml, prevDraftHtml) = (prevDraftHtml, null);
+        (draftPrompt, prevDraftPrompt) = (prevDraftPrompt ?? draftPrompt, null);
+        draftMountedHtml = null;
+        error = null;
+        phase = PagePhase.PreviewReady;
+    }
+
+    // ---- Explicit save ----
+    async Task Save()
+    {
+        if (draftHtml is null || string.IsNullOrWhiteSpace(widgetName)) return;
+        nameError = null;
+        var nameToSave = widgetName.Trim();
+
+        if (IsDuplicateName(nameToSave, selectedWidget?.Id))
+        {
+            nameError = $"A widget named \"{nameToSave}\" already exists.";
+            return;
+        }
+
+        if (selectedWidget is null)
+        {
+            var newWidget = new Widget
+            {
+                Name = nameToSave,
+                Prompt = draftPrompt,
+                Html = draftHtml,
+                Visibility = "private",
+                CreatedAt = DateTimeOffset.UtcNow,
+                ModifiedAt = DateTimeOffset.UtcNow
+            };
+            State.Mutate(p => p.Widgets.Add(newWidget));
+            selectedWidget = newWidget;
+        }
+        else
+        {
+            var w = selectedWidget;
+            State.Mutate(_ =>
+            {
+                if (w.Html != draftHtml || w.Prompt != draftPrompt)
+                {
+                    w.PreviousHtml = w.Html;
+                    w.PreviousPrompt = w.Prompt;
+                }
+                w.Html = draftHtml!;
+                w.Prompt = draftPrompt;
+                w.Name = nameToSave;
+                w.ModifiedAt = DateTimeOffset.UtcNow;
+            });
+            // Force the saved list iframe to remount with the new HTML.
+            widgetMountedHtmls.Remove(selectedWidget.Id);
+        }
+
+        prevDraftHtml = null;
+        prevDraftPrompt = null;
+        successMessage = "Saved. Available in Widgets and from the chat pin menu.";
+        phase = PagePhase.Saved;
+        await Task.CompletedTask; // keeps the method async for consistent error handling
+    }
+
+    // ---- Undo saved widget (restore PreviousHtml) ----
+    async Task UndoSavedWidget(Widget w)
+    {
+        if (w.PreviousHtml is null) return;
+
+        var prevHtml = w.PreviousHtml;
+        var prevPrompt = w.PreviousPrompt ?? w.Prompt;
+
+        // Revoke the current blob URL before changing the HTML.
+        if (widgetFrameRefs.TryGetValue(w.Id, out var el))
+        {
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", el); } catch { }
+        }
+
+        State.Mutate(_ =>
+        {
+            w.Html = prevHtml;
+            w.Prompt = prevPrompt;
+            w.PreviousHtml = null;
+            w.PreviousPrompt = null;
+            w.ModifiedAt = DateTimeOffset.UtcNow;
+        });
+
+        widgetMountedHtmls.Remove(w.Id); // force remount with restored HTML
+
+        // Sync the in-editor preview if this widget is currently selected.
+        if (selectedWidget?.Id == w.Id)
+        {
+            draftHtml = w.Html;
+            draftPrompt = w.Prompt;
+            prevDraftHtml = null;
+            prevDraftPrompt = null;
+            draftMountedHtml = null;
+            successMessage = null;
+            phase = PagePhase.Saved;
         }
     }
 
-    void Rename(Widget w, ChangeEventArgs e) => State.Mutate(_ => w.Name = e.Value?.ToString()?.Trim() ?? w.Name);
-    void SetVisibility(Widget w, ChangeEventArgs e) => State.Mutate(_ => w.Visibility = e.Value?.ToString() ?? "private");
+    // ---- Open saved widget in editor ----
+    void SelectWidget(Widget w)
+    {
+        if (selectedWidget?.Id == w.Id) return; // already editing this one
+        selectedWidget = w;
+        draftHtml = w.Html;
+        draftPrompt = w.Prompt;
+        widgetName = w.Name;
+        desc = w.Prompt;
+        prevDraftHtml = null;
+        prevDraftPrompt = null;
+        error = null;
+        nameError = null;
+        successMessage = null;
+        showRefinePanel = false;
+        refineRequest = "";
+        confirmDiscard = false;
+        draftMountedHtml = null;
+        phase = PagePhase.Saved;
+        formOpen = false;
+    }
 
+    // ---- Discard flow ----
+    async Task TryDiscard()
+    {
+        if (!HasUnsavedWork) { await ClearEditorState(); return; }
+        confirmDiscard = true;
+    }
+
+    async Task TryNewWidget()
+    {
+        if (!HasUnsavedWork) { await ClearEditorState(); return; }
+        confirmDiscard = true;
+    }
+
+    async Task ConfirmDiscard()
+    {
+        confirmDiscard = false;
+        await ClearEditorState();
+    }
+
+    bool HasUnsavedWork =>
+        draftHtml is not null && (
+            selectedWidget is null ||
+            draftHtml != selectedWidget.Html ||
+            draftPrompt != selectedWidget.Prompt ||
+            widgetName.Trim() != selectedWidget.Name ||
+            (formOpen && desc.Trim() != draftPrompt)
+        );
+
+    async Task ClearEditorState()
+    {
+        await RevokeDraftFrame();
+        draftHtml = null;
+        draftMountedHtml = null;
+        draftPrompt = "";
+        prevDraftHtml = null;
+        prevDraftPrompt = null;
+        selectedWidget = null;
+        desc = "";
+        widgetName = "";
+        nameError = null;
+        error = null;
+        successMessage = null;
+        showRefinePanel = false;
+        refineRequest = "";
+        confirmDiscard = false;
+        phase = PagePhase.Ready;
+        formOpen = true;
+    }
+
+    async Task RevokeDraftFrame()
+    {
+        if (draftMountedHtml is null) return;
+        try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", draftFrameRef); } catch { }
+        draftMountedHtml = null;
+    }
+
+    // ---- Remove saved widget ----
     async Task Remove(Widget w)
     {
-        // Revoke the widget's blob URL while its iframe is still in the DOM.
-        if (widgetRefs.TryGetValue(w, out var el))
+        confirmDeleteWidget = null;
+
+        if (widgetFrameRefs.TryGetValue(w.Id, out var el))
         {
-            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", el); }
-            catch { /* ignore revoke failures */ }
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", el); } catch { }
+            widgetFrameRefs.Remove(w.Id);
         }
-        widgetMounted.Remove(w);
-        widgetRefs.Remove(w);
+        widgetMountedHtmls.Remove(w.Id);
+
+        // If removing the currently selected widget, clear the editor first.
+        if (selectedWidget?.Id == w.Id)
+            await ClearEditorState();
+
         State.Mutate(p => p.Widgets.Remove(w));
     }
 
-    public void Dispose() => State.Changed -= Refresh;
+    // ---- Visibility ----
+    void SetVisibility(Widget w, ChangeEventArgs e)
+        => State.Mutate(_ => w.Visibility = e.Value?.ToString() ?? "private");
+
+    // ---- Helpers ----
+    bool IsDuplicateName(string name, string? excludeId)
+        => State.Profile.Widgets.Any(w =>
+               w.Name.Equals(name, StringComparison.OrdinalIgnoreCase) && w.Id != excludeId);
+
+    string MakeUniqueName(string baseName, string? excludeId)
+    {
+        if (!IsDuplicateName(baseName, excludeId)) return baseName;
+        for (int i = 2; i <= 99; i++)
+        {
+            var candidate = $"{baseName} {i}";
+            if (!IsDuplicateName(candidate, excludeId)) return candidate;
+        }
+        return baseName; // fallback (99 duplicates is extremely unlikely)
+    }
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        _cts.Cancel();
+        _cts.Dispose();
+    }
 }

@@ -183,6 +183,53 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         return $"```html-app\n{html}\n```";
     }
 
+    /// <summary>Generates a short (2-5 word) display name for a widget using the configured model.
+    /// Never throws: returns a derived fallback name on any error.</summary>
+    public async Task<string> GenerateWidgetNameAsync(string description, CancellationToken ct = default)
+    {
+        try
+        {
+            var cfg = await ResolveModelConfigAsync(state.Profile.Model, ct);
+            var model = factory.Create(cfg);
+            const string sys = "You name mini-app widgets. Reply with ONLY 2-5 words, plain text, no punctuation, no quotes, no explanation. Examples: Weather Dashboard, Flappy Bird Game, Paint App.";
+            var reply = await model.CompleteAsync(sys,
+                new[] { new ChatLine { Role = "user", Text = $"Name this widget: {description}" } },
+                default, ct);
+            var sanitized = SanitizeWidgetName(reply?.Trim() ?? "");
+            return sanitized.Length > 0 ? sanitized : DeriveFallbackName(description);
+        }
+        catch
+        {
+            return DeriveFallbackName(description);
+        }
+    }
+
+    /// <summary>Refines an existing widget by combining canonical instructions with a change request.
+    /// Returns the same format as BuildWidgetAsync (html-app block or error string).</summary>
+    public Task<string> RefineWidgetAsync(string canonicalPrompt, string changeRequest, CancellationToken ct = default)
+    {
+        var combined = string.IsNullOrWhiteSpace(changeRequest)
+            ? canonicalPrompt
+            : $"{canonicalPrompt}\n\nChange request: {changeRequest.Trim()}";
+        return BuildWidgetAsync(combined, ct);
+    }
+
+    private static string SanitizeWidgetName(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        var clean = System.Text.RegularExpressions.Regex.Replace(raw, @"[^\w\s\-]", " ");
+        clean = System.Text.RegularExpressions.Regex.Replace(clean, @"\s+", " ").Trim();
+        var words = clean.Split(' ', System.StringSplitOptions.RemoveEmptyEntries);
+        return string.Join(" ", words.Take(5));
+    }
+
+    internal static string DeriveFallbackName(string description)
+    {
+        if (string.IsNullOrWhiteSpace(description)) return "My Widget";
+        var words = description.Split(' ', System.StringSplitOptions.RemoveEmptyEntries);
+        return string.Join(" ", words.Take(4));
+    }
+
     /// <summary>
     /// A cheap structural completeness check for a generated widget: the document must close its
     /// html/body, and any script it opens must be closed. A truncated document (cut off mid-JS)

@@ -32,6 +32,12 @@ public static class MauiProgram
 		});
 #endif
 
+		// Parse --ui-mode from the command line before any service is registered so the
+		// forced value is available when the App constructor and CreateWindow run.
+		var uiModeOptions = UiModeParser.ParseArgs(Environment.GetCommandLineArgs());
+		builder.Services.AddSingleton(uiModeOptions);
+		builder.Services.AddSingleton<IUiModeService, UiModeService>();
+
 		builder.Services.AddMauiBlazorWebView();
 
 		builder.Services.AddHttpClient();
@@ -75,6 +81,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ConnectorCatalogService>();
 		builder.Services.AddSingleton<GoogleAuthService>();
 		builder.Services.AddSingleton<ConnectorAuthService>();
+		builder.Services.AddSingleton<ToolApprovalService>();
 		builder.Services.AddSingleton<ToolRegistry>();
 		builder.Services.AddSingleton<LocalFileRegistry>();
 		builder.Services.AddSingleton<AgentMedia>();
@@ -96,6 +103,11 @@ public static class MauiProgram
 #endif
 
 		var app = builder.Build();
+
+		// Bind the singleton service to the static bridge so the Windows platform layer
+		// can forward --ui-mode args from a second launch without a service-locator call.
+		UiModeActivationBridge.Register(app.Services.GetRequiredService<IUiModeService>());
+
 		// Auto-update marketplace-imported skills in the background at startup (never blocks launch).
 		_ = Task.Run(async () =>
 		{
@@ -105,4 +117,3 @@ public static class MauiProgram
 		return app;
 	}
 }
-

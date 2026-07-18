@@ -10,21 +10,22 @@
 @inject UpdateService Updater
 @inject ConnectorCatalogService Catalog
 @inject IJSRuntime JS
+@inject IUiModeService UiModeSvc
 @implements IDisposable
 
 @if (!State.IsOnboarded)
 {
     <Onboarding OnDone="Refresh" />
 }
-else if (PlatformCaps.IsMobile)
+else if (UiModeSvc.EffectiveMode == UiMode.Phone)
 {
-    <MobileShell>
+    <MobileShell ModeClass="ui-mode-phone">
         @Body
     </MobileShell>
 }
 else
 {
-    <div class="page">
+    <div class="page @ShellClass">
         <div class="scrim @(navOpen ? "show" : "")" @onclick="() => navOpen = false"></div>
         <div class="sidebar @(navOpen ? "open" : "")" aria-label="Sidebar">
             <NavMenu OnNavigate="CloseNav" />
@@ -48,7 +49,7 @@ else
                         @if (Setup.Running)
                         {
                             <span class="spinner"></span>
-                            <span class="gb-text">Model setup: @(Setup.Status ?? "working…")</span>
+                            <span class="gb-text">Model setup: @(Setup.Status ?? "working...")</span>
                         }
                         else
                         {
@@ -82,21 +83,38 @@ else
     </div>
 }
 
+@if (State.IsOnboarded)
+{
+    <ToolApprovalPrompt />
+    @if (!State.Profile.DiscoveryTourCompleted)
+    {
+        <DiscoveryTour />
+    }
+}
+
 @code {
     bool navOpen;
     DotNetObjectReference<MainLayout>? fileLinkRef;
+    UiMode _prevEffectiveMode;
 
     string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
         ? State.Profile.Handle : State.Profile.DisplayName;
+
+    // Deterministic class written to the desktop-shell root so CSS can force
+    // the correct layout regardless of physical window width.
+    string ShellClass => UiModeSvc.EffectiveMode == UiMode.Tablet
+        ? "ui-mode-tablet" : "ui-mode-desktop";
 
     void CloseNav() => navOpen = false;
 
     protected override async Task OnInitializedAsync()
     {
+        _prevEffectiveMode = UiModeSvc.EffectiveMode;
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
         Setup.Changed += Refresh;
         Updater.Changed += Refresh;
+        UiModeSvc.Changed += OnModeChanged;
 
         // When a toast is clicked, bring the window up and navigate to the relevant page.
 #if WINDOWS
@@ -112,13 +130,13 @@ else
 
         if (State.IsOnboarded)
         {
-            // On mobile, the desktop Home ("/") and Messages ("/messages") routes are replaced by
-            // the reworked mobile screens. Redirect the initial landing to the mobile equivalents.
-            if (PlatformCaps.IsMobile)
+            // In Phone mode the desktop Home ("/") and Messages ("/messages") routes are
+            // replaced by the reworked mobile screens. Redirect on initial load.
+            if (UiModeSvc.EffectiveMode == UiMode.Phone)
             {
                 var path = Nav.ToBaseRelativePath(Nav.Uri).Split('?')[0].TrimEnd('/');
-                if (path == "") { Nav.NavigateTo("/m/me"); }
-                else if (path == "messages") { Nav.NavigateTo("/m/messages"); }
+                if (path == "") Nav.NavigateTo("/m/me");
+                else if (path == "messages") Nav.NavigateTo("/m/messages");
             }
 
             await Msal.InitializeAsync();
@@ -149,6 +167,44 @@ else
 
     private void Refresh() => InvokeAsync(StateHasChanged);
 
+    // Raised from any thread by UiModeService; marshal to the UI thread.
+    private void OnModeChanged(object? sender, EventArgs e)
+        => _ = InvokeAsync(HandleModeChange);
+
+    private void HandleModeChange()
+    {
+        var newMode = UiModeSvc.EffectiveMode;
+        var prevMode = _prevEffectiveMode;
+        _prevEffectiveMode = newMode;
+
+        // Close the hamburger nav whenever the mode changes.
+        navOpen = false;
+
+        if (State.IsOnboarded)
+        {
+            var path = Nav.ToBaseRelativePath(Nav.Uri).Split('?')[0].TrimEnd('/');
+
+            if (prevMode != UiMode.Phone && newMode == UiMode.Phone)
+            {
+                // Entering Phone: redirect desktop routes to their mobile equivalents.
+                if (path == "") Nav.NavigateTo("/m/me");
+                else if (path == "messages") Nav.NavigateTo("/m/messages");
+            }
+            else if (prevMode == UiMode.Phone && newMode != UiMode.Phone)
+            {
+                // Leaving Phone: redirect mobile routes back to desktop equivalents.
+                if (path == "m/me") Nav.NavigateTo("/");
+                else if (path == "m/messages") Nav.NavigateTo("/messages");
+            }
+        }
+
+        // Bring the window foreground when triggered from a second command-line launch.
+        if (UiModeSvc.Source == UiModeSource.CommandLine)
+            AppControl.ShowMainWindow();
+
+        StateHasChanged();
+    }
+
     // Routes a mesh:// deep link: ensure the target conversation exists, bring the window forward,
     // and open it in Messages. Services and handles both land in a Messages thread.
     private void HandleDeepLink(string uri)
@@ -163,7 +219,7 @@ else
 
         AppControl.ShowMainWindow();
         State.RequestOpenConversation(key);
-        Nav.NavigateTo(PlatformCaps.IsMobile ? "/m/messages" : "/messages");
+        Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone ? "/m/messages" : "/messages");
     }
 
     public void Dispose()
@@ -172,6 +228,7 @@ else
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
         Updater.Changed -= Refresh;
+        UiModeSvc.Changed -= OnModeChanged;
 #if WINDOWS
         global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = null;
 #endif

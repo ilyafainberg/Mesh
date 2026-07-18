@@ -1,0 +1,221 @@
+/* ===== Status row ===== */
+.wgt-status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    min-height: 24px;
+}
+
+/* ===== Form helpers ===== */
+.wgt-optional {
+    font-weight: 400;
+    color: var(--fg-3);
+    font-size: .78rem;
+}
+
+.wgt-required {
+    color: var(--danger);
+    margin-left: 2px;
+    font-weight: 600;
+}
+
+/* ===== Sample buttons row ===== */
+.wgt-samples {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 14px;
+}
+
+.wgt-samples-label {
+    font-size: .8rem;
+    color: var(--fg-3);
+    flex-shrink: 0;
+    margin-right: 2px;
+}
+
+.wgt-sample-btn {
+    white-space: nowrap;
+}
+
+/* ===== Form action row ===== */
+.wgt-form-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+}
+
+/* ===== Refine panel ===== */
+.wgt-refine-panel {
+    margin-top: 10px;
+    padding: 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-m);
+}
+
+.wgt-refine-panel .field {
+    margin-bottom: 0;
+}
+
+.wgt-refine-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+/* ===== Draft undo row ===== */
+.wgt-undo-row {
+    margin-top: 8px;
+}
+
+/* ===== Preview action bar ===== */
+.wgt-preview-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--stroke-1);
+}
+
+/* ===== Inline confirmation ===== */
+.wgt-confirm-prompt {
+    font-size: .85rem;
+    color: var(--fg-2);
+    margin: 0 2px;
+    white-space: nowrap;
+}
+
+/* ===== Save success message ===== */
+.wgt-success {
+    color: var(--ok, #0e7a0b);
+    font-size: .85rem;
+    margin: 8px 0 0;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+/* ===== Saved section header ===== */
+.wgt-saved-section {
+    margin-top: 20px;
+}
+
+.wgt-saved-heading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: .95rem;
+    font-weight: 600;
+    color: var(--fg-2);
+    margin-bottom: 10px;
+}
+
+/* ===== Widget card list ===== */
+.wgt-list {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.wgt-card {
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-l);
+    padding: 12px;
+}
+
+.wgt-card--active {
+    border-color: var(--brand);
+    box-shadow: 0 0 0 2px var(--brand-tint, #e8f1fd);
+}
+
+.wgt-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+}
+
+.wgt-card-name {
+    font-weight: 600;
+    font-size: .92rem;
+    color: var(--fg-1);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.wgt-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+/* ===== Visibility row ===== */
+.wgt-visibility {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.wgt-vis-label {
+    font-size: .78rem;
+    color: var(--fg-3);
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+.wgt-visibility select {
+    flex: 1;
+    min-width: 0;
+    max-width: 220px;
+    font-size: .82rem;
+}
+
+/* ===== Focus ring consistency ===== */
+.wgt-sample-btn:focus-visible,
+.wgt-preview-actions button:focus-visible,
+.wgt-refine-actions button:focus-visible,
+.wgt-card-actions button:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
+}
+
+/* ===== Responsive: narrow widths ===== */
+@media (max-width: 480px) {
+    .wgt-preview-actions {
+        gap: 4px;
+    }
+
+    .wgt-card-head {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .wgt-card-actions {
+        width: 100%;
+    }
+
+    .wgt-visibility {
+        flex-wrap: wrap;
+    }
+
+    .wgt-visibility select {
+        max-width: 100%;
+    }
+}

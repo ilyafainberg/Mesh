@@ -1,0 +1,32 @@
+.empty-state {
+    display: grid;
+    justify-items: center;
+    gap: 8px;
+    padding: 48px 24px;
+    text-align: center;
+    color: var(--text-2);
+    border: 1px dashed var(--border);
+    border-radius: 16px;
+    background: var(--bg-2);
+}
+
+.empty-state > i {
+    font-size: 1.8rem;
+    color: var(--brand);
+}
+
+.empty-state h2 {
+    margin: 6px 0 0;
+    color: var(--text-1);
+    font-size: 1.05rem;
+}
+
+.empty-state p {
+    max-width: 520px;
+    margin: 0;
+    line-height: 1.45;
+}
+
+.empty-action {
+    margin-top: 8px;
+}

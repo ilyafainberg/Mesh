@@ -1,0 +1,615 @@
+@page "/tools"
+@inject AppState State
+@inject McpHost McpHostSvc
+@inject IHttpClientFactory HttpFactory
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow">
+        <div class="pane-head" style="padding-left:0;padding-right:0;">
+            <h2><i class="bi bi-tools"></i> Tools</h2>
+            <span class="muted">let your agent act on your behalf, with your permission</span>
+        </div>
+
+        @if (ShowIntro)
+        {
+            <EmptyState Icon="bi-tools"
+                        Title="No tools connected yet"
+                        Description="Tools let your agent read files, search the web, run scripts, or connect to external services. You stay in control: every tool needs your permission level before it acts.">
+                <Action>
+                    <button class="primary" @onclick="OpenAddMcp">
+                        <i class="bi bi-plug"></i> Connect a tool server
+                    </button>
+                </Action>
+            </EmptyState>
+        }
+
+        <div class="card-panel">
+            <h3>Local tools</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Let your agent use this machine: run scripts, search the web, read and write files.
+                These are off by default. Shared tools let that circle's agents run them on your machine;
+                only enable sharing for people you fully trust.
+            </div>
+            @foreach (var lt in VisibleLocalToolRows)
+            {
+                var setting = GetLocalTool(lt.Kind);
+                var (statusText, statusTone, statusIcon) = LocalToolStatus(setting);
+                <div class="local-tool-row">
+                    <div class="lt-main">
+                        <label class="switch">
+                            <input type="checkbox" checked="@setting.Enabled"
+                                   @onchange="e => SetLocalToolEnabled(lt.Kind, (bool)(e.Value ?? false))"
+                                   aria-label="@($"Enable {lt.Name}")" />
+                        </label>
+                        <div class="lt-text">
+                            <div class="lt-name"><i class="bi @lt.Icon"></i> @lt.Name</div>
+                            <div class="lt-sub">@lt.Description</div>
+                        </div>
+                        <StatusBadge Text="@statusText" Tone="@statusTone" Icon="@statusIcon" />
+                    </div>
+                    @if (setting.Enabled)
+                    {
+                        <div class="lt-extras">
+                            <div class="lt-share">
+                                <span class="lt-share-label">Who can use it</span>
+                                <select value="@setting.Visibility"
+                                        @onchange="e => SetLocalToolVisibility(lt.Kind, e.Value?.ToString())"
+                                        aria-label="@($"Visibility for {lt.Name}")">
+                                    <option value="private">Only me (Me chat)</option>
+                                    @foreach (var c in State.CircleNames)
+                                    {
+                                        <option value="@($"shared:{c}")">Share with @c</option>
+                                    }
+                                    <option value="public">Anyone allowed</option>
+                                </select>
+                            </div>
+                            <div class="lt-approval">
+                                <span class="lt-share-label">Permission level</span>
+                                <div class="approval-seg" role="radiogroup" aria-label="@($"Permission level for {lt.Name}")">
+                                    @foreach (var lvl in ApprovalLevels)
+                                    {
+                                        var capturedKind = lt.Kind;
+                                        var capturedLevel = lvl.Level;
+                                        var isActive = setting.ApprovalLevel == lvl.Level;
+                                        <button type="button"
+                                                class="ap-seg-btn @(isActive ? "active" : "")"
+                                                @onclick="() => SetLocalToolApproval(capturedKind, capturedLevel)"
+                                                aria-pressed="@isActive.ToString().ToLowerInvariant()"
+                                                title="@lvl.Tooltip">
+                                            @lvl.Label
+                                        </button>
+                                    }
+                                </div>
+                            </div>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        @if (!PlatformCaps.IsMobile)
+        {
+            <div class="card-panel">
+                <h3>Built-in tool servers</h3>
+                <div class="field-hint" style="margin-bottom:12px;">
+                    MCP servers that ship with Mesh and start automatically when enabled.
+                    Same rules as local tools: off by default, private unless shared with a circle.
+                </div>
+                @foreach (var def in McpServerRegistry.All)
+                {
+                    var bsetting = GetMcpServer(def.Id);
+                    var available = McpHostSvc.IsAvailable(def);
+                    var (bText, bTone, bIcon) = BundledMcpStatus(bsetting, available);
+                    <div class="local-tool-row">
+                        <div class="lt-main">
+                            <label class="switch">
+                                <input type="checkbox" checked="@bsetting.Enabled" disabled="@(!available)"
+                                       @onchange="e => SetMcpEnabled(def.Id, (bool)(e.Value ?? false))"
+                                       aria-label="@($"Enable {def.DisplayName}")" />
+                            </label>
+                            <div class="lt-text">
+                                <div class="lt-name"><i class="bi @def.Icon"></i> @def.DisplayName</div>
+                                <div class="lt-sub">@def.Description</div>
+                                @if (!available)
+                                {
+                                    <div class="lt-sub" style="color:var(--danger);">Not installed on this machine.</div>
+                                }
+                            </div>
+                            <StatusBadge Text="@bText" Tone="@bTone" Icon="@bIcon" />
+                        </div>
+                        @if (bsetting.Enabled && available)
+                        {
+                            <div class="lt-extras">
+                                <div class="lt-share">
+                                    <span class="lt-share-label">Who can use it</span>
+                                    <select value="@bsetting.Visibility"
+                                            @onchange="e => SetMcpVisibility(def.Id, e.Value?.ToString())"
+                                            aria-label="@($"Visibility for {def.DisplayName}")">
+                                        <option value="private">Only me (Me chat)</option>
+                                        @foreach (var c in State.CircleNames)
+                                        {
+                                            <option value="@($"shared:{c}")">Share with @c</option>
+                                        }
+                                        <option value="public">Anyone allowed</option>
+                                    </select>
+                                </div>
+                                <div class="lt-approval">
+                                    <span class="lt-share-label">Permission level</span>
+                                    <div class="approval-seg" role="radiogroup" aria-label="@($"Permission level for {def.DisplayName}")">
+                                        @foreach (var lvl in ApprovalLevels)
+                                        {
+                                            var capturedId = def.Id;
+                                            var capturedLevel = lvl.Level;
+                                            var isActive = bsetting.ApprovalLevel == lvl.Level;
+                                            <button type="button"
+                                                    class="ap-seg-btn @(isActive ? "active" : "")"
+                                                    @onclick="() => SetMcpApproval(capturedId, capturedLevel)"
+                                                    aria-pressed="@isActive.ToString().ToLowerInvariant()"
+                                                    title="@lvl.Tooltip">
+                                                @lvl.Label
+                                            </button>
+                                        }
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        }
+
+        <div class="card-panel">
+            <h3>Custom tool servers (MCP)</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Connect any MCP-compatible server to give your agent new abilities.
+                @(PlatformCaps.IsMobile
+                    ? "Remote (HTTP) servers work on mobile."
+                    : "Local (stdio) servers run as a process on this machine; remote (HTTP) servers connect over the network.")
+                Off by default, private unless shared with a circle.
+            </div>
+
+            @foreach (var srv in VisibleCustomServers)
+            {
+                var (cText, cTone, cIcon) = CustomMcpStatus(srv);
+                mcpTestState.TryGetValue(srv.Id, out var testResult);
+                <div class="local-tool-row">
+                    <div class="lt-main">
+                        <label class="switch">
+                            <input type="checkbox" checked="@srv.Enabled"
+                                   @onchange="e => SetCustomEnabled(srv, (bool)(e.Value ?? false))"
+                                   aria-label="@($"Enable {CustomLabel(srv)}")" />
+                        </label>
+                        <div class="lt-text">
+                            <div class="lt-name"><i class="bi bi-plug"></i> @CustomLabel(srv)</div>
+                            <div class="lt-sub">
+                                @(srv.Transport == McpTransport.Http
+                                    ? srv.Url
+                                    : $"{srv.Command} {string.Join(' ', srv.Arguments)}")
+                            </div>
+                        </div>
+                        <StatusBadge Text="@cText" Tone="@cTone" Icon="@cIcon" />
+                    </div>
+                    <div class="lt-mcp-actions">
+                        @if (testResult is not null)
+                        {
+                            <span class="lt-test-result @(testResult.Testing ? "testing" : testResult.Success ? "ok" : "err")"
+                                  role="status" aria-live="polite">
+                                @if (testResult.Testing)
+                                {
+                                    <span class="spinner-sm" aria-hidden="true"></span>
+                                }
+                                else
+                                {
+                                    <i class="bi @(testResult.Success ? "bi-check-circle" : "bi-exclamation-triangle")"
+                                       aria-hidden="true"></i>
+                                }
+                                <span>@testResult.Message</span>
+                            </span>
+                        }
+                        <button class="ghost"
+                                @onclick="() => TestCustomMcp(srv)"
+                                disabled="@(testResult?.Testing == true)"
+                                aria-label="@($"Test connection to {CustomLabel(srv)}")">
+                            @(testResult?.Testing == true ? "Testing..." : "Test connection")
+                        </button>
+                        @if (confirmRemoveId == srv.Id)
+                        {
+                            <button class="danger"
+                                    @onclick="() => ConfirmRemoveCustom(srv)"
+                                    aria-label="@($"Confirm remove {CustomLabel(srv)}")">
+                                Remove
+                            </button>
+                            <button class="ghost icon-btn"
+                                    @onclick="CancelRemove"
+                                    title="Cancel remove"
+                                    aria-label="Cancel remove">
+                                <i class="bi bi-x-lg"></i>
+                            </button>
+                        }
+                        else
+                        {
+                            <button class="icon-btn"
+                                    title="@($"Remove {CustomLabel(srv)}")"
+                                    @onclick="() => StartRemoveCustom(srv)"
+                                    aria-label="@($"Remove {CustomLabel(srv)}")">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        }
+                    </div>
+                    @if (srv.Enabled)
+                    {
+                        <div class="lt-extras">
+                            <div class="lt-share">
+                                <span class="lt-share-label">Who can use it</span>
+                                <select value="@srv.Visibility"
+                                        @onchange="e => SetCustomVisibility(srv, e.Value?.ToString())"
+                                        aria-label="@($"Visibility for {CustomLabel(srv)}")">
+                                    <option value="private">Only me (Me chat)</option>
+                                    @foreach (var cir in State.CircleNames)
+                                    {
+                                        <option value="@($"shared:{cir}")">Share with @cir</option>
+                                    }
+                                    <option value="public">Anyone allowed</option>
+                                </select>
+                            </div>
+                            <div class="lt-approval">
+                                <span class="lt-share-label">Permission level</span>
+                                <div class="approval-seg" role="radiogroup" aria-label="@($"Permission level for {CustomLabel(srv)}")">
+                                    @foreach (var lvl in ApprovalLevels)
+                                    {
+                                        var capturedSrv = srv;
+                                        var capturedLevel = lvl.Level;
+                                        var isActive = srv.ApprovalLevel == lvl.Level;
+                                        <button type="button"
+                                                class="ap-seg-btn @(isActive ? "active" : "")"
+                                                @onclick="() => SetCustomApproval(capturedSrv, capturedLevel)"
+                                                aria-pressed="@isActive.ToString().ToLowerInvariant()"
+                                                title="@lvl.Tooltip">
+                                            @lvl.Label
+                                        </button>
+                                    }
+                                </div>
+                            </div>
+                        </div>
+                    }
+                </div>
+            }
+
+            @if (addingMcp)
+            {
+                <div class="mcp-add">
+                    <label for="new-mcp-name">Name <span class="muted">(optional)</span></label>
+                    <input id="new-mcp-name" class="full" @bind="newMcpName" placeholder="My MCP server" />
+                    @if (!PlatformCaps.IsMobile)
+                    {
+                        <label for="new-mcp-transport">Connection type</label>
+                        <select id="new-mcp-transport" class="full" value="@newMcpTransport" @onchange="OnNewMcpTransportChange">
+                            <option value="Stdio">Local command (stdio)</option>
+                            <option value="Http">Remote (HTTP)</option>
+                        </select>
+                    }
+                    @if (newMcpTransport == "Http")
+                    {
+                        <label for="new-mcp-url">URL</label>
+                        <input id="new-mcp-url" class="full" @bind="newMcpUrl" placeholder="https://host/mcp" />
+                    }
+                    else
+                    {
+                        <label for="new-mcp-cmd">Command</label>
+                        <input id="new-mcp-cmd" class="full" @bind="newMcpCommand"
+                               placeholder="e.g. npx, python, or C:\path\to\server.exe" />
+                        <label for="new-mcp-args">Arguments <span class="muted">(one per line)</span></label>
+                        <textarea id="new-mcp-args" class="full" rows="3" @bind="newMcpArgs"
+                                  placeholder="-y&#10;@@modelcontextprotocol/server-filesystem&#10;C:\some\dir"></textarea>
+                    }
+                    <div class="mcp-add-actions">
+                        <button class="primary" @onclick="AddCustom" disabled="@AddMcpDisabled">Add server</button>
+                        <button class="ghost" @onclick="CancelAdd">Cancel</button>
+                    </div>
+                </div>
+            }
+            else
+            {
+                <button class="ghost" style="margin-top:10px;" @onclick="StartAddMcp">
+                    <i class="bi bi-plus-lg"></i> Add MCP server
+                </button>
+            }
+        </div>
+
+    </div>
+</div>
+
+@code {
+    // ---- local tool definitions ----
+    sealed record LocalToolRow(LocalToolKind Kind, string Name, string Icon, string Description);
+
+    static readonly LocalToolRow[] LocalToolRows =
+    {
+        new(LocalToolKind.PowerShell,      "PowerShell",        "bi-terminal",      "Run PowerShell scripts on this machine."),
+        new(LocalToolKind.Cmd,             "Command Prompt",    "bi-terminal-fill", "Run cmd.exe commands."),
+        new(LocalToolKind.Python,          "Python",            "bi-filetype-py",   "Run Python 3 scripts (Python must be installed)."),
+        new(LocalToolKind.CSharpScript,    "C# scripting",      "bi-filetype-cs",   "Run C# scripts as a .NET file-based app (needs the .NET SDK)."),
+        new(LocalToolKind.Browser,         "Browser",           "bi-globe2",        "Drive a real web browser (navigate, click, type, screenshot)."),
+        new(LocalToolKind.HeadlessBrowser, "Headless browser",  "bi-window-dock",   "Drive a background (invisible) web browser: navigate, read, click, type, screenshot."),
+        new(LocalToolKind.WebSearch,       "Web search",        "bi-search",        "Search the web (Bing, Google, or DuckDuckGo) and return top results."),
+        new(LocalToolKind.Geolocation,     "Location",          "bi-geo-alt",       "Report this device's approximate location (uses the OS location service, falling back to IP)."),
+        new(LocalToolKind.FileSystem,      "Files",             "bi-folder",        "Read, write, and convert files on this machine."),
+        new(LocalToolKind.WorkIq,          "WorkIQ",            "bi-microsoft",     "Ask about your Microsoft 365 world: email, Teams, meetings, files, people."),
+    };
+
+    // On mobile, hide desktop-only tools (scripts, browsers) that cannot run in a phone sandbox.
+    IEnumerable<LocalToolRow> VisibleLocalToolRows =>
+        PlatformCaps.IsMobile ? LocalToolRows.Where(r => !r.Kind.IsDesktopOnly()) : LocalToolRows;
+
+    // ---- approval level definitions ----
+    sealed record ApprovalLevelDef(ToolApprovalLevel Level, string Label, string Tooltip);
+
+    static readonly ApprovalLevelDef[] ApprovalLevels =
+    {
+        new(ToolApprovalLevel.AlwaysAsk,      "Always ask",         "Ask for approval before every tool call."),
+        new(ToolApprovalLevel.ReadOnlyAuto,   "Auto-approve reads", "Approve read-only calls automatically; ask before writes."),
+        new(ToolApprovalLevel.AutoApproveAll, "Auto-approve all",   "Approve all calls automatically without prompting."),
+    };
+
+    // ---- status computation ----
+    static (string Text, string Tone, string Icon) LocalToolStatus(LocalToolSetting s)
+    {
+        if (!s.Enabled) return ("Disabled", "disabled", "bi-circle");
+        if (s.ApprovalLevel == ToolApprovalLevel.AlwaysAsk)
+            return ("Permission required", "warning", "bi-question-circle");
+        return ("Ready", "ready", "bi-check-circle");
+    }
+
+    static (string Text, string Tone, string Icon) BundledMcpStatus(LocalToolSetting s, bool available)
+    {
+        if (!available) return ("Not installed", "error", "bi-exclamation-triangle");
+        if (!s.Enabled) return ("Disabled", "disabled", "bi-circle");
+        if (s.ApprovalLevel == ToolApprovalLevel.AlwaysAsk)
+            return ("Permission required", "warning", "bi-question-circle");
+        return ("Ready", "ready", "bi-check-circle");
+    }
+
+    static (string Text, string Tone, string Icon) CustomMcpStatus(CustomMcpServer c)
+    {
+        if (!c.Enabled) return ("Disabled", "disabled", "bi-circle");
+        var missingConfig = c.Transport == McpTransport.Http
+            ? string.IsNullOrWhiteSpace(c.Url)
+            : string.IsNullOrWhiteSpace(c.Command);
+        if (missingConfig) return ("Permission required", "warning", "bi-question-circle");
+        if (c.ApprovalLevel == ToolApprovalLevel.AlwaysAsk)
+            return ("Permission required", "warning", "bi-question-circle");
+        return ("Ready", "ready", "bi-check-circle");
+    }
+
+    // ---- intro empty state ----
+    bool ShowIntro =>
+        !State.Profile.LocalTools.Values.Any(s => s?.Enabled == true) &&
+        !State.Profile.McpServers.Values.Any(s => s?.Enabled == true) &&
+        !State.Profile.CustomMcpServers.Any();
+
+    // ---- local tool persistence ----
+    LocalToolSetting GetLocalTool(LocalToolKind kind)
+    {
+        if (!State.Profile.LocalTools.TryGetValue(kind, out var s) || s is null)
+        {
+            s = new LocalToolSetting();
+            State.Profile.LocalTools[kind] = s;
+        }
+        return s;
+    }
+
+    void SetLocalToolEnabled(LocalToolKind kind, bool enabled)
+        => State.Mutate(p =>
+        {
+            if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
+            s.Enabled = enabled;
+        });
+
+    void SetLocalToolVisibility(LocalToolKind kind, string? visibility)
+        => State.Mutate(p =>
+        {
+            if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
+            s.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!;
+        });
+
+    void SetLocalToolApproval(LocalToolKind kind, ToolApprovalLevel level)
+        => State.Mutate(p =>
+        {
+            if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
+            s.ApprovalLevel = level;
+        });
+
+    // ---- bundled MCP server persistence ----
+    LocalToolSetting GetMcpServer(string id)
+    {
+        if (!State.Profile.McpServers.TryGetValue(id, out var s) || s is null)
+        {
+            s = new LocalToolSetting();
+            State.Profile.McpServers[id] = s;
+        }
+        return s;
+    }
+
+    void SetMcpEnabled(string id, bool enabled)
+        => State.Mutate(p =>
+        {
+            if (!p.McpServers.TryGetValue(id, out var s) || s is null) { s = new LocalToolSetting(); p.McpServers[id] = s; }
+            s.Enabled = enabled;
+        });
+
+    void SetMcpVisibility(string id, string? visibility)
+        => State.Mutate(p =>
+        {
+            if (!p.McpServers.TryGetValue(id, out var s) || s is null) { s = new LocalToolSetting(); p.McpServers[id] = s; }
+            s.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!;
+        });
+
+    void SetMcpApproval(string id, ToolApprovalLevel level)
+        => State.Mutate(p =>
+        {
+            if (!p.McpServers.TryGetValue(id, out var s) || s is null) { s = new LocalToolSetting(); p.McpServers[id] = s; }
+            s.ApprovalLevel = level;
+        });
+
+    // ---- custom MCP server state ----
+    bool addingMcp;
+    string newMcpName = "";
+    string newMcpCommand = "";
+    string newMcpArgs = "";
+    string newMcpUrl = "";
+    string newMcpTransport = "Stdio";
+    string? confirmRemoveId;
+
+    // On mobile, only remote (HTTP) custom servers can run; hide stdio ones that cannot.
+    IEnumerable<CustomMcpServer> VisibleCustomServers =>
+        PlatformCaps.IsMobile
+            ? State.Profile.CustomMcpServers.Where(c => c.Transport == McpTransport.Http)
+            : State.Profile.CustomMcpServers;
+
+    static string CustomLabel(CustomMcpServer c)
+        => !string.IsNullOrWhiteSpace(c.Name) ? c.Name
+           : c.Transport == McpTransport.Http ? c.Url : c.Command;
+
+    bool AddMcpDisabled => newMcpTransport == "Http"
+        ? string.IsNullOrWhiteSpace(newMcpUrl)
+        : string.IsNullOrWhiteSpace(newMcpCommand);
+
+    void StartAddMcp()
+    {
+        addingMcp = true;
+        newMcpTransport = PlatformCaps.IsMobile ? "Http" : "Stdio";
+    }
+
+    void OpenAddMcp()
+    {
+        addingMcp = true;
+        newMcpTransport = PlatformCaps.IsMobile ? "Http" : "Stdio";
+    }
+
+    void CancelAdd()
+    {
+        addingMcp = false;
+        newMcpName = ""; newMcpCommand = ""; newMcpArgs = ""; newMcpUrl = "";
+        newMcpTransport = PlatformCaps.IsMobile ? "Http" : "Stdio";
+    }
+
+    void OnNewMcpTransportChange(ChangeEventArgs e) => newMcpTransport = e.Value?.ToString() ?? "Stdio";
+
+    void AddCustom()
+    {
+        var isHttp = newMcpTransport == "Http" || PlatformCaps.IsMobile;
+        if (isHttp)
+        {
+            if (string.IsNullOrWhiteSpace(newMcpUrl)) return;
+            State.Mutate(p => p.CustomMcpServers.Add(new CustomMcpServer
+            {
+                Name = newMcpName.Trim(),
+                Transport = McpTransport.Http,
+                Url = newMcpUrl.Trim(),
+                Enabled = true,
+                ApprovalLevel = ToolApprovalLevel.ReadOnlyAuto
+            }));
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(newMcpCommand)) return;
+            var args = (newMcpArgs ?? "")
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(a => a.Trim())
+                .Where(a => a.Length > 0)
+                .ToList();
+            State.Mutate(p => p.CustomMcpServers.Add(new CustomMcpServer
+            {
+                Name = newMcpName.Trim(),
+                Transport = McpTransport.Stdio,
+                Command = newMcpCommand.Trim(),
+                Arguments = args,
+                Enabled = true,
+                ApprovalLevel = ToolApprovalLevel.ReadOnlyAuto
+            }));
+        }
+        CancelAdd();
+    }
+
+    void StartRemoveCustom(CustomMcpServer c) => confirmRemoveId = c.Id;
+    void CancelRemove() => confirmRemoveId = null;
+
+    void ConfirmRemoveCustom(CustomMcpServer c)
+    {
+        confirmRemoveId = null;
+        mcpTestState.Remove(c.Id);
+        State.Mutate(p => p.CustomMcpServers.RemoveAll(x => x.Id == c.Id));
+    }
+
+    void SetCustomEnabled(CustomMcpServer c, bool enabled)
+        => State.Mutate(_ => c.Enabled = enabled);
+
+    void SetCustomVisibility(CustomMcpServer c, string? visibility)
+        => State.Mutate(_ => c.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!);
+
+    void SetCustomApproval(CustomMcpServer c, ToolApprovalLevel level)
+        => State.Mutate(_ => c.ApprovalLevel = level);
+
+    // ---- test connection ----
+    sealed record McpTestResult(string Message, bool Success, bool Testing);
+    readonly Dictionary<string, McpTestResult> mcpTestState = new();
+
+    async Task TestCustomMcp(CustomMcpServer srv)
+    {
+        var id = srv.Id;
+        mcpTestState[id] = new McpTestResult("Testing...", false, true);
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            if (srv.Transport == McpTransport.Stdio)
+            {
+                if (PlatformCaps.IsMobile)
+                    throw new Exception("Local command servers cannot run on mobile.");
+                if (string.IsNullOrWhiteSpace(srv.Command))
+                    throw new Exception("No command configured.");
+                var def = McpServerRegistry.FromCustom(srv);
+                if (!McpHostSvc.IsAvailable(def))
+                    throw new Exception($"Command not found: {srv.Command}");
+                mcpTestState[id] = new McpTestResult("Command found. The server will start on first use.", true, false);
+            }
+            else
+            {
+                if (string.IsNullOrWhiteSpace(srv.Url))
+                    throw new Exception("No URL configured.");
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                var http = HttpFactory.CreateClient();
+                await http.GetAsync(srv.Url.TrimEnd('/'), HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                var def = McpServerRegistry.FromCustom(srv);
+                using var toolCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                var tools = await McpHostSvc.GetToolsAsync(def, toolCts.Token);
+                var msg = tools.Count > 0
+                    ? $"Connected: {tools.Count} tool{(tools.Count == 1 ? "" : "s")} found."
+                    : "Server reachable. No MCP tools discovered; verify this endpoint supports the MCP protocol.";
+                mcpTestState[id] = new McpTestResult(msg, tools.Count > 0, false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            mcpTestState[id] = new McpTestResult("Connection timed out.", false, false);
+        }
+        catch (Exception ex)
+        {
+            mcpTestState[id] = new McpTestResult($"Failed: {ex.Message}", false, false);
+        }
+        await InvokeAsync(StateHasChanged);
+    }
+
+    // ---- lifecycle ----
+    protected override void OnInitialized()
+    {
+        State.Changed += Refresh;
+    }
+
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+    }
+}

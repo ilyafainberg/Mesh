@@ -92,7 +92,8 @@
                                     <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(line.Reasoning!))</div>
                                 }
                             }
-                            <MessageContent Text="@line.Text" Attachments="@line.Attachments" OnPin="PinWidget" />
+                            <MessageContent Text="@line.Text" Attachments="@line.Attachments"
+                                            OnPin="html => PinWidget(html, line)" />
                             @if (IsQueued(line))
                             {
                                 <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
@@ -157,8 +158,9 @@
                         <i class="bi bi-pin-angle"></i>
                         <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" aria-label="Name this widget" />
                         <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
-                        <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
+                        <button class="ghost icon-btn" @onclick="() => { pinHtml = null; pinError = null; }" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
                     </div>
+                    @if (pinError is not null) { <p class="err-text" role="alert">@pinError</p> }
                 }
                 @if (widgetMode)
                 {
@@ -251,6 +253,8 @@
     ReportDialog? reportDialog;
     string? pinHtml;
     string pinName = "";
+    string? pinPrompt;
+    string? pinError;
     ElementReference scrollEl;
     ElementReference composerEl;
     ElementReference threadListEl;
@@ -578,7 +582,7 @@
             {
                 var html = await Agent.BuildWidgetAsync(text, ct);
                 State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
-                State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = html });
+                State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = html, WidgetPrompt = text });
             }
             else if (home)
             {
@@ -676,10 +680,12 @@
         return clean.Length > 40 ? clean[..40].TrimEnd() + "…" : clean;
     }
 
-    void PinWidget(string html)
+    void PinWidget(string html, ChatLine line)
     {
         pinHtml = html;
         pinName = "";
+        pinPrompt = line.WidgetPrompt;
+        pinError = null;
     }
 
     void OnPinKey(KeyboardEventArgs e)
@@ -690,9 +696,24 @@
     void ConfirmPin()
     {
         if (pinHtml is null || string.IsNullOrWhiteSpace(pinName)) return;
-        State.Mutate(p => p.Widgets.Add(new Widget { Name = pinName.Trim(), Html = pinHtml!, Visibility = "private" }));
+        var name = pinName.Trim();
+        if (State.Profile.Widgets.Any(w => string.Equals(w.Name, name, StringComparison.OrdinalIgnoreCase)))
+        {
+            pinError = $"A widget named \"{name}\" already exists. Choose a different name.";
+            return;
+        }
+        State.Mutate(p => p.Widgets.Add(new Widget
+        {
+            Name = name,
+            Html = pinHtml!,
+            Prompt = pinPrompt ?? "Pinned from conversation",
+            Visibility = "private",
+            ModifiedAt = DateTimeOffset.UtcNow,
+        }));
         pinHtml = null;
         pinName = "";
+        pinPrompt = null;
+        pinError = null;
     }
 
     public void Dispose()

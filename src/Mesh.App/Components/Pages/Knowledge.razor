@@ -10,10 +10,8 @@
 
 <div class="pane-scroll">
     <div class="pane-narrow">
-    <div class="pane-head" style="padding-left:0;padding-right:0;">
-        <h2><i class="bi bi-journal-text"></i> Knowledge</h2>
-        <span class="muted">private stays with you; shared/public is exposed to guest agents</span>
-    </div>
+    <SectionHeader Title="Knowledge"
+                   Description="Teach your agent what you know - private items stay with you, shared or public items are visible to the circles you choose." />
 
     <div class="tabs">
         <button class="tab @(tab == "sources" ? "on" : "")" @onclick='() => tab = "sources"'>Connect a source</button>
@@ -339,6 +337,13 @@
     }
 
     <div class="kn-list">
+        @if (State.Profile.Knowledge.Count == 0 && !hintDismissed)
+        {
+            <div class="kn-hint" role="note" aria-label="Getting started tip">
+                <span class="kn-hint-text">Start with a short public bio so guest agents know who you are.</span>
+                <button class="kn-hint-close" @onclick="() => hintDismissed = true" aria-label="Dismiss tip"><i class="bi bi-x-lg"></i></button>
+            </div>
+        }
         @foreach (var k in State.Profile.Knowledge)
         {
             <div class="kn-card">
@@ -381,7 +386,13 @@
         }
         @if (State.Profile.Knowledge.Count == 0)
         {
-            <div class="empty">No knowledge yet. Add a public bio so guest agents have something to say.</div>
+            <EmptyState Icon="bi-journal-text"
+                        Title="No knowledge yet"
+                        Description="Add a public bio so guest agents have something to say about you.">
+                <Action>
+                    <button class="primary" @onclick='() => tab = "manual"'><i class="bi bi-plus-lg"></i> Write something</button>
+                </Action>
+            </EmptyState>
         }
     </div>
     </div>
@@ -390,6 +401,7 @@
 @code {
     string tab = "sources";
     string title = "", content = "", visibility = "private";
+    bool hintDismissed;
 
     string importRef = "";
     bool importing;

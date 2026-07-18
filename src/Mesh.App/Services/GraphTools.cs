@@ -240,8 +240,11 @@ public sealed class GmailSearchTool(GoogleAuthService auth, IHttpClientFactory h
 }
 
 /// <summary>Builds the set of tools available from the user's connected sources.</summary>
-public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost, AgentMedia media)
+public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost, AgentMedia media, ToolApprovalService approvals)
 {
+    private IAgentTool GuardReadTool(IAgentTool tool)
+        => new ApprovalTool(tool, ToolApprovalLevel.ReadOnlyAuto, approvals);
+
     /// <summary>Whether a provider exposes an email/message search tool.</summary>
     private static bool HasEmail(SourceProvider p) => p is
         SourceProvider.MicrosoftGraph or SourceProvider.MicrosoftPersonal or SourceProvider.Google;
@@ -254,7 +257,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         var tools = new List<IAgentTool>();
         if (HasEmail(src.Provider)) tools.Add(EmailTool(src, label, suffix, null));
         if (src.Provider == SourceProvider.MicrosoftGraph)
-            tools.Add(new SearchTeamsTool(auth, httpFactory, src.AccountId, MsalAuthService.WorkScopes, label, suffix));
+            tools.Add(GuardReadTool(new SearchTeamsTool(auth, httpFactory, src.AccountId, MsalAuthService.WorkScopes, label, suffix)));
         tools.AddRange(FileTools(src, label, suffix));
         return tools;
     }
@@ -267,31 +270,31 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         if (src.Provider is SourceProvider.MicrosoftGraph or SourceProvider.MicrosoftPersonal)
         {
             var scopes = src.Provider == SourceProvider.MicrosoftGraph ? MsalAuthService.WorkScopes : MsalAuthService.PersonalScopes;
-            list.Add(new SearchOneDriveTool(auth, httpFactory, extractor, src.AccountId, scopes, label, suffix, driveFolders));
+            list.Add(GuardReadTool(new SearchOneDriveTool(auth, httpFactory, extractor, src.AccountId, scopes, label, suffix, driveFolders)));
             // SharePoint is broad; only offer it with full-source access (not folder-scoped grants).
             if (src.Provider == SourceProvider.MicrosoftGraph && driveFolders is null)
-                list.Add(new SearchSharePointTool(auth, httpFactory, extractor, src.AccountId, scopes, label, suffix));
-            list.Add(new GetGraphFileTool(auth, httpFactory, extractor, src.AccountId, scopes, label, suffix));
+                list.Add(GuardReadTool(new SearchSharePointTool(auth, httpFactory, extractor, src.AccountId, scopes, label, suffix)));
+            list.Add(GuardReadTool(new GetGraphFileTool(auth, httpFactory, extractor, src.AccountId, scopes, label, suffix)));
         }
         else if (src.Provider == SourceProvider.Google)
         {
             var acct = src.AccountId ?? src.ConnectedAs;
-            list.Add(new SearchDriveTool(google, httpFactory, acct, label, suffix, driveFolders));
-            list.Add(new GetDriveFileTool(google, httpFactory, extractor, acct, label, suffix));
+            list.Add(GuardReadTool(new SearchDriveTool(google, httpFactory, acct, label, suffix, driveFolders)));
+            list.Add(GuardReadTool(new GetDriveFileTool(google, httpFactory, extractor, acct, label, suffix)));
         }
         else if (src.Provider == SourceProvider.Dropbox)
         {
             var acct = src.AccountId ?? src.ConnectedAs;
-            list.Add(new DropboxSearchTool(connectors, httpFactory, acct, label, suffix));
-            list.Add(new GetDropboxFileTool(connectors, httpFactory, extractor, acct, label, suffix));
+            list.Add(GuardReadTool(new DropboxSearchTool(connectors, httpFactory, acct, label, suffix)));
+            list.Add(GuardReadTool(new GetDropboxFileTool(connectors, httpFactory, extractor, acct, label, suffix)));
         }
         else if (src.Provider == SourceProvider.Notion)
         {
-            list.Add(new NotionSearchTool(connectors, httpFactory, src.AccountId ?? src.ConnectedAs, label, suffix));
+            list.Add(GuardReadTool(new NotionSearchTool(connectors, httpFactory, src.AccountId ?? src.ConnectedAs, label, suffix)));
         }
         else if (src.Provider == SourceProvider.Slack)
         {
-            list.Add(new SlackSearchTool(connectors, httpFactory, src.AccountId ?? src.ConnectedAs, label, suffix));
+            list.Add(GuardReadTool(new SlackSearchTool(connectors, httpFactory, src.AccountId ?? src.ConnectedAs, label, suffix)));
         }
         return list;
     }
@@ -303,7 +306,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
     {
         var tools = new List<IAgentTool>();
         // The owner can attach local files in their private chat; let the agent open them by path.
-        tools.Add(new ReadLocalFileTool(localFiles, extractor));
+        tools.Add(GuardReadTool(new ReadLocalFileTool(localFiles, extractor)));
         if (localTools is not null)
             tools.AddRange(LocalTools(localTools, owner: true, circles: null));
         foreach (var src in sources)
@@ -339,7 +342,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
             {
                 if (HasEmail(src.Provider)) tools.Add(EmailTool(src, label, suffix, null));
                 if (src.Provider == SourceProvider.MicrosoftGraph)
-                    tools.Add(new SearchTeamsTool(auth, httpFactory, src.AccountId, MsalAuthService.WorkScopes, label, suffix));
+                    tools.Add(GuardReadTool(new SearchTeamsTool(auth, httpFactory, src.AccountId, MsalAuthService.WorkScopes, label, suffix)));
                 tools.AddRange(FileTools(src, label, suffix));
                 continue;
             }
@@ -364,10 +367,10 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
 
     private IAgentTool EmailTool(ConnectedSource src, string label, string suffix, IReadOnlyList<FolderRef>? folders)
         => src.Provider == SourceProvider.Google
-            ? new GmailSearchTool(google, httpFactory, src.AccountId ?? src.ConnectedAs, label, suffix, folders)
-            : new SearchEmailTool(auth, httpFactory, src.AccountId,
+            ? GuardReadTool(new GmailSearchTool(google, httpFactory, src.AccountId ?? src.ConnectedAs, label, suffix, folders))
+            : GuardReadTool(new SearchEmailTool(auth, httpFactory, src.AccountId,
                 src.Provider == SourceProvider.MicrosoftGraph ? MsalAuthService.WorkScopes : MsalAuthService.PersonalScopes,
-                label, suffix, folders);
+                label, suffix, folders));
 
     /// <summary>
     /// Builds the enabled local-machine tools (scripts, browser, desktop, files). For the OWNER,
@@ -395,7 +398,8 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
                 if (circles is null || !Vis(setting.Visibility, circles)) continue;
             }
             var tool = MakeLocalTool(kind);
-            if (tool is not null) tools.Add(tool);
+            if (tool is not null)
+                tools.Add(new ApprovalTool(tool, setting.ApprovalLevel, approvals));
         }
         return tools;
     }
@@ -440,7 +444,8 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
                 if (!owner && (circles is null || !Vis(setting.Visibility, circles))) continue;
                 var def = McpServerRegistry.Find(id);
                 if (def is null || !mcpHost.IsAvailable(def)) continue;
-                tools.AddRange(await mcpHost.GetToolsAsync(def, ct));
+                tools.AddRange((await mcpHost.GetToolsAsync(def, ct))
+                    .Select(tool => new ApprovalTool(tool, setting.ApprovalLevel, approvals)));
             }
 
         // User-added custom servers.
@@ -451,7 +456,8 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
                 if (!owner && (circles is null || !Vis(c.Visibility, circles))) continue;
                 var def = McpServerRegistry.FromCustom(c);
                 if (!mcpHost.IsAvailable(def)) continue;
-                tools.AddRange(await mcpHost.GetToolsAsync(def, ct));
+                tools.AddRange((await mcpHost.GetToolsAsync(def, ct))
+                    .Select(tool => new ApprovalTool(tool, c.ApprovalLevel, approvals)));
             }
 
         return tools;

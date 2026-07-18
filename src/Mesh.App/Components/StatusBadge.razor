@@ -1,0 +1,17 @@
+<span class="status-badge @ToneClass">
+    @if (!string.IsNullOrWhiteSpace(Icon))
+    {
+        <i class="bi @Icon" aria-hidden="true"></i>
+    }
+    @Text
+</span>
+
+@code {
+    [Parameter, EditorRequired] public string Text { get; set; } = "";
+    [Parameter] public string Tone { get; set; } = "neutral";
+    [Parameter] public string? Icon { get; set; }
+
+    string ToneClass => Tone is "ready" or "warning" or "error" or "disabled"
+        ? Tone
+        : "neutral";
+}

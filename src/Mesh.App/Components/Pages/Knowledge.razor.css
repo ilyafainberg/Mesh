@@ -1,0 +1,41 @@
+/* First-visit dismissible hint banner */
+.kn-hint {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg-2, #f7f8fc);
+    border: 1px solid var(--stroke-1, #e6e9f0);
+    border-radius: var(--radius-m, 8px);
+    margin-bottom: 8px;
+    font-size: 0.875rem;
+    color: var(--fg-2, #555);
+    line-height: 1.45;
+}
+
+.kn-hint-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.kn-hint-close {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--fg-3, #aaa);
+    padding: 2px 4px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    font-size: 0.75rem;
+    line-height: 1;
+    transition: color 0.15s;
+}
+
+.kn-hint-close:hover {
+    color: var(--fg-1, #333);
+}
+
+.kn-hint-close:focus-visible {
+    outline: 2px solid var(--brand, #5c6ef8);
+    outline-offset: 2px;
+}

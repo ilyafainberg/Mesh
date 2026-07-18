@@ -1,0 +1,115 @@
+@inject AppState State
+@inject NavigationManager Nav
+
+@if (!dismissed)
+{
+    <div class="dt-backdrop"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="dt-title"
+         aria-describedby="dt-desc">
+        <div class="dt-card" @ref="card" @onkeydown="OnKeyDown" tabindex="-1">
+
+            <div class="dt-top-bar">
+                <span class="dt-progress" aria-label="Step @(step + 1) of 3">@(step + 1) of 3</span>
+                <div class="dt-dots" role="list" aria-label="Tour progress">
+                    @for (int i = 0; i < 3; i++)
+                    {
+                        var idx = i;
+                        <button class="dt-dot @(step == idx ? "active" : "")"
+                                role="listitem"
+                                aria-label="@DotLabel(idx)"
+                                @onclick="() => GoToStep(idx)"></button>
+                    }
+                </div>
+                <button class="dt-skip" @onclick="Skip" aria-label="Skip tour">Skip for now</button>
+            </div>
+
+            <div class="dt-step" aria-live="polite" aria-atomic="true">
+                @if (step == 0)
+                {
+                    <span class="dt-icon" aria-hidden="true"><i class="bi bi-grid-1x2-fill"></i></span>
+                    <h2 id="dt-title">Create a widget</h2>
+                    <p id="dt-desc">Widgets are mini-apps your agent builds and runs inside Mesh - Flappy Bird, a Paint canvas, a Weather card, or a Pomodoro timer, all generated from a description.</p>
+                    <div class="dt-actions">
+                        <button class="dt-primary" @onclick="GoWidgets">Open Widgets</button>
+                    </div>
+                }
+                else if (step == 1)
+                {
+                    <span class="dt-icon" aria-hidden="true"><i class="bi bi-plug-fill"></i></span>
+                    <h2 id="dt-title">Connect a tool</h2>
+                    <p id="dt-desc">Give your agent live access to your email, calendar, or files - it searches on demand and only shares what you allow with each contact.</p>
+                    <div class="dt-actions">
+                        <button class="dt-ghost" @onclick="Back">Back</button>
+                        <button class="dt-primary" @onclick="GoTools">Open Tools</button>
+                    </div>
+                }
+                else
+                {
+                    <span class="dt-icon" aria-hidden="true"><i class="bi bi-shield-lock-fill"></i></span>
+                    <h2 id="dt-title">Send an encrypted message</h2>
+                    <p id="dt-desc">Every Mesh message is end-to-end encrypted - add a contact and your agent handles secure conversations on your behalf.</p>
+                    <div class="dt-actions">
+                        <button class="dt-ghost" @onclick="Back">Back</button>
+                        <button class="dt-primary" @onclick="GoContacts">Open Contacts</button>
+                    </div>
+                }
+            </div>
+
+        </div>
+    </div>
+}
+
+@code {
+    int step;
+    bool dismissed;
+    bool focusPending = true;
+    ElementReference card;
+
+    string DotLabel(int idx) => idx == step ? $"Step {idx + 1}, current" : $"Step {idx + 1}";
+
+    void GoToStep(int idx) { step = idx; focusPending = true; }
+
+    void Back() { if (step > 0) { step--; focusPending = true; } }
+
+    void GoWidgets()
+    {
+        step = 1;
+        focusPending = true;
+        Nav.NavigateTo("/widgets");
+    }
+
+    void GoTools()
+    {
+        step = 2;
+        focusPending = true;
+        Nav.NavigateTo("/tools");
+    }
+
+    void GoContacts()
+    {
+        Complete();
+        Nav.NavigateTo("/contacts");
+    }
+
+    void Skip() => Complete();
+
+    void Complete()
+    {
+        dismissed = true;
+        State.Mutate(p => p.DiscoveryTourCompleted = true);
+    }
+
+    void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Skip();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (dismissed || !focusPending) return;
+        focusPending = false;
+        await card.FocusAsync();
+    }
+}

@@ -1,0 +1,117 @@
+/* Approval-level segmented control */
+.approval-seg {
+    display: inline-flex;
+    border: 1px solid var(--stroke-2);
+    border-radius: var(--radius-m);
+    overflow: hidden;
+    background: var(--bg-2);
+    flex-shrink: 0;
+}
+
+.ap-seg-btn {
+    border: none;
+    border-right: 1px solid var(--stroke-2);
+    border-radius: 0;
+    background: transparent;
+    color: var(--fg-2);
+    font-size: .78rem;
+    font-weight: 500;
+    padding: 4px 10px;
+    cursor: pointer;
+    transition: background .1s;
+    white-space: nowrap;
+    line-height: 1.4;
+}
+
+.ap-seg-btn:last-child {
+    border-right: none;
+}
+
+.ap-seg-btn:hover {
+    background: var(--bg-hover);
+}
+
+.ap-seg-btn:active {
+    background: var(--bg-pressed);
+}
+
+.ap-seg-btn.active {
+    background: var(--brand);
+    color: var(--fg-on-brand);
+    font-weight: 600;
+}
+
+.ap-seg-btn:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: -2px;
+    position: relative;
+    z-index: 1;
+}
+
+/* Extras row (visibility + approval selector, indented under enabled tool) */
+.lt-extras {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0 2px 46px;
+}
+
+/* Approval row layout (label + segmented control side by side) */
+.lt-approval {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+/* Action row for custom MCP servers: test button, remove button, confirm */
+.lt-mcp-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 2px 46px;
+    flex-wrap: wrap;
+}
+
+/* Inline test result badge */
+.lt-test-result {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: .82rem;
+    padding: 3px 9px;
+    border-radius: var(--radius-s);
+    background: var(--bg-3);
+    color: var(--fg-2);
+}
+
+.lt-test-result.ok {
+    background: #e6f6ed;
+    color: #116329;
+}
+
+.lt-test-result.err {
+    background: #fde7e9;
+    color: #a4262c;
+}
+
+.lt-test-result.testing {
+    background: var(--bg-3);
+    color: var(--fg-3);
+}
+
+/* Small inline spinner used while testing a connection */
+.spinner-sm {
+    display: inline-block;
+    width: 13px;
+    height: 13px;
+    border: 2px solid var(--stroke-2);
+    border-top-color: var(--brand);
+    border-radius: 50%;
+    animation: tools-spin .8s linear infinite;
+    flex-shrink: 0;
+}
+
+@keyframes tools-spin {
+    to { transform: rotate(360deg); }
+}

@@ -74,12 +74,21 @@ public enum LocalToolKind
     Geolocation
 }
 
+/// <summary>How much permission an enabled tool has to execute without asking first.</summary>
+public enum ToolApprovalLevel
+{
+    AlwaysAsk = 1,
+    ReadOnlyAuto = 2,
+    AutoApproveAll = 3
+}
+
 /// <summary>Per-tool grant: whether the local tool is enabled and who (beyond the owner) may use it.</summary>
 public sealed class LocalToolSetting
 {
     public bool Enabled { get; set; }
     /// <summary>"private" (owner only) | "public" | "shared:&lt;circle&gt;".</summary>
     public string Visibility { get; set; } = "private";
+    public ToolApprovalLevel ApprovalLevel { get; set; } = ToolApprovalLevel.ReadOnlyAuto;
 }
 
 /// <summary>How Mesh connects to a custom MCP server.</summary>
@@ -112,6 +121,7 @@ public sealed class CustomMcpServer
     public bool Enabled { get; set; }
     /// <summary>"private" | "public" | "shared:&lt;circle&gt;".</summary>
     public string Visibility { get; set; } = "private";
+    public ToolApprovalLevel ApprovalLevel { get; set; } = ToolApprovalLevel.ReadOnlyAuto;
 }
 
 public sealed class ModelConfig
@@ -209,6 +219,9 @@ public sealed class Widget
     /// <summary>"private" | "public" | "shared:&lt;circle&gt;", who your agent may send it to.</summary>
     public string Visibility { get; set; } = "private";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset ModifiedAt { get; set; } = DateTimeOffset.UtcNow;
+    public string? PreviousHtml { get; set; }
+    public string? PreviousPrompt { get; set; }
 }
 
 public sealed class Circle
@@ -399,6 +412,8 @@ public sealed class ChatLine
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Role { get; set; } = "user"; // user | assistant | system
     public string Text { get; set; } = "";
+    /// <summary>Original instructions for a generated widget in this line, used when saving it.</summary>
+    public string? WidgetPrompt { get; set; }
     /// <summary>The actual group-message author. Direct messages may leave this null.</summary>
     public string? SenderHandle { get; set; }
     /// <summary>Transient multimodal inputs for this turn. Never persisted or sent to peers.</summary>
@@ -541,6 +556,7 @@ public sealed class MeshProfile
 {
     public string Handle { get; set; } = "";
     public string DisplayName { get; set; } = "";
+    public bool DiscoveryTourCompleted { get; set; }
     public string PrivateKey { get; set; } = ""; // base64 PKCS#8 (device signing key, never exported)
     public string PublicKey { get; set; } = "";  // base64 SubjectPublicKeyInfo (device signing key)
 

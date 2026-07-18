@@ -4,4 +4,7 @@
     <Project Path="src/Mesh.Relay/Mesh.Relay.csproj" />
     <Project Path="src/Mesh.Shared/Mesh.Shared.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Mesh.App.Tests/Mesh.App.Tests.csproj" />
+  </Folder>
 </Solution>

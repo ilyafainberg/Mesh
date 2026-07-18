@@ -1,0 +1,54 @@
+@inject ToolApprovalService Approvals
+@implements IDisposable
+
+@if (Current is not null)
+{
+    <div class="approval-backdrop" role="presentation">
+        <section class="approval-dialog" role="alertdialog" aria-modal="true"
+                 aria-labelledby="tool-approval-title" aria-describedby="tool-approval-description">
+            <div class="approval-icon" aria-hidden="true">
+                <i class="bi @(Current.Operation == ToolOperationKind.Read ? "bi-eye" : "bi-pencil-square")"></i>
+            </div>
+            <div>
+                <StatusBadge Text="@(Current.Operation == ToolOperationKind.Read ? "Read data" : "Change data")"
+                             Tone="@(Current.Operation == ToolOperationKind.Read ? "ready" : "warning")" />
+                <h2 id="tool-approval-title">Allow @Current.ToolName?</h2>
+                <p id="tool-approval-description">@Current.Description</p>
+            </div>
+            <details>
+                <summary>Show request details</summary>
+                <pre>@Current.Arguments</pre>
+            </details>
+            @if (Approvals.Pending.Count > 1)
+            {
+                <div class="approval-queue">@((Approvals.Pending.Count - 1).ToString()) more request(s) waiting</div>
+            }
+            <div class="approval-actions">
+                <button class="btn secondary" @onclick="Deny">Not now</button>
+                <button class="btn primary" @onclick="Approve" autofocus>Allow once</button>
+            </div>
+        </section>
+    </div>
+}
+
+@code {
+    ToolApprovalRequest? Current => Approvals.Pending.FirstOrDefault();
+
+    protected override void OnInitialized() => Approvals.Changed += Refresh;
+
+    void Approve()
+    {
+        if (Current is not null)
+            Approvals.Approve(Current.Id);
+    }
+
+    void Deny()
+    {
+        if (Current is not null)
+            Approvals.Deny(Current.Id);
+    }
+
+    void Refresh() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Approvals.Changed -= Refresh;
+}

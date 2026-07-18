@@ -5,10 +5,8 @@
 
 <div class="pane-scroll">
     <div class="pane-narrow">
-    <div class="pane-head" style="padding-left:0;padding-right:0;">
-        <h2><i class="bi bi-lightning-charge"></i> Skills</h2>
-        <span class="muted">capabilities your agent can offer, exposed to circles just like knowledge</span>
-    </div>
+    <SectionHeader Title="Skills"
+                   Description="Expose capabilities your agent can perform - share them with circles so guest agents can request them." />
 
     <div class="card-panel">
         <div class="field">
@@ -192,6 +190,13 @@
     </div>
 
     <div class="kn-list">
+        @if (State.Profile.Skills.Count == 0 && !skillHintDismissed)
+        {
+            <div class="kn-hint" role="note" aria-label="Getting started tip">
+                <span class="kn-hint-text">Try "Book a 30-min intro call" - name a skill, describe it, write how your agent should handle it, then share it with a circle.</span>
+                <button class="kn-hint-close" @onclick="() => skillHintDismissed = true" aria-label="Dismiss tip"><i class="bi bi-x-lg"></i></button>
+            </div>
+        }
         @foreach (var s in State.Profile.Skills)
         {
             <div class="kn-card">
@@ -247,7 +252,9 @@
         }
         @if (State.Profile.Skills.Count == 0)
         {
-            <div class="empty">No skills yet. Add one and share it with a circle so guest agents can request it.</div>
+            <EmptyState Icon="bi-lightning-charge"
+                        Title="No skills yet"
+                        Description="Add a skill and share it with a circle so guest agents can request it." />
         }
     </div>
     </div>
@@ -257,6 +264,7 @@
     string name = "", description = "", instructions = "", visibility = "private";
     string? editingId;
     string editName = "", editDescription = "", editInstructions = "", editVisibility = "private";
+    bool skillHintDismissed;
 
     protected override void OnInitialized() => State.Changed += Refresh;
     void Refresh() => InvokeAsync(StateHasChanged);

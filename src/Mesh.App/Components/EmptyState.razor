@@ -1,0 +1,16 @@
+<div class="empty-state">
+    <i class="bi @Icon" aria-hidden="true"></i>
+    <h2>@Title</h2>
+    <p>@Description</p>
+    @if (Action is not null)
+    {
+        <div class="empty-action">@Action</div>
+    }
+</div>
+
+@code {
+    [Parameter] public string Icon { get; set; } = "bi-stars";
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter, EditorRequired] public string Description { get; set; } = "";
+    [Parameter] public RenderFragment? Action { get; set; }
+}

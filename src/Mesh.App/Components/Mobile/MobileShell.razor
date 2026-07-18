@@ -1,5 +1,5 @@
 @* Mobile chrome: hosts the routed page body plus a floating bottom tab bar and an overflow sheet.
-   Rendered by MainLayout only when PlatformCaps.IsMobile. Desktop never uses this. *@
+   Rendered by MainLayout when EffectiveMode == Phone. ModeClass is set by the caller. *@
 @inject NavigationManager Nav
 @inject AppState State
 @inject MeshClient Mesh
@@ -8,7 +8,7 @@
 @inject UpdateService Updater
 @implements IDisposable
 
-<div class="m-shell">
+<div class="m-shell @ModeClass">
     <div class="m-body">
         @if (Setup.HasBanner)
         {
@@ -96,6 +96,7 @@
                 <button class="m-sheet-link" @onclick='() => Go("/knowledge")'><i class="bi bi-journal-text"></i><span>Knowledge</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/skills")'><i class="bi bi-lightning-charge"></i><span>Skills</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/widgets")'><i class="bi bi-window-stack"></i><span>Widgets</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/tools")'><i class="bi bi-tools"></i><span>Tools</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/community")'><i class="bi bi-globe"></i><span>Community</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/settings")'><i class="bi bi-gear"></i><span>Settings</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/backup")'><i class="bi bi-shield-lock"></i><span>Backup</span></button>
@@ -108,6 +109,7 @@
 
 @code {
     [Parameter] public RenderFragment? ChildContent { get; set; }
+    [Parameter] public string ModeClass { get; set; } = "ui-mode-phone";
 
     enum Tab { None, Me, Messages, Contacts, Search }
 

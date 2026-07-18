@@ -33,14 +33,14 @@ public partial class App : MauiWinUIApplication
 		catch { /* a mutex is best-effort; the updater also uses Restart Manager file detection */ }
 		this.InitializeComponent();
 	}
-
 	protected override MauiApp CreateMauiApp() => MauiProgram.CreateMauiApp();
 
 	/// <summary>
 	/// Enforces a single running instance and routes mesh:// protocol activations. A second launch
-	/// forwards its activation (carrying any mesh:// URI) to the already-running instance and exits,
-	/// so only one window ever exists. All of this is best-effort: if the single-instance APIs fail
-	/// for any reason we fall through to a normal launch rather than blocking startup.
+	/// forwards its activation (carrying any mesh:// URI or --ui-mode flag) to the already-running
+	/// instance and exits, so only one window ever exists. All of this is best-effort: if the
+	/// single-instance APIs fail for any reason we fall through to a normal launch rather than
+	/// blocking startup.
 	/// </summary>
 	protected override async void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
 	{
@@ -59,9 +59,11 @@ public partial class App : MauiWinUIApplication
 			// We are the primary instance: react to future redirected activations from new launches.
 			primary.Activated += OnAppInstanceActivated;
 
-			// Handle a cold-start activation: the app was launched by clicking a mesh:// link. For an
-			// unpackaged app the URI arrives as a command-line argument, so scan those.
-			DispatchFromCommandLine(Environment.GetCommandLineArgs());
+			// Handle a cold-start activation: the app was launched by clicking a mesh:// link or
+			// with --ui-mode. For an unpackaged app the URI and flags arrive as command-line args.
+			// At this point MauiProgram has not yet run so UiModeActivationBridge is not registered;
+			// the bridge call is a safe no-op. The cold-start --ui-mode is handled by MauiProgram.
+			DispatchFromArgs(Environment.GetCommandLineArgs());
 		}
 		catch
 		{
@@ -74,8 +76,9 @@ public partial class App : MauiWinUIApplication
 	private void OnAppInstanceActivated(object? sender, AppActivationArguments args)
 		=> DispatchActivation(args);
 
-	// Extracts a mesh:// link from a redirected activation (a second launch handed to us). Handles
-	// both a rich Protocol activation and a plain Launch whose command line carries the URI.
+	// Extracts a mesh:// link or --ui-mode flag from a redirected activation (a second launch
+	// handed to us). Handles both a rich Protocol activation and a plain Launch whose command
+	// line carries the URI or flags.
 	private static void DispatchActivation(AppActivationArguments args)
 	{
 		try
@@ -89,15 +92,21 @@ public partial class App : MauiWinUIApplication
 			if (args.Kind == ExtendedActivationKind.Launch
 				&& args.Data is ILaunchActivatedEventArgs l && !string.IsNullOrWhiteSpace(l.Arguments))
 			{
-				DispatchFromCommandLine(l.Arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+				// Use quoted-aware splitting so "--ui-mode phone" and mesh:// tokens both survive.
+				DispatchFromArgs(UiModeParser.SplitWindowsArgs(l.Arguments));
 			}
 		}
 		catch { /* best-effort */ }
 	}
 
-	// Dispatches the first mesh:// token found among the given argument tokens.
-	private static void DispatchFromCommandLine(IEnumerable<string> argv)
+	// Dispatches a mesh:// deep link and forwards any --ui-mode flag to the running service.
+	// Safe to call before MauiProgram finishes (bridge calls are no-ops when not registered).
+	private static void DispatchFromArgs(IReadOnlyList<string> argv)
 	{
+		// Forward --ui-mode to the running UiModeService (no-op on cold start when bridge is unset).
+		UiModeActivationBridge.ApplyCommandLine(argv);
+
+		// Dispatch the first mesh:// token found among the argument tokens.
 		foreach (var a in argv)
 		{
 			var t = a.Trim().Trim('"');

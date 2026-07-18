@@ -181,7 +181,7 @@ else
                 {
                     <div class="bubble @(line.Role == "user" ? "assistant" : "user")">
                         <MessageContent Text="@line.Text" From="@InboundAuthor(conv, line)"
-                                        OnPin="PinWidget" />
+                                        OnPin="html => PinWidget(html, line)" />
                         <div class="msg-tag">
                             <i class="bi @(conv.IsGroup || line.Via == "person" ? "bi-person" : "bi-robot")"></i> @TagLabel(conv, line)
                             @if (queuedIds.Contains(line.Id))
@@ -216,8 +216,9 @@ else
                         <i class="bi bi-pin-angle"></i>
                         <input @bind="pinName" placeholder="Name this widget…" @onkeydown="OnPinKey" aria-label="Name this widget" />
                         <button class="primary" @onclick="ConfirmPin" disabled="@string.IsNullOrWhiteSpace(pinName)">Pin</button>
-                        <button class="ghost icon-btn" @onclick="() => pinHtml = null" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
+                        <button class="ghost icon-btn" @onclick="() => { pinHtml = null; pinError = null; }" title="Cancel" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
                     </div>
+                    @if (pinError is not null) { <p class="err-text" role="alert">@pinError</p> }
                 }
                 @if (widgetMode && !conv.IsGroup)
                 {
@@ -299,6 +300,8 @@ else
     bool directMode;
     string? pinHtml;
     string pinName = "";
+    string? pinPrompt;
+    string? pinError;
     ElementReference scrollEl;
     ElementReference composerEl;
     Microsoft.JSInterop.DotNetObjectReference<MobileMessages>? selfRef;
@@ -659,7 +662,10 @@ else
 
         var toSend = text;
         if (widget && !string.IsNullOrWhiteSpace(text))
+        {
+            line.WidgetPrompt = text;
             toSend = await Agent.BuildWidgetAsync(text);
+        }
 
         if (files.Count > 0)
         {
@@ -754,13 +760,26 @@ else
 
     int MaxOtherGroupMembers => FanoutProtocol.MaxRecipients - 1;
 
-    void PinWidget(string html) { pinHtml = html; pinName = ""; }
+    void PinWidget(string html, ChatLine line) { pinHtml = html; pinName = ""; pinPrompt = line.WidgetPrompt; pinError = null; }
     void OnPinKey(KeyboardEventArgs e) { if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(pinName)) ConfirmPin(); }
     void ConfirmPin()
     {
         if (pinHtml is null || string.IsNullOrWhiteSpace(pinName)) return;
-        State.Mutate(p => p.Widgets.Add(new Widget { Name = pinName.Trim(), Html = pinHtml!, Visibility = "private" }));
-        pinHtml = null; pinName = "";
+        var name = pinName.Trim();
+        if (State.Profile.Widgets.Any(w => string.Equals(w.Name, name, StringComparison.OrdinalIgnoreCase)))
+        {
+            pinError = $"A widget named \"{name}\" already exists. Choose a different name.";
+            return;
+        }
+        State.Mutate(p => p.Widgets.Add(new Widget
+        {
+            Name = name,
+            Html = pinHtml!,
+            Prompt = pinPrompt ?? "Pinned from conversation",
+            Visibility = "private",
+            ModifiedAt = DateTimeOffset.UtcNow,
+        }));
+        pinHtml = null; pinName = ""; pinPrompt = null; pinError = null;
     }
 
     // ---- approvals (human-in-the-loop) ----

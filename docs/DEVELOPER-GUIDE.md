@@ -726,3 +726,85 @@ The connector broker's catalog and secrets are configured via env vars per conne
 ---
 
 *End of guide.*
+
+
+---
+
+## 10. Mesh.App UI Mode (Developer Reference)
+
+This section documents the --ui-mode command-line flag available in the Windows Mesh.App desktop client.
+
+### 10.1 Command-line flag
+
+Pass --ui-mode when launching Mesh.exe to force a specific UI layout for the session:
+
+    Mesh.exe --ui-mode auto
+    Mesh.exe --ui-mode desktop
+    Mesh.exe --ui-mode tablet
+    Mesh.exe --ui-mode phone
+
+The flag is case-insensitive. The override is session-only: it is never written to user settings or profiles, and is discarded when the app exits.
+
+Omitting the flag preserves the existing adaptive behavior: the layout is resolved automatically from the window width.
+
+### 10.2 Modes
+
+| Mode | Behavior |
+|------|----------|
+| auto (default) | Adaptive: resolved from current window width on every resize. |
+| desktop | Locked to the desktop layout regardless of window width. |
+| tablet | Locked to the tablet layout regardless of window width. |
+| phone | Locked to the phone/mobile layout regardless of window width. |
+
+Width breakpoints used by auto resolution:
+
+| Width | Resolved mode |
+|-------|---------------|
+| <= 600 px | Phone |
+| 601 - 840 px | Tablet |
+| > 840 px | Desktop |
+
+Before the window reports a valid size, the platform default is used: Android/iOS resolve to Phone; all other platforms resolve to Desktop.
+
+### 10.3 Invalid values
+
+An unknown or missing value logs a warning and falls back to auto. The app never crashes on a bad flag value.
+
+### 10.4 Single-instance forwarding
+
+Mesh enforces a single running window. If a second launch is attempted while Mesh is already running, the new process forwards its activation to the primary instance and exits. The --ui-mode flag is forwarded along with the activation, so running:
+
+    Mesh.exe --ui-mode phone
+
+...while Mesh is already open will update the live layout of the running window. Deep-link (mesh://) activations continue to work alongside --ui-mode in the same command line.
+
+### 10.5 Architecture notes
+
+The implementation lives in src/Mesh.App/Services/UiModeService.cs and is a self-contained file with no MAUI UI references, making it linkable from a plain .NET test project.
+
+Key types:
+
+| Type | Description |
+|------|-------------|
+| UiMode | Auto, Desktop, Tablet, Phone |
+| UiModeSource | Default (no flag), CommandLine (flag present) |
+| IUiModeService | Service interface: RequestedMode, EffectiveMode, IsForced, Source, Changed event, UpdateWindowSize, ApplyRequestedMode, ApplyCommandLine |
+| UiModeParser | Pure static helpers: ParseArgs, ResolveFromWidth, SplitWindowsArgs |
+| UiModeActivationBridge | Static bridge for Windows single-instance forwarding without service-locator calls |
+
+Registration order in MauiProgram.CreateMauiApp:
+
+1. UiModeParser.ParseArgs(Environment.GetCommandLineArgs()) - parse before any service is built.
+2. AddSingleton<UiModeParseResult> - inject the immutable result into UiModeService.
+3. AddSingleton<IUiModeService, UiModeService> - register the service.
+4. After builder.Build(): UiModeActivationBridge.Register(...) - bind the static bridge.
+
+App.CreateWindow wires Window.SizeChanged and performs an initial UpdateWindowSize call immediately after WindowGeometry.Apply sets the window dimensions.
+
+### 10.6 Tests
+
+Parser and resolution tests live in tests/Mesh.App.Tests/. The project links UiModeService.cs directly (no MAUI build dependency) and targets net10.0.
+
+Run tests:
+
+    dotnet test tests/Mesh.App.Tests/Mesh.App.Tests.csproj
