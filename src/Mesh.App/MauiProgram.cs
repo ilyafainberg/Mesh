@@ -74,6 +74,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<AppState>();
 		builder.Services.AddSingleton<TokenMeter>();
 		builder.Services.AddSingleton<BrowserModelService>();
+		builder.Services.AddSingleton<CopilotMcpBridge>();
 		builder.Services.AddSingleton<CopilotAcpHost>();
 		builder.Services.AddSingleton<ModelFactory>();
 		builder.Services.AddSingleton<FoundryLocalService>();

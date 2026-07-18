@@ -823,7 +823,9 @@ Mesh starts `copilot --acp --stdio` as a managed child process. Model options co
 ACP `session/new` response, so the list reflects the current account and CLI version. The provider is
 desktop-only and stores no GitHub token. Mesh remains the canonical conversation store and creates a
 fresh ACP session for each completion. Copilot native tools and client filesystem/terminal capabilities
-are disabled in this version, avoiding a second permission system alongside Mesh Tools.
+are disabled. Enabled Mesh tools are exposed for that turn through a secret loopback MCP endpoint.
+Their calls still execute the original approval-wrapped `IAgentTool`, so the tool's Mesh approval level
+remains the single source of truth.
 
 Changing the selected model or effort restarts the ACP child process on the next request. `Auto` omits
 the corresponding CLI option and leaves the choice to Copilot.

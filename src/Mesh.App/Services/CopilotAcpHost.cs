@@ -9,13 +9,41 @@ using Mesh.App.Domain;
 namespace Mesh.App.Services;
 
 /// <summary>Managed ACP v1 client for the desktop GitHub Copilot CLI provider.</summary>
-public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDisposable
+public sealed class CopilotAcpHost(
+    ILogger<CopilotAcpHost> logger,
+    CopilotMcpBridge mcpBridge) : IAsyncDisposable
 {
     private sealed class TurnState
     {
         public StringBuilder Answer { get; } = new();
         public StringBuilder Thought { get; } = new();
         public IProgress<AgentStep>? Progress { get; init; }
+        public HashSet<string> AllowedToolNames { get; init; } = new(StringComparer.Ordinal);
+        public HashSet<string> MeshToolCallIds { get; } = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
+        private readonly List<string> messageOrder = new();
+
+        public void AppendAnswer(string? messageId, string? text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            if (text.StartsWith("Info: Disabled tools:", StringComparison.Ordinal)
+                || text.StartsWith("Info: Unknown tool name in the tool allowlist:", StringComparison.Ordinal))
+                return;
+            Answer.Append(text);
+            if (string.IsNullOrWhiteSpace(messageId)) return;
+            if (!messages.TryGetValue(messageId, out var message))
+            {
+                message = new StringBuilder();
+                messages[messageId] = message;
+                messageOrder.Add(messageId);
+            }
+            message.Append(text);
+        }
+
+        public string FinalAnswer()
+            => messageOrder.Count > 0
+                ? messages[messageOrder[^1]].ToString().Trim()
+                : Answer.ToString().Trim();
     }
 
     private readonly SemaphoreSlim turnGate = new(1, 1);
@@ -78,6 +106,7 @@ public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDispo
                 "You are a connection test.",
                 new[] { ("user", "Reply with exactly OK") },
                 Array.Empty<(string MimeType, byte[] Data)>(),
+                Array.Empty<IAgentTool>(),
                 ct: ct);
             return string.IsNullOrWhiteSpace(result)
                 ? (false, "GitHub Copilot CLI returned an empty response.")
@@ -94,18 +123,29 @@ public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDispo
         string systemPrompt,
         IReadOnlyList<(string Role, string Text)> history,
         IReadOnlyList<(string MimeType, byte[] Data)> images,
+        IReadOnlyList<IAgentTool> tools,
         IProgress<AgentStep>? progress = null,
         CancellationToken ct = default)
     {
         await turnGate.WaitAsync(ct);
+        CopilotMcpBridge.Registration? mcpRegistration = null;
+        string? sessionId = null;
         try
         {
-            await EnsureProcessAsync(config, ct);
-            var session = await NewSessionAsync(ct);
-            var sessionId = SessionId(session);
+            var toolFilter = string.Join(",",
+                tools.Select(tool => $"mesh-{tool.Name}").OrderBy(name => name, StringComparer.Ordinal));
+            var effectiveConfig = config with { ToolFilter = toolFilter };
+            await EnsureProcessAsync(effectiveConfig, ct);
+            mcpRegistration = await mcpBridge.RegisterAsync(tools, ct);
+            var session = await NewSessionAsync(mcpRegistration, ct);
+            sessionId = SessionId(session);
             var content = new List<object>
             {
-                new { type = "text", text = CopilotAcpProtocol.ComposePrompt(systemPrompt, history) }
+                new
+                {
+                    type = "text",
+                    text = CopilotAcpProtocol.ComposePrompt(systemPrompt, history, tools.Count > 0)
+                }
             };
             if (supportsImages)
                 content.AddRange(images.Select(image => (object)new
@@ -115,32 +155,34 @@ public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDispo
                     data = Convert.ToBase64String(image.Data)
                 }));
 
-            activeTurn = new TurnState { Progress = progress };
-            using var registration = ct.Register(() =>
+            activeTurn = new TurnState
+            {
+                Progress = progress,
+                AllowedToolNames = tools
+                    .SelectMany(tool => new[] { tool.Name, $"mesh-{tool.Name}" })
+                    .ToHashSet(StringComparer.Ordinal)
+            };
+            using var cancellationRegistration = ct.Register(() =>
             {
                 _ = SendNotificationAsync("session/cancel", new { sessionId }, CancellationToken.None);
             });
-            try
-            {
-                var result = await RequestAsync("session/prompt", new { sessionId, prompt = content }, ct);
-                var stopReason = result.TryGetProperty("stopReason", out var stop) ? stop.GetString() : null;
-                if (string.Equals(stopReason, "cancelled", StringComparison.OrdinalIgnoreCase))
-                    throw new OperationCanceledException(ct);
-                if (string.Equals(stopReason, "max_tokens", StringComparison.OrdinalIgnoreCase))
-                    return TruncationDetection.Marker;
-                var answer = activeTurn.Answer.ToString().Trim();
-                if (answer.Length == 0)
-                    throw new InvalidOperationException("GitHub Copilot CLI returned an empty response.");
-                return ReasoningExtract.Wrap(activeTurn.Thought.ToString(), answer);
-            }
-            finally
-            {
-                activeTurn = null;
-                await CloseSessionAsync(sessionId, CancellationToken.None);
-            }
+            var result = await RequestAsync("session/prompt", new { sessionId, prompt = content }, ct);
+            var stopReason = result.TryGetProperty("stopReason", out var stop) ? stop.GetString() : null;
+            if (string.Equals(stopReason, "cancelled", StringComparison.OrdinalIgnoreCase))
+                throw new OperationCanceledException(ct);
+            if (string.Equals(stopReason, "max_tokens", StringComparison.OrdinalIgnoreCase))
+                return TruncationDetection.Marker;
+            var answer = activeTurn.FinalAnswer();
+            if (answer.Length == 0)
+                throw new InvalidOperationException("GitHub Copilot CLI returned an empty response.");
+            return ReasoningExtract.Wrap(activeTurn.Thought.ToString(), answer);
         }
         finally
         {
+            activeTurn = null;
+            if (!string.IsNullOrWhiteSpace(sessionId))
+                await CloseSessionAsync(sessionId, CancellationToken.None);
+            mcpBridge.Unregister(mcpRegistration);
             turnGate.Release();
         }
     }
@@ -164,7 +206,10 @@ public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDispo
                 CreateNoWindow = true,
                 WorkingDirectory = WorkspaceDirectory()
             };
-            foreach (var argument in CopilotAcpProtocol.BuildServerArguments(config.Model, config.Effort))
+            foreach (var argument in CopilotAcpProtocol.BuildServerArguments(
+                         config.Model,
+                         config.Effort,
+                         config.ToolFilter))
                 start.ArgumentList.Add(argument);
 
             process = new Process { StartInfo = start, EnableRaisingEvents = true };
@@ -215,8 +260,30 @@ public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDispo
         }
     }
 
+    private Task<JsonElement> NewSessionAsync(
+        CopilotMcpBridge.Registration? registration,
+        CancellationToken ct)
+    {
+        object[] servers = registration is null
+            ? Array.Empty<object>()
+            :
+            [
+                new
+                {
+                    type = "http",
+                    name = registration.Name,
+                    url = registration.Url,
+                    headers = new[]
+                    {
+                        new { name = "Authorization", value = $"Bearer {registration.Token}" }
+                    }
+                }
+            ];
+        return RequestAsync("session/new", new { cwd = WorkspaceDirectory(), mcpServers = servers }, ct);
+    }
+
     private Task<JsonElement> NewSessionAsync(CancellationToken ct)
-        => RequestAsync("session/new", new { cwd = WorkspaceDirectory(), mcpServers = Array.Empty<object>() }, ct);
+        => NewSessionAsync(registration: null, ct);
 
     private async Task CloseSessionAsync(string sessionId, CancellationToken ct)
     {
@@ -310,12 +377,31 @@ public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDispo
         var method = root.GetProperty("method").GetString();
         if (method == "session/request_permission")
         {
-            await WriteAsync(new
+            string? toolCallId = null;
+            if (root.TryGetProperty("params", out var requestParameters)
+                && requestParameters.TryGetProperty("toolCall", out var toolCall)
+                && toolCall.TryGetProperty("toolCallId", out var toolCallIdValue))
+                toolCallId = toolCallIdValue.GetString();
+            var isMeshToolCall = toolCallId is not null
+                && activeTurn?.MeshToolCallIds.Contains(toolCallId) == true;
+            string? optionId = null;
+            if (isMeshToolCall
+                && root.TryGetProperty("params", out var parameters)
+                && parameters.TryGetProperty("options", out var options)
+                && options.ValueKind == JsonValueKind.Array)
             {
-                jsonrpc = "2.0",
-                id,
-                result = new { outcome = new { outcome = "cancelled" } }
-            }, ct);
+                foreach (var option in options.EnumerateArray())
+                {
+                    var kind = option.TryGetProperty("kind", out var kindValue) ? kindValue.GetString() : null;
+                    if (kind is not "allow_once" and not "allow_always") continue;
+                    optionId = option.TryGetProperty("optionId", out var idValue) ? idValue.GetString() : null;
+                    if (optionId is not null) break;
+                }
+            }
+            object outcome = optionId is null
+                ? new { outcome = "cancelled" }
+                : new { outcome = "selected", optionId };
+            await WriteAsync(new { jsonrpc = "2.0", id, result = new { outcome } }, ct);
             return;
         }
         await WriteAsync(new
@@ -343,12 +429,26 @@ public sealed class CopilotAcpHost(ILogger<CopilotAcpHost> logger) : IAsyncDispo
                 && contentType.GetString() == "text"
                 && content.TryGetProperty("text", out var text))
             {
-                if (kind == "agent_message_chunk") turn.Answer.Append(text.GetString());
+                var messageId = update.TryGetProperty("messageId", out var idValue)
+                    ? idValue.GetString()
+                    : null;
+                if (kind == "agent_message_chunk") turn.AppendAnswer(messageId, text.GetString());
                 else turn.Thought.Append(text.GetString());
             }
             return;
         }
         if (kind is not "tool_call" and not "tool_call_update") return;
+        if (kind == "tool_call"
+            && update.TryGetProperty("toolCallId", out var toolCallIdValue)
+            && toolCallIdValue.GetString() is { } toolCallId)
+        {
+            var titleText = update.TryGetProperty("title", out var titleCandidate)
+                ? titleCandidate.GetString()
+                : null;
+            if (turn.AllowedToolNames.Any(name =>
+                    string.Equals(titleText, name, StringComparison.Ordinal)))
+                turn.MeshToolCallIds.Add(toolCallId);
+        }
         var title = update.TryGetProperty("title", out var titleValue) ? titleValue.GetString() : "Copilot action";
         var status = update.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : "pending";
         var state = status switch

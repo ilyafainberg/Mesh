@@ -23,6 +23,13 @@ public class CopilotAcpProtocolTests
     }
 
     [TestMethod]
+    public void BuildArguments_Tools_UsesSingleFilterArgument()
+    {
+        var args = CopilotAcpProtocol.BuildServerArguments("auto", "auto", "mesh-web_search,mesh-file_system");
+        CollectionAssert.Contains(args.ToArray(), "--available-tools=mesh-web_search,mesh-file_system");
+    }
+
+    [TestMethod]
     public void BuildArguments_InvalidEffort_Throws()
         => Assert.ThrowsException<ArgumentException>(
             () => CopilotAcpProtocol.BuildServerArguments("auto", "ridiculous"));
@@ -37,6 +44,17 @@ public class CopilotAcpProtocolTests
         StringAssert.Contains(prompt, "USER: Hello");
         StringAssert.Contains(prompt, "ASSISTANT: Hi");
         StringAssert.Contains(prompt, "Do not use tools or access files.");
+    }
+
+    [TestMethod]
+    public void ComposePrompt_WithTools_UsesMeshPermissionLanguage()
+    {
+        var prompt = CopilotAcpProtocol.ComposePrompt(
+            "Be concise.",
+            new[] { ("user", "Use a tool") },
+            toolsAvailable: true);
+        StringAssert.Contains(prompt, "Use only tools supplied by Mesh.");
+        Assert.IsFalse(prompt.Contains("Do not use tools", StringComparison.Ordinal));
     }
 
     [TestMethod]

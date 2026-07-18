@@ -249,15 +249,15 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
     {
         public Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
             CompletionOptions? options = null, CancellationToken ct = default)
-            => CompleteCoreAsync(systemPrompt, history, progress: null, options, ct);
+            => CompleteCoreAsync(systemPrompt, history, Array.Empty<IAgentTool>(), progress: null, options, ct);
 
         public Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
             IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
             CompletionOptions? options = null, CancellationToken ct = default)
-            => CompleteCoreAsync(systemPrompt, history, progress, options, ct);
+            => CompleteCoreAsync(systemPrompt, history, tools, progress, options, ct);
 
         private Task<string> CompleteCoreAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-            IProgress<AgentStep>? progress, CompletionOptions? options, CancellationToken ct)
+            IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress, CompletionOptions? options, CancellationToken ct)
         {
             var promptLines = history.Select(line => (line.Role, line.Text)).ToList();
             var images = history
@@ -271,7 +271,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
                 string.IsNullOrWhiteSpace(cfg.CopilotExecutable) ? "copilot" : cfg.CopilotExecutable.Trim(),
                 string.IsNullOrWhiteSpace(cfg.Model) ? "auto" : cfg.Model.Trim(),
                 cfg.CopilotEffort.ToString());
-            return host.CompleteAsync(config, system, promptLines, images, progress, ct);
+            return host.CompleteAsync(config, system, promptLines, images, tools, progress, ct);
         }
     }
 

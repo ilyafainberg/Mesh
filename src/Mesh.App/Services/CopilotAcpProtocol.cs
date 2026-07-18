@@ -11,7 +11,11 @@ public sealed record CopilotModelOption(
     string? PriceCategory,
     bool Enabled);
 
-public sealed record CopilotAcpConfig(string Executable, string Model, string Effort);
+public sealed record CopilotAcpConfig(
+    string Executable,
+    string Model,
+    string Effort,
+    string ToolFilter = "");
 
 public static class CopilotAcpProtocol
 {
@@ -20,9 +24,12 @@ public static class CopilotAcpProtocol
         "none", "minimal", "low", "medium", "high", "xhigh", "max"
     };
 
-    public static IReadOnlyList<string> BuildServerArguments(string? model, string? effort)
+    public static IReadOnlyList<string> BuildServerArguments(
+        string? model,
+        string? effort,
+        string? toolFilter = null)
     {
-        var args = new List<string> { "--acp", "--stdio", "--available-tools=" };
+        var args = new List<string> { "--acp", "--stdio", $"--available-tools={toolFilter?.Trim() ?? ""}" };
         var normalizedModel = NormalizeModel(model);
         if (normalizedModel != "auto")
         {
@@ -52,7 +59,10 @@ public static class CopilotAcpProtocol
         return normalized;
     }
 
-    public static string ComposePrompt(string systemPrompt, IReadOnlyList<(string Role, string Text)> history)
+    public static string ComposePrompt(
+        string systemPrompt,
+        IReadOnlyList<(string Role, string Text)> history,
+        bool toolsAvailable = false)
     {
         var sb = new StringBuilder();
         sb.AppendLine("SYSTEM INSTRUCTIONS:");
@@ -66,7 +76,9 @@ public static class CopilotAcpProtocol
             sb.AppendLine(text.Trim());
         }
         sb.AppendLine();
-        sb.Append("Do not use tools or access files. Return only the assistant answer.");
+        sb.Append(toolsAvailable
+            ? "Use only tools supplied by Mesh. Their permission decisions are authoritative. Return the assistant answer."
+            : "Do not use tools or access files. Return only the assistant answer.");
         return sb.ToString();
     }
 
