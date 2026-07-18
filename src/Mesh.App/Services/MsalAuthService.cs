@@ -10,7 +10,7 @@ namespace Mesh.App.Services;
 /// </summary>
 public sealed class MsalAuthService
 {
-    // Mesh Agent Client, Feincraft tenant, multi-tenant + personal accounts, http://localhost redirect.
+    // Mesh Agent Client, multi-tenant + personal accounts, http://localhost redirect.
     public const string ClientId = "562957d8-0f97-47eb-a445-a93d4a938f5a";
     private const string Authority = "https://login.microsoftonline.com/common";
 

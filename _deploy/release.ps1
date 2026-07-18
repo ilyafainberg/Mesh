@@ -216,14 +216,14 @@ function Build-Windows {
   if (-not (Test-Path $exe)) { Die "installer not produced at $exe" }
   Ok "installer built"
 
-  Say "Windows: sign installer (Azure Trusted Signing)"
+  Say "Windows: sign installer"
   Invoke-Native $SignTool @(
-    "sign", "/v", "/fd", "SHA256", "/tr", $TimeStamp, "/td", "SHA256",
+    "sign", "/q", "/fd", "SHA256", "/tr", $TimeStamp, "/td", "SHA256",
     "/dlib", $SignDlib, "/dmdf", $SignMeta, $exe
   ) "signtool sign"
   $sig = Get-AuthenticodeSignature $exe
   if ($sig.Status -ne "Valid") { Die "signature not valid (status: $($sig.Status))." }
-  Ok "signed: $($sig.SignerCertificate.Subject)"
+  Ok "installer signature valid"
 
   # Use script scope (not a return value): external tool stdout from Invoke-Native would otherwise
   # pollute the function's output stream and turn the returned object into an array.
@@ -288,7 +288,7 @@ function Get-ReleaseNotes {
     $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
     $log = & git -c core.longpaths=true log --pretty=format:"- %s" -n 30 $range
   } finally { Pop-Location }
-  "## Mesh v$Version`n`nSigned Windows installer (CN=Feincraft, Azure Trusted Signing).`n`n### Changes`n$($log -join "`n")`n`n### Install`nDownload and run Mesh-Setup-v$Version.exe. The EXE is Authenticode-signed by Feincraft using Azure Trusted Signing." |
+  "## Mesh v$Version`n`n### Changes`n$($log -join "`n")`n`n### Install`nDownload and run Mesh-Setup-v$Version.exe." |
     Set-Content $tmp -NoNewline
   return $tmp
 }
@@ -344,7 +344,14 @@ function Push-MicrosoftStore([string]$exe) {
   Say "Microsoft Store: update package"
   $publisher = Join-Path $Deploy "publish-store.ps1"
   if (-not (Test-Path $publisher)) { Die "Store publisher not found at $publisher." }
-  $blobUrl = "$BlobBase/Mesh-Setup-v$Version.exe"
+  $key = (& az storage account keys list --account-name $BlobAccount --resource-group $BlobRg --query "[0].value" -o tsv)
+  if (-not $key) { Die "could not fetch Blob account key for Store installer." }
+  $storeBlobName = "store/Mesh-Setup-v$Version.exe"
+  Invoke-Native "az" @(
+    "storage","blob","upload","--account-name",$BlobAccount,"--container-name",$BlobCtr,
+    "--name",$storeBlobName,"--file",$exe,"--account-key",$key,"--overwrite","--only-show-errors"
+  ) "Store installer upload"
+  $blobUrl = "$BlobBase/$storeBlobName"
   $args = @{
     Version = $Version
     InstallerUrl = $blobUrl
@@ -375,8 +382,8 @@ if (-not $SkipPush)   { Invoke-GitCommitPush }
 if ($script:WinExe -and -not $SkipBlob)   { Publish-Blob   $script:WinExe }
 if ($script:WinExe -and -not $SkipGitHub) {
   $sig = Get-AuthenticodeSignature $script:WinExe
-  if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "CN=Feincraft") {
-    Die "refusing GitHub upload: installer signature is not valid or is not from Feincraft."
+  if ($sig.Status -ne "Valid") {
+    Die "refusing GitHub upload: installer signature is not valid."
   }
   Publish-GitHubRelease $script:WinExe
 }

@@ -43,10 +43,9 @@ public sealed record UpdateInfo(
 public sealed record UpdateCheckResult(bool Available, Version Current, Version? Latest, UpdateInfo? Info, string? Error);
 
 /// <summary>
-/// Self-update for the Windows client. The client ships as a self-contained zip in the public
-/// GitHub releases repo, so updating means: read the latest release via the GitHub API, download
-/// the win-x64 client asset with progress, extract it, then hand off to a small .cmd that waits
-/// for this process to exit, copies the new files over the install directory, and relaunches.
+/// Self-update for the Windows client. The signed installer ships inside a zip in the public
+/// GitHub releases repo. Updating means: read the latest release via the GitHub API, download
+/// and extract the archive, then launch the installer.
 /// </summary>
 /// <remarks>
 /// Only supported on Windows (the published asset is win-x64). On other platforms
@@ -59,8 +58,8 @@ public sealed class UpdateService
     // uses the Windows Restart Manager to swap files reliably (no manual copy/relaunch dance).
     private const string Owner = "MeshRelayAI";
     private const string Repo = "Mesh";
-    // The installer asset. Preferred as a raw ".exe"; a ".zip" wrapping the installer is also
-    // accepted (older releases) and unpacked before running.
+    // Public releases use a ".zip" wrapping the installer. Raw ".exe" assets remain accepted
+    // for backward compatibility with older releases.
     private const string InstallerPrefix = "Mesh-Setup";
 
     private readonly IHttpClientFactory httpFactory;
@@ -167,8 +166,8 @@ public sealed class UpdateService
             long assetSize = 0;
             if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
             {
-                // Prefer a raw installer (.exe); fall back to a zipped installer (.zip).
-                foreach (var wantExe in new[] { true, false })
+                // Prefer the current zipped release format; fall back to legacy raw installers.
+                foreach (var wantZip in new[] { true, false })
                 {
                     foreach (var a in assets.EnumerateArray())
                     {
@@ -177,7 +176,7 @@ public sealed class UpdateService
                         var isExe = name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
                         var isZip = name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
                         if (!name.StartsWith(InstallerPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-                        if (wantExe ? !isExe : !isZip) continue;
+                        if (wantZip ? !isZip : !isExe) continue;
                         assetName = name;
                         assetUrl = a.TryGetProperty("browser_download_url", out var u) ? u.GetString() : null;
                         assetSize = a.TryGetProperty("size", out var s) && s.TryGetInt64(out var sv) ? sv : 0;

@@ -3,7 +3,7 @@
 
   Prereq: `az login` into a subscription where you have Contributor/Owner
   (the current corp tenant sub "COSMIC AKS PlayGround" denied resource-group writes,
-  so run this against a subscription you can write to, e.g. your Feincraft/personal tenant:
+  so run this against an Azure subscription you can write to:
      az login --tenant <your-tenant-id>
      az account set --subscription "<sub name or id>"
 

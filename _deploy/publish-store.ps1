@@ -54,7 +54,7 @@ $Installer = Join-Path $Deploy "artifacts\Mesh-Setup-v$Version.exe"
 $BlobBase = "https://meshrelaydl.blob.core.windows.net/releases"
 
 if (-not $InstallerUrl) {
-  $InstallerUrl = "$BlobBase/Mesh-Setup-v$Version.exe"
+  $InstallerUrl = "$BlobBase/store/Mesh-Setup-v$Version.exe"
 }
 
 function Say($message)  { Write-Host "`n=== $message ===" -ForegroundColor Cyan }

@@ -1,6 +1,6 @@
 ## Mesh v1.4.0
 
-Signed Windows installer (CN=Feincraft, Azure Trusted Signing).
+Signed Windows installer.
 
 ### Fixes and improvements
 - **In-chat generated apps now run JavaScript.** Sandboxed previews switched from `srcdoc` to Blob URLs so scripts execute (sandbox remains locked down: no same-origin access).

@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot            # .../Mesh
 $stage = Join-Path $repo "_deploy/totalcontrol"
 
-$tcProject = "C:\Users\ifain\OneDrive - Feincraft\Projects\TotalControl\TotalControl.csproj"
+$tcProject = "C:\Users\ifain\OneDrive - Microsoft\Power CAT\TotalControl\TotalControl.csproj"
 if (-not (Test-Path -LiteralPath $tcProject)) {
     Write-Error "TotalControl project not found at: $tcProject"
 }

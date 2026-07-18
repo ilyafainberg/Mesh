@@ -11,12 +11,12 @@
 
   LOCAL MAC USAGE (PowerShell 7 / pwsh)
     ./_deploy/release-ios.ps1 -Version 1.6.1 `
-      -CodesignKey "Apple Distribution: Feincraft (TEAMID)" `
+      -CodesignKey "Apple Distribution: Your Organization (TEAMID)" `
       -CodesignProvision "Mesh App Store"
 
   WINDOWS + PAIRED MAC USAGE
     ./_deploy/release-ios.ps1 -Version 1.6.1 `
-      -CodesignKey "Apple Distribution: Feincraft (TEAMID)" `
+      -CodesignKey "Apple Distribution: Your Organization (TEAMID)" `
       -CodesignProvision "Mesh App Store" `
       -MacAddress 192.168.1.20 -MacUser ilya
 
@@ -26,7 +26,7 @@
 
   OPTIONAL TESTFLIGHT UPLOAD (must run locally on macOS)
     ./_deploy/release-ios.ps1 -Version 1.6.1 `
-      -CodesignKey "Apple Distribution: Feincraft (TEAMID)" `
+      -CodesignKey "Apple Distribution: Your Organization (TEAMID)" `
       -CodesignProvision "Mesh App Store" `
       -PushTestFlight `
       -AppStoreAppId 1234567890 `

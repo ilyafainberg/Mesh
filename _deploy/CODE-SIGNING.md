@@ -13,14 +13,14 @@ Provisioned (done):
 Remaining (needs a human + company legal docs):
 
 1. **Identity validation (portal only).** Azure portal -> `mesh-signing` account ->
-   Identity validations -> New -> **Organization**. Legal entity: **Feincraft**.
-   Enter Feincraft's exact registered legal name, address, and business identifier
+   Identity validations -> New -> **Organization**.
+   Enter the organization's exact registered legal name, address, and business identifier
    (VAT / company number). Submit. Microsoft verifies against public business
    records; approval takes ~1-5 business days.
    (EU organizations are eligible; EU individuals are not, which is why this must be
    the registered company, not a personal identity.)
 
-   Direct link (Feincraft tenant):
+   Direct link:
    `https://portal.azure.com/#@efd78fe9-febc-406f-815a-16a98942bab3/resource/subscriptions/e263ca58-3bfa-4b52-98f0-1df2824a6995/resourceGroups/rg-mesh-signing/providers/Microsoft.CodeSigning/codeSigningAccounts/mesh-signing/identityValidations`
 
 2. **Create a certificate profile** (after validation is `Completed`):
