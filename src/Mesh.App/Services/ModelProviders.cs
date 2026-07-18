@@ -217,7 +217,7 @@ internal static class ReasoningControls
 }
 
 /// <summary>Builds an <see cref="IChatModel"/> for the configured provider.</summary>
-public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state, TokenMeter meter, BrowserModelService browserModel)
+public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state, TokenMeter meter, BrowserModelService browserModel, CopilotAcpHost copilot)
 {
     public IChatModel Create(ModelConfig cfg) => cfg.Provider switch
     {
@@ -233,6 +233,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
         ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg, meter),
         ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg, meter),
         ModelProvider.Browser => new BrowserChatModel(browserModel, cfg),
+        ModelProvider.GitHubCopilot => new CopilotAcpModel(copilot, cfg),
         _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg, meter),
     };
 
@@ -241,6 +242,37 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
     {
         if (!string.IsNullOrWhiteSpace(cfg.Endpoint)) return cfg;
         return new ModelConfig { Provider = cfg.Provider, Model = cfg.Model, ApiKey = cfg.ApiKey, Endpoint = defaultEndpoint, ReasoningEffort = cfg.ReasoningEffort };
+    }
+
+    /// <summary>GitHub Copilot CLI provider using its ACP stdio server. Mesh remains the history source.</summary>
+    public sealed class CopilotAcpModel(CopilotAcpHost host, ModelConfig cfg) : IChatModel
+    {
+        public Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+            CompletionOptions? options = null, CancellationToken ct = default)
+            => CompleteCoreAsync(systemPrompt, history, progress: null, options, ct);
+
+        public Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+            IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+            CompletionOptions? options = null, CancellationToken ct = default)
+            => CompleteCoreAsync(systemPrompt, history, progress, options, ct);
+
+        private Task<string> CompleteCoreAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+            IProgress<AgentStep>? progress, CompletionOptions? options, CancellationToken ct)
+        {
+            var promptLines = history.Select(line => (line.Role, line.Text)).ToList();
+            var images = history
+                .SelectMany(line => line.Attachments)
+                .Where(attachment => attachment.IsImage)
+                .Select(attachment => (attachment.MimeType, attachment.Data))
+                .ToList();
+            var budget = CompletionOptions.Resolve(options);
+            var system = systemPrompt + $"\nKeep the response within approximately {budget} output tokens.";
+            var config = new CopilotAcpConfig(
+                string.IsNullOrWhiteSpace(cfg.CopilotExecutable) ? "copilot" : cfg.CopilotExecutable.Trim(),
+                string.IsNullOrWhiteSpace(cfg.Model) ? "auto" : cfg.Model.Trim(),
+                cfg.CopilotEffort.ToString());
+            return host.CompleteAsync(config, system, promptLines, images, progress, ct);
+        }
     }
 
     /// <summary>

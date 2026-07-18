@@ -24,7 +24,7 @@
         </div>
 
         @* ===== Creation / edit form ===== *@
-        @if (formOpen)
+        @if (formOpen && selectedWidget is null)
         {
             <div class="card-panel">
                 <div class="field">
@@ -92,7 +92,7 @@
                         <i class="bi bi-magic" aria-hidden="true"></i>
                         @(busy && phase == PagePhase.Generating ? "Generating..." : "Generate")
                     </button>
-                    @if (draftHtml is not null)
+                    @if (draftHtml is not null && selectedWidget is null)
                     {
                         <button class="ghost" type="button" @onclick='() => formOpen = false' disabled="@busy">
                             <i class="bi bi-eye" aria-hidden="true"></i> Back to preview
@@ -225,15 +225,17 @@
                 <div class="wgt-list">
                     @foreach (var w in State.Profile.Widgets)
                     {
-                        <div class="wgt-card @(selectedWidget?.Id == w.Id ? "wgt-card--active" : "")">
+                        var isEditing = selectedWidget?.Id == w.Id;
+                        <div class="wgt-card @(isEditing ? "wgt-card--active" : "")">
                             <div class="wgt-card-head">
                                 <span class="wgt-card-name">@w.Name</span>
                                 <div class="wgt-card-actions">
                                     <button class="ghost small" type="button" @onclick="() => SelectWidget(w)"
-                                            title="@(selectedWidget?.Id == w.Id ? "Currently editing" : "Preview or edit this widget")"
-                                            aria-label="@(selectedWidget?.Id == w.Id ? $"Editing {w.Name}" : $"Preview and edit {w.Name}")">
-                                        <i class="bi @(selectedWidget?.Id == w.Id ? "bi-pencil-fill" : "bi-eye")" aria-hidden="true"></i>
-                                        @(selectedWidget?.Id == w.Id ? "Editing" : "Preview / Edit")
+                                            disabled="@isEditing"
+                                            title="@(isEditing ? "Currently editing inline" : "Edit this widget inline")"
+                                            aria-label="@(isEditing ? $"Editing {w.Name} inline" : $"Edit {w.Name} inline")">
+                                        <i class="bi @(isEditing ? "bi-pencil-fill" : "bi-pencil")" aria-hidden="true"></i>
+                                        @(isEditing ? "Editing inline" : "Edit")
                                     </button>
                                     @if (w.PreviousHtml is not null)
                                     {
@@ -289,6 +291,80 @@
                                         title="@($"{w.Name} preview")"
                                         aria-label="@($"{w.Name} preview")"></iframe>
                             </div>
+
+                            @if (isEditing)
+                            {
+                                <div class="wgt-inline-editor" aria-label="@($"Edit {w.Name}")">
+                                    <div class="wgt-inline-grid">
+                                        <div class="field">
+                                           <label for="@($"edit-name-{w.Id}")">Widget name</label>
+                                           <input id="@($"edit-name-{w.Id}")" class="full" type="text"
+                                                  @bind="widgetName" @bind:event="oninput"
+                                                  disabled="@busy" autocomplete="off" />
+                                        </div>
+                                        <div class="field">
+                                           <label for="@($"edit-instructions-{w.Id}")">Instructions</label>
+                                           <textarea id="@($"edit-instructions-{w.Id}")" class="full" rows="2"
+                                                     @bind="desc" @bind:event="oninput"
+                                                     disabled="@busy"></textarea>
+                                        </div>
+                                    </div>
+
+                                    <div class="field">
+                                        <label for="@($"edit-change-{w.Id}")">What would you like to change?</label>
+                                        <textarea id="@($"edit-change-{w.Id}")" class="full" rows="2"
+                                                 @bind="refineRequest" @bind:event="oninput"
+                                                 placeholder="e.g. Add dark mode and larger controls"
+                                                 disabled="@busy"></textarea>
+                                    </div>
+
+                                    @if (nameError is not null)
+                                    {
+                                        <p class="err-text" role="alert">@nameError</p>
+                                    }
+                                    @if (error is not null)
+                                    {
+                                        <p class="err-text" role="alert">@error</p>
+                                    }
+                                    @if (successMessage is not null)
+                                    {
+                                        <p class="wgt-success" role="status">@successMessage</p>
+                                    }
+
+                                    <div class="wgt-inline-actions">
+                                        <button class="primary" type="button" @onclick="Refine"
+                                               disabled="@(busy || string.IsNullOrWhiteSpace(refineRequest))">
+                                           <i class="bi bi-magic"></i> @(busy ? "Working..." : "Apply changes")
+                                        </button>
+                                        <button class="ghost" type="button" @onclick="Generate"
+                                               disabled="@(busy || string.IsNullOrWhiteSpace(desc))">
+                                           <i class="bi bi-arrow-clockwise"></i> Regenerate from instructions
+                                        </button>
+                                        @if (prevDraftHtml is not null)
+                                        {
+                                           <button class="ghost" type="button" @onclick="UndoDraft" disabled="@busy">
+                                               <i class="bi bi-arrow-counterclockwise"></i> Undo
+                                           </button>
+                                        }
+                                        <button class="primary" type="button" @onclick="Save"
+                                               disabled="@(busy || string.IsNullOrWhiteSpace(widgetName))">
+                                           <i class="bi bi-check-lg"></i> Save
+                                        </button>
+                                        <button class="ghost" type="button" @onclick="TryDiscard" disabled="@busy">
+                                           Close editor
+                                        </button>
+                                    </div>
+
+                                    @if (confirmDiscard)
+                                    {
+                                        <div class="wgt-inline-confirm">
+                                           <span>Discard unsaved changes?</span>
+                                           <button class="danger small" type="button" @onclick="ConfirmDiscard">Discard</button>
+                                           <button class="ghost small" type="button" @onclick="() => confirmDiscard = false">Keep editing</button>
+                                        </div>
+                                    }
+                                </div>
+                            }
                         </div>
                     }
                 </div>
@@ -373,7 +449,7 @@
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         // Mount or remount the draft iframe whenever the HTML changes.
-        if (draftHtml is not null && draftMountedHtml != draftHtml)
+        if (selectedWidget is null && draftHtml is not null && draftMountedHtml != draftHtml)
         {
             try
             {
@@ -387,11 +463,12 @@
         foreach (var w in State.Profile.Widgets)
         {
             if (!widgetFrameRefs.TryGetValue(w.Id, out var el)) continue;
-            if (widgetMountedHtmls.TryGetValue(w.Id, out var mounted) && mounted == w.Html) continue;
+            var html = selectedWidget?.Id == w.Id && draftHtml is not null ? draftHtml : w.Html;
+            if (widgetMountedHtmls.TryGetValue(w.Id, out var mounted) && mounted == html) continue;
             try
             {
-                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, w.Html);
-                widgetMountedHtmls[w.Id] = w.Html;
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, html);
+                widgetMountedHtmls[w.Id] = html;
             }
             catch { /* retry on next render */ }
         }
@@ -564,6 +641,7 @@
             draftPrompt = string.IsNullOrWhiteSpace(draftPrompt)
                 ? request
                 : $"{draftPrompt}; {request}";
+            desc = draftPrompt;
             draftMountedHtml = null;
             refineRequest = "";
             showRefinePanel = false;
@@ -597,6 +675,7 @@
         if (prevDraftHtml is null) return;
         (draftHtml, prevDraftHtml) = (prevDraftHtml, null);
         (draftPrompt, prevDraftPrompt) = (prevDraftPrompt ?? draftPrompt, null);
+        desc = draftPrompt;
         draftMountedHtml = null;
         error = null;
         phase = PagePhase.PreviewReady;
@@ -685,6 +764,7 @@
         {
             draftHtml = w.Html;
             draftPrompt = w.Prompt;
+            desc = w.Prompt;
             prevDraftHtml = null;
             prevDraftPrompt = null;
             draftMountedHtml = null;
@@ -740,7 +820,7 @@
             draftHtml != selectedWidget.Html ||
             draftPrompt != selectedWidget.Prompt ||
             widgetName.Trim() != selectedWidget.Name ||
-            (formOpen && desc.Trim() != draftPrompt)
+            desc.Trim() != draftPrompt
         );
 
     async Task ClearEditorState()

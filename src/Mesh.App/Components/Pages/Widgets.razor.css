@@ -165,6 +165,35 @@
     flex-wrap: wrap;
 }
 
+.wgt-inline-editor {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--stroke-1);
+}
+
+.wgt-inline-grid {
+    display: grid;
+    grid-template-columns: minmax(180px, .65fr) minmax(260px, 1.35fr);
+    gap: 12px;
+}
+
+.wgt-inline-actions,
+.wgt-inline-confirm {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+}
+
+.wgt-inline-confirm {
+    padding: 10px 12px;
+    border: 1px solid var(--warn-stroke);
+    border-radius: var(--radius-m);
+    background: var(--warn-bg);
+    color: var(--fg-2);
+}
+
 /* ===== Visibility row ===== */
 .wgt-visibility {
     display: flex;
@@ -217,5 +246,14 @@
 
     .wgt-visibility select {
         max-width: 100%;
+    }
+
+    .wgt-inline-grid {
+        grid-template-columns: 1fr;
+        gap: 0;
+    }
+
+    .wgt-inline-actions > button {
+        min-height: 44px;
     }
 }

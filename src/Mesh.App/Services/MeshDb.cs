@@ -97,6 +97,8 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("conversations", "group_owner_handle", "TEXT");
         AddColumnIfMissing("conversations", "group_members_json", "TEXT");
         AddColumnIfMissing("conversations", "group_version", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("conversations", "sort_order", "INTEGER");
+        NormalizeConversationOrder();
         AddColumnIfMissing("chat_lines", "sender_handle", "TEXT");
         AddColumnIfMissing("own_chat", "thread_id", "TEXT");
         // Transcript + reasoning persistence: internal lines are the model's hidden execution record;
@@ -170,7 +172,7 @@ public sealed class MeshDb : IDisposable
             cmd.CommandText = """
                 SELECT handle, service_id, service_name, provider_handle,
                        group_id, group_name, group_owner_handle, group_members_json, group_version
-                FROM conversations ORDER BY created_at, handle;
+                FROM conversations ORDER BY sort_order, created_at, handle;
                 """;
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -290,10 +292,55 @@ public sealed class MeshDb : IDisposable
     public void EnsureConversation(string handle)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT OR IGNORE INTO conversations(handle, created_at) VALUES($h, $t);";
+        cmd.CommandText = """
+            INSERT OR IGNORE INTO conversations(handle, created_at, sort_order)
+            VALUES($h, $t, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM conversations));
+            """;
         cmd.Parameters.AddWithValue("$h", handle);
         cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToString("O"));
         cmd.ExecuteNonQuery();
+    }
+
+    private void NormalizeConversationOrder()
+    {
+        var handles = new List<string>();
+        using (var read = conn.CreateCommand())
+        {
+            read.CommandText = """
+                SELECT handle FROM conversations
+                ORDER BY COALESCE(sort_order, 2147483647), created_at, handle;
+                """;
+            using var reader = read.ExecuteReader();
+            while (reader.Read()) handles.Add(reader.GetString(0));
+        }
+
+        using var tx = conn.BeginTransaction();
+        for (var i = 0; i < handles.Count; i++)
+        {
+            using var update = conn.CreateCommand();
+            update.Transaction = tx;
+            update.CommandText = "UPDATE conversations SET sort_order = $o WHERE handle = $h;";
+            update.Parameters.AddWithValue("$o", i);
+            update.Parameters.AddWithValue("$h", handles[i]);
+            update.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    /// <summary>Persists the complete user-defined order of message conversations atomically.</summary>
+    public void ReorderConversations(IReadOnlyList<string> orderedHandles)
+    {
+        using var tx = conn.BeginTransaction();
+        for (var i = 0; i < orderedHandles.Count; i++)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "UPDATE conversations SET sort_order = $o WHERE handle = $h;";
+            cmd.Parameters.AddWithValue("$o", i);
+            cmd.Parameters.AddWithValue("$h", orderedHandles[i]);
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
     }
 
     /// <summary>Marks a conversation as a service thread and persists its service metadata.</summary>

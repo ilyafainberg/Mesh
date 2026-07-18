@@ -53,16 +53,23 @@
                         <div class="lt-extras">
                             <div class="lt-share">
                                 <span class="lt-share-label">Who can use it</span>
-                                <select value="@setting.Visibility"
-                                        @onchange="e => SetLocalToolVisibility(lt.Kind, e.Value?.ToString())"
-                                        aria-label="@($"Visibility for {lt.Name}")">
-                                    <option value="private">Only me (Me chat)</option>
-                                    @foreach (var c in State.CircleNames)
-                                    {
-                                        <option value="@($"shared:{c}")">Share with @c</option>
-                                    }
-                                    <option value="public">Anyone allowed</option>
-                                </select>
+                                @if (lt.Kind == LocalToolKind.MeshData)
+                                {
+                                    <span class="lt-owner-only"><i class="bi bi-lock"></i> Only me (Me chat)</span>
+                                }
+                                else
+                                {
+                                    <select value="@setting.Visibility"
+                                            @onchange="e => SetLocalToolVisibility(lt.Kind, e.Value?.ToString())"
+                                            aria-label="@($"Visibility for {lt.Name}")">
+                                        <option value="private">Only me (Me chat)</option>
+                                        @foreach (var c in State.CircleNames)
+                                        {
+                                            <option value="@($"shared:{c}")">Share with @c</option>
+                                        }
+                                        <option value="public">Anyone allowed</option>
+                                    </select>
+                                }
                             </div>
                             <div class="lt-approval">
                                 <span class="lt-share-label">Permission level</span>
@@ -336,6 +343,7 @@
         new(LocalToolKind.Geolocation,     "Location",          "bi-geo-alt",       "Report this device's approximate location (uses the OS location service, falling back to IP)."),
         new(LocalToolKind.FileSystem,      "Files",             "bi-folder",        "Read, write, and convert files on this machine."),
         new(LocalToolKind.WorkIq,          "WorkIQ",            "bi-microsoft",     "Ask about your Microsoft 365 world: email, Teams, meetings, files, people."),
+        new(LocalToolKind.MeshData,        "Mesh data",         "bi-database",      "Search your private Mesh chats, Me topics, contacts, widgets, knowledge, skills, services, configuration, and settings."),
     };
 
     // On mobile, hide desktop-only tools (scripts, browsers) that cannot run in a phone sandbox.
@@ -404,6 +412,7 @@
         {
             if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
             s.Enabled = enabled;
+            if (kind == LocalToolKind.MeshData) s.Visibility = "private";
         });
 
     void SetLocalToolVisibility(LocalToolKind kind, string? visibility)

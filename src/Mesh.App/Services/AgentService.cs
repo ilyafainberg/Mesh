@@ -46,6 +46,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var p = state.Profile;
         var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
         agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
+        if (!SupportsMeshTools(p.Model.Provider)) agentTools.Clear();
         var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
@@ -141,6 +142,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var p = state.Profile;
         var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
         agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
+        if (!SupportsMeshTools(p.Model.Provider)) agentTools.Clear();
         var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider))
             + "\nYou are answering your owner remotely from another of their devices. Be concise.";
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
@@ -317,6 +319,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             vis == "public" || (vis.StartsWith("shared:") && cs.Contains(vis["shared:".Length..]));
         var agentTools = tools.GuestTools(p.Sources, circles, p.LocalTools).ToList();
         agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: false, circles: circles, ct));
+        if (!SupportsMeshTools(p.Model.Provider)) agentTools.Clear();
         var widgets = p.Widgets.Where(w => Visible(w.Visibility, circles)).ToList();
 
         var sys = BuildGuestSystemPrompt(p, fromHandle, circles, agentTools, widgets);
@@ -389,6 +392,9 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
 
     // ---- history windowing (keeps small local models under their context limit) ----
     private static bool IsSmall(ModelProvider p) => p == ModelProvider.FoundryLocal;
+
+    private static bool SupportsMeshTools(ModelProvider provider)
+        => provider != ModelProvider.GitHubCopilot;
 
     /// <summary>Trims history to the most recent turns within a provider-appropriate budget.</summary>
     private static IReadOnlyList<ChatLine> Window(IReadOnlyList<ChatLine> history, ModelProvider provider)
@@ -677,4 +683,3 @@ Widget runtime restrictions:
     private static string Truncate(string s, int max)
         => string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "…";
 }
-

@@ -903,6 +903,22 @@ public sealed class AppState
         return conv;
     }
 
+    /// <summary>Moves one message conversation to the requested list position and persists the order.</summary>
+    public void ReorderConversation(string handle, int newIndex)
+    {
+        var normalized = Norm(handle);
+        var oldIndex = Profile.Conversations.FindIndex(
+            c => c.Handle.Equals(normalized, StringComparison.OrdinalIgnoreCase));
+        if (oldIndex < 0 || Profile.Conversations.Count < 2) return;
+        newIndex = Math.Clamp(newIndex, 0, Profile.Conversations.Count - 1);
+        if (oldIndex == newIndex) return;
+        var conversation = Profile.Conversations[oldIndex];
+        Profile.Conversations.RemoveAt(oldIndex);
+        Profile.Conversations.Insert(newIndex, conversation);
+        activeDb?.ReorderConversations(Profile.Conversations.Select(c => c.Handle).ToList());
+        NotifyChanged();
+    }
+
     /// <summary>Clears all message history for a conversation but keeps it in the list.</summary>
     public void ClearConversation(string handle)
     {

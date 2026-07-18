@@ -3,7 +3,6 @@
 @page "/m/messages"
 @inject AppState State
 @inject MeshClient Mesh
-@inject AgentService Agent
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 @implements IDisposable
@@ -50,21 +49,34 @@
             </section>
         }
 
-        <div class="chat-rows">
-            @foreach (var c in State.Profile.Conversations)
+        <div class="conversation-filters" role="group" aria-label="Filter conversations">
+            @foreach (var option in ConversationFilters)
+            {
+                <button type="button" class="@(conversationFilter == option.Value ? "active" : "")"
+                        aria-pressed="@(conversationFilter == option.Value)"
+                        @onclick="() => conversationFilter = option.Value">@option.Label</button>
+            }
+        </div>
+        <div class="chat-rows" @ref="threadListEl">
+            @foreach (var c in FilteredConversations)
             {
                 var nm = State.DisplayNameFor(c.Handle);
                 var initial = string.IsNullOrEmpty(nm) ? "?" : nm.Substring(0, 1).ToUpperInvariant();
-                <div class="chat-row @(c.Handle == active ? "active" : "") @(c.IsGroup ? "group-chat-row" : "")" @onclick="() => Select(c.Handle)">
-                    <span class="avatar">
-                        @if (c.IsGroup) { <i class="bi bi-people-fill" aria-hidden="true"></i> }
-                        else { @initial }
-                    </span>
+                <div class="chat-row @(c.Handle == active ? "active" : "")" data-thread-id="@c.Handle" @key="c.Handle" @onclick="() => Select(c.Handle)">
+                    <button class="thread-grip" data-thread-grip type="button" title="Drag to reorder"
+                            aria-label="Drag @nm to reorder; use Up or Down arrow from the keyboard"
+                            aria-keyshortcuts="ArrowUp ArrowDown"
+                            @onkeydown="e => OnConversationGripKey(e, c.Handle)"
+                            @onclick:stopPropagation="true">
+                        <i class="bi bi-grip-vertical"></i>
+                    </button>
+                    @if (!c.IsGroup)
+                    {
+                        <span class="avatar">@initial</span>
+                    }
                     <div class="chat-main">
-                        <div class="chat-title">
-                            <span class="chat-name">@nm</span>
-                            @if (c.IsGroup) { <span class="group-count">@MemberCount(c) members</span> }
-                        </div>
+                        <span class="chat-name">@nm</span>
+                        @if (c.IsGroup) { <span class="tag group-thread-tag"><i class="bi bi-people-fill"></i> group</span> }
                         @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
                         @if (!c.IsGroup && !c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
                     </div>
@@ -72,10 +84,11 @@
                 </div>
             }
         </div>
+        <div class="sr-only" aria-live="polite">@reorderStatus</div>
 
-        @if (State.Profile.Conversations.Count == 0)
+        @if (!FilteredConversations.Any())
         {
-            <div class="empty conv-empty">No conversations yet. Add someone by their handle above to start one.</div>
+            <div class="empty conv-empty">@FilterEmptyText</div>
         }
 
         @if (State.Profile.Approvals.Count > 0)
@@ -122,7 +135,7 @@ else
     var conv = State.GetOrCreateConversation(active);
     <div class="m-thread">
         <header class="thread-bar">
-            <button class="ghost icon-btn back-btn" @onclick="() => active = null" title="Back" aria-label="Back to conversations"><i class="bi bi-chevron-left"></i></button>
+            <button class="ghost icon-btn back-btn" @onclick="CloseThread" title="Back" aria-label="Back to conversations"><i class="bi bi-chevron-left"></i></button>
             <div class="thread-id">
                 <span class="thread-name">@State.DisplayNameFor(active)</span>
                 @if (conv.IsGroup)
@@ -220,15 +233,14 @@ else
                     </div>
                     @if (pinError is not null) { <p class="err-text" role="alert">@pinError</p> }
                 }
-                @if (widgetMode && !conv.IsGroup)
+                @if (selectedWidget is not null)
                 {
                     <div class="mode-chip">
-                        <i class="bi bi-window-stack"></i> widget
-                        <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
-                        <span class="mode-hint">describe a mini-app to send</span>
+                        <i class="bi bi-window-stack"></i> @selectedWidget.Name
+                        <button class="chip-x" @onclick="RemoveSelectedWidget" title="Remove widget" aria-label="Remove @selectedWidget.Name"><i class="bi bi-x"></i></button>
                     </div>
                 }
-                else if (ShowPreview)
+                @if (ShowPreview)
                 {
                     <div class="composer-preview">
                         <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
@@ -263,18 +275,48 @@ else
                     </div>
                 }
                 <div class="composer">
-                    @if (!conv.IsGroup)
+                    @if (!conv.IsService)
                     {
-                        <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="() => widgetMode = !widgetMode" disabled="@busy" title="Create a widget (mini-app)" aria-label="Create a widget (mini-app)">
-                            <i class="bi bi-plus-lg"></i>
-                        </button>
+                        <div class="widget-picker-anchor">
+                            <button class="ghost icon-btn plus-btn @(showWidgetPicker ? "on" : "")"
+                                    @onclick="ToggleWidgetPicker" title="Choose a saved widget"
+                                    aria-label="Choose a saved widget" aria-haspopup="menu"
+                                    aria-expanded="@showWidgetPicker" aria-controls="mobile-messages-widget-picker">
+                                <i class="bi bi-plus-lg"></i>
+                            </button>
+                            @if (showWidgetPicker)
+                            {
+                                <div id="mobile-messages-widget-picker" class="widget-picker" role="menu" aria-label="Choose a saved widget">
+                                    @if (State.Profile.Widgets.Count == 0)
+                                    {
+                                        <div class="widget-picker-empty">No saved widgets yet</div>
+                                        <button class="widget-picker-item" role="menuitem" @onclick="OpenWidgets">
+                                            <i class="bi bi-window-stack"></i>
+                                            <span>Go to Widgets</span>
+                                        </button>
+                                    }
+                                    else
+                                    {
+                                        <div class="widget-picker-list">
+                                            @foreach (var widget in State.Profile.Widgets)
+                                            {
+                                                <button class="widget-picker-item" role="menuitem" @onclick="() => SelectWidget(widget)" @key="widget.Id">
+                                                    <i class="bi bi-window-stack"></i>
+                                                    <span>@widget.Name</span>
+                                                </button>
+                                            }
+                                        </div>
+                                    }
+                                </div>
+                            }
+                        </div>
                     }
                     <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@busy" title="Attach an image or document" aria-label="Attach an image or document">
                         <i class="bi bi-paperclip"></i>
                     </button>
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
                            placeholder="@Placeholder" aria-label="Message input"></textarea>
-                    <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send"><i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i></button>
+                    <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null)" title="Send" aria-label="Send"><i class="bi bi-send"></i></button>
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
             </div>
@@ -296,14 +338,17 @@ else
     string groupMembers = "";
     string? groupCreateError;
     bool busy;
-    bool widgetMode;
+    bool showWidgetPicker;
+    Widget? selectedWidget;
     bool directMode;
     string? pinHtml;
     string pinName = "";
     string? pinPrompt;
     string? pinError;
+    string reorderStatus = "";
     ElementReference scrollEl;
     ElementReference composerEl;
+    ElementReference threadListEl;
     Microsoft.JSInterop.DotNetObjectReference<MobileMessages>? selfRef;
     bool composerWired;
     int lastCount = -1;
@@ -321,7 +366,7 @@ else
     readonly HashSet<string> queuedIds = new();
 
     sealed record PendingMsg(
-        string Handle, ChatLine Line, string Text, List<StagedFile> Files, bool Direct, bool Widget,
+        string Handle, ChatLine Line, string Text, List<StagedFile> Files, bool Direct, Widget? Widget,
         bool ExpectedGroup, bool ExpectedService);
 
     sealed record StagedFile(string Name, string Mime, string Base64, long Size)
@@ -334,9 +379,7 @@ else
     bool ActiveIsService => active is not null && State.FindConversation(active)?.IsService == true;
     bool ActiveIsGroup => active is not null && State.FindConversation(active)?.IsGroup == true;
 
-    string Placeholder => widgetMode && !ActiveIsGroup
-        ? "Describe a widget to send…"
-        : ActiveIsGroup
+    string Placeholder => ActiveIsGroup
             ? $"Message {State.DisplayNameFor(active!)}…"
         : ActiveIsService
             ? $"Message {State.DisplayNameFor(active!)}…"
@@ -377,12 +420,19 @@ else
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        if (firstRender)
+            selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
+
+        if (selfRef is not null)
+        {
+            try { await JS.InvokeVoidAsync("meshUI.threadReorder", threadListEl, selfRef); } catch { }
+        }
+
         if (active is null) return;
 
         if (!composerWired)
         {
             composerWired = true;
-            selfRef ??= Microsoft.JSInterop.DotNetObjectReference.Create(this);
             try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
             try { await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef); } catch { }
         }
@@ -400,6 +450,34 @@ else
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
     [Microsoft.JSInterop.JSInvokable]
     public Task SendFromComposer() => Send();
+
+    [Microsoft.JSInterop.JSInvokable]
+    public Task ReorderThread(string draggedId, string targetId, bool before)
+    {
+        var from = State.Profile.Conversations.FindIndex(c => c.Handle == draggedId);
+        var target = State.Profile.Conversations.FindIndex(c => c.Handle == targetId);
+        if (from < 0 || target < 0 || from == target) return Task.CompletedTask;
+        var destination = target + (before ? 0 : 1);
+        if (from < destination) destination--;
+        State.ReorderConversation(draggedId, destination);
+        return InvokeAsync(StateHasChanged);
+    }
+
+    async Task OnConversationGripKey(KeyboardEventArgs e, string handle)
+    {
+        if (e.Key is not ("ArrowUp" or "ArrowDown")) return;
+        var visible = FilteredConversations.ToList();
+        var index = visible.FindIndex(c => c.Handle == handle);
+        var targetIndex = e.Key == "ArrowUp" ? index - 1 : index + 1;
+        if (index < 0 || targetIndex < 0 || targetIndex >= visible.Count)
+        {
+            reorderStatus = $"{State.DisplayNameFor(handle)} cannot move further {(e.Key == "ArrowUp" ? "up" : "down")}.";
+            return;
+        }
+        await ReorderThread(handle, visible[targetIndex].Handle, before: e.Key == "ArrowUp");
+        var newPosition = State.Profile.Conversations.FindIndex(c => c.Handle == handle) + 1;
+        reorderStatus = $"{State.DisplayNameFor(handle)} moved to position {newPosition}.";
+    }
 
     /// <summary>
     /// Invoked from paste.js when a file is pasted into the composer. Stages the pasted bytes the
@@ -445,7 +523,21 @@ else
         finally { reverifying = false; }
     }
 
-    void Select(string handle) { active = handle; confirmDelete = null; composerWired = false; State.MarkRead(handle); }
+    void Select(string handle)
+    {
+        active = handle;
+        confirmDelete = null;
+        composerWired = false;
+        ClearSelectedWidget();
+        State.MarkRead(handle);
+    }
+
+    void ToggleWidgetPicker() => showWidgetPicker = !showWidgetPicker;
+    void SelectWidget(Widget widget) { selectedWidget = widget; showWidgetPicker = false; }
+    void RemoveSelectedWidget() => ClearSelectedWidget();
+    void ClearSelectedWidget() { selectedWidget = null; showWidgetPicker = false; }
+    void CloseThread() { active = null; ClearSelectedWidget(); }
+    void OpenWidgets() => Nav.NavigateTo("/widgets");
 
     void ClearActive()
     {
@@ -461,6 +553,7 @@ else
         active = null;
         confirmDelete = null;
         composerWired = false;
+        ClearSelectedWidget();
         State.DeleteConversation(h);
     }
 
@@ -497,6 +590,7 @@ else
         if (string.IsNullOrWhiteSpace(newHandle)) return;
         active = AppState.Norm(newHandle);
         composerWired = false;
+        ClearSelectedWidget();
         State.GetOrCreateConversation(active);
         newHandle = "";
         State.Save();
@@ -580,28 +674,30 @@ else
     async Task Send()
     {
         if (active is null) return;
-        if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0) return;
+        if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null) return;
         var text = input;
         var files = attachments.ToList();
+        var widget = selectedWidget;
         input = "";
         attachments.Clear();
+        selectedWidget = null;
+        showWidgetPicker = false;
         _ = ResetComposer();
 
         var direct = directMode;
-        var widget = widgetMode;
-        if (widgetMode) widgetMode = false;
 
         var activeConv = State.FindConversation(active);
         var isGroup = activeConv?.IsGroup == true;
         var isService = activeConv?.IsService == true;
-        if (isGroup) { direct = true; widget = false; }
-        else if (isService) { direct = false; widget = false; }
+        if (isGroup) direct = true;
+        else if (isService) { direct = false; widget = null; }
 
         var via = direct ? "person" : "agent";
         var line = new ChatLine
         {
             Role = "assistant", Text = text, Via = via, AddressedToAgent = !direct,
-            SenderHandle = isGroup ? AppState.Norm(State.Profile.Handle) : null
+            SenderHandle = isGroup ? AppState.Norm(State.Profile.Handle) : null,
+            WidgetPrompt = widget?.Prompt
         };
         State.AddChatLine(active, line);
 
@@ -636,10 +732,10 @@ else
         finally { busy = false; }
     }
 
-    // Finalizes a bubble's text (widget build + attachments) and sends it to the peer, reusing
+    // Finalizes a bubble's text (saved widget + attachments) and sends it to the peer, reusing
     // the line's stable id so delivery receipts update the right bubble.
     async Task DeliverAsync(
-        string handle, ChatLine line, string text, List<StagedFile> files, bool direct, bool widget,
+        string handle, ChatLine line, string text, List<StagedFile> files, bool direct, Widget? widget,
         bool expectedGroup, bool expectedService)
     {
         var conv = State.FindConversation(handle);
@@ -661,10 +757,11 @@ else
         }
 
         var toSend = text;
-        if (widget && !string.IsNullOrWhiteSpace(text))
+        if (widget is not null)
         {
-            line.WidgetPrompt = text;
-            toSend = await Agent.BuildWidgetAsync(text);
+            line.WidgetPrompt = widget.Prompt;
+            var widgetHtml = WidgetForSend(widget.Html);
+            toSend = string.IsNullOrWhiteSpace(toSend) ? widgetHtml : $"{toSend.TrimEnd()}\n\n{widgetHtml}";
         }
 
         if (files.Count > 0)
@@ -689,6 +786,39 @@ else
         var kind = direct ? MeshKinds.DirectMessage : MeshKinds.Chat;
         await Mesh.SendAsync(handle, kind, toSend, line.Id);
     }
+
+    static string WidgetForSend(string html)
+    {
+        var value = html.Trim();
+        return value.StartsWith("```html-app", StringComparison.OrdinalIgnoreCase)
+            ? value
+            : $"```html-app\n{value}\n```";
+    }
+
+    enum ConversationFilter { All, Chats, Groups, Services }
+    readonly record struct FilterOption(ConversationFilter Value, string Label);
+    static readonly FilterOption[] ConversationFilters =
+    [
+        new(ConversationFilter.All, "All"),
+        new(ConversationFilter.Chats, "Chats"),
+        new(ConversationFilter.Groups, "Groups"),
+        new(ConversationFilter.Services, "Services")
+    ];
+    ConversationFilter conversationFilter;
+    IEnumerable<Conversation> FilteredConversations => State.Profile.Conversations.Where(c => conversationFilter switch
+    {
+        ConversationFilter.Chats => !c.IsGroup && !c.IsService,
+        ConversationFilter.Groups => c.IsGroup,
+        ConversationFilter.Services => c.IsService,
+        _ => true
+    });
+    string FilterEmptyText => conversationFilter switch
+    {
+        ConversationFilter.Chats => "No chats yet.",
+        ConversationFilter.Groups => "No groups yet.",
+        ConversationFilter.Services => "No services yet.",
+        _ => "No conversations yet. Add someone by their handle above to start one."
+    };
 
     int MemberCount(Conversation conv) => conv.GroupMembers.Count;
 
@@ -742,6 +872,7 @@ else
             var conv = await Mesh.CreateGroupAsync(name, members);
             active = conv.Handle;
             composerWired = false;
+            ClearSelectedWidget();
             State.MarkRead(conv.Handle);
         }
         catch (Exception ex) { groupCreateError = ex.Message; }
@@ -792,6 +923,7 @@ else
         await Mesh.ApproveDraftAsync(a.Id, edited);
         editedDrafts.Remove(a.Id);
         active = a.From;
+        ClearSelectedWidget();
     }
 
     void Reject(PendingApproval a)
@@ -811,6 +943,7 @@ else
             p.Requests.RemoveAll(r => r.From == from);
         });
         active = from;
+        ClearSelectedWidget();
     }
 
     void Decline(string from) => State.Mutate(p => p.Requests.RemoveAll(r => r.From == from));

@@ -64,15 +64,6 @@ public class UiModeParserTests
     }
 
     [TestMethod]
-    public void FlagTablet_ReturnsTabletCommandLine()
-    {
-        var result = UiModeParser.ParseArgs(["Mesh.exe", "--ui-mode", "tablet"]);
-        Assert.AreEqual(UiMode.Tablet, result.Mode);
-        Assert.AreEqual(UiModeSource.CommandLine, result.Source);
-        Assert.IsFalse(result.HadInvalidInput);
-    }
-
-    [TestMethod]
     public void FlagPhone_ReturnsPhoneCommandLine()
     {
         var result = UiModeParser.ParseArgs(["Mesh.exe", "--ui-mode", "phone"]);
@@ -98,14 +89,6 @@ public class UiModeParserTests
     {
         var result = UiModeParser.ParseArgs(["Mesh.exe", "--ui-mode", "Desktop"]);
         Assert.AreEqual(UiMode.Desktop, result.Mode);
-        Assert.IsFalse(result.HadInvalidInput);
-    }
-
-    [TestMethod]
-    public void FlagTablet_UpperCase_ReturnsTablet()
-    {
-        var result = UiModeParser.ParseArgs(["Mesh.exe", "--ui-mode", "TABLET"]);
-        Assert.AreEqual(UiMode.Tablet, result.Mode);
         Assert.IsFalse(result.HadInvalidInput);
     }
 
@@ -161,6 +144,15 @@ public class UiModeParserTests
     }
 
     [TestMethod]
+    public void TabletValue_ReturnsTabletCommandLine()
+    {
+        var result = UiModeParser.ParseArgs(["Mesh.exe", "--ui-mode", "tablet"]);
+        Assert.AreEqual(UiMode.Tablet, result.Mode);
+        Assert.AreEqual(UiModeSource.CommandLine, result.Source);
+        Assert.IsFalse(result.HadInvalidInput);
+    }
+
+    [TestMethod]
     public void EmptyValue_ReturnsAutoCommandLineWithInvalidFlag()
     {
         var result = UiModeParser.ParseArgs(["Mesh.exe", "--ui-mode", ""]);
@@ -192,8 +184,8 @@ public class UiModeParserTests
     [TestMethod]
     public void SplitWindowsArgs_QuotedPath()
     {
-        var tokens = UiModeParser.SplitWindowsArgs("\"C:\\path to\\Mesh.exe\" --ui-mode tablet");
-        CollectionAssert.AreEqual(new[] { "C:\\path to\\Mesh.exe", "--ui-mode", "tablet" }, tokens);
+        var tokens = UiModeParser.SplitWindowsArgs("\"C:\\path to\\Mesh.exe\" --ui-mode phone");
+        CollectionAssert.AreEqual(new[] { "C:\\path to\\Mesh.exe", "--ui-mode", "phone" }, tokens);
     }
 
     [TestMethod]

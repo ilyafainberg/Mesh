@@ -100,10 +100,9 @@ else
     string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
         ? State.Profile.Handle : State.Profile.DisplayName;
 
-    // Deterministic class written to the desktop-shell root so CSS can force
-    // the correct layout regardless of physical window width.
     string ShellClass => UiModeSvc.EffectiveMode == UiMode.Tablet
-        ? "ui-mode-tablet" : "ui-mode-desktop";
+        ? "ui-mode-tablet"
+        : "ui-mode-desktop";
 
     void CloseNav() => navOpen = false;
 

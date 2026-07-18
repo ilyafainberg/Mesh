@@ -166,8 +166,17 @@
                 {
                     <div class="mode-chip">
                         <i class="bi bi-window-stack"></i> widget
-                        <button class="chip-x" @onclick="() => widgetMode = false" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
+                        <button class="chip-x" @onclick="ClearWidgetMode" title="Cancel widget" aria-label="Cancel widget"><i class="bi bi-x"></i></button>
                         <span class="mode-hint">describe the mini-app you want</span>
+                    </div>
+                }
+                else if (selectedWidget is not null)
+                {
+                    <div class="mode-chip selected-widget-chip">
+                        <i class="bi bi-window-stack"></i>
+                        <span class="widget-chip-name">@selectedWidget.Name</span>
+                        <button class="chip-x" @onclick="ClearWidgetMode" title="Remove widget" aria-label="Remove selected widget"><i class="bi bi-x"></i></button>
+                        <span class="mode-hint">send to use, or describe changes</span>
                     </div>
                 }
                 else if (ShowPreview)
@@ -192,9 +201,40 @@
                     </div>
                 }
                 <div class="composer">
-                    <button class="ghost icon-btn plus-btn @(widgetMode ? "on" : "")" @onclick="ToggleWidget" disabled="@ActiveBusy" title="Create a widget (mini-app)" aria-label="Create a widget">
-                        <i class="bi bi-plus-lg"></i>
-                    </button>
+                    <div class="widget-picker-anchor">
+                        <button class="ghost icon-btn plus-btn @(widgetMode || selectedWidget is not null || widgetPickerOpen ? "on" : "")"
+                                @onclick="ToggleWidgetPicker" disabled="@ActiveBusy" title="Create or choose a widget"
+                                aria-label="Create or choose a widget" aria-haspopup="menu" aria-expanded="@widgetPickerOpen"
+                                aria-controls="home-widget-picker">
+                            <i class="bi bi-plus-lg"></i>
+                        </button>
+                        @if (widgetPickerOpen)
+                        {
+                            <div id="home-widget-picker" class="widget-picker" role="menu" aria-label="Choose a widget">
+                                <button class="widget-picker-item widget-picker-create" role="menuitem" @onclick="CreateNewWidget">
+                                    <i class="bi bi-magic"></i>
+                                    <span>Create new widget</span>
+                                </button>
+                                <div class="widget-picker-separator" role="separator"></div>
+                                @if (State.Profile.Widgets.Count == 0)
+                                {
+                                    <div class="widget-picker-empty">No saved widgets yet</div>
+                                }
+                                else
+                                {
+                                    <div class="widget-picker-list">
+                                        @foreach (var widget in State.Profile.Widgets)
+                                        {
+                                            <button class="widget-picker-item" role="menuitem" @onclick="() => SelectWidget(widget)" @key="widget.Id">
+                                                <i class="bi bi-window-stack"></i>
+                                                <span>@widget.Name</span>
+                                            </button>
+                                        }
+                                    </div>
+                                }
+                            </div>
+                        }
+                    </div>
                     <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@ActiveBusy" title="Attach an image or document" aria-label="Attach an image or document">
                         <i class="bi bi-paperclip"></i>
                     </button>
@@ -206,7 +246,7 @@
                         </button>
                     }
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
-                              placeholder="@(widgetMode ? "Describe the widget you want…" : "Message your assistant…")" aria-label="Message your assistant"></textarea>
+                              placeholder="@ComposerPlaceholder" aria-label="Message your assistant"></textarea>
                     @if (ActiveBusy)
                     {
                         <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop" aria-label="Stop">
@@ -215,8 +255,8 @@
                     }
                     else
                     {
-                        <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0)" title="Send" aria-label="Send">
-                            <i class="bi @(widgetMode ? "bi-magic" : "bi-send")"></i>
+                        <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null)" title="Send" aria-label="Send">
+                            <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
                         </button>
                     }
                 </div>
@@ -245,6 +285,8 @@
     // running turn and its thinking indicator survive navigating away from and back to the Me section,
     // and a fresh page instance never starts a second concurrent turn for an already-running thread.
     bool widgetMode;
+    bool widgetPickerOpen;
+    Widget? selectedWidget;
     bool homeMode;
     bool confirmDelete;
     bool renaming;
@@ -267,6 +309,11 @@
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
     bool ActiveBusy => Active is not null && State.IsThreadBusy(Active.Id);
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
+    string ComposerPlaceholder => widgetMode
+        ? "Describe the widget you want…"
+        : selectedWidget is not null
+            ? $"Use or change {selectedWidget.Name}…"
+            : "Message your assistant…";
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
@@ -480,7 +527,28 @@
         activeThread = State.Profile.OwnThreads.Count > 0 ? State.Profile.OwnThreads[^1].Id : null;
     }
 
-    void ToggleWidget() { widgetMode = !widgetMode; }
+    void ToggleWidgetPicker() => widgetPickerOpen = !widgetPickerOpen;
+
+    void CreateNewWidget()
+    {
+        widgetPickerOpen = false;
+        selectedWidget = null;
+        widgetMode = true;
+    }
+
+    void SelectWidget(Widget widget)
+    {
+        widgetPickerOpen = false;
+        widgetMode = false;
+        selectedWidget = widget;
+    }
+
+    void ClearWidgetMode()
+    {
+        widgetPickerOpen = false;
+        widgetMode = false;
+        selectedWidget = null;
+    }
 
     async Task ResetComposer()
     {
@@ -526,14 +594,18 @@
 
     async Task Send()
     {
-        if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0) return;
+        if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null) return;
 
         // Ensure there is a thread to write into, and name a fresh one after its first message.
         var thread = Active ?? State.NewOwnThread();
         activeThread = thread.Id;
         var text = input;
-        if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(text))
-            State.RenameOwnThread(thread.Id, Titleize(text));
+        var chosenWidget = selectedWidget;
+        var titleText = !string.IsNullOrWhiteSpace(text)
+            ? text
+            : chosenWidget is not null ? $"Use widget: {chosenWidget.Name}" : "";
+        if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(titleText))
+            State.RenameOwnThread(thread.Id, Titleize(titleText));
 
         var files = attachments.ToList();
         // Capture the composer modes now, since they are reset immediately and the turn runs async.
@@ -542,6 +614,8 @@
         input = "";
         attachments.Clear();
         widgetMode = false;
+        widgetPickerOpen = false;
+        selectedWidget = null;
         _ = ResetComposer();
 
         // This thread is already running a turn: queue this input for its next turn instead of
@@ -551,10 +625,25 @@
         // shared app state, so a page instance reopened mid-turn still queues instead of double-running.
         if (State.IsThreadBusy(thread.Id))
         {
+            // Widget creation/refinement is typed work, not a generic agent continuation. Preserve
+            // the composer state instead of degrading it into the normal queued-chat path.
+            if (wasWidget || chosenWidget is not null)
+            {
+                input = text;
+                attachments.AddRange(files);
+                widgetMode = wasWidget;
+                selectedWidget = chosenWidget;
+                attachError = "Wait for the current turn to finish before using or changing a widget.";
+                return;
+            }
             var queuedImages = await LoadImageAttachmentsAsync(files, CancellationToken.None);
             var qLine = new ChatLine
             {
-                Role = "user", Text = ComposeOwnerPrompt(text, files, queuedImages), Attachments = queuedImages
+                Role = "user",
+                Text = chosenWidget is null
+                    ? ComposeOwnerPrompt(text, files, queuedImages)
+                    : ComposeQueuedWidgetPrompt(chosenWidget, text, files, queuedImages),
+                Attachments = queuedImages
             };
             State.AddOwnChatLine(thread.Id, qLine);
             State.EnqueueForThread(thread.Id, qLine);
@@ -563,22 +652,79 @@
 
         // Run this thread's turn WITHOUT awaiting it here, so sending in one Me topic never blocks
         // (or visually freezes) another. Each thread manages its own busy state and queue drain.
-        _ = RunThreadTurnAsync(thread.Id, text, files, wasWidget, wasHome);
+        _ = RunThreadTurnAsync(thread.Id, text, files, wasWidget, wasHome, chosenWidget);
     }
 
     // Runs one owner turn for a single thread, then drains that thread's queue. Independent of any
     // other thread's turn (service scopes flow via AsyncLocal, so concurrent turns do not mix). Run
     // state lives in AppState, so this task keeps the indicator correct even if the Me page is closed
     // (navigated away) mid-turn; it only touches singletons, so it is safe after component disposal.
-    async Task RunThreadTurnAsync(string threadId, string text, List<StagedFile> files, bool widget, bool home)
+    async Task RunThreadTurnAsync(string threadId, string text, List<StagedFile> files, bool widget, bool home, Widget? existingWidget)
     {
-        var ct = State.BeginThreadTurn(threadId, widget);
+        var existingWidgetId = existingWidget?.Id;
+        var existingWidgetName = existingWidget?.Name;
+        var existingWidgetPrompt = existingWidget?.Prompt;
+        var existingWidgetHtml = existingWidget?.Html;
+        var ct = State.BeginThreadTurn(threadId, widget || existingWidget is not null);
         try
         {
             var imageFiles = await LoadImageAttachmentsAsync(files, ct);
-            Runs.Start(threadId, text, imageFiles.Count > 0, widget);
+            Runs.Start(threadId, text, imageFiles.Count > 0, widget || existingWidget is not null);
             Runs.Executing(threadId);
-            if (widget)
+            if (existingWidget is not null && string.IsNullOrWhiteSpace(text) && files.Count == 0)
+            {
+                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = $"Use widget: {existingWidgetName}" });
+                State.AddOwnChatLine(threadId, new ChatLine
+                {
+                    Role = "assistant",
+                    Text = AsWidgetResponse(existingWidgetHtml!),
+                    WidgetPrompt = existingWidgetPrompt
+                });
+            }
+            else if (existingWidget is not null && (!string.IsNullOrWhiteSpace(text) || files.Count > 0))
+            {
+                var changeRequest = ComposeOwnerPrompt(text, files, imageFiles);
+                State.AddOwnChatLine(threadId, new ChatLine
+                {
+                    Role = "user",
+                    Text = $"Update widget {existingWidgetName}: {changeRequest}",
+                    Attachments = imageFiles
+                });
+                var result = await Agent.RefineWidgetAsync(existingWidgetPrompt!, changeRequest, ct);
+                var combinedPrompt = CombineWidgetPrompt(existingWidgetPrompt!, changeRequest);
+                var appSegment = Markdown.Parse(result).FirstOrDefault(segment => segment.IsApp);
+                State.AddOwnChatLine(threadId, new ChatLine
+                {
+                    Role = "assistant",
+                    Text = result,
+                    WidgetPrompt = appSegment is not null ? combinedPrompt : existingWidgetPrompt
+                });
+                if (appSegment is not null)
+                {
+                    var savedUpdateApplied = false;
+                    State.Mutate(profile =>
+                    {
+                        var saved = profile.Widgets.FirstOrDefault(w => w.Id == existingWidgetId);
+                        if (saved is null) return;
+                        if (!string.Equals(saved.Prompt, existingWidgetPrompt, StringComparison.Ordinal)
+                            || !string.Equals(saved.Html, existingWidgetHtml, StringComparison.Ordinal))
+                            return;
+                        saved.PreviousHtml = saved.Html;
+                        saved.PreviousPrompt = saved.Prompt;
+                        saved.Html = appSegment.Content;
+                        saved.Prompt = combinedPrompt;
+                        saved.ModifiedAt = DateTimeOffset.UtcNow;
+                        savedUpdateApplied = true;
+                    });
+                    if (!savedUpdateApplied)
+                        State.AddOwnChatLine(threadId, new ChatLine
+                        {
+                            Role = "assistant",
+                            Text = "[This widget changed in another chat while the refinement was running, so this version was not saved.]"
+                        });
+                }
+            }
+            else if (widget)
             {
                 var html = await Agent.BuildWidgetAsync(text, ct);
                 State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
@@ -671,6 +817,20 @@
         }
         return prompt;
     }
+
+    static string ComposeQueuedWidgetPrompt(Widget widget, string text, List<StagedFile> files, IReadOnlyList<ChatAttachment> images)
+    {
+        var request = ComposeOwnerPrompt(text, files, images);
+        return string.IsNullOrWhiteSpace(request)
+            ? $"Use saved widget \"{widget.Name}\". Its canonical prompt is: {widget.Prompt}"
+            : $"Update saved widget \"{widget.Name}\". Canonical prompt: {widget.Prompt}\n\nChange request: {request}";
+    }
+
+    static string CombineWidgetPrompt(string canonicalPrompt, string changeRequest) =>
+        string.IsNullOrWhiteSpace(canonicalPrompt) ? changeRequest : $"{canonicalPrompt}; {changeRequest}";
+
+    static string AsWidgetResponse(string html) =>
+        Markdown.Parse(html).Any(segment => segment.IsApp) ? html : $"```html-app\n{html}\n```";
 
     // A short title from the first message of a new chat.
     static string Titleize(string text)

@@ -32,12 +32,12 @@ public class UiModeServiceTests
         => Assert.AreEqual(UiMode.Tablet, UiModeParser.ResolveFromWidth(601, isMobilePlatform: false));
 
     [TestMethod]
-    public void Resolve_Width840_ReturnsTablet()
-        => Assert.AreEqual(UiMode.Tablet, UiModeParser.ResolveFromWidth(840, isMobilePlatform: false));
+    public void Resolve_Width1099_ReturnsTablet()
+        => Assert.AreEqual(UiMode.Tablet, UiModeParser.ResolveFromWidth(1099, isMobilePlatform: false));
 
     [TestMethod]
-    public void Resolve_Width841_ReturnsDesktop()
-        => Assert.AreEqual(UiMode.Desktop, UiModeParser.ResolveFromWidth(841, isMobilePlatform: false));
+    public void Resolve_Width1100_ReturnsDesktop()
+        => Assert.AreEqual(UiMode.Desktop, UiModeParser.ResolveFromWidth(1100, isMobilePlatform: false));
 
     [TestMethod]
     public void Resolve_LargeWidth_ReturnsDesktop()
@@ -87,19 +87,19 @@ public class UiModeServiceTests
     }
 
     [TestMethod]
-    public void ForcedTablet_UpdateWindowSize_EffectiveModeUnchanged()
-    {
-        var svc = CreateService(new(UiMode.Tablet, UiModeSource.CommandLine, false));
-        svc.UpdateWindowSize(1920, 1080); // desktop-sized window
-        Assert.AreEqual(UiMode.Tablet, svc.EffectiveMode);
-    }
-
-    [TestMethod]
     public void ForcedPhone_UpdateWindowSize_EffectiveModeUnchanged()
     {
         var svc = CreateService(new(UiMode.Phone, UiModeSource.CommandLine, false));
         svc.UpdateWindowSize(2560, 1440); // large desktop window
         Assert.AreEqual(UiMode.Phone, svc.EffectiveMode);
+    }
+
+    [TestMethod]
+    public void ForcedTablet_UpdateWindowSize_EffectiveModeUnchanged()
+    {
+        var svc = CreateService(new(UiMode.Tablet, UiModeSource.CommandLine, false));
+        svc.UpdateWindowSize(2560, 1440);
+        Assert.AreEqual(UiMode.Tablet, svc.EffectiveMode);
     }
 
     [TestMethod]

@@ -240,7 +240,7 @@ public sealed class GmailSearchTool(GoogleAuthService auth, IHttpClientFactory h
 }
 
 /// <summary>Builds the set of tools available from the user's connected sources.</summary>
-public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost, AgentMedia media, ToolApprovalService approvals)
+public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost, AgentMedia media, ToolApprovalService approvals, AppState state)
 {
     private IAgentTool GuardReadTool(IAgentTool tool)
         => new ApprovalTool(tool, ToolApprovalLevel.ReadOnlyAuto, approvals);
@@ -389,6 +389,9 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         foreach (var (kind, setting) in settings)
         {
             if (setting is null || !setting.Enabled) continue;
+            // Mesh data contains the owner's private chats and configuration. It is never exposed
+            // through a guest agent, even if an old profile contains a non-private visibility value.
+            if (!owner && kind == LocalToolKind.MeshData) continue;
             // Desktop-only tools (scripts, browsers) cannot run on a phone, so never offer them to the
             // agent on mobile. This gates both the owner and guest paths since both flow through here.
             if (PlatformCaps.IsMobile && kind.IsDesktopOnly()) continue;
@@ -416,6 +419,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         LocalToolKind.Geolocation => new GeoLocationTool(httpFactory),
         LocalToolKind.FileSystem => new FileSystemTool(extractor),
         LocalToolKind.WorkIq => new AskWorkIqTool(),
+        LocalToolKind.MeshData => new SearchMeshDataTool(state),
         _ => null
     };
 

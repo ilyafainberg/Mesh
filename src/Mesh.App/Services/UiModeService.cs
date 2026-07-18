@@ -30,11 +30,11 @@ public sealed record UiModeParseResult(UiMode Mode, UiModeSource Source, bool Ha
 /// </summary>
 public static class UiModeParser
 {
-    /// <summary>Maximum width (inclusive) at which a window is treated as Phone.</summary>
+    /// <summary>Maximum width at which a window uses the phone shell.</summary>
     public const double PhoneMaxWidth = 600;
 
-    /// <summary>Maximum width (inclusive) at which a window is treated as Tablet.</summary>
-    public const double TabletMaxWidth = 840;
+    /// <summary>Minimum width at which a window is treated as Desktop.</summary>
+    public const double DesktopMinWidth = 1100;
 
     /// <summary>
     /// Resolves the effective UI mode from a window width. When width is zero or
@@ -45,8 +45,7 @@ public static class UiModeParser
     {
         if (width <= 0) return isMobilePlatform ? UiMode.Phone : UiMode.Desktop;
         if (width <= PhoneMaxWidth) return UiMode.Phone;
-        if (width <= TabletMaxWidth) return UiMode.Tablet;
-        return UiMode.Desktop;
+        return width < DesktopMinWidth ? UiMode.Tablet : UiMode.Desktop;
     }
 
     /// <summary>

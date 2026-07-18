@@ -753,7 +753,7 @@ Omitting the flag preserves the existing adaptive behavior: the layout is resolv
 |------|----------|
 | auto (default) | Adaptive: resolved from current window width on every resize. |
 | desktop | Locked to the desktop layout regardless of window width. |
-| tablet | Locked to the tablet layout regardless of window width. |
+| tablet | Locked to the compact desktop layout with hamburger navigation. |
 | phone | Locked to the phone/mobile layout regardless of window width. |
 
 Width breakpoints used by auto resolution:
@@ -761,8 +761,8 @@ Width breakpoints used by auto resolution:
 | Width | Resolved mode |
 |-------|---------------|
 | <= 600 px | Phone |
-| 601 - 840 px | Tablet |
-| > 840 px | Desktop |
+| 601-1099 px | Tablet |
+| >= 1100 px | Desktop |
 
 Before the window reports a valid size, the platform default is used: Android/iOS resolve to Phone; all other platforms resolve to Desktop.
 
@@ -808,3 +808,22 @@ Parser and resolution tests live in tests/Mesh.App.Tests/. The project links UiM
 Run tests:
 
     dotnet test tests/Mesh.App.Tests/Mesh.App.Tests.csproj
+
+---
+
+## 11. GitHub Copilot CLI model provider
+
+The desktop client can use an installed GitHub Copilot CLI as its model provider through ACP v1 over stdio.
+
+1. Install GitHub Copilot CLI and run `copilot login` in a terminal.
+2. In Mesh Settings, choose **GitHub Copilot CLI (ACP)**.
+3. Select an account-available model and reasoning effort, then select **Change model**.
+
+Mesh starts `copilot --acp --stdio` as a managed child process. Model options come from the structured
+ACP `session/new` response, so the list reflects the current account and CLI version. The provider is
+desktop-only and stores no GitHub token. Mesh remains the canonical conversation store and creates a
+fresh ACP session for each completion. Copilot native tools and client filesystem/terminal capabilities
+are disabled in this version, avoiding a second permission system alongside Mesh Tools.
+
+Changing the selected model or effort restarts the ACP child process on the next request. `Auto` omits
+the corresponding CLI option and leaves the choice to Copilot.

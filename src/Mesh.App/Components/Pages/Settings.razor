@@ -3,6 +3,7 @@
 @inject MeshClient Mesh
 @inject MsalAuthService Msal
 @inject FoundryLocalService Foundry
+@inject CopilotAcpHost Copilot
 @inject ModelSetupService Setup
 @inject IHttpClientFactory HttpFactory
 @inject UpdateService Updater
@@ -77,6 +78,7 @@
                         {
                             <option value="Browser">Browser model (scripted)</option>
                         }
+                        <option value="GitHubCopilot">GitHub Copilot CLI (ACP)</option>
                     }
                 </select>
             </div>
@@ -88,6 +90,65 @@
                         <i class="bi bi-gift"></i>
                         <span>The Mesh free model runs on a shared Mesh-hosted model, no API key needed. There is a daily token budget, so it can pause once that budget is used up for the day. Switch to your own key@(PlatformCaps.IsMobile ? "" : " or an on-device model") for unlimited use.</span>
                     </div>
+                </div>
+            }
+            else if (provider == "GitHubCopilot")
+            {
+                <div class="field">
+                    <div class="connector-note">
+                        <i class="bi bi-github"></i>
+                        <span>Desktop only. Uses your installed and signed-in GitHub Copilot CLI through ACP. Mesh does not store a GitHub token. Copilot native tools are disabled in this first version.</span>
+                    </div>
+                </div>
+                <div class="field">
+                    <label>Copilot command</label>
+                    <input class="full" @bind="copilotExecutable" placeholder="copilot" autocomplete="off" />
+                    <div class="field-hint">Use <code>copilot</code> when it is on PATH, or enter the full path to the executable or command file. Run <code>copilot login</code> in a terminal first.</div>
+                </div>
+                <div class="field">
+                    <label>Model</label>
+                    <div class="model-row">
+                        <select class="full" value="@CopilotModelSelectValue" @onchange="OnCopilotModelSelect">
+                            @if (copilotModels.Count == 0)
+                            {
+                                <option value="auto">Automatic (Copilot chooses)</option>
+                            }
+                            @foreach (var option in copilotModels)
+                            {
+                                <option value="@option.Id" disabled="@(!option.Enabled)">@CopilotModelLabel(option)</option>
+                            }
+                            <option value="__custom__">Custom model ID...</option>
+                        </select>
+                        <button class="ghost icon-btn" title="Refresh Copilot model list"
+                                @onclick="() => LoadCopilotModelsAsync(force: true)"
+                                disabled="@loadingCopilotModels"
+                                aria-label="Refresh Copilot model list">
+                            <i class="bi @(loadingCopilotModels ? "bi-hourglass-split" : "bi-arrow-repeat")"></i>
+                        </button>
+                    </div>
+                    @if (copilotModelIsCustom)
+                    {
+                        <input class="full" style="margin-top:8px;" @bind="model" placeholder="Model ID, for example gpt-5.4" />
+                    }
+                    <div class="field-hint">The list comes from the installed CLI and reflects models enabled for your Copilot account. Automatic lets Copilot choose.</div>
+                    @if (!string.IsNullOrWhiteSpace(copilotModelsError))
+                    {
+                        <div class="err-text" role="alert">@copilotModelsError</div>
+                    }
+                </div>
+                <div class="field">
+                    <label>Reasoning effort</label>
+                    <select class="full" @bind="copilotEffort">
+                        <option value="Auto">Auto (Copilot default)</option>
+                        <option value="None">None</option>
+                        <option value="Minimal">Minimal</option>
+                        <option value="Low">Low</option>
+                        <option value="Medium">Medium</option>
+                        <option value="High">High</option>
+                        <option value="XHigh">Extra high</option>
+                        <option value="Max">Maximum</option>
+                    </select>
+                    <div class="field-hint">Changing the model or effort restarts the local ACP process for the next response.</div>
                 </div>
             }
             else if (provider == "FoundryLocal")
@@ -252,7 +313,7 @@
                 </div>
             }
 
-            @if (provider is not "MeshHosted" and not "Browser" and not "FoundryLocal")
+            @if (provider is not "MeshHosted" and not "Browser" and not "FoundryLocal" and not "GitHubCopilot")
             {
                 <div class="field">
                     <label>Reasoning effort</label>
@@ -597,6 +658,8 @@
     string apiKey = "";
     string apiVersion = "";
     string reasoningEffort = "Auto";
+    string copilotExecutable = "copilot";
+    string copilotEffort = "Auto";
     string browserEngine = "Firefox";
     string browserContextMode = "FullPrompt";
     string browserPresetStatus = "";
@@ -616,6 +679,10 @@
 
     List<FoundryModel> foundryModels = new();
     bool loadingModels;
+    List<CopilotModelOption> copilotModels = new();
+    bool loadingCopilotModels;
+    bool copilotModelIsCustom;
+    string? copilotModelsError;
 
     string? linkCode;
     string? qrDataUri;
@@ -697,7 +764,7 @@
     // On mobile, Foundry Local (On Device) cannot run, so a persisted FoundryLocal profile is coerced
     // to the safe hosted default for the UI. Saving keeps that coerced value.
     string EffectiveProvider(ModelProvider pv)
-        => PlatformCaps.IsMobile && pv == ModelProvider.FoundryLocal
+        => PlatformCaps.IsMobile && pv is ModelProvider.FoundryLocal or ModelProvider.GitHubCopilot
             ? nameof(ModelProvider.MeshHosted)
             : pv.ToString();
 
@@ -711,6 +778,8 @@
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
         reasoningEffort = p.Model.ReasoningEffort.ToString();
+        copilotExecutable = string.IsNullOrWhiteSpace(p.Model.CopilotExecutable) ? "copilot" : p.Model.CopilotExecutable;
+        copilotEffort = p.Model.CopilotEffort.ToString();
         browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
         browserContextMode = string.Equals(p.Model.BrowserContextMode, "CurrentTurn", StringComparison.OrdinalIgnoreCase) ? "CurrentTurn" : "FullPrompt";
         browserUrl = p.Model.BrowserUrl ?? "";
@@ -732,6 +801,7 @@
         "Grok" => "grok-2-latest",
         "Groq" => "llama-3.3-70b-versatile",
         "AzureOpenAI" => "my-gpt-4o-mini (deployment name)",
+        "GitHubCopilot" => "auto",
         _ => "gpt-4o-mini"
     };
 
@@ -754,7 +824,12 @@
 
     // Keep the custom flag in sync when a provider/model is loaded or changed.
     void SyncModelCustomFlag()
-        => modelIsCustom = CatalogOptions.Count > 0 && !string.IsNullOrWhiteSpace(model) && !CatalogOptions.Any(o => o.Id == model);
+    {
+        modelIsCustom = CatalogOptions.Count > 0 && !string.IsNullOrWhiteSpace(model) && !CatalogOptions.Any(o => o.Id == model);
+        copilotModelIsCustom = provider == "GitHubCopilot"
+            && !string.IsNullOrWhiteSpace(model)
+            && !copilotModels.Any(option => option.Id.Equals(model, StringComparison.OrdinalIgnoreCase));
+    }
 
     static bool IsFoundryId(string id) =>
         id.Contains("generic-cpu", StringComparison.OrdinalIgnoreCase) || id.Contains("-instruct-", StringComparison.OrdinalIgnoreCase);
@@ -773,6 +848,8 @@
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
         reasoningEffort = p.Model.ReasoningEffort.ToString();
+        copilotExecutable = string.IsNullOrWhiteSpace(p.Model.CopilotExecutable) ? "copilot" : p.Model.CopilotExecutable;
+        copilotEffort = p.Model.CopilotEffort.ToString();
         browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
         browserUrl = p.Model.BrowserUrl ?? "";
         browserExecuteScript = p.Model.BrowserExecuteScript ?? browserExecuteScript;
@@ -804,6 +881,8 @@
     protected override async Task OnInitializedAsync()
     {
         await LoadDevicesAsync();
+        if (provider == "GitHubCopilot")
+            await LoadCopilotModelsAsync();
     }
 
     async Task LoadDevicesAsync()
@@ -843,6 +922,14 @@
         {
             model = "openrouter/auto"; // OpenRouter routes by the user's account settings; client never pins a model
         }
+        else if (provider == "GitHubCopilot")
+        {
+            model = "auto";
+            copilotExecutable = string.IsNullOrWhiteSpace(copilotExecutable) ? "copilot" : copilotExecutable;
+            copilotEffort = "Auto";
+            copilotModelIsCustom = false;
+            _ = LoadCopilotModelsAsync();
+        }
         else if (provider == "FoundryLocal")
         {
             foundryModels = Foundry.CachedModels.ToList();
@@ -852,7 +939,7 @@
                         ?? foundryModels.FirstOrDefault()?.Id
                         ?? FoundryLocalService.DefaultModel;
         }
-        else if (IsFoundryId(model))
+        else if (IsFoundryId(model) || string.Equals(model, "auto", StringComparison.OrdinalIgnoreCase))
         {
             model = ""; // let the provider's placeholder show
         }
@@ -865,6 +952,54 @@
             if (!opts.Any(o => o.Id == model)) model = opts[0].Id;
         }
         SyncModelCustomFlag();
+    }
+
+    string CopilotModelSelectValue
+        => !copilotModelIsCustom && copilotModels.Any(option => option.Id.Equals(model, StringComparison.OrdinalIgnoreCase))
+            ? copilotModels.First(option => option.Id.Equals(model, StringComparison.OrdinalIgnoreCase)).Id
+            : string.Equals(model, "auto", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(model)
+                ? "auto"
+                : "__custom__";
+
+    static string CopilotModelLabel(CopilotModelOption option)
+    {
+        var suffix = string.IsNullOrWhiteSpace(option.Usage) ? "" : $" ({option.Usage})";
+        return option.Name + suffix + (option.Enabled ? "" : " - unavailable");
+    }
+
+    void OnCopilotModelSelect(ChangeEventArgs e)
+    {
+        var value = e.Value?.ToString() ?? "auto";
+        copilotModelIsCustom = value == "__custom__";
+        model = copilotModelIsCustom ? "" : value;
+    }
+
+    async Task LoadCopilotModelsAsync(bool force = false)
+    {
+        if (loadingCopilotModels || provider != "GitHubCopilot") return;
+        loadingCopilotModels = true;
+        copilotModelsError = null;
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            copilotModels = (await Copilot.GetModelsAsync(
+                string.IsNullOrWhiteSpace(copilotExecutable) ? "copilot" : copilotExecutable.Trim(),
+                force)).ToList();
+            if (!copilotModels.Any(option => option.Id.Equals("auto", StringComparison.OrdinalIgnoreCase)))
+                copilotModels.Insert(0, new CopilotModelOption("auto", "Automatic", "Let Copilot choose", null, null, true));
+            SyncModelCustomFlag();
+        }
+        catch (Exception ex)
+        {
+            copilotModelsError = ex.Message;
+            copilotModels = new() { new CopilotModelOption("auto", "Automatic", "Let Copilot choose", null, null, true) };
+            SyncModelCustomFlag();
+        }
+        finally
+        {
+            loadingCopilotModels = false;
+            await InvokeAsync(StateHasChanged);
+        }
     }
 
     /// <summary>Manual refresh, the only place that re-queries the on-device catalog after startup.</summary>
@@ -942,6 +1077,8 @@
             p.Model.Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim();
             p.Model.ApiVersion = string.IsNullOrWhiteSpace(apiVersion) ? null : apiVersion.Trim();
             p.Model.ReasoningEffort = Enum.TryParse<ReasoningEffort>(reasoningEffort, out var effort) ? effort : ReasoningEffort.Auto;
+            p.Model.CopilotExecutable = string.IsNullOrWhiteSpace(copilotExecutable) ? "copilot" : copilotExecutable.Trim();
+            p.Model.CopilotEffort = Enum.TryParse<CopilotEffort>(copilotEffort, out var cliEffort) ? cliEffort : CopilotEffort.Auto;
             p.Model.BrowserEngine = browserEngine;
             p.Model.BrowserContextMode = browserContextMode;
             p.Model.BrowserUrl = string.IsNullOrWhiteSpace(browserUrl) ? null : browserUrl.Trim();

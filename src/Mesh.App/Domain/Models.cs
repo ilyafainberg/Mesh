@@ -3,10 +3,13 @@ using Mesh.Shared;
 
 namespace Mesh.App.Domain;
 
-public enum ModelProvider { Anthropic, OpenAI, Gemini, FoundryLocal, Grok, Groq, MeshHosted, AzureOpenAI, OpenRouter, Browser }
+public enum ModelProvider { Anthropic, OpenAI, Gemini, FoundryLocal, Grok, Groq, MeshHosted, AzureOpenAI, OpenRouter, Browser, GitHubCopilot }
 
 /// <summary>Provider-native reasoning intensity. Auto omits the control and uses the model default.</summary>
 public enum ReasoningEffort { Auto, Low, Medium, High }
+
+/// <summary>Reasoning effort levels accepted by GitHub Copilot CLI.</summary>
+public enum CopilotEffort { Auto, None, Minimal, Low, Medium, High, XHigh, Max }
 
 /// <summary>Where a knowledge item's content came from.</summary>
 public enum KnowledgeSource { Manual, File }
@@ -71,7 +74,8 @@ public enum LocalToolKind
     WorkIq,
     HeadlessBrowser,
     WebSearch,
-    Geolocation
+    Geolocation,
+    MeshData
 }
 
 /// <summary>How much permission an enabled tool has to execute without asking first.</summary>
@@ -131,6 +135,10 @@ public sealed class ModelConfig
     public string Model { get; set; } = "claude-sonnet-4-6";
     /// <summary>Requested reasoning intensity. Auto leaves the choice to the provider.</summary>
     public ReasoningEffort ReasoningEffort { get; set; } = ReasoningEffort.Auto;
+    /// <summary>GitHub Copilot CLI command or absolute path. Desktop only.</summary>
+    public string CopilotExecutable { get; set; } = "copilot";
+    /// <summary>GitHub Copilot CLI reasoning effort. Auto omits the launch option.</summary>
+    public CopilotEffort CopilotEffort { get; set; } = CopilotEffort.Auto;
     /// <summary>Optional base URL override for OpenAI-compatible endpoints, or the Azure OpenAI resource URL.</summary>
     public string? Endpoint { get; set; }
     /// <summary>Azure OpenAI REST api-version (Azure only). Falls back to a sane default when unset.</summary>
@@ -158,6 +166,7 @@ public sealed class ModelConfig
     public bool IsConfigured =>
         Provider == ModelProvider.MeshHosted
         || (Provider == ModelProvider.Browser && OperatingSystem.IsWindows() && !string.IsNullOrWhiteSpace(BrowserUrl))
+        || (Provider == ModelProvider.GitHubCopilot && !OperatingSystem.IsAndroid() && !OperatingSystem.IsIOS())
         || Provider == ModelProvider.FoundryLocal
         || !string.IsNullOrWhiteSpace(ApiKey)
         || !string.IsNullOrWhiteSpace(Endpoint);
