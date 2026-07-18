@@ -13,14 +13,17 @@
     <style>
         /* Boot splash shown before Blazor mounts, then replaced automatically. */
         html, body { margin: 0; height: 100%; }
-        #app { height: 100vh; }
+        #app {
+            height: calc(100vh - env(safe-area-inset-top, 0px));
+            height: calc(100dvh - env(safe-area-inset-top, 0px));
+        }
         .app-splash {
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
             gap: 20px;
-            height: 100vh;
+            height: 100%;
             background: #f6f8fb;
             font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
         }

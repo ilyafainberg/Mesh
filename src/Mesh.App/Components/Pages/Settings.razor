@@ -384,6 +384,18 @@
             </div>
             <div class="field-row">
                 <div>
+                    <div class="field-label">Plan before acting</div>
+                    <div class="field-sub">Generate and show a concise action plan before each standard topic turn in Me. Uses an extra model request, so responses may take longer and use more MTokens or Copilot premium requests.</div>
+                </div>
+                <label class="switch">
+                    <input type="checkbox"
+                           checked="@State.Profile.PlanBeforeActing"
+                           @onchange="e => Toggle(p => p.PlanBeforeActing = (bool)(e.Value ?? false))"
+                           aria-label="Plan before acting in Me topics" />
+                </label>
+            </div>
+            <div class="field-row">
+                <div>
                     <div class="field-label">Interactive apps</div>
                     <div class="field-sub">Let agents send interactive mini-apps in messages. They run sandboxed and never auto-run.</div>
                 </div>

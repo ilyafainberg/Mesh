@@ -65,7 +65,7 @@ button:disabled {
     flex-direction: column;
     min-height: 100%;
     background: var(--bg-canvas);
-    padding: 8px 0 96px;
+    padding: 8px 0 16px;
 }
 
 .m-list-head {
@@ -523,6 +523,7 @@ button:disabled {
 .messages {
     flex: 1;
     overflow-y: auto;
+    overscroll-behavior: contain;
     background: var(--bg-canvas);
     -webkit-overflow-scrolling: touch;
 }

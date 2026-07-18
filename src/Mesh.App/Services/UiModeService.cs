@@ -7,7 +7,7 @@ namespace Mesh.App.Services;
 // ---------------------------------------------------------------------------
 
 /// <summary>UI layout mode. Auto means adaptive (resolved from window width).</summary>
-public enum UiMode { Auto, Desktop, Tablet, Phone }
+public enum UiMode { Auto, Desktop, Phone }
 
 /// <summary>How the current requested mode was set.</summary>
 public enum UiModeSource { Default, CommandLine }
@@ -33,19 +33,16 @@ public static class UiModeParser
     /// <summary>Maximum width at which a window uses the phone shell.</summary>
     public const double PhoneMaxWidth = 600;
 
-    /// <summary>Minimum width at which a window is treated as Desktop.</summary>
-    public const double DesktopMinWidth = 1100;
-
     /// <summary>
     /// Resolves the effective UI mode from a window width. When width is zero or
     /// negative (not yet known), falls back to platform: mobile gets Phone, all
-    /// others get Desktop.
+    /// others get Desktop. Above the phone breakpoint the desktop shell is used;
+    /// it collapses its own sidebar to a hamburger at narrow widths.
     /// </summary>
     public static UiMode ResolveFromWidth(double width, bool isMobilePlatform)
     {
         if (width <= 0) return isMobilePlatform ? UiMode.Phone : UiMode.Desktop;
-        if (width <= PhoneMaxWidth) return UiMode.Phone;
-        return width < DesktopMinWidth ? UiMode.Tablet : UiMode.Desktop;
+        return width <= PhoneMaxWidth ? UiMode.Phone : UiMode.Desktop;
     }
 
     /// <summary>

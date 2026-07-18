@@ -740,7 +740,6 @@ Pass --ui-mode when launching Mesh.exe to force a specific UI layout for the ses
 
     Mesh.exe --ui-mode auto
     Mesh.exe --ui-mode desktop
-    Mesh.exe --ui-mode tablet
     Mesh.exe --ui-mode phone
 
 The flag is case-insensitive. The override is session-only: it is never written to user settings or profiles, and is discarded when the app exits.
@@ -752,8 +751,7 @@ Omitting the flag preserves the existing adaptive behavior: the layout is resolv
 | Mode | Behavior |
 |------|----------|
 | auto (default) | Adaptive: resolved from current window width on every resize. |
-| desktop | Locked to the desktop layout regardless of window width. |
-| tablet | Locked to the compact desktop layout with hamburger navigation. |
+| desktop | Locked to the desktop layout. The sidebar collapses to hamburger navigation at narrow widths. |
 | phone | Locked to the phone/mobile layout regardless of window width. |
 
 Width breakpoints used by auto resolution:
@@ -761,8 +759,7 @@ Width breakpoints used by auto resolution:
 | Width | Resolved mode |
 |-------|---------------|
 | <= 600 px | Phone |
-| 601-1099 px | Tablet |
-| >= 1100 px | Desktop |
+| > 600 px | Desktop |
 
 Before the window reports a valid size, the platform default is used: Android/iOS resolve to Phone; all other platforms resolve to Desktop.
 
@@ -786,7 +783,7 @@ Key types:
 
 | Type | Description |
 |------|-------------|
-| UiMode | Auto, Desktop, Tablet, Phone |
+| UiMode | Auto, Desktop, Phone |
 | UiModeSource | Default (no flag), CommandLine (flag present) |
 | IUiModeService | Service interface: RequestedMode, EffectiveMode, IsForced, Source, Changed event, UpdateWindowSize, ApplyRequestedMode, ApplyCommandLine |
 | UiModeParser | Pure static helpers: ParseArgs, ResolveFromWidth, SplitWindowsArgs |

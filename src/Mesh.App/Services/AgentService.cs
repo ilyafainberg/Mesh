@@ -50,6 +50,32 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
         var history = Window(thread.Lines, p.Model.Provider).ToList();
+        if (p.PlanBeforeActing)
+        {
+            var previousRun = state.AgentRunFor(thread.Id);
+            var runId = previousRun?.RunId ?? Guid.NewGuid().ToString("n");
+            var startedAt = previousRun?.StartedAt ?? DateTimeOffset.UtcNow;
+            state.SetAgentRun(new AgentRunState(
+                runId,
+                thread.Id,
+                AgentRunPhase.Planning,
+                "**Planning...**",
+                previousRun?.Subtasks ?? Array.Empty<AgentSubtaskState>(),
+                startedAt));
+
+            var plan = await BuildVisiblePlanAsync(model, p, history, agentTools, ct);
+            var hyperscale = previousRun?.Phase == AgentRunPhase.Hyperscaling
+                || plan.Contains("Plan - Hyperscale", StringComparison.OrdinalIgnoreCase);
+            state.SetAgentRun(new AgentRunState(
+                runId,
+                thread.Id,
+                hyperscale ? AgentRunPhase.Hyperscaling : AgentRunPhase.Executing,
+                plan,
+                previousRun?.Subtasks ?? Array.Empty<AgentSubtaskState>(),
+                startedAt));
+            sys += "\nVISIBLE ACTION PLAN:\n" + plan
+                + "\nExecute this plan now. Adapt when needed, keep tool progress visible, and mention important deviations in the final answer.";
+        }
 
         // In Hyperscale mode, spawn read-only specialist agents in parallel. They cannot call tools
         // or mutate files, so their workstreams cannot conflict. Their findings become private
@@ -103,6 +129,65 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             return finalAnswer;
         }
     }
+
+    private static async Task<string> BuildVisiblePlanAsync(
+        IChatModel model,
+        MeshProfile profile,
+        IReadOnlyList<ChatLine> history,
+        IReadOnlyList<IAgentTool> agentTools,
+        CancellationToken ct)
+    {
+        var capabilities = new StringBuilder();
+        if (agentTools.Count > 0)
+        {
+            capabilities.AppendLine("Available tools:");
+            foreach (var tool in agentTools)
+                capabilities.AppendLine($"- {tool.Name}: {tool.Description}");
+        }
+        var skills = profile.Skills.Where(skill => skill.Enabled).Select(skill => skill.Name).ToList();
+        if (skills.Count > 0)
+            capabilities.AppendLine("Enabled skills: " + string.Join(", ", skills));
+        if (profile.Knowledge.Count > 0)
+            capabilities.AppendLine($"Knowledge items available during execution: {profile.Knowledge.Count}");
+
+        var plannerPrompt =
+            """
+            Create a concise, user-visible action plan for the next assistant response.
+            Return Markdown only, with a heading and 1-5 numbered action steps.
+            Use **Plan - Hyperscale** only when independent workstreams genuinely benefit from parallel execution; otherwise use **Plan**.
+            For a trivial request, use one step such as "Answer directly."
+            Describe observable actions, not hidden reasoning or chain-of-thought.
+            Do not execute tools or answer the request in this planning turn.
+            """
+            + "\n" + capabilities;
+        try
+        {
+            var reply = await model.CompleteAsync(
+                plannerPrompt,
+                history,
+                new CompletionOptions(800),
+                ct);
+            var (_, visible) = ReasoningExtract.FromText(reply);
+            if (ModelReply.IsFailure(visible) || string.IsNullOrWhiteSpace(visible))
+                return FallbackPlan();
+            visible = visible.Trim();
+            if (visible.Length > 3000) visible = visible[..3000].TrimEnd();
+            return visible.Contains("**Plan", StringComparison.OrdinalIgnoreCase)
+                ? visible
+                : "**Plan**\n" + visible;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return FallbackPlan();
+        }
+    }
+
+    private static string FallbackPlan()
+        => "**Plan**\n1. Complete the request directly.";
 
     private static IReadOnlyList<ChatLine> SpecialistInput(IReadOnlyList<ChatLine> history, string request)
     {

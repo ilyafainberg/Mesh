@@ -15,11 +15,19 @@ public sealed class CopilotAcpHost(
 {
     private sealed class TurnState
     {
+        public sealed class ToolProgress
+        {
+            public string Label { get; set; } = "Copilot action";
+            public string? Arguments { get; set; }
+            public bool StartedReported { get; set; }
+        }
+
         public StringBuilder Answer { get; } = new();
         public StringBuilder Thought { get; } = new();
         public IProgress<AgentStep>? Progress { get; init; }
         public HashSet<string> AllowedToolNames { get; init; } = new(StringComparer.Ordinal);
         public HashSet<string> MeshToolCallIds { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, ToolProgress> ToolCalls { get; } = new(StringComparer.Ordinal);
         private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
         private readonly List<string> messageOrder = new();
 
@@ -438,18 +446,30 @@ public sealed class CopilotAcpHost(
             return;
         }
         if (kind is not "tool_call" and not "tool_call_update") return;
-        if (kind == "tool_call"
-            && update.TryGetProperty("toolCallId", out var toolCallIdValue)
-            && toolCallIdValue.GetString() is { } toolCallId)
+        if (!update.TryGetProperty("toolCallId", out var toolCallIdValue)
+            || toolCallIdValue.GetString() is not { } toolCallId)
+            return;
+
+        var titleText = update.TryGetProperty("title", out var titleCandidate)
+            ? titleCandidate.GetString()
+            : null;
+        if (kind == "tool_call")
         {
-            var titleText = update.TryGetProperty("title", out var titleCandidate)
-                ? titleCandidate.GetString()
-                : null;
             if (turn.AllowedToolNames.Any(name =>
                     string.Equals(titleText, name, StringComparison.Ordinal)))
                 turn.MeshToolCallIds.Add(toolCallId);
         }
-        var title = update.TryGetProperty("title", out var titleValue) ? titleValue.GetString() : "Copilot action";
+
+        if (!turn.ToolCalls.TryGetValue(toolCallId, out var tracked))
+        {
+            tracked = new TurnState.ToolProgress();
+            turn.ToolCalls[toolCallId] = tracked;
+        }
+        if (!string.IsNullOrWhiteSpace(titleText))
+            tracked.Label = FriendlyToolLabel(titleText, turn.AllowedToolNames);
+        if (update.TryGetProperty("rawInput", out var rawInput))
+            tracked.Arguments = ToolTrace.Clip(rawInput.GetRawText());
+
         var status = update.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : "pending";
         var state = status switch
         {
@@ -457,7 +477,58 @@ public sealed class CopilotAcpHost(
             "failed" or "cancelled" => AgentStepState.Failed,
             _ => AgentStepState.Started
         };
-        turn.Progress?.Report(new AgentStep("copilot", title ?? "Copilot action", state));
+        var stepKey = $"copilot:{toolCallId}";
+        if (!tracked.StartedReported)
+        {
+            turn.Progress?.Report(new AgentStep(
+                stepKey,
+                tracked.Label,
+                AgentStepState.Started,
+                tracked.Arguments));
+            tracked.StartedReported = true;
+        }
+        if (state != AgentStepState.Started)
+        {
+            turn.Progress?.Report(new AgentStep(
+                stepKey,
+                tracked.Label,
+                state,
+                tracked.Arguments,
+                ExtractToolResult(update)));
+        }
+    }
+
+    private static string FriendlyToolLabel(string title, IReadOnlySet<string> allowedToolNames)
+    {
+        var toolName = title.StartsWith("mesh-", StringComparison.Ordinal)
+            ? title["mesh-".Length..]
+            : title;
+        return allowedToolNames.Contains(title) || allowedToolNames.Contains(toolName)
+            ? ReasoningExtract.Label(toolName)
+            : title;
+    }
+
+    private static string? ExtractToolResult(JsonElement update)
+    {
+        if (update.TryGetProperty("rawOutput", out var rawOutput))
+            return ToolTrace.Clip(rawOutput.GetRawText());
+        if (!update.TryGetProperty("content", out var content)
+            || content.ValueKind != JsonValueKind.Array)
+            return null;
+        var output = new StringBuilder();
+        foreach (var item in content.EnumerateArray())
+        {
+            JsonElement textContainer;
+            if (item.TryGetProperty("content", out var nested))
+                textContainer = nested;
+            else
+                textContainer = item;
+            if (textContainer.TryGetProperty("type", out var type)
+                && type.GetString() == "text"
+                && textContainer.TryGetProperty("text", out var text))
+                output.AppendLine(text.GetString());
+        }
+        return ToolTrace.Clip(output.ToString().Trim());
     }
 
     private async Task ReadStderrAsync(StreamReader error, CancellationToken ct)

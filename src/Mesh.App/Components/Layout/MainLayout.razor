@@ -100,9 +100,7 @@ else
     string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
         ? State.Profile.Handle : State.Profile.DisplayName;
 
-    string ShellClass => UiModeSvc.EffectiveMode == UiMode.Tablet
-        ? "ui-mode-tablet"
-        : "ui-mode-desktop";
+    string ShellClass => "ui-mode-desktop";
 
     void CloseNav() => navOpen = false;
 

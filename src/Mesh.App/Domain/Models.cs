@@ -566,6 +566,8 @@ public sealed class MeshProfile
     public string Handle { get; set; } = "";
     public string DisplayName { get; set; } = "";
     public bool DiscoveryTourCompleted { get; set; }
+    /// <summary>Generate and show a model-authored action plan before each standard Me topic turn.</summary>
+    public bool PlanBeforeActing { get; set; }
     public string PrivateKey { get; set; } = ""; // base64 PKCS#8 (device signing key, never exported)
     public string PublicKey { get; set; } = "";  // base64 SubjectPublicKeyInfo (device signing key)
 

@@ -144,12 +144,12 @@ public class UiModeParserTests
     }
 
     [TestMethod]
-    public void TabletValue_ReturnsTabletCommandLine()
+    public void TabletValue_NowUnsupported_ReturnsAutoCommandLineWithInvalidFlag()
     {
         var result = UiModeParser.ParseArgs(["Mesh.exe", "--ui-mode", "tablet"]);
-        Assert.AreEqual(UiMode.Tablet, result.Mode);
+        Assert.AreEqual(UiMode.Auto, result.Mode);
         Assert.AreEqual(UiModeSource.CommandLine, result.Source);
-        Assert.IsFalse(result.HadInvalidInput);
+        Assert.IsTrue(result.HadInvalidInput);
     }
 
     [TestMethod]
