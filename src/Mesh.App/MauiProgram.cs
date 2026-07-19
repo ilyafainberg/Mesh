@@ -86,7 +86,9 @@ public static class MauiProgram
 		builder.Services.AddSingleton<GoogleAuthService>();
 		builder.Services.AddSingleton<ConnectorAuthService>();
 		builder.Services.AddSingleton<ToolApprovalService>();
+		builder.Services.AddSingleton<LocationPermissionService>();
 		builder.Services.AddSingleton<ToolRegistry>();
+		builder.Services.AddSingleton<IQrScanner, QrScannerService>();
 		builder.Services.AddSingleton<LocalFileRegistry>();
 		builder.Services.AddSingleton<AgentMedia>();
 		builder.Services.AddSingleton<McpHost>();

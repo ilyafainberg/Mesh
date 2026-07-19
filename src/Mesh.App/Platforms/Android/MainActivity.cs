@@ -11,12 +11,22 @@ namespace Mesh.App;
 [Activity(Theme = "@style/Maui.SplashTheme", MainLauncher = true, LaunchMode = LaunchMode.SingleTask, ConfigurationChanges = ConfigChanges.ScreenSize | ConfigChanges.Orientation | ConfigChanges.UiMode | ConfigChanges.ScreenLayout | ConfigChanges.SmallestScreenSize | ConfigChanges.Density, WindowSoftInputMode = SoftInput.AdjustResize)]
 [IntentFilter(new[] { Intent.ActionView },
     Categories = new[] { Intent.CategoryDefault, Intent.CategoryBrowsable },
-    DataScheme = "mesh")]
+    DataScheme = "mesh", DataHost = "link")]
+[IntentFilter(new[] { Intent.ActionView },
+    Categories = new[] { Intent.CategoryDefault, Intent.CategoryBrowsable },
+    DataScheme = "mesh", DataHost = "service")]
+[IntentFilter(new[] { Intent.ActionView },
+    Categories = new[] { Intent.CategoryDefault, Intent.CategoryBrowsable },
+    DataScheme = "mesh", DataHost = "user")]
+[IntentFilter(new[] { Intent.ActionView },
+    Categories = new[] { Intent.CategoryDefault, Intent.CategoryBrowsable },
+    DataScheme = "https", DataHost = "meshrelay.net", DataPathPrefix = "/link", AutoVerify = true)]
 public class MainActivity : MauiAppCompatActivity
 {
     protected override void OnCreate(Bundle? savedInstanceState)
     {
         base.OnCreate(savedInstanceState);
+        Microsoft.Maui.ApplicationModel.Platform.Init(this, savedInstanceState);
 
         // Cold start: the app was launched by a clicked mesh:// link (SingleTask so there is one task).
         HandleDeepLinkIntent(Intent);
@@ -61,11 +71,20 @@ public class MainActivity : MauiAppCompatActivity
         HandleDeepLinkIntent(intent);
     }
 
+    protected override void OnActivityResult(int requestCode, Result resultCode, Intent? data)
+    {
+        base.OnActivityResult(requestCode, resultCode, data);
+        Microsoft.Identity.Client.AuthenticationContinuationHelper.SetAuthenticationContinuationEventArgs(
+            requestCode, resultCode, data);
+    }
+
     /// <summary>Routes a mesh:// deep link from an intent to the Blazor UI, if present.</summary>
     private static void HandleDeepLinkIntent(Intent? intent)
     {
         var data = intent?.DataString;
-        if (!string.IsNullOrWhiteSpace(data) && data.StartsWith("mesh://", System.StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrWhiteSpace(data) &&
+            (data.StartsWith("mesh://", System.StringComparison.OrdinalIgnoreCase) ||
+             data.StartsWith("https://meshrelay.net/link", System.StringComparison.OrdinalIgnoreCase)))
             DeepLinkDispatch.Dispatch(data);
     }
 

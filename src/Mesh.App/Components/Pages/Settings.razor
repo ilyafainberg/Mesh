@@ -1311,11 +1311,20 @@
         linkWorking = true;
         try
         {
+            if (!Uri.TryCreate(State.Profile.RelayUrl, UriKind.Absolute, out var relayUri) ||
+                (relayUri.Scheme != Uri.UriSchemeHttps && !(relayUri.Scheme == Uri.UriSchemeHttp && relayUri.IsLoopback)) ||
+                !string.IsNullOrEmpty(relayUri.UserInfo) || !string.IsNullOrEmpty(relayUri.Query) ||
+                !string.IsNullOrEmpty(relayUri.Fragment))
+            {
+                linkError = "A valid HTTPS relay URL is required before generating a device-link.";
+                return;
+            }
             var ttl = TimeSpan.FromMinutes(5);
             var (ok, code, err) = await Mesh.CreateLinkInviteAsync(ttl);
             if (!ok || code is null) { linkError = err ?? "Could not create invite."; return; }
             linkCode = code;
-            qrDataUri = BuildQr(code);
+            var pairingUrl = UniversalLink.ForPairing(State.Profile.Handle, code, State.Profile.RelayUrl);
+            qrDataUri = BuildQr(pairingUrl);
             remaining = (int)ttl.TotalSeconds;
             linkTimer = new System.Threading.Timer(_ =>
             {
@@ -1336,11 +1345,9 @@
         qrDataUri = null;
     }
 
-    // The QR payload carries relay + handle + code so the other device can prefill everything.
-    string BuildQr(string code)
+    // HTTPS opens from a normal Camera app; the landing page immediately hands off to Mesh.
+    string BuildQr(string payload)
     {
-        var payload = $"mesh://link?relay={Uri.EscapeDataString(State.Profile.RelayUrl)}"
-                    + $"&handle={Uri.EscapeDataString(State.Profile.Handle)}&code={Uri.EscapeDataString(code)}";
         using var gen = new QRCoder.QRCodeGenerator();
         using var data = gen.CreateQrCode(payload, QRCoder.QRCodeGenerator.ECCLevel.Q);
         var png = new QRCoder.PngByteQRCode(data).GetGraphic(6);

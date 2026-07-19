@@ -204,7 +204,7 @@ public static class DeepLink
             || !uri.AbsolutePath.Equals("/link", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        var q = ParseQuery(uri.Query);
+        var q = ParseQuery(string.IsNullOrWhiteSpace(uri.Fragment) ? uri.Query : uri.Fragment);
         var code = Get(q, "code");
         if (string.IsNullOrWhiteSpace(code)) return false;
 
@@ -223,7 +223,7 @@ public static class DeepLink
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (string.IsNullOrEmpty(query)) return result;
-        foreach (var pair in query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        foreach (var pair in query.TrimStart('?', '#').Split('&', StringSplitOptions.RemoveEmptyEntries))
         {
             var eq = pair.IndexOf('=');
             if (eq < 0) { result[Uri.UnescapeDataString(pair)] = ""; continue; }
@@ -256,7 +256,7 @@ public static class UniversalLink
         var q = $"handle={Uri.EscapeDataString(LinkProtocol.Normalize(handle))}&code={Uri.EscapeDataString(code.Trim())}";
         if (!string.IsNullOrWhiteSpace(relayUrl))
             q += $"&relay={Uri.EscapeDataString(relayUrl.TrimEnd('/'))}";
-        return $"{BaseUrl}/link?{q}";
+        return $"{BaseUrl}/link#{q}";
     }
 }
 

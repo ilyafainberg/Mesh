@@ -13,6 +13,9 @@ public sealed class MsalAuthService
     // Mesh Agent Client, multi-tenant + personal accounts, http://localhost redirect.
     public const string ClientId = "562957d8-0f97-47eb-a445-a93d4a938f5a";
     private const string Authority = "https://login.microsoftonline.com/common";
+    public const string AndroidRedirectUri = "msal562957d8-0f97-47eb-a445-a93d4a938f5a://auth";
+    public const string IosRedirectUri = "msauth.net.meshrelay.mesh://auth";
+    public static string MobileRedirectUri => OperatingSystem.IsIOS() ? IosRedirectUri : AndroidRedirectUri;
 
     // The well-known tenant id used by consumer (personal) Microsoft accounts.
     private const string ConsumerTenantId = "9188040d-6c67-4c5b-b112-36a304b66dad";
@@ -33,11 +36,15 @@ public sealed class MsalAuthService
         Directory.CreateDirectory(dir);
         cacheFile = Path.Combine(dir, "msal-cache.bin");
 
-        app = PublicClientApplicationBuilder.Create(ClientId)
+        var builder = PublicClientApplicationBuilder.Create(ClientId)
             .WithAuthority(Authority)
-            // Desktop system-browser flow requires a loopback redirect (http://localhost).
-            .WithRedirectUri("http://localhost")
-            .Build();
+            .WithRedirectUri(IsMobile ? MobileRedirectUri : "http://localhost");
+#if ANDROID
+        builder = builder.WithParentActivityOrWindow(() => Microsoft.Maui.ApplicationModel.Platform.CurrentActivity!);
+#elif IOS
+        builder = builder.WithParentActivityOrWindow(() => Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController());
+#endif
+        app = builder.Build();
 
         // Persist the token cache across restarts (DPAPI-protected, CurrentUser), so
         // connected Microsoft accounts don't need to re-auth every launch. This custom cache
@@ -106,16 +113,17 @@ public sealed class MsalAuthService
         try
         {
             var builder = app.AcquireTokenInteractive(scopes)
-                .WithPrompt(Prompt.SelectAccount)
-                .WithUseEmbeddedWebView(false)
-                .WithSystemWebViewOptions(FrontWindowOptions());
-            var handle = ParentWindow.GetHandle();
-            if (handle != IntPtr.Zero)
-                builder = builder.WithParentActivityOrWindow(handle);
+                .WithPrompt(Prompt.SelectAccount);
+            builder = ConfigureInteractive(builder);
             var result = await builder.ExecuteAsync(ct);
             BrowserLauncher.CloseAuthWindow();
             Changed?.Invoke();
             return (true, result.Account, null);
+        }
+        catch (MsalClientException ex)
+        {
+            BrowserLauncher.CloseAuthWindow();
+            return (false, null, FormatMsalError(ex));
         }
         catch (Exception ex)
         {
@@ -153,16 +161,19 @@ public sealed class MsalAuthService
             catch (MsalUiRequiredException)
             {
                 var builder = app.AcquireTokenInteractive(scopes)
-                    .WithUseEmbeddedWebView(false)
-                    .WithSystemWebViewOptions(FrontWindowOptions());
+                    .WithUseEmbeddedWebView(false);
                 if (account is not null) builder = builder.WithAccount(account);
-                var handle = ParentWindow.GetHandle();
-                if (handle != IntPtr.Zero) builder = builder.WithParentActivityOrWindow(handle);
+                builder = ConfigureInteractive(builder);
                 result = await builder.ExecuteAsync(ct);
                 BrowserLauncher.CloseAuthWindow();
             }
             Changed?.Invoke();
             return (true, result.AccessToken, null);
+        }
+        catch (MsalClientException ex)
+        {
+            BrowserLauncher.CloseAuthWindow();
+            return (false, null, FormatMsalError(ex));
         }
         catch (Exception ex)
         {
@@ -177,5 +188,33 @@ public sealed class MsalAuthService
         foreach (var acc in accounts.Where(a => accountId is null || a.HomeAccountId?.Identifier == accountId))
             await app.RemoveAsync(acc);
         Changed?.Invoke();
+    }
+
+    private static bool IsMobile => OperatingSystem.IsAndroid() || OperatingSystem.IsIOS();
+
+    private static string FormatMsalError(MsalClientException ex)
+        => IsMobile
+            ? $"Microsoft mobile sign-in could not complete. Confirm the app registration includes redirect URI {MobileRedirectUri}. Details: {ex.Message}"
+            : ex.Message;
+
+    private static AcquireTokenInteractiveParameterBuilder ConfigureInteractive(
+        AcquireTokenInteractiveParameterBuilder builder)
+    {
+        builder = builder.WithUseEmbeddedWebView(false);
+        if (IsMobile)
+        {
+#if ANDROID
+            var activity = Microsoft.Maui.ApplicationModel.Platform.CurrentActivity;
+            if (activity is not null) builder = builder.WithParentActivityOrWindow(activity);
+#elif IOS
+            var controller = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
+            if (controller is not null) builder = builder.WithParentActivityOrWindow(controller);
+#endif
+            return builder;
+        }
+
+        builder = builder.WithSystemWebViewOptions(FrontWindowOptions());
+        var handle = ParentWindow.GetHandle();
+        return handle == IntPtr.Zero ? builder : builder.WithParentActivityOrWindow(handle);
     }
 }

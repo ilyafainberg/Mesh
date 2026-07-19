@@ -34,6 +34,11 @@
     <string>Mesh uses the camera to scan a device-link QR code.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
     <string>Mesh uses precise location only when you enable and run the Location tool.</string>
+    <key>NSLocationTemporaryUsageDescriptionDictionary</key>
+    <dict>
+        <key>TemporaryFullAccuracyUsageDescription</key>
+        <string>Mesh uses precise location only when you run the Location tool.</string>
+    </dict>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
@@ -43,6 +48,8 @@
             <array>
                 <string>mesh</string>
                 <string>net.meshrelay.mesh</string>
+                <string>msal562957d8-0f97-47eb-a445-a93d4a938f5a</string>
+                <string>msauth.net.meshrelay.mesh</string>
             </array>
         </dict>
     </array>

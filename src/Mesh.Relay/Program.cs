@@ -13,6 +13,7 @@ using Mesh.Relay.Storage;
 using Mesh.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
 
 // Cap REST request bodies. Message attachments travel over the hub (WebSocket), not REST, so
 // REST payloads (registration, link, token broker, model prompt) are always small.
@@ -149,6 +150,73 @@ app.MapGet("/health", () => Results.Ok(new
     time = DateTimeOffset.UtcNow,
     capabilities = transportCapabilities
 }));
+
+// Camera-compatible device-link landing. Sensitive pairing data stays in the URL fragment, which
+// browsers never send to the relay. This page validates and hands it to the app locally.
+app.MapGet("/link", (HttpContext context) =>
+{
+    var nonce = Convert.ToBase64String(RandomNumberGenerator.GetBytes(18));
+    SetSensitiveResponseHeaders(context,
+        $"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+    var html = $$"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Open Mesh</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f3f4f6;margin:0;color:#111827}.wrap{max-width:420px;margin:0 auto;padding:48px 16px}.brand{font-weight:700;font-size:20px;color:#2563eb;text-align:center;margin-bottom:24px}.card{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.1);text-align:center}h1{font-size:22px;margin:0 0 10px}.btn{display:block;width:100%;box-sizing:border-box;text-align:center;background:#2563eb;color:#fff;text-decoration:none;padding:12px;border:0;border-radius:10px;margin-top:12px;font:600 16px inherit;cursor:pointer}.btn.alt{background:#fff;color:#2563eb;border:1px solid #2563eb}.code{font-family:ui-monospace,Consolas,monospace;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-top:16px}.muted{color:#6b7280;font-size:13px}</style></head>
+<body><div class="wrap"><div class="brand">Mesh</div><div class="card">
+<h1>Link this device</h1><p>This single-use code expires shortly. Open Mesh to continue.</p>
+<a class="btn" id="open" href="#">Open Mesh</a>
+<button class="btn alt" id="copy" type="button">Copy link code</button>
+<div class="code" id="code">Checking link...</div>
+<p class="muted" id="status">If Mesh did not open, use the button above or copy the code.</p>
+</div></div><script nonce="{{nonce}}">
+const values=new URLSearchParams(location.hash.slice(1));
+const handle=(values.get('handle')||'').trim().toLowerCase();
+const code=(values.get('code')||'').trim();
+const relay=(values.get('relay')||'').trim();
+let relayUrl;try{relayUrl=new URL(relay);}catch{}
+const validRelay=relayUrl&&relayUrl.protocol==='https:'&&!relayUrl.username&&!relayUrl.password&&!relayUrl.search&&!relayUrl.hash;
+const validHandle=/^[a-z0-9_-]{2,64}$/.test(handle);
+const validCode=/^[A-Za-z0-9_-]{6,512}$/.test(code);
+const open=document.getElementById('open'),codeBox=document.getElementById('code'),status=document.getElementById('status');
+if(validRelay&&validHandle&&validCode){
+  const target='mesh://link?'+new URLSearchParams({handle,code,relay}).toString();
+  open.href=target;codeBox.textContent=code;window.location.replace(target);
+}else{
+  open.hidden=true;document.getElementById('copy').hidden=true;codeBox.textContent='Invalid device-link';
+  status.textContent='This link is incomplete or malformed. Generate a new link in Mesh Settings.';
+}
+document.getElementById('copy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(code);status.textContent='Link code copied.';}catch{status.textContent='Press and hold the code to copy it.';} });
+</script></body></html>
+""";
+    return Results.Content(html, "text/html", Encoding.UTF8);
+});
+
+// Google redirects to this registered HTTPS URI on mobile. No token exchange, secret, state, or
+// authorization code is retained here; validated transient values are immediately sent to the app.
+app.MapGet("/oauth/google/callback", (HttpContext context) =>
+{
+    SetSensitiveResponseHeaders(context, "default-src 'none'; frame-ancestors 'none'");
+    var code = context.Request.Query["code"].ToString();
+    var stateValue = context.Request.Query["state"].ToString();
+    var error = context.Request.Query["error"].ToString();
+    var validState = stateValue.Length is >= 20 and <= 256 &&
+                     stateValue.All(c => char.IsLetterOrDigit(c) || c is '_' or '-');
+    var validCode = code.Length <= 4096 && code.All(c => !char.IsControl(c));
+    var validError = error.Length <= 128 &&
+                     error.All(c => char.IsLetterOrDigit(c) || c is '_' or '-' or '.');
+    if (!validState || !validCode || !validError ||
+        (string.IsNullOrEmpty(code) == string.IsNullOrEmpty(error)))
+        return Results.BadRequest(new { error = "invalid OAuth callback" });
+
+    var values = new List<KeyValuePair<string, string?>>
+    {
+        new("state", stateValue)
+    };
+    if (!string.IsNullOrEmpty(code)) values.Add(new("code", code));
+    if (!string.IsNullOrEmpty(error)) values.Add(new("error", error));
+    var callback = "mesh://oauth/google" + QueryString.Create(values);
+    return Results.Redirect(callback);
+});
 
 // ---- Metrics (aggregate counts only, no handles/PII) ----------------------
 // Unauthenticated read so ops can scrape it; exposes only process-wide totals + a live gauge.
@@ -798,6 +866,17 @@ static string Normalize(string handle)
     => handle.Trim().TrimStart('@').ToLowerInvariant();
 
 static string Trim(string s) => s.Length > 300 ? s[..300] : s;
+
+static void SetSensitiveResponseHeaders(HttpContext context, string contentSecurityPolicy)
+{
+    context.Response.Headers["Cache-Control"] = "no-store, max-age=0";
+    context.Response.Headers["Pragma"] = "no-cache";
+    context.Response.Headers["Referrer-Policy"] = "no-referrer";
+    context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    context.Response.Headers["X-Frame-Options"] = "DENY";
+    context.Response.Headers["Content-Security-Policy"] = contentSecurityPolicy;
+    context.Response.Headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
+}
 
 static bool IsAdmin(HttpContext context, string? configuredKey)
 {

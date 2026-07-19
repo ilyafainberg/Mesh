@@ -27,6 +27,8 @@ public sealed class PairingLinkTests
         Assert.AreEqual("alice", parsed.Handle);
         Assert.AreEqual("single-use-code", parsed.PairingCode);
         Assert.AreEqual("https://relay.example", parsed.RelayUrl);
+        Assert.AreEqual("", new Uri(value).Query);
+        Assert.IsTrue(new Uri(value).Fragment.StartsWith("#handle=", StringComparison.Ordinal));
     }
 
     [TestMethod]

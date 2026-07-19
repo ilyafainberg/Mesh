@@ -206,17 +206,18 @@ else
     // and open it in Messages. Services and handles both land in a Messages thread.
     private void HandleDeepLink(string uri)
     {
+        if (DeepLink.TryParsePairing(uri, out var pairing))
+        {
+            State.SetPendingPairingLink(pairing);
+            return;
+        }
+
         var link = DeepLink.TryParse(uri);
         string? key = null;
         if (link.Kind == DeepLink.Kind.Service && !string.IsNullOrEmpty(link.Handle) && !string.IsNullOrEmpty(link.ServiceId))
             key = State.GetOrCreateServiceConversation(link.Handle!, link.ServiceId!, link.ServiceName).Handle;
         else if (link.Kind == DeepLink.Kind.User && !string.IsNullOrEmpty(link.Handle))
             key = State.GetOrCreateConversation(link.Handle!).Handle;
-        else if (link.Kind == DeepLink.Kind.Pairing)
-        {
-            State.SetPendingPairingLink(link);
-            return;
-        }
         if (key is null) return;
 
         AppControl.ShowMainWindow();
