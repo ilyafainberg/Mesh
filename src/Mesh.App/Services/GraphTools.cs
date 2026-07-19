@@ -240,7 +240,7 @@ public sealed class GmailSearchTool(GoogleAuthService auth, IHttpClientFactory h
 }
 
 /// <summary>Builds the set of tools available from the user's connected sources.</summary>
-public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost, AgentMedia media, ToolApprovalService approvals, AppState state)
+public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google, ConnectorAuthService connectors, IHttpClientFactory httpFactory, DocumentExtractor extractor, LocalFileRegistry localFiles, McpHost mcpHost, AgentMedia media, ToolApprovalService approvals, AppState state, LocationPermissionService locationPermission)
 {
     private IAgentTool GuardReadTool(IAgentTool tool)
         => new ApprovalTool(tool, ToolApprovalLevel.ReadOnlyAuto, approvals);
@@ -416,7 +416,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         LocalToolKind.Browser => new BrowserTool(media),
         LocalToolKind.HeadlessBrowser => new HeadlessBrowserTool(media),
         LocalToolKind.WebSearch => new WebSearchTool(),
-        LocalToolKind.Geolocation => new GeoLocationTool(httpFactory),
+        LocalToolKind.Geolocation => new GeoLocationTool(locationPermission),
         LocalToolKind.FileSystem => new FileSystemTool(extractor),
         LocalToolKind.WorkIq => new AskWorkIqTool(),
         LocalToolKind.MeshData => new SearchMeshDataTool(state),

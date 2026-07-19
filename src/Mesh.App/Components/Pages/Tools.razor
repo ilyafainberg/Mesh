@@ -2,6 +2,7 @@
 @inject AppState State
 @inject McpHost McpHostSvc
 @inject IHttpClientFactory HttpFactory
+@inject LocationPermissionService LocationPermission
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -34,12 +35,12 @@
             @foreach (var lt in VisibleLocalToolRows)
             {
                 var setting = GetLocalTool(lt.Kind);
-                var (statusText, statusTone, statusIcon) = LocalToolStatus(setting);
+                var (statusText, statusTone, statusIcon) = LocalToolStatus(lt.Kind, setting);
                 <div class="local-tool-row">
                     <div class="lt-main">
                         <label class="switch">
                             <input type="checkbox" checked="@setting.Enabled"
-                                   @onchange="e => SetLocalToolEnabled(lt.Kind, (bool)(e.Value ?? false))"
+                                   @onchange="e => SetLocalToolEnabledAsync(lt.Kind, (bool)(e.Value ?? false))"
                                    aria-label="@($"Enable {lt.Name}")" />
                         </label>
                         <div class="lt-text">
@@ -51,6 +52,27 @@
                     @if (setting.Enabled)
                     {
                         <div class="lt-extras">
+                            @if (lt.Kind == LocalToolKind.Geolocation && locationPermissionStatus is not null)
+                            {
+                                <div class="lt-location-permission">
+                                    <span>@locationPermissionStatus.Message</span>
+                                    @if (!locationPermissionStatus.IsGranted &&
+                                         locationPermissionStatus.State != LocationPermissionState.Unsupported)
+                                    {
+                                        <button type="button" class="ghost"
+                                                disabled="@requestingLocationPermission"
+                                                @onclick="RequestLocationPermissionAsync">
+                                            @if (requestingLocationPermission)
+                                            {
+                                                <span class="spinner-sm"></span>
+                                            }
+                                            @(locationPermissionStatus.State == LocationPermissionState.PermissionRequired
+                                                ? "Request permission"
+                                                : "Check again")
+                                        </button>
+                                    }
+                                </div>
+                            }
                             <div class="lt-share">
                                 <span class="lt-share-label">Who can use it</span>
                                 @if (lt.Kind == LocalToolKind.MeshData)
@@ -340,7 +362,7 @@
         new(LocalToolKind.Browser,         "Browser",           "bi-globe2",        "Drive a real web browser (navigate, click, type, screenshot)."),
         new(LocalToolKind.HeadlessBrowser, "Headless browser",  "bi-window-dock",   "Drive a background (invisible) web browser: navigate, read, click, type, screenshot."),
         new(LocalToolKind.WebSearch,       "Web search",        "bi-search",        "Search the web (Bing, Google, or DuckDuckGo) and return top results."),
-        new(LocalToolKind.Geolocation,     "Location",          "bi-geo-alt",       "Report this device's approximate location (uses the OS location service, falling back to IP)."),
+        new(LocalToolKind.Geolocation,     "Location",          "bi-geo-alt",       "Report this device's precise location using native OS permission and location services."),
         new(LocalToolKind.FileSystem,      "Files",             "bi-folder",        "Read, write, and convert files on this machine."),
         new(LocalToolKind.WorkIq,          "WorkIQ",            "bi-microsoft",     "Ask about your Microsoft 365 world: email, Teams, meetings, files, people."),
         new(LocalToolKind.MeshData,        "Mesh data",         "bi-database",      "Search your private Mesh chats, Me topics, contacts, widgets, knowledge, skills, services, configuration, and settings."),
@@ -361,9 +383,25 @@
     };
 
     // ---- status computation ----
-    static (string Text, string Tone, string Icon) LocalToolStatus(LocalToolSetting s)
+    (string Text, string Tone, string Icon) LocalToolStatus(LocalToolKind kind, LocalToolSetting s)
     {
         if (!s.Enabled) return ("Disabled", "disabled", "bi-circle");
+        if (kind == LocalToolKind.Geolocation)
+        {
+            if (locationPermissionStatus is null)
+                return ("Checking...", "disabled", "bi-hourglass-split");
+            if (!locationPermissionStatus.IsGranted)
+                return locationPermissionStatus.State switch
+                {
+                    LocationPermissionState.PermissionRequired =>
+                        ("Permission required", "warning", "bi-geo-alt"),
+                    LocationPermissionState.ServicesDisabled =>
+                        ("Location services off", "error", "bi-exclamation-triangle"),
+                    LocationPermissionState.Unsupported =>
+                        ("Unsupported", "error", "bi-exclamation-triangle"),
+                    _ => ("Unavailable", "error", "bi-exclamation-triangle")
+                };
+        }
         if (s.ApprovalLevel == ToolApprovalLevel.AlwaysAsk)
             return ("Permission required", "warning", "bi-question-circle");
         return ("Ready", "ready", "bi-check-circle");
@@ -407,13 +445,36 @@
         return s;
     }
 
-    void SetLocalToolEnabled(LocalToolKind kind, bool enabled)
-        => State.Mutate(p =>
+    async Task SetLocalToolEnabledAsync(LocalToolKind kind, bool enabled)
+    {
+        State.Mutate(p =>
         {
             if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
             s.Enabled = enabled;
             if (kind == LocalToolKind.MeshData) s.Visibility = "private";
         });
+        if (kind == LocalToolKind.Geolocation && enabled)
+            await RequestLocationPermissionAsync();
+    }
+
+    LocationPermissionStatus? locationPermissionStatus;
+    bool requestingLocationPermission;
+
+    async Task RequestLocationPermissionAsync()
+    {
+        if (requestingLocationPermission) return;
+        requestingLocationPermission = true;
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            locationPermissionStatus = await LocationPermission.RequestAsync();
+        }
+        finally
+        {
+            requestingLocationPermission = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
 
     void SetLocalToolVisibility(LocalToolKind kind, string? visibility)
         => State.Mutate(p =>
@@ -610,9 +671,10 @@
     }
 
     // ---- lifecycle ----
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         State.Changed += Refresh;
+        locationPermissionStatus = await LocationPermission.GetStatusAsync();
     }
 
     void Refresh() => InvokeAsync(StateHasChanged);

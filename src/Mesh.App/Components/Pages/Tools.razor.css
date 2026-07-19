@@ -132,6 +132,22 @@
     color: var(--brand);
 }
 
+.lt-location-permission {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    color: var(--fg-2);
+    font-size: .82rem;
+}
+
+.lt-location-permission .ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
 /* Small inline spinner used while testing a connection */
 .spinner-sm {
     display: inline-block;
