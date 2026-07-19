@@ -297,6 +297,57 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <inheritdoc />
+    public async Task SetDeviceMetadataAsync(
+        string handle,
+        string deviceId,
+        string? name,
+        string platform,
+        bool remoteAgentEnabled,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            HandleDoc doc;
+            string etag;
+            try
+            {
+                var read = await handlesContainer
+                    .ReadItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return;
+            }
+
+            doc.DeviceNames ??= new Dictionary<string, string>();
+            doc.DevicePlatforms ??= new Dictionary<string, string>();
+            doc.DeviceRemoteAgentEnabled ??= new Dictionary<string, bool>();
+            if (!string.IsNullOrWhiteSpace(name))
+                doc.DeviceNames[deviceId] = name;
+            doc.DevicePlatforms[deviceId] = platform;
+            doc.DeviceRemoteAgentEnabled[deviceId] = remoteAgentEnabled;
+
+            try
+            {
+                await handlesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    /// <inheritdoc />
     public async Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
@@ -804,7 +855,11 @@ public sealed class CosmosRelayStore : IRelayStore
         RegisteredAt = doc.RegisteredAt,
         DevicePublicKeys = doc.DevicePublicKeys is null ? new List<string>() : new List<string>(doc.DevicePublicKeys),
         RecoveryPublicKey = doc.RecoveryPublicKey,
-        DeviceNames = doc.DeviceNames is null ? new Dictionary<string, string>() : new Dictionary<string, string>(doc.DeviceNames)
+        DeviceNames = doc.DeviceNames is null ? new Dictionary<string, string>() : new Dictionary<string, string>(doc.DeviceNames),
+        DevicePlatforms = doc.DevicePlatforms is null ? new Dictionary<string, string>() : new Dictionary<string, string>(doc.DevicePlatforms),
+        DeviceRemoteAgentEnabled = doc.DeviceRemoteAgentEnabled is null
+            ? new Dictionary<string, bool>()
+            : new Dictionary<string, bool>(doc.DeviceRemoteAgentEnabled)
     };
 
     private static string NormalizeHandle(string handle)
@@ -833,6 +888,12 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("deviceNames")]
         public Dictionary<string, string>? DeviceNames { get; set; }
+
+        [JsonPropertyName("devicePlatforms")]
+        public Dictionary<string, string>? DevicePlatforms { get; set; }
+
+        [JsonPropertyName("deviceRemoteAgentEnabled")]
+        public Dictionary<string, bool>? DeviceRemoteAgentEnabled { get; set; }
     }
 
     /// <summary>

@@ -124,9 +124,10 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
     }
     catch (JsonException)
     {
-        toDevice = null; // Malformed payload: fall back to a normal broadcast.
+        return false;
     }
-    await router.DeliverLocalAsync(toHandle, envelopeJson, excludeConnectionId: null, toDevice: toDevice);
+    return await router.DeliverLocalAsync(
+        toHandle, envelopeJson, excludeConnectionId: null, toDevice: toDevice);
 });
 
 // ---- Health ---------------------------------------------------------------
@@ -295,9 +296,21 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         // Capture the recovery public key at registration so a future device can recover the handle.
         if (!string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
-        // Record the friendly device name (if provided) so the per-device directory can show it.
-        if (!string.IsNullOrWhiteSpace(req.DeviceName))
-            await store.SetDeviceNameAsync(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), req.DeviceName);
+        var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
+        if (string.IsNullOrWhiteSpace(req.DevicePlatform))
+        {
+            if (!string.IsNullOrWhiteSpace(req.DeviceName))
+                await store.SetDeviceNameAsync(handle, deviceId, req.DeviceName);
+        }
+        else
+        {
+            await store.SetDeviceMetadataAsync(
+                handle,
+                deviceId,
+                req.DeviceName,
+                req.DevicePlatform.Trim().ToLowerInvariant(),
+                req.RemoteAgentEnabled);
+        }
         metrics.HandleRegistered();
         app.Logger.LogInformation("handle registered: {Handle}", handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), created.RegisteredAt));
@@ -310,9 +323,21 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         // First-writer-wins: adopt a recovery key on re-register only if none is stored yet.
         if (existing.RecoveryPublicKey is null && !string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
-        // Refresh the friendly device name (if provided) on re-register.
-        if (!string.IsNullOrWhiteSpace(req.DeviceName))
-            await store.SetDeviceNameAsync(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), req.DeviceName);
+        var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
+        if (string.IsNullOrWhiteSpace(req.DevicePlatform))
+        {
+            if (!string.IsNullOrWhiteSpace(req.DeviceName))
+                await store.SetDeviceNameAsync(handle, deviceId, req.DeviceName);
+        }
+        else
+        {
+            await store.SetDeviceMetadataAsync(
+                handle,
+                deviceId,
+                req.DeviceName,
+                req.DevicePlatform.Trim().ToLowerInvariant(),
+                req.RemoteAgentEnabled);
+        }
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), existing.RegisteredAt));
     }
 
@@ -569,23 +594,26 @@ app.MapGet("/handles/{handle}", async (string handle) =>
     return Results.Ok(new HandleInfo(rec.Handle, rec.DisplayName, rec.DevicePublicKeys, online, rec.RegisteredAt));
 });
 
-// Per-device directory: one DeviceInfo per registered device key, with its friendly name (if set)
-// and whether it is currently connected. Lets a client offer a "home device" picker and route a
-// remote-agent request to exactly one device. Online is best-effort per-instance presence for now.
-app.MapGet("/handles/{handle}/devices", async (string handle, ConnectionRegistry registry) =>
+// Per-device directory: metadata is durable, while online state comes from cross-replica presence.
+app.MapGet("/handles/{handle}/devices", async (string handle) =>
 {
     var key = Normalize(handle);
     var rec = await store.GetHandleAsync(key);
     if (rec is null) return Results.NotFound();
 
-    var onlineDevices = registry.OnlineDeviceIds(key);
-    var devices = rec.DevicePublicKeys
+    var deviceIds = rec.DevicePublicKeys
         .Select(pubkey => DeviceProtocol.DeviceId(pubkey))
         .Distinct()
-        .Select(deviceId => new DeviceInfo(
+        .ToArray();
+    var owners = await Task.WhenAll(deviceIds.Select(deviceId =>
+        backplane.GetInstanceForDeviceAsync(key, deviceId)));
+    var devices = deviceIds
+        .Select((deviceId, index) => new DeviceInfo(
             deviceId,
             rec.DeviceNames.GetValueOrDefault(deviceId),
-            onlineDevices.Contains(deviceId)))
+            owners[index] is not null,
+            rec.DevicePlatforms.GetValueOrDefault(deviceId, DevicePlatforms.Unknown),
+            rec.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId)))
         .ToArray();
 
     return Results.Ok(devices);

@@ -33,37 +33,15 @@ public sealed class MeshRouter(
     public async Task RouteAsync(MeshEnvelope env, string? excludeConnectionId = null)
     {
         var to = Normalize(env.To);
-        var envelopeJson = JsonSerializer.Serialize(env, Json);
         var toDevice = env.ToDevice;
 
-        if (toDevice is not null)
+        if (!string.IsNullOrWhiteSpace(toDevice))
         {
-            // Per-device directed routing: target exactly one device of the handle.
-            // Cross-instance per-device presence is best-effort for now: we only know which device
-            // ids are connected on THIS instance, so a device on another replica is reached by the
-            // same directed forward as today (the owning instance re-applies the ToDevice filter
-            // from the envelope JSON). If the chosen device is not reachable anywhere, we fall back
-            // to a normal broadcast so the request is not silently dropped.
-
-            // 1a. Local delivery restricted to the target device.
-            if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId, toDevice)) return;
-
-            // 1b. Directed cross-instance forward; the owner re-runs DeliverLocalAsync and re-applies
-            //     the ToDevice filter because the envelope JSON carries ToDevice.
-            var deviceOwner = await backplane.GetInstanceForAsync(to);
-            if (deviceOwner is not null && deviceOwner != backplane.InstanceId
-                && await backplane.PublishToOwnerAsync(deviceOwner, to, envelopeJson))
-                return;
-
-            // 1c. Fallback: the chosen device is offline/unreachable. Broadcast to the handle's other
-            //     connections (toDevice=null) so the request still reaches the owner.
-            if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId)) return;
-
-            // Nobody at all is connected on this instance for the fallback either: queue offline.
-            await store.EnqueueAsync(to, envelopeJson);
+            await RouteToDeviceAsync(env, excludeConnectionId);
             return;
         }
 
+        var envelopeJson = JsonSerializer.Serialize(env, Json);
         // 1. Local delivery to any of the recipient's connections on this instance.
         if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId)) return;
 
@@ -93,14 +71,34 @@ public sealed class MeshRouter(
         var owner = await backplane.GetInstanceForDeviceAsync(to, env.ToDevice);
         if (owner is not null && owner != backplane.InstanceId)
         {
-            // Keep a device-specific offline copy as a reliability fallback for stale pub/sub
-            // presence. The recipient deduplicates by the encrypted message id after reconnect.
-            await store.EnqueueAsync(DeviceInboxKey(to, env.ToDevice), envelopeJson);
-            await backplane.PublishToOwnerAsync(owner, to, envelopeJson);
-            return;
+            if (await backplane.PublishToOwnerAsync(owner, to, envelopeJson))
+                return;
         }
 
         await store.EnqueueAsync(DeviceInboxKey(to, env.ToDevice), envelopeJson);
+    }
+
+    /// <summary>
+    /// Routes to one device only when its live presence exists. This path never queues and never
+    /// broadcasts, so callers can reject operations that require an immediately available device.
+    /// </summary>
+    public async Task<bool> RouteToOnlineDeviceAsync(
+        MeshEnvelope env,
+        string? excludeConnectionId = null,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(env.ToDevice))
+            return false;
+
+        var to = Normalize(env.To);
+        var envelopeJson = JsonSerializer.Serialize(env, Json);
+        if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId, env.ToDevice))
+            return true;
+
+        var owner = await backplane.GetInstanceForDeviceAsync(to, env.ToDevice, ct);
+        return owner is not null
+            && owner != backplane.InstanceId
+            && await backplane.PublishToOwnerAsync(owner, to, envelopeJson, ct);
     }
 
     /// <summary>

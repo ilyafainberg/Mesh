@@ -28,6 +28,12 @@ public sealed class StoredHandle
     /// (GET /handles/{handle}/devices). Absence of an entry just means the device is unnamed.
     /// </summary>
     public Dictionary<string, string> DeviceNames { get; set; } = new();
+
+    /// <summary>Platform identifiers keyed by stable device id.</summary>
+    public Dictionary<string, string> DevicePlatforms { get; set; } = new();
+
+    /// <summary>Remote-agent opt-in state keyed by stable device id.</summary>
+    public Dictionary<string, bool> DeviceRemoteAgentEnabled { get; set; } = new();
 }
 
 /// <summary>A pending device-link invite: single use, short lived, addressed to a handle.</summary>
@@ -83,6 +89,15 @@ public interface IRelayStore
     /// directory can show it as a pickable "home device". No-op if the handle is missing.
     /// </summary>
     Task SetDeviceNameAsync(string handle, string deviceId, string name, CancellationToken ct = default);
+
+    /// <summary>Updates the directory metadata for one authorized device. No-op if missing.</summary>
+    Task SetDeviceMetadataAsync(
+        string handle,
+        string deviceId,
+        string? name,
+        string platform,
+        bool remoteAgentEnabled,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Sets the handle's recovery public key, but only if one is not already stored (first writer

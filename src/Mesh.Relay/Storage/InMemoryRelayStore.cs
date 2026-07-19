@@ -69,6 +69,25 @@ public sealed class InMemoryRelayStore : IRelayStore
         return Task.CompletedTask;
     }
 
+    public Task SetDeviceMetadataAsync(
+        string handle,
+        string deviceId,
+        string? name,
+        string platform,
+        bool remoteAgentEnabled,
+        CancellationToken ct = default)
+    {
+        if (handles.TryGetValue(handle, out var rec))
+            lock (rec)
+            {
+                if (!string.IsNullOrWhiteSpace(name))
+                    rec.DeviceNames[deviceId] = name;
+                rec.DevicePlatforms[deviceId] = platform;
+                rec.DeviceRemoteAgentEnabled[deviceId] = remoteAgentEnabled;
+            }
+        return Task.CompletedTask;
+    }
+
     public Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))
@@ -233,7 +252,9 @@ public sealed class InMemoryRelayStore : IRelayStore
                 RegisteredAt = r.RegisteredAt,
                 DevicePublicKeys = r.DevicePublicKeys.ToList(),
                 RecoveryPublicKey = r.RecoveryPublicKey,
-                DeviceNames = new Dictionary<string, string>(r.DeviceNames)
+                DeviceNames = new Dictionary<string, string>(r.DeviceNames),
+                DevicePlatforms = new Dictionary<string, string>(r.DevicePlatforms),
+                DeviceRemoteAgentEnabled = new Dictionary<string, bool>(r.DeviceRemoteAgentEnabled)
             };
     }
 }

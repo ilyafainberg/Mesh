@@ -19,7 +19,7 @@ public interface IBackplane
     /// Starts listening for messages addressed to sockets on THIS instance. The handler
     /// is invoked with (toHandle, envelopeJson) and should deliver to the local socket.
     /// </summary>
-    Task StartAsync(Func<string, string, Task> deliverLocal, CancellationToken ct = default);
+    Task StartAsync(Func<string, string, Task<bool>> deliverLocal, CancellationToken ct = default);
 
     /// <summary>Records that <paramref name="handle"/> is connected on this instance (renew before TTL).</summary>
     Task SetPresenceAsync(string handle, CancellationToken ct = default);
@@ -41,7 +41,7 @@ public interface IBackplane
 
     /// <summary>
     /// Publishes a message to the instance that owns the handle so it can deliver it to the
-    /// live socket. Returns true if the message was handed to the owning instance.
+    /// live socket. Returns true only when the owning instance confirms local delivery.
     /// </summary>
     Task<bool> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default);
 }

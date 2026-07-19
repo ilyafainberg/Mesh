@@ -114,6 +114,34 @@ public sealed class MeshHub(
         var stamped = env with { From = state.Handle }; // relay asserts the authenticated sender
         stamped = stamped with { FromDevice = state.DeviceId }; // stamp the sending device (set at auth)
 
+        if (stamped.Kind == MeshKinds.RemoteAgentRequest)
+        {
+            if (Normalize(stamped.To) != state.Handle)
+                return MeshSendResult.Reject("remote_agent_same_handle_required");
+            if (string.IsNullOrWhiteSpace(stamped.ToDevice))
+                return MeshSendResult.Reject("home_device_required");
+
+            var registration = await store.GetHandleAsync(state.Handle, Context.ConnectionAborted);
+            var platform = registration?.DevicePlatforms.GetValueOrDefault(stamped.ToDevice);
+            var remoteAgentEnabled =
+                registration?.DeviceRemoteAgentEnabled.GetValueOrDefault(stamped.ToDevice) == true;
+            if (!DevicePlatforms.IsDesktop(platform) || !remoteAgentEnabled)
+                return MeshSendResult.Reject("home_device_not_eligible");
+
+            var owner = await backplane.GetInstanceForDeviceAsync(
+                state.Handle, stamped.ToDevice, Context.ConnectionAborted);
+            if (owner is null)
+                return MeshSendResult.Reject("home_device_offline");
+
+            var delivered = await router.RouteToOnlineDeviceAsync(
+                stamped, Context.ConnectionId, Context.ConnectionAborted);
+            if (!delivered)
+                return MeshSendResult.Reject("home_device_offline");
+
+            metrics.MessageRouted();
+            return MeshSendResult.Ok();
+        }
+
         // Usage attestation note: a ServiceRequest envelope carries the serviceId inside its
         // end-to-end encrypted body (ServiceProtocol-framed), so the relay cannot observe which
         // service was invoked while routing here. Attested usage for reputation is therefore recorded

@@ -14,7 +14,7 @@ public sealed class InMemoryBackplane : IBackplane
 
     public string InstanceId { get; } = Guid.NewGuid().ToString("n")[..8];
 
-    public Task StartAsync(Func<string, string, Task> deliverLocal, CancellationToken ct = default)
+    public Task StartAsync(Func<string, string, Task<bool>> deliverLocal, CancellationToken ct = default)
         => Task.CompletedTask; // nothing to subscribe to on a single instance
 
     public Task SetPresenceAsync(string handle, CancellationToken ct = default)

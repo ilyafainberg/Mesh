@@ -72,7 +72,15 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             var sig = IdentityService.Sign(p.PrivateKey, ClaimProtocol.Message(h, p.PublicKey));
             var deviceName = EnsureDeviceName();
             var resp = await http.PostAsJsonAsync($"{p.RelayUrl.TrimEnd('/')}/handles",
-                new RegisterHandleRequest(p.Handle, p.PublicKey, p.DisplayName, NullIfBlank(p.RecoveryPublicKey), sig, deviceName));
+                new RegisterHandleRequest(
+                    p.Handle,
+                    p.PublicKey,
+                    p.DisplayName,
+                    NullIfBlank(p.RecoveryPublicKey),
+                    sig,
+                    deviceName,
+                    PlatformCaps.DevicePlatform,
+                    PlatformCaps.CanHostHomeAgent && p.ActAsRemoteAgent));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
             if (resp.IsSuccessStatusCode) return true;
 
@@ -464,24 +472,56 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         // our own handle (the relay only routes same-handle envelopes between our linked devices).
         if (env.Kind == MeshKinds.RemoteAgentRequest)
         {
-            // Belt-and-suspenders: the relay already delivers a targeted request only to the chosen
-            // device, but if this envelope names a different device than ours, ignore it.
-            if (env.ToDevice is not null && env.ToDevice != MyDeviceId) return;
-            if (state.Profile.ActAsRemoteAgent && from == AppState.Norm(state.Profile.Handle))
-            {
-                var answer = await agent.AskAsRemoteAsync(text, ct);
-                // Target the answer back to the device that asked so only it receives the response.
-                await SendAsync(from, MeshKinds.RemoteAgentResponse, answer, toDevice: env.FromDevice);
-            }
+            if (!string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal)
+                || !PlatformCaps.CanHostHomeAgent
+                || !state.Profile.ActAsRemoteAgent
+                || from != AppState.Norm(state.Profile.Handle)
+                || string.IsNullOrWhiteSpace(env.FromDevice)
+                || !RemoteAgentProtocol.TryParseRequest(text, out var request))
+                return;
+
+            var answer = await agent.AskAsRemoteAsync(request.Prompt, ct);
+            var responseBody = RemoteAgentProtocol.ResponseBody(
+                request.RequestId, request.ThreadId, answer);
+            if (!await SendAsync(
+                    from,
+                    MeshKinds.RemoteAgentResponse,
+                    responseBody,
+                    toDevice: env.FromDevice))
+                Log?.Invoke($"home agent response {request.RequestId} could not be dispatched");
             return;
         }
         if (env.Kind == MeshKinds.RemoteAgentResponse)
         {
-            // The mobile side records the home agent's answer as an incoming assistant line.
-            state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = "agent", AddressedToAgent = true });
-            state.MarkUnread(from);
-            if (ShouldNotify(state.FindContact(from)))
-                notifier.Notify("Your home agent replied", Preview(text), NotifyKind.Message, "messages");
+            if (from != AppState.Norm(state.Profile.Handle)
+                || (env.ToDevice is not null
+                    && !string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
+                || !RemoteAgentProtocol.TryParseResponse(text, out var response)
+                || !state.Profile.OwnThreads.Any(thread =>
+                    string.Equals(thread.Id, response.ThreadId, StringComparison.Ordinal)))
+                return;
+
+            var thread = state.Profile.OwnThreads.First(item =>
+                string.Equals(item.Id, response.ThreadId, StringComparison.Ordinal));
+            if (thread.Lines.Any(line =>
+                    string.Equals(line.Id, response.RequestId, StringComparison.Ordinal)))
+                return;
+
+            state.AddOwnChatLine(response.ThreadId, new ChatLine
+            {
+                Id = response.RequestId,
+                Role = "assistant",
+                Text = response.Text,
+                Via = "home-agent",
+                AddressedToAgent = true
+            });
+            StateChanged?.Invoke();
+            if (!state.Profile.DoNotDisturb)
+                notifier.Notify(
+                    "Your home agent replied",
+                    Preview(response.Text),
+                    NotifyKind.Message,
+                    PlatformCaps.IsMobile ? "/m/me" : "/");
             return;
         }
 
@@ -1017,13 +1057,86 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     public void RejectDraft(string approvalId)
         => state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
 
-    /// <summary>
-    /// Sends a request to the owner's OTHER devices asking a remote (home) agent to answer with its
-    /// full local toolset. Routed to the same handle; the relay excludes this device, so a linked
-    /// desktop that opted in (ActAsRemoteAgent) responds. Returns false when not connected.
-    /// </summary>
-    public async Task<bool> AskHomeAgentAsync(string prompt)
-        => await SendAsync(state.Profile.Handle, MeshKinds.RemoteAgentRequest, prompt, toDevice: state.Profile.HomeDeviceId);
+    /// <summary>Dispatches an owner prompt to the selected, live home-agent desktop.</summary>
+    public async Task<RemoteAgentDispatchResult> AskHomeAgentAsync(
+        string threadId,
+        string prompt,
+        CancellationToken ct = default)
+    {
+        var requestId = Guid.NewGuid().ToString("n");
+        if (!Connected)
+            return RemoteAgentDispatchResult.Reject("not_connected", requestId);
+        if (string.IsNullOrWhiteSpace(threadId))
+            return RemoteAgentDispatchResult.Reject("invalid_thread", requestId);
+        if (!state.Profile.OwnThreads.Any(thread =>
+                string.Equals(thread.Id, threadId, StringComparison.Ordinal)))
+            return RemoteAgentDispatchResult.Reject("invalid_thread", requestId);
+        if (string.IsNullOrWhiteSpace(prompt))
+            return RemoteAgentDispatchResult.Reject("invalid_prompt", requestId);
+
+        var homeDeviceId = state.Profile.HomeDeviceId?.Trim();
+        if (string.IsNullOrWhiteSpace(homeDeviceId))
+            return RemoteAgentDispatchResult.Reject("home_device_required", requestId);
+
+        Mesh.Shared.DeviceInfo[] devices;
+        try
+        {
+            var http = httpFactory.CreateClient("relay");
+            devices = await http.GetFromJsonAsync<Mesh.Shared.DeviceInfo[]>(
+                $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(AppState.Norm(state.Profile.Handle))}/devices",
+                Json,
+                ct) ?? Array.Empty<Mesh.Shared.DeviceInfo>();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log?.Invoke($"home agent directory lookup failed: {ex.Message}");
+            return RemoteAgentDispatchResult.Reject("directory_unavailable", requestId);
+        }
+
+        var selected = devices.FirstOrDefault(device =>
+            string.Equals(device.DeviceId, homeDeviceId, StringComparison.Ordinal));
+        if (selected is null || !selected.IsEligibleHomeAgent)
+            return RemoteAgentDispatchResult.Reject("home_device_not_eligible", requestId);
+        if (!selected.Online)
+            return RemoteAgentDispatchResult.Reject("home_device_offline", requestId);
+        if (!supportsSendResults)
+            return RemoteAgentDispatchResult.Reject("transport_ack_required", requestId);
+
+        var body = RemoteAgentProtocol.RequestBody(requestId, threadId, prompt);
+        var wire = body;
+        var keys = await ResolveDeviceKeysAsync(AppState.Norm(state.Profile.Handle));
+        if (keys.Count > 0)
+            wire = MessageCrypto.Encrypt(body, keys) ?? body;
+
+        var signature = IdentityService.Sign(state.Profile.PrivateKey, wire);
+        var envelope = MeshEnvelope.Create(
+            state.Profile.Handle,
+            AppState.Norm(state.Profile.Handle),
+            MeshKinds.RemoteAgentRequest,
+            wire,
+            signature,
+            toDevice: homeDeviceId);
+        try
+        {
+            var result = await hub!.InvokeAsync<MeshSendResult>(
+                MeshHubProtocol.SendEnvelope, envelope, ct);
+            if (!result.Accepted)
+            {
+                Log?.Invoke($"home agent dispatch rejected: {DescribeResult(result)}");
+                return RemoteAgentDispatchResult.Reject(result.Code, requestId);
+            }
+            return RemoteAgentDispatchResult.Ok(requestId);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"home agent dispatch failed: {ex.Message}");
+            return RemoteAgentDispatchResult.Reject("transport_error", requestId);
+        }
+    }
 
     /// <summary>
     /// Lists the devices currently registered under this handle (from the relay directory) so the
