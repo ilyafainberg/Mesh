@@ -24,20 +24,16 @@ public class UiModeServiceTests
         => Assert.AreEqual(UiMode.Phone, UiModeParser.ResolveFromWidth(0, isMobilePlatform: true));
 
     [TestMethod]
-    public void Resolve_Width600_ReturnsPhone()
-        => Assert.AreEqual(UiMode.Phone, UiModeParser.ResolveFromWidth(600, isMobilePlatform: false));
+    public void Resolve_Width1100_ReturnsPhone()
+        => Assert.AreEqual(UiMode.Phone, UiModeParser.ResolveFromWidth(1100, isMobilePlatform: false));
 
     [TestMethod]
-    public void Resolve_Width601_ReturnsDesktop()
-        => Assert.AreEqual(UiMode.Desktop, UiModeParser.ResolveFromWidth(601, isMobilePlatform: false));
+    public void Resolve_Width1101_ReturnsDesktop()
+        => Assert.AreEqual(UiMode.Desktop, UiModeParser.ResolveFromWidth(1101, isMobilePlatform: false));
 
     [TestMethod]
-    public void Resolve_Width1099_ReturnsDesktop()
-        => Assert.AreEqual(UiMode.Desktop, UiModeParser.ResolveFromWidth(1099, isMobilePlatform: false));
-
-    [TestMethod]
-    public void Resolve_Width1100_ReturnsDesktop()
-        => Assert.AreEqual(UiMode.Desktop, UiModeParser.ResolveFromWidth(1100, isMobilePlatform: false));
+    public void Resolve_Width1099_ReturnsPhone()
+        => Assert.AreEqual(UiMode.Phone, UiModeParser.ResolveFromWidth(1099, isMobilePlatform: false));
 
     [TestMethod]
     public void Resolve_LargeWidth_ReturnsDesktop()
@@ -124,11 +120,11 @@ public class UiModeServiceTests
     }
 
     [TestMethod]
-    public void Auto_UpdateWindowSize_MidWidth_EffectiveModeDesktop()
+    public void Auto_UpdateWindowSize_TabletWidth_EffectiveModePhone()
     {
         var svc = CreateService(new(UiMode.Auto, UiModeSource.Default, false));
         svc.UpdateWindowSize(768, 1024);
-        Assert.AreEqual(UiMode.Desktop, svc.EffectiveMode);
+        Assert.AreEqual(UiMode.Phone, svc.EffectiveMode);
     }
 
     // -----------------------------------------------------------------------

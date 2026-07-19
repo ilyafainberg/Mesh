@@ -432,6 +432,10 @@ button:disabled {
     z-index: 1100;
     display: flex;
     flex-direction: column;
+    width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
 }
 
 .thread-bar {
@@ -522,6 +526,7 @@ button:disabled {
 /* Messages scroll area */
 .messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
     background: var(--bg-canvas);
@@ -533,6 +538,8 @@ button:disabled {
     flex-direction: column;
     gap: 2px;
     padding: 10px 12px;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .bubble {
@@ -543,6 +550,7 @@ button:disabled {
     line-height: 1.45;
     word-wrap: break-word;
     overflow-wrap: anywhere;
+    min-width: 0;
 }
 
 .bubble.assistant {
@@ -594,7 +602,7 @@ button:disabled {
     border-top: 1px solid var(--stroke-1);
     background: var(--bg-1);
     padding: 8px 10px;
-    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
     flex-shrink: 0;
 }
 

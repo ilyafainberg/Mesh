@@ -7,6 +7,8 @@
     min-height: 0;
     overflow: hidden;
     background: var(--bg-canvas);
+    width: 100%;
+    max-width: 100%;
 }
 
 /* Scrollable body region. Sits above the in-flow tab bar in the flex column. */
@@ -17,6 +19,7 @@
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
     padding-bottom: 8px;
+    overflow-x: hidden;
 }
 
 /* Bottom tab bar. In-flow flex child (NOT position:fixed): a fixed bar sibling to a
@@ -30,8 +33,9 @@
     display: flex;
     align-items: stretch;
     justify-content: space-around;
-    height: calc(68px + env(safe-area-inset-bottom));
-    padding-bottom: env(safe-area-inset-bottom);
+    min-height: 68px;
+    height: calc(68px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
     background: var(--bg-1);
     border-top: 1px solid var(--stroke-1);
     box-shadow: 0 -2px 10px rgba(0, 0, 0, .06);
@@ -54,6 +58,8 @@
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     transition: color .12s ease;
+    min-width: 0;
+    overflow: hidden;
 }
 
 .m-tab:hover,
@@ -77,6 +83,10 @@
     line-height: 1;
     font-weight: 600;
     letter-spacing: .1px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* Small numeric badge, top-right of the icon. */
@@ -119,7 +129,7 @@
     border-top-left-radius: 16px;
     border-top-right-radius: 16px;
     box-shadow: var(--shadow-16);
-    padding: 8px 16px calc(16px + env(safe-area-inset-bottom));
+    padding: 8px 16px calc(16px + env(safe-area-inset-bottom, 0px));
     animation: m-slide-up .2s ease;
 }
 

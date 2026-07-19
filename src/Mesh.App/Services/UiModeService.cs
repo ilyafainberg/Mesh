@@ -31,13 +31,12 @@ public sealed record UiModeParseResult(UiMode Mode, UiModeSource Source, bool Ha
 public static class UiModeParser
 {
     /// <summary>Maximum width at which a window uses the phone shell.</summary>
-    public const double PhoneMaxWidth = 600;
+    public const double PhoneMaxWidth = 1100;
 
     /// <summary>
     /// Resolves the effective UI mode from a window width. When width is zero or
     /// negative (not yet known), falls back to platform: mobile gets Phone, all
-    /// others get Desktop. Above the phone breakpoint the desktop shell is used;
-    /// it collapses its own sidebar to a hamburger at narrow widths.
+    /// others get Desktop. Above the phone breakpoint the desktop shell is used.
     /// </summary>
     public static UiMode ResolveFromWidth(double width, bool isMobilePlatform)
     {

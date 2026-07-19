@@ -200,6 +200,10 @@
     display: flex;
     flex-direction: column;
     background: var(--bg-1);
+    width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
 }
 
 .thread-bar {
@@ -290,6 +294,8 @@
     flex-direction: column;
     gap: 2px;
     padding: 10px 12px;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .empty {
@@ -314,6 +320,7 @@
     line-height: 1.45;
     word-wrap: break-word;
     overflow-wrap: anywhere;
+    min-width: 0;
 }
 
 .bubble.user {
@@ -353,7 +360,7 @@
     flex: none;
     background: var(--bg-1);
     border-top: 1px solid var(--stroke-1);
-    padding-bottom: env(safe-area-inset-bottom);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 .composer-inner {
