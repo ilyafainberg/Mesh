@@ -81,6 +81,14 @@ public sealed class MeshDb : IDisposable
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sync_versions(
+                entity_key TEXT PRIMARY KEY,
+                version TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sync_tombstones(
+                kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                PRIMARY KEY(kind, entity_id));
             INSERT OR IGNORE INTO meta(k, v) VALUES('schema_version', '1');");
 
         // Idempotent migration for databases created before line_id/status existed.
@@ -88,6 +96,14 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("chat_lines", "status", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("own_chat", "line_id", "TEXT");
         AddColumnIfMissing("own_chat", "status", "TEXT NOT NULL DEFAULT ''");
+        Exec("""
+            UPDATE chat_lines
+            SET line_id = 'legacy-conversation-' || printf('%016x', id)
+            WHERE line_id IS NULL OR trim(line_id) = '';
+            UPDATE own_chat
+            SET line_id = 'legacy-topic-' || printf('%016x', id)
+            WHERE line_id IS NULL OR trim(line_id) = '';
+            """);
         // Service-thread metadata on conversations (null for normal person DMs).
         AddColumnIfMissing("conversations", "service_id", "TEXT");
         AddColumnIfMissing("conversations", "service_name", "TEXT");
@@ -100,11 +116,14 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("conversations", "sort_order", "INTEGER");
         NormalizeConversationOrder();
         AddColumnIfMissing("chat_lines", "sender_handle", "TEXT");
+        AddColumnIfMissing("chat_lines", "internal", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("chat_lines", "reasoning", "TEXT");
         AddColumnIfMissing("own_chat", "thread_id", "TEXT");
         // Transcript + reasoning persistence: internal lines are the model's hidden execution record;
         // reasoning is the collapsible "thinking" (previously not persisted, so lost on restart).
         AddColumnIfMissing("own_chat", "internal", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("own_chat", "reasoning", "TEXT");
+        AddColumnIfMissing("own_chat", "sender_handle", "TEXT");
         // User-defined topic order. Existing rows retain their creation order through the fallback sort.
         AddColumnIfMissing("own_threads", "sort_order", "INTEGER");
         NormalizeOwnThreadOrder();
@@ -193,7 +212,10 @@ public sealed class MeshDb : IDisposable
 
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT handle, role, text, via, at, line_id, status, sender_handle FROM chat_lines ORDER BY id;";
+            cmd.CommandText = """
+                SELECT handle, role, text, via, at, line_id, status, sender_handle, internal, reasoning
+                FROM chat_lines ORDER BY id;
+                """;
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -206,7 +228,9 @@ public sealed class MeshDb : IDisposable
                     At = ParseAt(r.GetString(4)),
                     Id = r.IsDBNull(5) ? Guid.NewGuid().ToString("n") : r.GetString(5),
                     Status = r.IsDBNull(6) ? "" : r.GetString(6),
-                    SenderHandle = r.IsDBNull(7) ? null : r.GetString(7)
+                    SenderHandle = r.IsDBNull(7) ? null : r.GetString(7),
+                    Internal = !r.IsDBNull(8) && r.GetInt64(8) != 0,
+                    Reasoning = r.IsDBNull(9) ? null : r.GetString(9)
                 });
             }
         }
@@ -249,7 +273,10 @@ public sealed class MeshDb : IDisposable
 
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT thread_id, role, text, via, at, line_id, status, internal, reasoning FROM own_chat WHERE thread_id IS NOT NULL ORDER BY id;";
+            cmd.CommandText = """
+                SELECT thread_id, role, text, via, at, line_id, status, internal, reasoning, sender_handle
+                FROM own_chat WHERE thread_id IS NOT NULL ORDER BY id;
+                """;
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -263,7 +290,8 @@ public sealed class MeshDb : IDisposable
                     Id = r.IsDBNull(5) ? Guid.NewGuid().ToString("n") : r.GetString(5),
                     Status = r.IsDBNull(6) ? "" : r.GetString(6),
                     Internal = !r.IsDBNull(7) && r.GetInt64(7) != 0,
-                    Reasoning = r.IsDBNull(8) ? null : r.GetString(8)
+                    Reasoning = r.IsDBNull(8) ? null : r.GetString(8),
+                    SenderHandle = r.IsDBNull(9) ? null : r.GetString(9)
                 });
             }
         }
@@ -288,6 +316,204 @@ public sealed class MeshDb : IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    // ---- device sync merge state -------------------------------------------
+
+    public sealed record SyncTombstone(string Kind, string EntityId, string Version);
+
+    public string? GetSyncVersion(string entityKey)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT version FROM sync_versions WHERE entity_key = $key;";
+        cmd.Parameters.AddWithValue("$key", entityKey);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    public void SetSyncVersion(string entityKey, string version)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO sync_versions(entity_key, version) VALUES($key, $version)
+            ON CONFLICT(entity_key) DO UPDATE SET version = excluded.version;
+            """;
+        cmd.Parameters.AddWithValue("$key", entityKey);
+        cmd.Parameters.AddWithValue("$version", version);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Atomically advances an entity version only when the candidate is newer.</summary>
+    public bool TryAdvanceSyncVersion(string entityKey, string version)
+    {
+        using var tx = conn.BeginTransaction();
+        string? current;
+        using (var read = conn.CreateCommand())
+        {
+            read.Transaction = tx;
+            read.CommandText = "SELECT version FROM sync_versions WHERE entity_key = $key;";
+            read.Parameters.AddWithValue("$key", entityKey);
+            current = read.ExecuteScalar() as string;
+        }
+        if (string.Compare(version, current ?? "", StringComparison.Ordinal) <= 0)
+        {
+            tx.Rollback();
+            return false;
+        }
+        using (var write = conn.CreateCommand())
+        {
+            write.Transaction = tx;
+            write.CommandText = """
+                INSERT INTO sync_versions(entity_key, version) VALUES($key, $version)
+                ON CONFLICT(entity_key) DO UPDATE SET version = excluded.version;
+                """;
+            write.Parameters.AddWithValue("$key", entityKey);
+            write.Parameters.AddWithValue("$version", version);
+            write.ExecuteNonQuery();
+        }
+        tx.Commit();
+        return true;
+    }
+
+    public IReadOnlyList<SyncTombstone> GetSyncTombstones()
+    {
+        var result = new List<SyncTombstone>();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT kind, entity_id, version FROM sync_tombstones ORDER BY version, kind, entity_id;";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            result.Add(new SyncTombstone(reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+        return result;
+    }
+
+    public string? GetSyncTombstoneVersion(string kind, string entityId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT version FROM sync_tombstones WHERE kind = $kind AND entity_id = $id;";
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    /// <summary>Atomically inserts or advances a clear/delete tombstone.</summary>
+    public bool SetSyncTombstone(string kind, string entityId, string version)
+    {
+        using var tx = conn.BeginTransaction();
+        string? current;
+        using (var read = conn.CreateCommand())
+        {
+            read.Transaction = tx;
+            read.CommandText = "SELECT version FROM sync_tombstones WHERE kind = $kind AND entity_id = $id;";
+            read.Parameters.AddWithValue("$kind", kind);
+            read.Parameters.AddWithValue("$id", entityId);
+            current = read.ExecuteScalar() as string;
+        }
+        if (string.Compare(version, current ?? "", StringComparison.Ordinal) <= 0)
+        {
+            tx.Rollback();
+            return false;
+        }
+        using (var write = conn.CreateCommand())
+        {
+            write.Transaction = tx;
+            write.CommandText = """
+                INSERT INTO sync_tombstones(kind, entity_id, version) VALUES($kind, $id, $version)
+                ON CONFLICT(kind, entity_id) DO UPDATE SET version = excluded.version;
+                """;
+            write.Parameters.AddWithValue("$kind", kind);
+            write.Parameters.AddWithValue("$id", entityId);
+            write.Parameters.AddWithValue("$version", version);
+            write.ExecuteNonQuery();
+        }
+        tx.Commit();
+        return true;
+    }
+
+    public void ApplyTopicClear(string id, string kind, string version)
+    {
+        using var tx = conn.BeginTransaction();
+        using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = tx;
+            delete.CommandText = "DELETE FROM own_chat WHERE thread_id = $id;";
+            delete.Parameters.AddWithValue("$id", id);
+            delete.ExecuteNonQuery();
+        }
+        UpsertSyncTombstone(tx, kind, id, version);
+        tx.Commit();
+    }
+
+    public void ApplyTopicDelete(string id, string kind, string version)
+    {
+        using var tx = conn.BeginTransaction();
+        using (var lines = conn.CreateCommand())
+        {
+            lines.Transaction = tx;
+            lines.CommandText = "DELETE FROM own_chat WHERE thread_id = $id;";
+            lines.Parameters.AddWithValue("$id", id);
+            lines.ExecuteNonQuery();
+        }
+        using (var topic = conn.CreateCommand())
+        {
+            topic.Transaction = tx;
+            topic.CommandText = "DELETE FROM own_threads WHERE id = $id;";
+            topic.Parameters.AddWithValue("$id", id);
+            topic.ExecuteNonQuery();
+        }
+        UpsertSyncTombstone(tx, kind, id, version);
+        tx.Commit();
+    }
+
+    public void ApplyConversationClear(string handle, string kind, string version)
+    {
+        using var tx = conn.BeginTransaction();
+        using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = tx;
+            delete.CommandText = "DELETE FROM chat_lines WHERE handle = $handle;";
+            delete.Parameters.AddWithValue("$handle", handle);
+            delete.ExecuteNonQuery();
+        }
+        UpsertSyncTombstone(tx, kind, handle, version);
+        tx.Commit();
+    }
+
+    public void ApplyConversationDelete(string handle, string kind, string version)
+    {
+        using var tx = conn.BeginTransaction();
+        using (var lines = conn.CreateCommand())
+        {
+            lines.Transaction = tx;
+            lines.CommandText = "DELETE FROM chat_lines WHERE handle = $handle;";
+            lines.Parameters.AddWithValue("$handle", handle);
+            lines.ExecuteNonQuery();
+        }
+        using (var conversation = conn.CreateCommand())
+        {
+            conversation.Transaction = tx;
+            conversation.CommandText = "DELETE FROM conversations WHERE handle = $handle;";
+            conversation.Parameters.AddWithValue("$handle", handle);
+            conversation.ExecuteNonQuery();
+        }
+        UpsertSyncTombstone(tx, kind, handle, version);
+        tx.Commit();
+    }
+
+    private void UpsertSyncTombstone(
+        SqliteTransaction transaction,
+        string kind,
+        string entityId,
+        string version)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = """
+            INSERT INTO sync_tombstones(kind, entity_id, version) VALUES($kind, $id, $version)
+            ON CONFLICT(kind, entity_id) DO UPDATE SET version = excluded.version;
+            """;
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        cmd.Parameters.AddWithValue("$version", version);
+        cmd.ExecuteNonQuery();
+    }
+
     /// <summary>Records that a conversation thread exists so an empty thread survives a reload.</summary>
     public void EnsureConversation(string handle)
     {
@@ -298,6 +524,52 @@ public sealed class MeshDb : IDisposable
             """;
         cmd.Parameters.AddWithValue("$h", handle);
         cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Upserts all persisted conversation metadata and its explicit order.</summary>
+    public void UpsertConversation(
+        string handle,
+        int sortOrder,
+        string? serviceId,
+        string? serviceName,
+        string? providerHandle,
+        string? groupId,
+        string? groupName,
+        string? groupOwnerHandle,
+        IReadOnlyList<string> groupMembers,
+        int groupVersion)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO conversations(
+                handle, created_at, sort_order, service_id, service_name, provider_handle,
+                group_id, group_name, group_owner_handle, group_members_json, group_version)
+            VALUES($h, $created, $sort, $sid, $sname, $provider, $gid, $gname, $owner, $members, $gversion)
+            ON CONFLICT(handle) DO UPDATE SET
+                sort_order = excluded.sort_order,
+                service_id = excluded.service_id,
+                service_name = excluded.service_name,
+                provider_handle = excluded.provider_handle,
+                group_id = excluded.group_id,
+                group_name = excluded.group_name,
+                group_owner_handle = excluded.group_owner_handle,
+                group_members_json = excluded.group_members_json,
+                group_version = excluded.group_version;
+            """;
+        cmd.Parameters.AddWithValue("$h", handle);
+        cmd.Parameters.AddWithValue("$created", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$sort", sortOrder);
+        cmd.Parameters.AddWithValue("$sid", (object?)serviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$sname", (object?)serviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$provider", (object?)providerHandle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$gid", (object?)groupId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$gname", (object?)groupName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$owner", (object?)groupOwnerHandle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$members", groupId is null
+            ? (object)DBNull.Value
+            : JsonSerializer.Serialize(groupMembers, JsonOpts));
+        cmd.Parameters.AddWithValue("$gversion", groupVersion);
         cmd.ExecuteNonQuery();
     }
 
@@ -391,8 +663,9 @@ public sealed class MeshDb : IDisposable
         EnsureConversation(handle);
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO chat_lines(line_id, handle, role, text, via, status, at, sender_handle)
-            VALUES($lid, $h, $r, $x, $v, $s, $a, $sender);
+            INSERT INTO chat_lines(
+                line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning)
+            VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning);
             """;
         cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$h", handle);
@@ -402,14 +675,67 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$s", line.Status);
         cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$internal", line.Internal ? 1 : 0);
+        cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Inserts or replaces one persisted conversation line by its stable id.</summary>
+    public void UpsertChatLine(string handle, ChatLine line)
+    {
+        EnsureConversation(handle);
+        using var tx = conn.BeginTransaction();
+        int updated;
+        using (var update = conn.CreateCommand())
+        {
+            update.Transaction = tx;
+            update.CommandText = """
+                UPDATE chat_lines
+                SET role = $r, text = $x, via = $v, status = $s, at = $a,
+                    sender_handle = $sender, internal = $internal, reasoning = $reasoning
+                WHERE handle = $h AND line_id = $lid;
+                """;
+            AddChatLineParameters(update, handle, line);
+            updated = update.ExecuteNonQuery();
+        }
+        if (updated == 0)
+        {
+            using var insert = conn.CreateCommand();
+            insert.Transaction = tx;
+            insert.CommandText = """
+                INSERT INTO chat_lines(
+                    line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning)
+                VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning);
+                """;
+            AddChatLineParameters(insert, handle, line);
+            insert.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    private static void AddChatLineParameters(SqliteCommand cmd, string handle, ChatLine line)
+    {
+        cmd.Parameters.AddWithValue("$lid", line.Id);
+        cmd.Parameters.AddWithValue("$h", handle);
+        cmd.Parameters.AddWithValue("$r", line.Role);
+        cmd.Parameters.AddWithValue("$x", line.Text);
+        cmd.Parameters.AddWithValue("$v", line.Via);
+        cmd.Parameters.AddWithValue("$s", line.Status);
+        cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
+        cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$internal", line.Internal ? 1 : 0);
+        cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
     }
 
     /// <summary>Appends a single line to a "Me" topic thread.</summary>
     public void AppendOwnChat(string threadId, ChatLine line)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO own_chat(line_id, thread_id, role, text, via, status, at, internal, reasoning) VALUES($lid, $tid, $r, $x, $v, $s, $a, $i, $rz);";
+        cmd.CommandText = """
+            INSERT INTO own_chat(
+                line_id, thread_id, role, text, via, status, at, internal, reasoning, sender_handle)
+            VALUES($lid, $tid, $r, $x, $v, $s, $a, $i, $rz, $sender);
+            """;
         cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$tid", threadId);
         cmd.Parameters.AddWithValue("$r", line.Role);
@@ -419,7 +745,54 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
         cmd.Parameters.AddWithValue("$i", line.Internal ? 1 : 0);
         cmd.Parameters.AddWithValue("$rz", (object?)line.Reasoning ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Inserts or replaces one persisted topic line by its stable id.</summary>
+    public void UpsertOwnChat(string threadId, ChatLine line)
+    {
+        using var tx = conn.BeginTransaction();
+        int updated;
+        using (var update = conn.CreateCommand())
+        {
+            update.Transaction = tx;
+            update.CommandText = """
+                UPDATE own_chat
+                SET role = $r, text = $x, via = $v, status = $s, at = $a,
+                    internal = $internal, reasoning = $reasoning, sender_handle = $sender
+                WHERE thread_id = $tid AND line_id = $lid;
+                """;
+            AddOwnChatParameters(update, threadId, line);
+            updated = update.ExecuteNonQuery();
+        }
+        if (updated == 0)
+        {
+            using var insert = conn.CreateCommand();
+            insert.Transaction = tx;
+            insert.CommandText = """
+                INSERT INTO own_chat(
+                    line_id, thread_id, role, text, via, status, at, internal, reasoning, sender_handle)
+                VALUES($lid, $tid, $r, $x, $v, $s, $a, $internal, $reasoning, $sender);
+                """;
+            AddOwnChatParameters(insert, threadId, line);
+            insert.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    private static void AddOwnChatParameters(SqliteCommand cmd, string threadId, ChatLine line)
+    {
+        cmd.Parameters.AddWithValue("$lid", line.Id);
+        cmd.Parameters.AddWithValue("$tid", threadId);
+        cmd.Parameters.AddWithValue("$r", line.Role);
+        cmd.Parameters.AddWithValue("$x", line.Text);
+        cmd.Parameters.AddWithValue("$v", line.Via);
+        cmd.Parameters.AddWithValue("$s", line.Status);
+        cmd.Parameters.AddWithValue("$a", line.At.ToString("O"));
+        cmd.Parameters.AddWithValue("$internal", line.Internal ? 1 : 0);
+        cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
     }
 
     /// <summary>Records that a "Me" thread exists so an empty thread survives a reload.</summary>
@@ -430,6 +803,24 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$t", title);
         cmd.Parameters.AddWithValue("$c", createdAt.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Upserts complete topic metadata and its explicit order.</summary>
+    public void UpsertOwnThread(string id, string title, DateTimeOffset createdAt, int sortOrder)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO own_threads(id, title, created_at, sort_order) VALUES($id, $title, $created, $sort)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                created_at = excluded.created_at,
+                sort_order = excluded.sort_order;
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$title", title);
+        cmd.Parameters.AddWithValue("$created", createdAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$sort", sortOrder);
         cmd.ExecuteNonQuery();
     }
 

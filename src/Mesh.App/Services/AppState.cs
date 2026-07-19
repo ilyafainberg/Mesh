@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text;
 using Mesh.App.Domain;
 using Mesh.Shared;
 
@@ -30,6 +31,7 @@ public sealed class AppState
     {
         WriteIndented = true
     };
+    private static readonly JsonSerializerOptions SyncJson = new(JsonSerializerDefaults.Web);
 
     private sealed class AccountIndex
     {
@@ -43,10 +45,12 @@ public sealed class AppState
     private string? activeId;
     private List<AccountRef> accounts = new();
     private MeshDb? activeDb;
+    private bool applyingDeviceSync;
 
     public MeshProfile Profile { get; private set; } = new();
 
     public event Action? Changed;
+    public event Action<DeviceSyncOperation>? DeviceSyncOperationCreated;
 
     // Handles with unread inbound person-messages (in-memory, cleared when the conversation is viewed).
     private readonly HashSet<string> unread = new(StringComparer.OrdinalIgnoreCase);
@@ -200,7 +204,8 @@ public sealed class AppState
     {
         var conv = GetOrCreateConversation(handle);
         conv.Lines.Add(line);
-        activeDb?.AppendChatLine(Norm(handle), line);
+        activeDb?.AppendChatLine(conv.Handle, line);
+        EmitLineUpsert(DeviceSyncKinds.ConversationLineUpsert, conv.Handle, line);
         NotifyChanged();
     }
 
@@ -210,6 +215,7 @@ public sealed class AppState
         var thread = GetOrCreateOwnThread(threadId);
         thread.Lines.Add(line);
         activeDb?.AppendOwnChat(thread.Id, line);
+        EmitLineUpsert(DeviceSyncKinds.TopicLineUpsert, thread.Id, line);
         NotifyChanged();
     }
 
@@ -231,6 +237,7 @@ public sealed class AppState
         var thread = new OwnThread { Title = title };
         Profile.OwnThreads.Add(thread);
         activeDb?.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+        EmitTopicUpsert(thread);
         NotifyChanged();
         return thread;
     }
@@ -247,6 +254,7 @@ public sealed class AppState
         Profile.OwnThreads.RemoveAt(oldIndex);
         Profile.OwnThreads.Insert(newIndex, thread);
         activeDb?.ReorderOwnThreads(Profile.OwnThreads.Select(t => t.Id).ToList());
+        foreach (var orderedThread in Profile.OwnThreads) EmitTopicUpsert(orderedThread);
         NotifyChanged();
     }
 
@@ -256,6 +264,7 @@ public sealed class AppState
         if (thread is null) return;
         thread.Title = string.IsNullOrWhiteSpace(title) ? thread.Title : title.Trim();
         activeDb?.RenameOwnThread(thread.Id, thread.Title);
+        EmitTopicUpsert(thread);
         NotifyChanged();
     }
 
@@ -264,19 +273,818 @@ public sealed class AppState
     {
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
         if (thread is null) return;
+        var lineVersions = thread.Lines
+            .Select(line => activeDb?.GetSyncVersion(LineSyncKey(
+                DeviceSyncKinds.TopicLineUpsert, thread.Id, line.Id)))
+            .ToList();
         thread.Lines.Clear();
-        activeDb?.ClearOwnThread(thread.Id);
+        EmitTombstone(DeviceSyncKinds.TopicClear, thread.Id, lineVersions);
         NotifyChanged();
     }
 
     /// <summary>Deletes a "Me" thread and all its messages.</summary>
     public void DeleteOwnThread(string threadId)
     {
-        Profile.OwnThreads.RemoveAll(t => t.Id == threadId);
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        if (thread is null) return;
+        var lineVersions = thread.Lines
+            .Select(line => activeDb?.GetSyncVersion(LineSyncKey(
+                DeviceSyncKinds.TopicLineUpsert, thread.Id, line.Id)))
+            .ToList();
+        Profile.OwnThreads.Remove(thread);
         completedThreads.Remove(threadId);
-        activeDb?.DeleteOwnThread(threadId);
+        EmitTombstone(DeviceSyncKinds.TopicDelete, threadId, lineVersions);
         NotifyChanged();
     }
+
+    // ---- device sync -------------------------------------------------------
+
+    public IReadOnlyList<DeviceSyncOperation> CreateDeviceSyncSnapshot()
+    {
+        var deviceId = LocalDeviceId();
+        if (deviceId is null || activeDb is null) return Array.Empty<DeviceSyncOperation>();
+
+        var operations = new List<DeviceSyncOperation>();
+        for (var i = 0; i < Profile.OwnThreads.Count; i++)
+        {
+            var thread = Profile.OwnThreads[i];
+            var entityId = thread.Id;
+            var version = GetOrCreateSnapshotVersion(
+                SyncKey(DeviceSyncKinds.TopicUpsert, entityId),
+                thread.CreatedAt,
+                DeviceSyncKinds.TopicUpsert,
+                entityId);
+            operations.Add(SnapshotOperation(
+                deviceId,
+                DeviceSyncKinds.TopicUpsert,
+                entityId,
+                version,
+                new DeviceSyncTopic(thread.Id, thread.Title, thread.CreatedAt, i)));
+
+            foreach (var line in thread.Lines)
+            {
+                version = GetOrCreateSnapshotVersion(
+                    LineSyncKey(DeviceSyncKinds.TopicLineUpsert, thread.Id, line.Id),
+                    line.At,
+                    DeviceSyncKinds.TopicLineUpsert,
+                    thread.Id + "\0" + line.Id);
+                operations.Add(SnapshotOperation(
+                    deviceId,
+                    DeviceSyncKinds.TopicLineUpsert,
+                    thread.Id,
+                    version,
+                    ToSyncLine(line)));
+            }
+        }
+
+        for (var i = 0; i < Profile.Conversations.Count; i++)
+        {
+            var conversation = Profile.Conversations[i];
+            var handle = Norm(conversation.Handle);
+            var version = GetOrCreateSnapshotVersion(
+                SyncKey(DeviceSyncKinds.ConversationUpsert, handle),
+                DateTimeOffset.UnixEpoch,
+                DeviceSyncKinds.ConversationUpsert,
+                handle);
+            operations.Add(SnapshotOperation(
+                deviceId,
+                DeviceSyncKinds.ConversationUpsert,
+                handle,
+                version,
+                ToSyncConversation(conversation, i)));
+
+            foreach (var line in conversation.Lines)
+            {
+                version = GetOrCreateSnapshotVersion(
+                    LineSyncKey(DeviceSyncKinds.ConversationLineUpsert, handle, line.Id),
+                    line.At,
+                    DeviceSyncKinds.ConversationLineUpsert,
+                    handle + "\0" + line.Id);
+                operations.Add(SnapshotOperation(
+                    deviceId,
+                    DeviceSyncKinds.ConversationLineUpsert,
+                    handle,
+                    version,
+                    ToSyncLine(line)));
+            }
+        }
+
+        foreach (var tombstone in activeDb.GetSyncTombstones())
+            operations.Add(new DeviceSyncOperation(
+                SnapshotOperationId(tombstone.Version, tombstone.Kind, tombstone.EntityId),
+                deviceId,
+                tombstone.Kind,
+                tombstone.EntityId,
+                tombstone.Version,
+                ""));
+
+        return operations;
+    }
+
+    public bool ApplyDeviceSyncBatch(DeviceSyncBatch batch)
+    {
+        if (batch is null || activeDb is null) return false;
+        var deviceId = LocalDeviceId();
+        if (deviceId is null
+            || string.IsNullOrWhiteSpace(batch.SourceDeviceId)
+            || string.Equals(batch.SourceDeviceId, deviceId, StringComparison.Ordinal)
+            || batch.Operations is null)
+            return false;
+
+        var visibleChanged = false;
+        applyingDeviceSync = true;
+        try
+        {
+            foreach (var operation in batch.Operations
+                         .Where(operation => operation is not null)
+                         .OrderBy(operation => operation.Version, StringComparer.Ordinal))
+            {
+                if (!IsValidOperation(operation, batch.SourceDeviceId, deviceId)) continue;
+                try
+                {
+                    visibleChanged |= ApplyDeviceSyncOperation(operation);
+                }
+                catch (JsonException)
+                {
+                }
+                catch (ArgumentException)
+                {
+                }
+                catch (FormatException)
+                {
+                }
+            }
+        }
+        finally
+        {
+            applyingDeviceSync = false;
+        }
+
+        if (visibleChanged) NotifyChanged();
+        return visibleChanged;
+    }
+
+    private bool ApplyDeviceSyncOperation(DeviceSyncOperation operation)
+    {
+        return operation.Kind switch
+        {
+            DeviceSyncKinds.TopicUpsert => ApplyTopicUpsert(operation),
+            DeviceSyncKinds.TopicLineUpsert => ApplyTopicLineUpsert(operation),
+            DeviceSyncKinds.TopicClear => ApplyTopicClear(operation),
+            DeviceSyncKinds.TopicDelete => ApplyTopicDelete(operation),
+            DeviceSyncKinds.ConversationUpsert => ApplyConversationUpsert(operation),
+            DeviceSyncKinds.ConversationLineUpsert => ApplyConversationLineUpsert(operation),
+            DeviceSyncKinds.ConversationClear => ApplyConversationClear(operation),
+            DeviceSyncKinds.ConversationDelete => ApplyConversationDelete(operation),
+            _ => false
+        };
+    }
+
+    private bool ApplyTopicUpsert(DeviceSyncOperation operation)
+    {
+        var dto = DeserializePayload<DeviceSyncTopic>(operation);
+        if (string.IsNullOrWhiteSpace(dto.Id)
+            || !string.Equals(dto.Id, operation.EntityId, StringComparison.Ordinal)
+            || dto.SortOrder < 0
+            || IsBlockedByTombstone(DeviceSyncKinds.TopicDelete, dto.Id, operation.Version)
+            || !IsNewer(operation, DeviceSyncKinds.TopicUpsert))
+            return false;
+
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == dto.Id);
+        var changed = thread is null
+            || !string.Equals(thread.Title, dto.Title, StringComparison.Ordinal)
+            || thread.CreatedAt != dto.CreatedAt
+            || Profile.OwnThreads.IndexOf(thread) != Math.Min(dto.SortOrder, Profile.OwnThreads.Count - 1);
+        if (thread is null)
+        {
+            thread = new OwnThread { Id = dto.Id };
+            Profile.OwnThreads.Insert(Math.Min(dto.SortOrder, Profile.OwnThreads.Count), thread);
+        }
+        else
+        {
+            Profile.OwnThreads.Remove(thread);
+            Profile.OwnThreads.Insert(Math.Min(dto.SortOrder, Profile.OwnThreads.Count), thread);
+        }
+        thread.Title = dto.Title ?? "";
+        thread.CreatedAt = dto.CreatedAt;
+        activeDb!.UpsertOwnThread(thread.Id, thread.Title, thread.CreatedAt, Profile.OwnThreads.IndexOf(thread));
+        activeDb.TryAdvanceSyncVersion(SyncKey(operation.Kind, operation.EntityId), operation.Version);
+        activeDb.ReorderOwnThreads(Profile.OwnThreads.Select(t => t.Id).ToList());
+        return changed;
+    }
+
+    private bool ApplyTopicLineUpsert(DeviceSyncOperation operation)
+    {
+        var threadId = operation.EntityId;
+        var dto = DeserializePayload<DeviceSyncLine>(operation);
+        var lineId = dto.Id;
+        if (!IsValidLine(dto, lineId)
+            || IsBlockedByTombstone(DeviceSyncKinds.TopicDelete, threadId, operation.Version)
+            || IsBlockedByTombstone(DeviceSyncKinds.TopicClear, threadId, operation.Version)
+            || !DeviceSyncVersion.IsNewer(
+                operation.Version,
+                activeDb!.GetSyncVersion(LineSyncKey(
+                    DeviceSyncKinds.TopicLineUpsert, threadId, lineId))))
+            return false;
+
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        if (thread is null)
+        {
+            thread = new OwnThread { Id = threadId, CreatedAt = dto.At };
+            Profile.OwnThreads.Add(thread);
+            activeDb!.UpsertOwnThread(thread.Id, thread.Title, thread.CreatedAt, Profile.OwnThreads.Count - 1);
+        }
+        var line = thread.Lines.FirstOrDefault(item => item.Id == lineId);
+        var changed = line is null || !LineEquals(line, dto);
+        if (line is null)
+        {
+            line = new ChatLine { Id = lineId };
+            thread.Lines.Add(line);
+        }
+        MergeLine(line, dto);
+        activeDb!.UpsertOwnChat(threadId, line);
+        activeDb.TryAdvanceSyncVersion(
+            LineSyncKey(operation.Kind, threadId, lineId), operation.Version);
+        return changed;
+    }
+
+    private bool ApplyTopicClear(DeviceSyncOperation operation)
+    {
+        if (IsBlockedByTombstone(DeviceSyncKinds.TopicDelete, operation.EntityId, operation.Version)
+            || !CanApplyClear(
+                operation,
+                DeviceSyncKinds.TopicLineUpsert,
+                Profile.OwnThreads.FirstOrDefault(t => t.Id == operation.EntityId)?.Lines))
+            return false;
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == operation.EntityId);
+        var changed = thread is not null && thread.Lines.Count > 0;
+        thread?.Lines.Clear();
+        activeDb!.ApplyTopicClear(
+            operation.EntityId, operation.Kind, operation.Version);
+        return changed;
+    }
+
+    private bool ApplyTopicDelete(DeviceSyncOperation operation)
+    {
+        if (!CanApplyDelete(
+                operation,
+                DeviceSyncKinds.TopicUpsert,
+                DeviceSyncKinds.TopicClear,
+                DeviceSyncKinds.TopicLineUpsert,
+                Profile.OwnThreads.FirstOrDefault(t => t.Id == operation.EntityId)?.Lines))
+            return false;
+        var changed = Profile.OwnThreads.RemoveAll(t => t.Id == operation.EntityId) > 0;
+        completedThreads.Remove(operation.EntityId);
+        activeDb!.ApplyTopicDelete(
+            operation.EntityId, operation.Kind, operation.Version);
+        return changed;
+    }
+
+    private bool ApplyConversationUpsert(DeviceSyncOperation operation)
+    {
+        var dto = DeserializePayload<DeviceSyncConversation>(operation);
+        var handle = Norm(dto.Handle ?? "");
+        if (handle.Length == 0
+            || !string.Equals(handle, operation.EntityId, StringComparison.Ordinal)
+            || dto.SortOrder < 0
+            || dto.GroupMembers is null
+            || IsBlockedByTombstone(DeviceSyncKinds.ConversationDelete, handle, operation.Version)
+            || !IsNewer(operation, DeviceSyncKinds.ConversationUpsert))
+            return false;
+
+        var normalized = NormalizeSyncConversation(dto, handle);
+        var conversation = FindConversation(handle);
+        var targetIndex = Math.Min(normalized.SortOrder, Math.Max(0, Profile.Conversations.Count - 1));
+        var changed = conversation is null
+            || !ConversationEquals(conversation, normalized)
+            || Profile.Conversations.IndexOf(conversation) != targetIndex;
+        if (conversation is null)
+        {
+            conversation = new Conversation { Handle = handle };
+            Profile.Conversations.Insert(Math.Min(normalized.SortOrder, Profile.Conversations.Count), conversation);
+        }
+        else
+        {
+            Profile.Conversations.Remove(conversation);
+            Profile.Conversations.Insert(Math.Min(normalized.SortOrder, Profile.Conversations.Count), conversation);
+        }
+        MergeConversation(conversation, normalized);
+        activeDb!.UpsertConversation(
+            handle,
+            Profile.Conversations.IndexOf(conversation),
+            conversation.ServiceId,
+            conversation.ServiceName,
+            conversation.ProviderHandle,
+            conversation.GroupId,
+            conversation.GroupName,
+            conversation.GroupOwnerHandle,
+            conversation.GroupMembers,
+            conversation.GroupVersion);
+        activeDb.TryAdvanceSyncVersion(SyncKey(operation.Kind, operation.EntityId), operation.Version);
+        activeDb.ReorderConversations(Profile.Conversations.Select(c => c.Handle).ToList());
+        return changed;
+    }
+
+    private bool ApplyConversationLineUpsert(DeviceSyncOperation operation)
+    {
+        var handle = Norm(operation.EntityId);
+        var dto = DeserializePayload<DeviceSyncLine>(operation);
+        var lineId = dto.Id;
+        if (!string.Equals(handle, operation.EntityId, StringComparison.Ordinal)
+            || !IsValidLine(dto, lineId)
+            || IsBlockedByTombstone(DeviceSyncKinds.ConversationDelete, handle, operation.Version)
+            || IsBlockedByTombstone(DeviceSyncKinds.ConversationClear, handle, operation.Version)
+            || !DeviceSyncVersion.IsNewer(
+                operation.Version,
+                activeDb!.GetSyncVersion(LineSyncKey(
+                    DeviceSyncKinds.ConversationLineUpsert, handle, lineId))))
+            return false;
+
+        var conversation = FindConversation(handle);
+        if (conversation is null)
+        {
+            conversation = new Conversation { Handle = handle };
+            Profile.Conversations.Add(conversation);
+            activeDb!.UpsertConversation(
+                handle, Profile.Conversations.Count - 1, null, null, null, null, null, null, Array.Empty<string>(), 0);
+        }
+        var line = conversation.Lines.FirstOrDefault(item => item.Id == lineId);
+        var changed = line is null || !LineEquals(line, dto);
+        if (line is null)
+        {
+            line = new ChatLine { Id = lineId };
+            conversation.Lines.Add(line);
+        }
+        MergeLine(line, dto);
+        activeDb!.UpsertChatLine(handle, line);
+        activeDb.TryAdvanceSyncVersion(
+            LineSyncKey(operation.Kind, handle, lineId), operation.Version);
+        return changed;
+    }
+
+    private bool ApplyConversationClear(DeviceSyncOperation operation)
+    {
+        var handle = Norm(operation.EntityId);
+        if (handle.Length == 0
+            || !string.Equals(handle, operation.EntityId, StringComparison.Ordinal)
+            || IsBlockedByTombstone(DeviceSyncKinds.ConversationDelete, handle, operation.Version)
+            || !CanApplyClear(
+                operation,
+                DeviceSyncKinds.ConversationLineUpsert,
+                FindConversation(handle)?.Lines))
+            return false;
+        var conversation = FindConversation(handle);
+        var changed = conversation is not null && conversation.Lines.Count > 0;
+        conversation?.Lines.Clear();
+        activeDb!.ApplyConversationClear(handle, operation.Kind, operation.Version);
+        return changed;
+    }
+
+    private bool ApplyConversationDelete(DeviceSyncOperation operation)
+    {
+        var handle = Norm(operation.EntityId);
+        if (handle.Length == 0
+            || !string.Equals(handle, operation.EntityId, StringComparison.Ordinal)
+            || !CanApplyDelete(
+                operation,
+                DeviceSyncKinds.ConversationUpsert,
+                DeviceSyncKinds.ConversationClear,
+                DeviceSyncKinds.ConversationLineUpsert,
+                FindConversation(handle)?.Lines))
+            return false;
+        var changed = Profile.Conversations.RemoveAll(
+            c => c.Handle.Equals(handle, StringComparison.OrdinalIgnoreCase)) > 0;
+        unread.Remove(handle);
+        if (Profile.UnreadFrom.Remove(handle)) activeDb!.SaveProfile(Profile);
+        activeDb!.ApplyConversationDelete(handle, operation.Kind, operation.Version);
+        return changed;
+    }
+
+    private void EmitTopicUpsert(OwnThread thread)
+    {
+        var sortOrder = Profile.OwnThreads.IndexOf(thread);
+        EmitUpsert(
+            DeviceSyncKinds.TopicUpsert,
+            thread.Id,
+            new DeviceSyncTopic(thread.Id, thread.Title, thread.CreatedAt, Math.Max(0, sortOrder)),
+            DeviceSyncKinds.TopicDelete);
+    }
+
+    private void EmitConversationUpsert(Conversation conversation)
+    {
+        var handle = Norm(conversation.Handle);
+        EmitUpsert(
+            DeviceSyncKinds.ConversationUpsert,
+            handle,
+            ToSyncConversation(conversation, Math.Max(0, Profile.Conversations.IndexOf(conversation))),
+            DeviceSyncKinds.ConversationDelete);
+    }
+
+    private void EmitLineUpsert(string kind, string parentId, ChatLine line)
+    {
+        if (applyingDeviceSync) return;
+        var deviceId = LocalDeviceId();
+        if (activeDb is null || deviceId is null) return;
+        var deleteKind = kind == DeviceSyncKinds.TopicLineUpsert
+            ? DeviceSyncKinds.TopicDelete
+            : DeviceSyncKinds.ConversationDelete;
+        var clearKind = kind == DeviceSyncKinds.TopicLineUpsert
+            ? DeviceSyncKinds.TopicClear
+            : DeviceSyncKinds.ConversationClear;
+        var operationId = NewId();
+        var version = CreateNewerVersion(
+            deviceId,
+            operationId,
+            new[]
+            {
+                activeDb.GetSyncVersion(LineSyncKey(kind, parentId, line.Id)),
+                activeDb.GetSyncTombstoneVersion(deleteKind, parentId),
+                activeDb.GetSyncTombstoneVersion(clearKind, parentId)
+            });
+        if (!activeDb.TryAdvanceSyncVersion(
+                LineSyncKey(kind, parentId, line.Id), version))
+            return;
+        DeviceSyncOperationCreated?.Invoke(new DeviceSyncOperation(
+            operationId,
+            deviceId,
+            kind,
+            parentId,
+            version,
+            JsonSerializer.Serialize(ToSyncLine(line), SyncJson)));
+    }
+
+    private void EmitUpsert<T>(string kind, string entityId, T payload, string deleteKind)
+    {
+        if (applyingDeviceSync) return;
+        EmitOperation(
+            kind,
+            entityId,
+            payload,
+            activeDb?.GetSyncVersion(SyncKey(kind, entityId)),
+            activeDb?.GetSyncTombstoneVersion(deleteKind, entityId));
+    }
+
+    private void EmitTombstone(
+        string kind,
+        string entityId,
+        IEnumerable<string?>? additionalVersions = null)
+    {
+        if (applyingDeviceSync) return;
+        var versions = new List<string?>
+        {
+            activeDb?.GetSyncTombstoneVersion(kind, entityId),
+            kind is DeviceSyncKinds.TopicDelete
+                ? activeDb?.GetSyncVersion(SyncKey(DeviceSyncKinds.TopicUpsert, entityId))
+                : kind is DeviceSyncKinds.ConversationDelete
+                    ? activeDb?.GetSyncVersion(SyncKey(DeviceSyncKinds.ConversationUpsert, entityId))
+                    : null
+        };
+        if (kind == DeviceSyncKinds.TopicDelete)
+            versions.Add(activeDb?.GetSyncTombstoneVersion(DeviceSyncKinds.TopicClear, entityId));
+        else if (kind == DeviceSyncKinds.ConversationDelete)
+            versions.Add(activeDb?.GetSyncTombstoneVersion(DeviceSyncKinds.ConversationClear, entityId));
+        if (additionalVersions is not null) versions.AddRange(additionalVersions);
+        EmitOperation<object?>(kind, entityId, null, versions.ToArray());
+    }
+
+    private void EmitOperation<T>(string kind, string entityId, T payload, params string?[] priorVersions)
+    {
+        var deviceId = LocalDeviceId();
+        if (activeDb is null) return;
+        if (deviceId is null)
+        {
+            switch (kind)
+            {
+                case DeviceSyncKinds.TopicDelete:
+                    activeDb.DeleteOwnThread(entityId);
+                    break;
+                case DeviceSyncKinds.TopicClear:
+                    activeDb.ClearOwnThread(entityId);
+                    break;
+                case DeviceSyncKinds.ConversationDelete:
+                    activeDb.DeleteConversation(entityId);
+                    break;
+                case DeviceSyncKinds.ConversationClear:
+                    activeDb.ClearConversation(entityId);
+                    break;
+            }
+            return;
+        }
+        var operationId = NewId();
+        var version = CreateNewerVersion(deviceId, operationId, priorVersions);
+        var serialized = payload is null ? "" : JsonSerializer.Serialize(payload, SyncJson);
+        if (kind is DeviceSyncKinds.TopicDelete
+            or DeviceSyncKinds.TopicClear
+            or DeviceSyncKinds.ConversationDelete
+            or DeviceSyncKinds.ConversationClear)
+        {
+            switch (kind)
+            {
+                case DeviceSyncKinds.TopicDelete:
+                    activeDb.ApplyTopicDelete(entityId, kind, version);
+                    break;
+                case DeviceSyncKinds.TopicClear:
+                    activeDb.ApplyTopicClear(entityId, kind, version);
+                    break;
+                case DeviceSyncKinds.ConversationDelete:
+                    activeDb.ApplyConversationDelete(entityId, kind, version);
+                    break;
+                case DeviceSyncKinds.ConversationClear:
+                    activeDb.ApplyConversationClear(entityId, kind, version);
+                    break;
+            }
+        }
+        else
+        {
+            if (!activeDb.TryAdvanceSyncVersion(SyncKey(kind, entityId), version)) return;
+        }
+        DeviceSyncOperationCreated?.Invoke(
+            new DeviceSyncOperation(operationId, deviceId, kind, entityId, version, serialized));
+    }
+
+    private string? LocalDeviceId()
+        => string.IsNullOrWhiteSpace(Profile.PublicKey)
+            ? null
+            : DeviceProtocol.DeviceId(Profile.PublicKey);
+
+    private string GetOrCreateSnapshotVersion(
+        string entityKey,
+        DateTimeOffset at,
+        string kind,
+        string entityId)
+    {
+        var version = activeDb!.GetSyncVersion(entityKey);
+        if (version is not null) return version;
+        var operationId = LegacyOperationId(kind, entityId);
+        version = DeviceSyncVersion.Create(at, "legacy", operationId);
+        activeDb.TryAdvanceSyncVersion(entityKey, version);
+        return version;
+    }
+
+    private static DeviceSyncOperation SnapshotOperation<T>(
+        string deviceId,
+        string kind,
+        string entityId,
+        string version,
+        T payload)
+        => new(
+            SnapshotOperationId(version, kind, entityId),
+            deviceId,
+            kind,
+            entityId,
+            version,
+            JsonSerializer.Serialize(payload, SyncJson));
+
+    private static string SnapshotOperationId(string version, string kind, string entityId)
+    {
+        var separator = version.LastIndexOf('|');
+        return separator >= 0 && separator + 1 < version.Length
+            ? version[(separator + 1)..]
+            : LegacyOperationId(kind, entityId);
+    }
+
+    private static string LegacyOperationId(string kind, string entityId)
+        => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(kind + "\0" + entityId))).ToLowerInvariant();
+
+    private static string CreateNewerVersion(
+        string deviceId,
+        string operationId,
+        IEnumerable<string?> priorVersions)
+    {
+        var at = DateTimeOffset.UtcNow;
+        var candidate = DeviceSyncVersion.Create(at, deviceId, operationId);
+        var newest = priorVersions
+            .Where(version => !string.IsNullOrWhiteSpace(version))
+            .Max(StringComparer.Ordinal);
+        if (newest is null || DeviceSyncVersion.IsNewer(candidate, newest)) return candidate;
+        var separator = newest.IndexOf('|');
+        if (separator <= 0
+            || !long.TryParse(newest[..separator], out var ticks)
+            || ticks >= DateTimeOffset.MaxValue.UtcTicks)
+            return candidate;
+        return DeviceSyncVersion.Create(
+            new DateTimeOffset(ticks + 1, TimeSpan.Zero), deviceId, operationId);
+    }
+
+    private bool IsNewer(DeviceSyncOperation operation, string kind)
+        => DeviceSyncVersion.IsNewer(
+            operation.Version,
+            activeDb!.GetSyncVersion(SyncKey(kind, operation.EntityId)));
+
+    private bool IsBlockedByTombstone(string kind, string entityId, string version)
+        => DeviceSyncVersion.Compare(
+            activeDb!.GetSyncTombstoneVersion(kind, entityId),
+            version) >= 0;
+
+    private bool CanApplyTombstone(DeviceSyncOperation operation)
+        => DeviceSyncVersion.IsNewer(
+            operation.Version,
+            activeDb!.GetSyncTombstoneVersion(operation.Kind, operation.EntityId));
+
+    private bool CanApplyClear(
+        DeviceSyncOperation operation,
+        string lineKind,
+        IReadOnlyList<ChatLine>? lines)
+        => CanApplyTombstone(operation)
+           && IsNewerThanLines(operation.Version, lineKind, operation.EntityId, lines);
+
+    private bool CanApplyDelete(
+        DeviceSyncOperation operation,
+        string upsertKind,
+        string clearKind,
+        string lineKind,
+        IReadOnlyList<ChatLine>? lines)
+        => CanApplyTombstone(operation)
+           && DeviceSyncVersion.IsNewer(
+               operation.Version,
+               activeDb!.GetSyncVersion(SyncKey(upsertKind, operation.EntityId)))
+           && DeviceSyncVersion.IsNewer(
+               operation.Version,
+               activeDb.GetSyncTombstoneVersion(clearKind, operation.EntityId))
+           && IsNewerThanLines(operation.Version, lineKind, operation.EntityId, lines);
+
+    private bool IsNewerThanLines(
+        string version,
+        string lineKind,
+        string parentId,
+        IReadOnlyList<ChatLine>? lines)
+        => lines is null
+           || lines.All(line => DeviceSyncVersion.IsNewer(
+               version,
+               activeDb!.GetSyncVersion(LineSyncKey(
+                   lineKind, parentId, line.Id))));
+
+    private static bool IsValidOperation(
+        DeviceSyncOperation operation,
+        string batchSource,
+        string localDeviceId)
+    {
+        if (string.IsNullOrWhiteSpace(operation.OperationId)
+            || string.IsNullOrWhiteSpace(operation.SourceDeviceId)
+            || !string.Equals(operation.SourceDeviceId, batchSource, StringComparison.Ordinal)
+            || string.Equals(operation.SourceDeviceId, localDeviceId, StringComparison.Ordinal)
+            || string.IsNullOrWhiteSpace(operation.EntityId)
+            || !IsVersion(operation.Version))
+            return false;
+        return operation.Kind is DeviceSyncKinds.TopicUpsert
+            or DeviceSyncKinds.TopicLineUpsert
+            or DeviceSyncKinds.TopicClear
+            or DeviceSyncKinds.TopicDelete
+            or DeviceSyncKinds.ConversationUpsert
+            or DeviceSyncKinds.ConversationLineUpsert
+            or DeviceSyncKinds.ConversationClear
+            or DeviceSyncKinds.ConversationDelete;
+    }
+
+    private static bool IsVersion(string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version)) return false;
+        var first = version.IndexOf('|');
+        var second = first < 0 ? -1 : version.IndexOf('|', first + 1);
+        return first == 19
+               && second > first + 1
+               && second + 1 < version.Length
+               && version.IndexOf('|', second + 1) < 0
+               && long.TryParse(version[..first], out var ticks)
+               && ticks >= DateTimeOffset.MinValue.UtcTicks
+               && ticks <= DateTimeOffset.MaxValue.UtcTicks;
+    }
+
+    private static T DeserializePayload<T>(DeviceSyncOperation operation)
+    {
+        if (string.IsNullOrWhiteSpace(operation.Payload))
+            throw new JsonException("A sync upsert payload is required.");
+        return JsonSerializer.Deserialize<T>(operation.Payload, SyncJson)
+               ?? throw new JsonException("A sync upsert payload was null.");
+    }
+
+    private static DeviceSyncLine ToSyncLine(ChatLine line)
+        => new(
+            line.Id,
+            line.Role,
+            line.Text,
+            line.Via,
+            line.Status,
+            line.At,
+            line.SenderHandle,
+            line.Internal,
+            line.Reasoning);
+
+    private static DeviceSyncConversation ToSyncConversation(Conversation conversation, int sortOrder)
+        => new(
+            Norm(conversation.Handle),
+            sortOrder,
+            conversation.ServiceId,
+            conversation.ServiceName,
+            conversation.ProviderHandle,
+            conversation.GroupId,
+            conversation.GroupName,
+            conversation.GroupOwnerHandle,
+            conversation.GroupMembers.ToList(),
+            conversation.GroupVersion);
+
+    private static DeviceSyncConversation NormalizeSyncConversation(
+        DeviceSyncConversation dto,
+        string handle)
+    {
+        var provider = string.IsNullOrWhiteSpace(dto.ProviderHandle) ? null : Norm(dto.ProviderHandle);
+        var owner = string.IsNullOrWhiteSpace(dto.GroupOwnerHandle) ? null : Norm(dto.GroupOwnerHandle);
+        var members = dto.GroupMembers
+            .Where(member => !string.IsNullOrWhiteSpace(member))
+            .Select(Norm)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var groupId = string.IsNullOrWhiteSpace(dto.GroupId) ? null : NormalizeGroupId(dto.GroupId);
+        var serviceId = string.IsNullOrWhiteSpace(dto.ServiceId) ? null : dto.ServiceId.Trim();
+        if (groupId is not null && serviceId is not null)
+            throw new ArgumentException("A synchronized conversation cannot be both a group and a service.");
+        if (groupId is not null
+            && (string.IsNullOrWhiteSpace(dto.GroupName)
+                || owner is null
+                || dto.GroupVersion < 1
+                || members.Count < 2
+                || !members.Contains(owner, StringComparer.OrdinalIgnoreCase)))
+            throw new ArgumentException("Synchronized group metadata is invalid.");
+        if (groupId is not null && handle != GroupKey(groupId))
+            throw new ArgumentException("Synchronized group handle is invalid.");
+        if (serviceId is not null && provider is null)
+            throw new ArgumentException("Synchronized service metadata is invalid.");
+        if (serviceId is not null && handle != ServiceKey(provider!, serviceId))
+            throw new ArgumentException("Synchronized service handle is invalid.");
+        return dto with
+        {
+            Handle = handle,
+            ServiceId = serviceId,
+            ServiceName = serviceId is null ? null : dto.ServiceName,
+            ProviderHandle = provider,
+            GroupId = groupId,
+            GroupName = groupId is null ? null : dto.GroupName!.Trim(),
+            GroupOwnerHandle = groupId is null ? null : owner,
+            GroupMembers = groupId is null ? Array.Empty<string>() : members,
+            GroupVersion = groupId is null ? 0 : dto.GroupVersion
+        };
+    }
+
+    private static bool IsValidLine(DeviceSyncLine line, string lineId)
+        => !string.IsNullOrWhiteSpace(line.Id)
+           && string.Equals(line.Id, lineId, StringComparison.Ordinal)
+           && line.Role is not null
+           && line.Text is not null
+           && line.Via is not null
+           && line.Status is not null;
+
+    private static bool LineEquals(ChatLine line, DeviceSyncLine dto)
+        => line.Role == dto.Role
+           && line.Text == dto.Text
+           && line.Via == dto.Via
+           && line.Status == dto.Status
+           && line.At == dto.At
+           && line.SenderHandle == dto.SenderHandle
+           && line.Internal == dto.Internal
+           && line.Reasoning == dto.Reasoning;
+
+    private static void MergeLine(ChatLine line, DeviceSyncLine dto)
+    {
+        line.Role = dto.Role;
+        line.Text = dto.Text;
+        line.Via = dto.Via;
+        line.Status = dto.Status;
+        line.At = dto.At;
+        line.SenderHandle = dto.SenderHandle;
+        line.Internal = dto.Internal;
+        line.Reasoning = dto.Reasoning;
+        line.Attachments.Clear();
+    }
+
+    private static bool ConversationEquals(Conversation conversation, DeviceSyncConversation dto)
+        => conversation.Handle == dto.Handle
+           && conversation.ServiceId == dto.ServiceId
+           && conversation.ServiceName == dto.ServiceName
+           && conversation.ProviderHandle == dto.ProviderHandle
+           && conversation.GroupId == dto.GroupId
+           && conversation.GroupName == dto.GroupName
+           && conversation.GroupOwnerHandle == dto.GroupOwnerHandle
+           && conversation.GroupMembers.SequenceEqual(dto.GroupMembers, StringComparer.OrdinalIgnoreCase)
+           && conversation.GroupVersion == dto.GroupVersion;
+
+    private static void MergeConversation(Conversation conversation, DeviceSyncConversation dto)
+    {
+        conversation.Handle = dto.Handle;
+        conversation.ServiceId = dto.ServiceId;
+        conversation.ServiceName = dto.ServiceName;
+        conversation.ProviderHandle = dto.ProviderHandle;
+        conversation.GroupId = dto.GroupId;
+        conversation.GroupName = dto.GroupName;
+        conversation.GroupOwnerHandle = dto.GroupOwnerHandle;
+        conversation.GroupMembers = dto.GroupMembers.ToList();
+        conversation.GroupVersion = dto.GroupVersion;
+    }
+
+    private static string SyncKey(string kind, string entityId) => kind + "\u001f" + entityId;
+
+    private static string LineSyncKey(string kind, string parentId, string lineId)
+        => kind + "\u001f" + parentId + "\u001f" + lineId;
 
     // ---- token counter ----------------------------------------------------
 
@@ -596,24 +1404,44 @@ public sealed class AppState
     /// <summary>Updates an outgoing line's delivery status (persisted) and refreshes the UI.</summary>
     public void SetLineStatus(string lineId, string status)
     {
+        Conversation? owner = null;
+        ChatLine? updated = null;
         foreach (var conv in Profile.Conversations)
         {
             var line = conv.Lines.FirstOrDefault(l => l.Id == lineId);
-            if (line is not null) { line.Status = status; break; }
+            if (line is not null)
+            {
+                line.Status = status;
+                owner = conv;
+                updated = line;
+                break;
+            }
         }
         activeDb?.UpdateLineStatus(lineId, status);
+        if (owner is not null && updated is not null)
+            EmitLineUpsert(DeviceSyncKinds.ConversationLineUpsert, owner.Handle, updated);
         NotifyChanged();
     }
 
     /// <summary>Updates an outgoing line after widget/file content is finalized and persists it.</summary>
     public void SetLineText(string lineId, string text)
     {
+        Conversation? owner = null;
+        ChatLine? updated = null;
         foreach (var conv in Profile.Conversations)
         {
             var line = conv.Lines.FirstOrDefault(l => l.Id == lineId);
-            if (line is not null) { line.Text = text; break; }
+            if (line is not null)
+            {
+                line.Text = text;
+                owner = conv;
+                updated = line;
+                break;
+            }
         }
         activeDb?.UpdateLineText(lineId, text);
+        if (owner is not null && updated is not null)
+            EmitLineUpsert(DeviceSyncKinds.ConversationLineUpsert, owner.Handle, updated);
         NotifyChanged();
     }
 
@@ -874,6 +1702,7 @@ public sealed class AppState
         conv.GroupVersion = normalized.Version;
         activeDb?.SetConversationGroup(
             key, conv.GroupId, conv.GroupName, conv.GroupOwnerHandle, conv.GroupMembers, conv.GroupVersion);
+        EmitConversationUpsert(conv);
         NotifyChanged();
         return conv;
     }
@@ -889,19 +1718,25 @@ public sealed class AppState
         var provider = Norm(providerHandle);
         var name = string.IsNullOrWhiteSpace(serviceName) ? serviceId : serviceName!.Trim();
         var conv = FindConversation(key);
+        var changed = false;
         if (conv is null)
         {
             conv = new Conversation { Handle = key, ServiceId = serviceId, ServiceName = name, ProviderHandle = provider };
             Profile.Conversations.Add(conv);
             activeDb?.SetConversationService(key, serviceId, name, provider);
+            changed = true;
         }
-        else if (!string.IsNullOrWhiteSpace(serviceName) && conv.ServiceName != name)
+        else if (conv.ServiceId != serviceId
+                 || conv.ServiceName != name
+                 || conv.ProviderHandle != provider)
         {
             conv.ServiceId = serviceId;
             conv.ServiceName = name;
             conv.ProviderHandle = provider;
             activeDb?.SetConversationService(key, serviceId, name, provider);
+            changed = true;
         }
+        if (changed) EmitConversationUpsert(conv);
         NotifyChanged();
         return conv;
     }
@@ -915,6 +1750,7 @@ public sealed class AppState
             conv = new Conversation { Handle = handle };
             Profile.Conversations.Add(conv);
             activeDb?.EnsureConversation(handle);
+            EmitConversationUpsert(conv);
         }
         return conv;
     }
@@ -932,6 +1768,8 @@ public sealed class AppState
         Profile.Conversations.RemoveAt(oldIndex);
         Profile.Conversations.Insert(newIndex, conversation);
         activeDb?.ReorderConversations(Profile.Conversations.Select(c => c.Handle).ToList());
+        foreach (var orderedConversation in Profile.Conversations)
+            EmitConversationUpsert(orderedConversation);
         NotifyChanged();
     }
 
@@ -941,8 +1779,12 @@ public sealed class AppState
         var h = Norm(handle);
         var conv = Profile.Conversations.FirstOrDefault(c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
         if (conv is null) return;
+        var lineVersions = conv.Lines
+            .Select(line => activeDb?.GetSyncVersion(LineSyncKey(
+                DeviceSyncKinds.ConversationLineUpsert, h, line.Id)))
+            .ToList();
         conv.Lines.Clear();
-        activeDb?.ClearConversation(h);
+        EmitTombstone(DeviceSyncKinds.ConversationClear, h, lineVersions);
         NotifyChanged();
     }
 
@@ -950,10 +1792,17 @@ public sealed class AppState
     public void DeleteConversation(string handle)
     {
         var h = Norm(handle);
-        Profile.Conversations.RemoveAll(c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
+        var conversation = Profile.Conversations.FirstOrDefault(
+            c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
+        if (conversation is null) return;
+        var lineVersions = conversation.Lines
+            .Select(line => activeDb?.GetSyncVersion(LineSyncKey(
+                DeviceSyncKinds.ConversationLineUpsert, h, line.Id)))
+            .ToList();
+        Profile.Conversations.Remove(conversation);
         unread.Remove(h);
         if (Profile.UnreadFrom.Remove(h)) activeDb?.SaveProfile(Profile);
-        activeDb?.DeleteConversation(h);
+        EmitTombstone(DeviceSyncKinds.ConversationDelete, h, lineVersions);
         NotifyChanged();
     }
 
