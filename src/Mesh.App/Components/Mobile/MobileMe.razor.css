@@ -355,6 +355,16 @@
 .bubble.user .msg-tag { color: rgba(255,255,255,.85); }
 .bubble.assistant .msg-tag { color: var(--fg-3); }
 
+.planning-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg-3);
+    font-size: 13px;
+}
+
+.home-agent-tag { color: var(--fg-3); }
+
 /* ---------- Composer area ---------- */
 .composer-area {
     flex: none;

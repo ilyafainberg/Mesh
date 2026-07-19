@@ -94,6 +94,10 @@
                             }
                             <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                             OnPin="html => PinWidget(html, line)" />
+                            @if (line.Via == "home-agent")
+                            {
+                                <div class="msg-tag home-agent-tag"><i class="bi bi-house-gear"></i> Home Agent</div>
+                            }
                             @if (IsQueued(line))
                             {
                                 <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
@@ -107,8 +111,15 @@
                         @{ var run = Active is null ? null : State.AgentRunFor(Active.Id); }
                         @if (run is not null)
                         {
-                            <div class="text md">@((MarkupString)Markdown.ToHtml(run.Plan))</div>
-                            <div class="msg-tag"><i class="bi bi-diagram-3"></i> @run.Phase.ToString().ToLowerInvariant()</div>
+                            @if (run.Phase == AgentRunPhase.Planning)
+                            {
+                                <div class="planning-row"><i class="bi bi-diagram-3"></i> Planning</div>
+                            }
+                            else
+                            {
+                                <div class="text md">@((MarkupString)Markdown.ToHtml(run.Plan))</div>
+                                <div class="msg-tag"><i class="bi bi-diagram-3"></i> @run.Phase.ToString().ToLowerInvariant()</div>
+                            }
                         }
                         @{ var steps = Active is null ? null : State.AgentStepsFor(Active.Id); }
                         @if (steps is { Count: > 0 })
@@ -144,7 +155,10 @@
                                 @(showStepDetails ? "Hide details" : "Show details")
                             </button>
                         }
-                        <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
+                        @if (run?.Phase != AgentRunPhase.Planning)
+                        {
+                            <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
+                        }
                     </div>
                 }
             </div>
@@ -238,7 +252,7 @@
                     <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@ActiveBusy" title="Attach an image or document" aria-label="Attach an image or document">
                         <i class="bi bi-paperclip"></i>
                     </button>
-                    @if (!IsDesktop)
+                    @if (PlatformCaps.IsMobile)
                     {
                         <button class="ghost icon-btn plus-btn @(homeMode ? "on" : "")" @onclick="() => homeMode = !homeMode" disabled="@ActiveBusy"
                                 title="Ask my home agent (runs on my desktop with full tools)" aria-label="Ask my home agent">
@@ -246,7 +260,7 @@
                         </button>
                     }
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
-                              placeholder="@ComposerPlaceholder" aria-label="Message your assistant"></textarea>
+                              placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
                     @if (ActiveBusy)
                     {
                         <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop" aria-label="Stop">
@@ -309,11 +323,14 @@
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
     bool ActiveBusy => Active is not null && State.IsThreadBusy(Active.Id);
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
-    string ComposerPlaceholder => widgetMode
+    string ComposerPlaceholder => homeMode
+        ? "Message your home assistant..."
+        : widgetMode
         ? "Describe the widget you want…"
         : selectedWidget is not null
             ? $"Use or change {selectedWidget.Name}…"
             : "Message your assistant…";
+    string ComposerAriaLabel => homeMode ? "Message your home assistant" : "Message your assistant";
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
@@ -337,6 +354,16 @@
         _ => "bi-dot"
     };
 
+    static string HomeAgentFailure(string code) => code.ToLowerInvariant() switch
+    {
+        "home_device_required" or "no-target" or "no_target" or "no-home-device" => "Select an online desktop in Settings first.",
+        "home_device_offline" or "offline" or "target-offline" or "target_offline" => "Your selected Home device is offline.",
+        "home_device_not_eligible" or "disabled" or "target-disabled" or "target_disabled" => "Home Agent is unavailable on the selected desktop.",
+        "not_connected" or "disconnected" or "not-connected" or "relay-disconnected" or "unreachable" => "Could not reach your Home device. Check its connection.",
+        "rejected" => "Your Home device rejected the request.",
+        _ => "Could not send this request to your Home device."
+    };
+
     // Tier-1 steerable input: messages submitted while a thread's turn is running are queued for that
     // thread (shown immediately as a subtle "queued" line) and answered together in ONE follow-up turn
     // after the current one finishes, in order. A thread never runs two of its own turns concurrently,
@@ -347,9 +374,6 @@
     {
         public string SizeLabel => Human(Size);
     }
-
-    // Desktop clients are the home agent, so the "ask my home agent" shortcut is only useful on mobile.
-    static bool IsDesktop => OperatingSystem.IsWindows() || OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS();
 
     IReadOnlyList<OwnThread> Threads => State.Profile.OwnThreads;
     OwnThread? Active => activeThread is null ? null : State.Profile.OwnThreads.FirstOrDefault(t => t.Id == activeThread);
@@ -614,6 +638,7 @@
         input = "";
         attachments.Clear();
         widgetMode = false;
+        homeMode = false;
         widgetPickerOpen = false;
         selectedWidget = null;
         _ = ResetComposer();
@@ -732,16 +757,32 @@
             }
             else if (home)
             {
-                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = text });
-                var ok = await Mesh.AskHomeAgentAsync(text);
-                State.AddOwnChatLine(threadId, new ChatLine
+                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = text, Via = "home-agent" });
+                try
                 {
-                    Role = "assistant",
-                    Text = ok
-                        ? "Sent to your home agent. Its reply will arrive in Messages (from your own handle) and as a notification."
-                        : "[could not reach your home agent: not connected, or no device has 'Answer my other devices' enabled]"
-                });
+                    var result = await Mesh.AskHomeAgentAsync(threadId, text, ct);
+                    if (!result.Accepted)
+                    {
+                        State.AddOwnChatLine(threadId, new ChatLine
+                        {
+                            Role = "assistant",
+                            Text = HomeAgentFailure(result.Code),
+                            Via = "home-agent"
+                        });
+                    }
+                }
+                catch (OperationCanceledException) { throw; }
+                catch
+                {
+                    State.AddOwnChatLine(threadId, new ChatLine
+                    {
+                        Role = "assistant",
+                        Text = "Could not reach your Home device. Check its connection.",
+                        Via = "home-agent"
+                    });
+                }
             }
+
             else
             {
                 await Agent.AskAsOwnerAsync(threadId, ComposeOwnerPrompt(text, files, imageFiles), imageFiles, ct);
