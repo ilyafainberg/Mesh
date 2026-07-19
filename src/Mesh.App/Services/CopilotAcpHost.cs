@@ -11,7 +11,8 @@ namespace Mesh.App.Services;
 /// <summary>Managed ACP v1 client for the desktop GitHub Copilot CLI provider.</summary>
 public sealed class CopilotAcpHost(
     ILogger<CopilotAcpHost> logger,
-    CopilotMcpBridge mcpBridge) : IAsyncDisposable
+    CopilotMcpBridge mcpBridge,
+    TokenMeter tokenMeter) : IAsyncDisposable
 {
     private sealed class TurnState
     {
@@ -28,6 +29,7 @@ public sealed class CopilotAcpHost(
         public HashSet<string> AllowedToolNames { get; init; } = new(StringComparer.Ordinal);
         public HashSet<string> MeshToolCallIds { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, ToolProgress> ToolCalls { get; } = new(StringComparer.Ordinal);
+        public CopilotAcpUsageAccumulator Usage { get; } = new();
         private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
         private readonly List<string> messageOrder = new();
 
@@ -37,6 +39,7 @@ public sealed class CopilotAcpHost(
             if (text.StartsWith("Info: Disabled tools:", StringComparison.Ordinal)
                 || text.StartsWith("Info: Unknown tool name in the tool allowlist:", StringComparison.Ordinal))
                 return;
+            text = CopilotAcpProtocol.NormalizeText(text);
             Answer.Append(text);
             if (string.IsNullOrWhiteSpace(messageId)) return;
             if (!messages.TryGetValue(messageId, out var message))
@@ -49,9 +52,9 @@ public sealed class CopilotAcpHost(
         }
 
         public string FinalAnswer()
-            => messageOrder.Count > 0
+            => CopilotAcpProtocol.NormalizeText(messageOrder.Count > 0
                 ? messages[messageOrder[^1]].ToString().Trim()
-                : Answer.ToString().Trim();
+                : Answer.ToString().Trim());
     }
 
     private readonly SemaphoreSlim turnGate = new(1, 1);
@@ -175,6 +178,7 @@ public sealed class CopilotAcpHost(
                 _ = SendNotificationAsync("session/cancel", new { sessionId }, CancellationToken.None);
             });
             var result = await RequestAsync("session/prompt", new { sessionId, prompt = content }, ct);
+            RecordUsage(result, activeTurn);
             var stopReason = result.TryGetProperty("stopReason", out var stop) ? stop.GetString() : null;
             if (string.Equals(stopReason, "cancelled", StringComparison.OrdinalIgnoreCase))
                 throw new OperationCanceledException(ct);
@@ -183,7 +187,9 @@ public sealed class CopilotAcpHost(
             var answer = activeTurn.FinalAnswer();
             if (answer.Length == 0)
                 throw new InvalidOperationException("GitHub Copilot CLI returned an empty response.");
-            return ReasoningExtract.Wrap(activeTurn.Thought.ToString(), answer);
+            return ReasoningExtract.Wrap(
+                CopilotAcpProtocol.NormalizeText(activeTurn.Thought.ToString()),
+                answer);
         }
         finally
         {
@@ -211,6 +217,9 @@ public sealed class CopilotAcpHost(
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                StandardInputEncoding = new UTF8Encoding(false),
+                StandardOutputEncoding = new UTF8Encoding(false),
+                StandardErrorEncoding = new UTF8Encoding(false),
                 CreateNoWindow = true,
                 WorkingDirectory = WorkspaceDirectory()
             };
@@ -430,6 +439,11 @@ public sealed class CopilotAcpHost(
             || turn is null)
             return;
         var kind = update.TryGetProperty("sessionUpdate", out var type) ? type.GetString() : null;
+        if (kind == "usage_update")
+        {
+            RecordUsage(update, turn);
+            return;
+        }
         if (kind is "agent_message_chunk" or "agent_thought_chunk")
         {
             if (update.TryGetProperty("content", out var content)
@@ -441,7 +455,7 @@ public sealed class CopilotAcpHost(
                     ? idValue.GetString()
                     : null;
                 if (kind == "agent_message_chunk") turn.AppendAnswer(messageId, text.GetString());
-                else turn.Thought.Append(text.GetString());
+                else turn.Thought.Append(CopilotAcpProtocol.NormalizeText(text.GetString()));
             }
             return;
         }
@@ -541,7 +555,7 @@ public sealed class CopilotAcpHost(
                 if (line is null) break;
                 lock (stderrGate)
                 {
-                    stderrTail = (stderrTail + "\n" + line).Trim();
+                    stderrTail = (stderrTail + "\n" + CopilotAcpProtocol.NormalizeText(line)).Trim();
                     if (stderrTail.Length > 4000) stderrTail = stderrTail[^4000..];
                 }
             }
@@ -551,7 +565,8 @@ public sealed class CopilotAcpHost(
 
     private string FriendlyError(string? message)
     {
-        var text = string.IsNullOrWhiteSpace(message) ? "GitHub Copilot CLI request failed." : message;
+        var text = CopilotAcpProtocol.NormalizeText(
+            string.IsNullOrWhiteSpace(message) ? "GitHub Copilot CLI request failed." : message);
         var combined = text + " " + StderrHint();
         if (combined.Contains("login", StringComparison.OrdinalIgnoreCase)
             || combined.Contains("auth", StringComparison.OrdinalIgnoreCase)
@@ -564,6 +579,13 @@ public sealed class CopilotAcpHost(
     {
         lock (stderrGate)
             return stderrTail.Length == 0 ? "" : stderrTail;
+    }
+
+    private void RecordUsage(JsonElement element, TurnState turn)
+    {
+        if (!CopilotAcpProtocol.TryParseUsage(element, out var usage)) return;
+        var delta = turn.Usage.Apply(usage);
+        tokenMeter.Record(delta.PromptTokens, delta.CompletionTokens);
     }
 
     private void FailPending(string message)
