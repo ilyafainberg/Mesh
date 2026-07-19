@@ -2,7 +2,7 @@
 @inject AppState State
 @inject AgentService Agent
 @inject IJSRuntime JS
-@implements IDisposable
+@implements IAsyncDisposable
 
 <div class="pane-scroll">
     <div class="pane-narrow">
@@ -126,12 +126,13 @@
                     </div>
                 }
 
-                <div class="app-frame">
+                <div class="app-frame wgt-frame">
                     <iframe @ref="draftFrameRef"
                             sandbox="allow-scripts"
                             referrerpolicy="no-referrer"
                             title="Widget preview"
                             aria-label="Widget preview"></iframe>
+                    <div class="widget-render-status" hidden aria-live="polite"></div>
                 </div>
 
                 @if (error is not null && phase != PagePhase.Failed)
@@ -284,12 +285,13 @@
                                 </select>
                             </div>
 
-                            <div class="app-frame">
+                            <div class="app-frame wgt-frame">
                                 <iframe @ref="widgetFrameRefs[w.Id]"
                                         sandbox="allow-scripts"
                                         referrerpolicy="no-referrer"
                                         title="@($"{w.Name} preview")"
                                         aria-label="@($"{w.Name} preview")"></iframe>
+                                <div class="widget-render-status" hidden aria-live="polite"></div>
                             </div>
 
                             @if (isEditing)
@@ -890,10 +892,20 @@
         return baseName; // fallback (99 duplicates is extremely unlikely)
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
         State.Changed -= Refresh;
         _cts.Cancel();
         _cts.Dispose();
+        if (draftMountedHtml is not null)
+        {
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", draftFrameRef); } catch { }
+        }
+        foreach (var frame in widgetFrameRefs.Values)
+        {
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", frame); } catch { }
+        }
+        widgetFrameRefs.Clear();
+        widgetMountedHtmls.Clear();
     }
 }

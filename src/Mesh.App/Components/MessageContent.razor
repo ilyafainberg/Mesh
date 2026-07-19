@@ -1,5 +1,6 @@
 @inject AppState State
 @inject IJSRuntime JS
+@implements IAsyncDisposable
 
 @if (Attachments is { Count: > 0 })
 {
@@ -56,10 +57,13 @@
         appHtml[id] = seg.Content;
         @if (running.Contains(id))
         {
-            <div class="app-frame @(expanded.Contains(id) ? "expanded" : "")">
+            <div class="app-frame widget-frame-host @(expanded.Contains(id) ? "expanded" : "")"
+                 style="width:100%;max-width:100%;min-width:0;">
                 <iframe @ref="frameRefs[id]"
                         sandbox="allow-scripts"
-                        referrerpolicy="no-referrer"></iframe>
+                        referrerpolicy="no-referrer"
+                        style="min-width:0;max-width:100%;"></iframe>
+                <div class="widget-render-status" hidden aria-live="polite"></div>
                 <div class="app-toolbar">
                     @if (OnPin.HasDelegate)
                     {
@@ -107,8 +111,7 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // For each freshly shown app frame, hand its HTML to the iframe via
-        // srcdoc so inline scripts run. Only set once per mount to avoid reloading.
+        // Hand each freshly shown app to the secure loader once per mount.
         foreach (var id in running.ToList())
         {
             if (mounted.Contains(id)) continue;
@@ -164,5 +167,16 @@
         int u = 0;
         while (size >= 1024 && u < units.Length - 1) { size /= 1024; u++; }
         return $"{size:0.#} {units[u]}";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var frame in frameRefs.Values)
+        {
+            try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", frame); }
+            catch { }
+        }
+        frameRefs.Clear();
+        mounted.Clear();
     }
 }

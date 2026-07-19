@@ -138,6 +138,17 @@
     box-shadow: 0 0 0 2px var(--brand-tint, #e8f1fd);
 }
 
+.wgt-frame {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+}
+
+.wgt-frame iframe {
+    min-width: 0;
+    max-width: 100%;
+}
+
 .wgt-card-head {
     display: flex;
     align-items: center;
@@ -227,6 +238,12 @@
 
 /* ===== Responsive: narrow widths ===== */
 @media (max-width: 480px) {
+    .wgt-frame {
+        height: min(70vh, 560px);
+        min-height: 240px;
+        resize: none;
+    }
+
     .wgt-preview-actions {
         gap: 4px;
     }

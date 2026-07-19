@@ -2,6 +2,9 @@
 window.sandboxFrame = (function () {
   'use strict';
 
+  var readyTimeoutMs = 5000;
+  var generation = 0;
+  var frameStates = new WeakMap();
   var csp = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
     "img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; " +
     "frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
@@ -46,11 +49,126 @@ window.sandboxFrame = (function () {
     return Date.now().toString(36) + Math.random().toString(36).slice(2);
   }
 
-  function clearBlob(iframe) {
-    var url = iframe && iframe.dataset ? iframe.dataset.blobUrl : null;
+  function clearBlob(iframe, state) {
+    var url = state && state.blobUrl;
+    if (!url) url = iframe && iframe.dataset ? iframe.dataset.blobUrl : null;
     if (url) {
       URL.revokeObjectURL(url);
-      delete iframe.dataset.blobUrl;
+      if (state) state.blobUrl = null;
+      if (iframe.dataset.blobUrl === url) delete iframe.dataset.blobUrl;
+    }
+  }
+
+  function clearAttempt(iframe, state, revokeBlob) {
+    if (!state) return;
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    if (state.loadHandler) {
+      iframe.removeEventListener('load', state.loadHandler);
+      state.loadHandler = null;
+    }
+    if (state.errorHandler) {
+      iframe.removeEventListener('error', state.errorHandler);
+      state.errorHandler = null;
+    }
+    if (revokeBlob) clearBlob(iframe, state);
+  }
+
+  function statusElement(iframe) {
+    return iframe.parentElement && iframe.parentElement.querySelector('.widget-render-status');
+  }
+
+  function showStatus(iframe, message, isError) {
+    var notice = statusElement(iframe);
+    if (!notice) return;
+    notice.hidden = false;
+    notice.setAttribute('role', isError ? 'alert' : 'status');
+    notice.style.cssText = 'position:absolute;left:10px;right:10px;bottom:10px;z-index:2;' +
+      'padding:9px 11px;border-radius:6px;background:' + (isError ? '#fde7e9' : '#fff4ce') + ';' +
+      'color:' + (isError ? '#8a1520' : '#5c4813') + ';border:1px solid ' +
+      (isError ? '#e8a1a8' : '#e5c365') + ';font:13px system-ui,sans-serif;white-space:normal';
+    notice.textContent = message;
+  }
+
+  function hideStatus(iframe) {
+    var notice = statusElement(iframe);
+    if (!notice) return;
+    notice.hidden = true;
+    notice.textContent = '';
+  }
+
+  function isMobileWebView() {
+    var ua = navigator.userAgent || '';
+    return !!(navigator.userAgentData && navigator.userAgentData.mobile) ||
+      /Android|iPhone|iPad|iPod/i.test(ua);
+  }
+
+  function isCurrent(iframe, state) {
+    return frameStates.get(iframe) === state && iframe.dataset.widgetGeneration === String(state.generation);
+  }
+
+  function failFrame(iframe, state) {
+    if (!isCurrent(iframe, state)) return;
+    clearAttempt(iframe, state, true);
+    iframe.removeAttribute('src');
+    iframe.removeAttribute('srcdoc');
+    iframe.dataset.widgetError = 'rendering-failed';
+    showStatus(iframe, 'Widget preview could not be rendered securely.', true);
+    iframe.dispatchEvent(new CustomEvent('mesh-widget-error', {
+      detail: { type: 'mesh-widget-render-error', generation: state.generation }
+    }));
+  }
+
+  function tryNext(iframe, state) {
+    if (!isCurrent(iframe, state)) return;
+    clearAttempt(iframe, state, true);
+    state.attempt++;
+    if (state.attempt >= state.modes.length) {
+      failFrame(iframe, state);
+      return;
+    }
+
+    if (state.attempt > 0) {
+      showStatus(iframe, 'Trying the secure compatibility renderer...', false);
+    }
+
+    var mode = state.modes[state.attempt];
+    var nonce = randomNonce() + '-' + state.generation + '-' + state.attempt;
+    var content = secureDocument(state.html, nonce);
+    iframe.dataset.widgetNonce = nonce;
+    delete iframe.dataset.widgetReady;
+
+    state.loadHandler = function () {
+      if (!isCurrent(iframe, state)) clearAttempt(iframe, state, false);
+    };
+    state.errorHandler = function () {
+      if (isCurrent(iframe, state)) tryNext(iframe, state);
+    };
+    iframe.addEventListener('load', state.loadHandler);
+    iframe.addEventListener('error', state.errorHandler);
+    state.timer = setTimeout(function () {
+      if (isCurrent(iframe, state)) tryNext(iframe, state);
+    }, readyTimeoutMs);
+
+    try {
+      if (mode === 'srcdoc') {
+        iframe.removeAttribute('src');
+        iframe.srcdoc = content;
+      } else if (mode === 'blob') {
+        iframe.removeAttribute('srcdoc');
+        var blob = new Blob([content], { type: 'text/html' });
+        state.blobUrl = URL.createObjectURL(blob);
+        iframe.dataset.blobUrl = state.blobUrl;
+        iframe.src = state.blobUrl;
+      } else {
+        iframe.removeAttribute('srcdoc');
+        iframe.src = 'data:text/html;charset=utf-8,' + encodeURIComponent(content);
+      }
+    } catch (e) {
+      console.warn('Widget renderer failed; trying fallback', mode, e);
+      tryNext(iframe, state);
     }
   }
 
@@ -61,23 +179,18 @@ window.sandboxFrame = (function () {
     for (var i = 0; i < frames.length; i++) {
       var frame = frames[i];
       if (frame.contentWindow !== event.source || frame.dataset.widgetNonce !== data.nonce) continue;
+      var state = frameStates.get(frame);
+      if (!state || !isCurrent(frame, state)) continue;
+      clearAttempt(frame, state, false);
       if (data.type === 'mesh-widget-error') {
         var message = data.message || 'Unknown widget error';
         frame.dataset.widgetError = message;
-        var oldNotice = frame.parentElement && frame.parentElement.querySelector('.widget-runtime-error');
-        if (oldNotice) oldNotice.remove();
-        if (frame.parentElement) {
-          var notice = document.createElement('div');
-          notice.className = 'widget-runtime-error';
-          notice.setAttribute('role', 'alert');
-          notice.style.cssText = 'padding:10px 12px;background:#fde7e9;color:#8a1520;font:13px system-ui,sans-serif;border-top:1px solid #e8a1a8;white-space:normal';
-          notice.textContent = 'Widget failed to start: ' + message;
-          frame.insertAdjacentElement('afterend', notice);
-        }
+        showStatus(frame, 'Widget failed to start: ' + message, true);
         frame.dispatchEvent(new CustomEvent('mesh-widget-error', { detail: data }));
         console.error('Widget failed:', message, data.line || '', data.column || '');
       } else {
         frame.dataset.widgetReady = 'true';
+        if (!frame.dataset.widgetError) hideStatus(frame);
         frame.dispatchEvent(new CustomEvent('mesh-widget-ready', { detail: data }));
       }
       break;
@@ -90,21 +203,25 @@ window.sandboxFrame = (function () {
     setFrameHtml: function (iframe, html) {
       if (!iframe) return;
       try {
-        clearBlob(iframe);
-        var nonce = randomNonce();
-        iframe.dataset.widgetNonce = nonce;
+        var previous = frameStates.get(iframe);
+        clearAttempt(iframe, previous, true);
+        generation++;
+        var state = {
+          generation: generation,
+          html: html || '',
+          modes: isMobileWebView() ? ['blob', 'data'] : ['srcdoc', 'blob'],
+          attempt: -1,
+          timer: null,
+          loadHandler: null,
+          errorHandler: null,
+          blobUrl: null
+        };
+        frameStates.set(iframe, state);
+        iframe.dataset.widgetGeneration = String(state.generation);
         delete iframe.dataset.widgetError;
         delete iframe.dataset.widgetReady;
-        var content = secureDocument(html, nonce);
-        if ('srcdoc' in iframe) {
-          iframe.removeAttribute('src');
-          iframe.srcdoc = content;
-          return;
-        }
-        var blob = new Blob([content], { type: 'text/html' });
-        var url = URL.createObjectURL(blob);
-        iframe.dataset.blobUrl = url;
-        iframe.src = url;
+        hideStatus(iframe);
+        tryNext(iframe, state);
       } catch (e) {
         console.error('sandboxFrame.setFrameHtml failed', e);
         throw e;
@@ -114,14 +231,16 @@ window.sandboxFrame = (function () {
     revokeFrame: function (iframe) {
       if (!iframe) return;
       try {
-        clearBlob(iframe);
-        var notice = iframe.parentElement && iframe.parentElement.querySelector('.widget-runtime-error');
-        if (notice) notice.remove();
+        var state = frameStates.get(iframe);
+        clearAttempt(iframe, state, true);
+        frameStates.delete(iframe);
         iframe.removeAttribute('src');
-        if ('srcdoc' in iframe) iframe.removeAttribute('srcdoc');
+        iframe.removeAttribute('srcdoc');
         delete iframe.dataset.widgetNonce;
+        delete iframe.dataset.widgetGeneration;
         delete iframe.dataset.widgetError;
         delete iframe.dataset.widgetReady;
+        hideStatus(iframe);
       } catch (e) {
         console.error('sandboxFrame.revokeFrame failed', e);
       }
