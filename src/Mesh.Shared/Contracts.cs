@@ -373,6 +373,12 @@ public sealed record RemoteAgentRequestPayload(string RequestId, string ThreadId
 
 public sealed record RemoteAgentResponsePayload(string RequestId, string ThreadId, string Text);
 
+public sealed record RemoteAgentDispatchResult(bool Accepted, string Code, string RequestId)
+{
+    public static RemoteAgentDispatchResult Ok(string requestId) => new(true, "accepted", requestId);
+    public static RemoteAgentDispatchResult Reject(string code, string requestId = "") => new(false, code, requestId);
+}
+
 public static class RemoteAgentProtocol
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);

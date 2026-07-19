@@ -44,4 +44,14 @@ public sealed class RemoteAgentProtocolTests
         Assert.IsFalse(DevicePlatforms.IsDesktop(DevicePlatforms.IOS));
         Assert.IsFalse(DevicePlatforms.IsDesktop(DevicePlatforms.Unknown));
     }
+
+    [TestMethod]
+    public void DispatchResult_ProvidesStableFailureCode()
+    {
+        var result = RemoteAgentDispatchResult.Reject("home_device_offline", "request-1");
+
+        Assert.IsFalse(result.Accepted);
+        Assert.AreEqual("home_device_offline", result.Code);
+        Assert.AreEqual("request-1", result.RequestId);
+    }
 }
