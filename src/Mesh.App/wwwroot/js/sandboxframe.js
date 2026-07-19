@@ -141,7 +141,16 @@ window.sandboxFrame = (function () {
     delete iframe.dataset.widgetReady;
 
     state.loadHandler = function () {
-      if (!isCurrent(iframe, state)) clearAttempt(iframe, state, false);
+      if (!isCurrent(iframe, state)) {
+        clearAttempt(iframe, state, false);
+        return;
+      }
+      clearAttempt(iframe, state, false);
+      iframe.dataset.widgetReady = 'true';
+      hideStatus(iframe);
+      iframe.dispatchEvent(new CustomEvent('mesh-widget-ready', {
+        detail: { type: 'mesh-widget-load-ready', generation: state.generation }
+      }));
     };
     state.errorHandler = function () {
       if (isCurrent(iframe, state)) tryNext(iframe, state);
@@ -189,9 +198,11 @@ window.sandboxFrame = (function () {
         frame.dispatchEvent(new CustomEvent('mesh-widget-error', { detail: data }));
         console.error('Widget failed:', message, data.line || '', data.column || '');
       } else {
+        var wasReady = frame.dataset.widgetReady === 'true';
         frame.dataset.widgetReady = 'true';
         if (!frame.dataset.widgetError) hideStatus(frame);
-        frame.dispatchEvent(new CustomEvent('mesh-widget-ready', { detail: data }));
+        if (!wasReady)
+          frame.dispatchEvent(new CustomEvent('mesh-widget-ready', { detail: data }));
       }
       break;
     }
@@ -209,7 +220,7 @@ window.sandboxFrame = (function () {
         var state = {
           generation: generation,
           html: html || '',
-          modes: isMobileWebView() ? ['blob', 'data'] : ['srcdoc', 'blob'],
+          modes: isMobileWebView() ? ['srcdoc', 'blob', 'data'] : ['srcdoc', 'blob'],
           attempt: -1,
           timer: null,
           loadHandler: null,

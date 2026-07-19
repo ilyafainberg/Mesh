@@ -15,7 +15,7 @@
 
 @if (!State.IsOnboarded)
 {
-    <Onboarding OnDone="Refresh" />
+    <Onboarding @key="State.PairingLinkGeneration" OnDone="Refresh" />
 }
 else if (UiModeSvc.EffectiveMode == UiMode.Phone)
 {

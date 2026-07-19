@@ -67,8 +67,10 @@ public class MainActivity : MauiAppCompatActivity
     /// <summary>Warm start: a clicked mesh:// link arrives while the app is already running (SingleTask).</summary>
     protected override void OnNewIntent(Intent? intent)
     {
-        base.OnNewIntent(intent);
+        if (intent is not null)
+            Intent = intent;
         HandleDeepLinkIntent(intent);
+        base.OnNewIntent(intent);
     }
 
     protected override void OnActivityResult(int requestCode, Result resultCode, Intent? data)
