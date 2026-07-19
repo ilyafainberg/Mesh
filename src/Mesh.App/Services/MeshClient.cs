@@ -14,18 +14,48 @@ namespace Mesh.App.Services;
 /// keepalive and automatic reconnection; this client adds the device-key auth handshake,
 /// end-to-end encryption, and dispatch of inbound messages to the agent and UI.
 /// </summary>
-public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFactory httpFactory, INotifier notifier)
+public sealed class MeshClient
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan GroupKeyCacheLifetime = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DeviceSyncTargetCacheLifetime = TimeSpan.FromSeconds(30);
+    private const int DeviceSyncSnapshotBatchSize = 100;
+    private readonly AppState state;
+    private readonly AgentService agent;
+    private readonly IHttpClientFactory httpFactory;
+    private readonly INotifier notifier;
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> keyCacheUpdated = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim deviceSyncSendGate = new(1, 1);
     private HubConnection? hub;
     private volatile bool authenticated;
     private volatile bool supportsSendResults;
     private volatile bool supportsFanout;
+    private volatile bool supportsDeviceSync;
+    private volatile DeviceSyncIdentity? authenticatedDeviceSyncIdentity;
     private volatile bool wantConnected;   // the user intends to be connected; drives auto-recovery
     private int reconnectScheduled;         // 0/1 guard so only one recovery loop runs at a time
+    private IReadOnlyList<string> deviceSyncTargetCache = Array.Empty<string>();
+    private DateTimeOffset deviceSyncTargetCacheUpdated;
+    private string deviceSyncTargetCacheIdentity = "";
+
+    public MeshClient(AppState state, AgentService agent, IHttpClientFactory httpFactory, INotifier notifier)
+    {
+        this.state = state;
+        this.agent = agent;
+        this.httpFactory = httpFactory;
+        this.notifier = notifier;
+        state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
+    }
+
+    private sealed record DeviceSyncIdentity(
+        HubConnection Connection,
+        string Handle,
+        string NormalizedHandle,
+        string DeviceId,
+        string PublicKey,
+        string PrivateKey,
+        string RelayUrl);
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
     public event Action? StateChanged;
@@ -290,8 +320,12 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         connection.On(MeshHubProtocol.Ready, () =>
         {
             authenticated = true;
+            var identity = CaptureDeviceSyncIdentity(connection);
+            authenticatedDeviceSyncIdentity = identity;
             Log?.Invoke("hub connected + authenticated");
             StateChanged?.Invoke();
+            if (identity is not null)
+                _ = RunDeviceSyncHandshakeAsync(identity);
         });
 
         connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
@@ -304,11 +338,18 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
 
         // A reconnect re-runs the server's challenge automatically (the handler stays registered),
         // so we just reflect the transient unauthenticated state in the UI.
-        connection.Reconnecting += _ => { authenticated = false; StateChanged?.Invoke(); return Task.CompletedTask; };
+        connection.Reconnecting += _ =>
+        {
+            authenticated = false;
+            authenticatedDeviceSyncIdentity = null;
+            StateChanged?.Invoke();
+            return Task.CompletedTask;
+        };
         connection.Reconnected += _ => { StateChanged?.Invoke(); return Task.CompletedTask; };
         connection.Closed += _ =>
         {
             authenticated = false;
+            authenticatedDeviceSyncIdentity = null;
             StateChanged?.Invoke();
             // SignalR's own auto-reconnect has given up by the time Closed fires. If the user still
             // wants to be connected, keep trying ourselves so a long drop does not strand us offline.
@@ -335,6 +376,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     {
         supportsSendResults = false;
         supportsFanout = false;
+        supportsDeviceSync = false;
         try
         {
             var http = httpFactory.CreateClient("relay");
@@ -346,6 +388,8 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
                 && results.ValueKind == JsonValueKind.True;
             supportsFanout = capabilities.TryGetProperty("fanout", out var fanout)
                 && fanout.ValueKind == JsonValueKind.True;
+            supportsDeviceSync = capabilities.TryGetProperty("deviceSync", out var deviceSync)
+                && deviceSync.ValueKind == JsonValueKind.True;
         }
         catch (Exception ex)
         {
@@ -410,6 +454,7 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
     {
         var from = AppState.Norm(env.From);
         var isGroupKind = env.Kind is MeshKinds.GroupControl or MeshKinds.GroupMessage or MeshKinds.Fanout;
+        var isDeviceSync = DeviceSyncKinds.IsEnvelopeKind(env.Kind);
         if (env.Kind == MeshKinds.Fanout
             && env.ToDevice is not null
             && !string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
@@ -430,21 +475,53 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         // Client-side verification: check the sender's signature against their pinned signing
         // keys (trust on first use). This defends against a malicious or compromised relay
         // forging or tampering with messages. On first contact we fetch and pin the keys.
-        var pinned = state.FindContact(from)?.SigningKeys.ToList() ?? new List<string>();
-        if (pinned.Count == 0)
-            pinned = (await ResolveDeviceKeysAsync(from)).ToList();
-        if (isGroupKind && pinned.Count == 0)
+        DeviceSyncIdentity? inboundSyncIdentity = null;
+        List<string> pinned;
+        if (isDeviceSync)
+        {
+            inboundSyncIdentity = authenticatedDeviceSyncIdentity;
+            if (inboundSyncIdentity is null) return;
+            pinned = (await ResolveOwnDeviceKeysAsync(inboundSyncIdentity)).ToList();
+            if (!IsCurrentDeviceSyncIdentity(inboundSyncIdentity)) return;
+        }
+        else
+        {
+            pinned = state.FindContact(from)?.SigningKeys.ToList() ?? new List<string>();
+            if (pinned.Count == 0)
+                pinned = (await ResolveDeviceKeysAsync(from)).ToList();
+        }
+        if ((isGroupKind || isDeviceSync) && pinned.Count == 0)
         {
             Log?.Invoke($"dropped {env.Kind} from @{from}: no sender keys available for signature verification");
             return;
         }
-        if (pinned.Count > 0 && !MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? ""))
+        var signatureValid = pinned.Count == 0
+            || MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? "");
+        if (!signatureValid && isDeviceSync && inboundSyncIdentity is not null)
         {
+            pinned = (await ResolveOwnDeviceKeysAsync(inboundSyncIdentity, refresh: true)).ToList();
+            signatureValid = IsCurrentDeviceSyncIdentity(inboundSyncIdentity)
+                && pinned.Count > 0
+                && MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? "");
+        }
+        if (!signatureValid)
+        {
+            if (isDeviceSync)
+                Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: signature verification failed");
             // The sender's keys no longer match what we pinned: the contact's identity may have
             // changed (rotation, reinstall, or an impostor). Surface it for re-verification instead
             // of silently dropping, and do not auto-repin (that would defeat trust on first use).
-            state.FlagContactKeyChanged(from);
-            Log?.Invoke($"identity change: message from @{from} did not match pinned keys (re-verify)");
+            else
+            {
+                state.FlagContactKeyChanged(from);
+                Log?.Invoke($"identity change: message from @{from} did not match pinned keys (re-verify)");
+            }
+            return;
+        }
+
+        if (isDeviceSync)
+        {
+            await HandleInboundDeviceSyncAsync(env, from, ct);
             return;
         }
 
@@ -712,6 +789,371 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
             }
         }
         StateChanged?.Invoke();
+    }
+
+    private DeviceSyncIdentity? CaptureDeviceSyncIdentity(HubConnection connection)
+    {
+        var p = state.Profile;
+        var handle = AppState.Norm(p.Handle);
+        var deviceId = string.IsNullOrWhiteSpace(p.PublicKey)
+            ? ""
+            : DeviceProtocol.DeviceId(p.PublicKey);
+        if (string.IsNullOrWhiteSpace(handle)
+            || string.IsNullOrWhiteSpace(deviceId)
+            || string.IsNullOrWhiteSpace(p.PublicKey)
+            || string.IsNullOrWhiteSpace(p.PrivateKey))
+            return null;
+        return new DeviceSyncIdentity(
+            connection,
+            p.Handle,
+            handle,
+            deviceId,
+            p.PublicKey,
+            p.PrivateKey,
+            p.RelayUrl.TrimEnd('/'));
+    }
+
+    private bool IsCurrentDeviceSyncIdentity(DeviceSyncIdentity identity)
+    {
+        var p = state.Profile;
+        return ReferenceEquals(hub, identity.Connection)
+            && identity.Connection.State == HubConnectionState.Connected
+            && authenticated
+            && string.Equals(AppState.Norm(p.Handle), identity.NormalizedHandle, StringComparison.Ordinal)
+            && string.Equals(p.PublicKey, identity.PublicKey, StringComparison.Ordinal)
+            && string.Equals(p.PrivateKey, identity.PrivateKey, StringComparison.Ordinal)
+            && string.Equals(p.RelayUrl.TrimEnd('/'), identity.RelayUrl, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(MyDeviceId, identity.DeviceId, StringComparison.Ordinal);
+    }
+
+    private void OnDeviceSyncOperationCreated(DeviceSyncOperation operation)
+    {
+        var identity = authenticatedDeviceSyncIdentity;
+        if (identity is null || !Connected || !supportsSendResults || !supportsDeviceSync)
+            return;
+        if (!string.Equals(operation.SourceDeviceId, identity.DeviceId, StringComparison.Ordinal))
+        {
+            Log?.Invoke("device sync live operation dropped: source device did not match current identity");
+            return;
+        }
+        _ = FanOutDeviceSyncOperationAsync(identity, operation);
+    }
+
+    private async Task FanOutDeviceSyncOperationAsync(
+        DeviceSyncIdentity identity, DeviceSyncOperation operation)
+    {
+        await deviceSyncSendGate.WaitAsync();
+        try
+        {
+            if (!IsCurrentDeviceSyncIdentity(identity)
+                || !supportsSendResults
+                || !supportsDeviceSync)
+                return;
+            var targets = await GetDeviceSyncTargetsAsync(identity, refresh: false);
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+            var batch = new DeviceSyncBatch(
+                Guid.NewGuid().ToString("n"), identity.DeviceId, false, new[] { operation });
+            var body = JsonSerializer.Serialize(batch, Json);
+            foreach (var target in targets)
+            {
+                if (!IsCurrentDeviceSyncIdentity(identity)) return;
+                await SendDeviceSyncEnvelopeCoreAsync(
+                    identity, target, DeviceSyncKinds.EnvelopeOperation, body, CancellationToken.None);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"device sync live fan-out failed: {ex.Message}");
+        }
+        finally
+        {
+            deviceSyncSendGate.Release();
+        }
+    }
+
+    private async Task RunDeviceSyncHandshakeAsync(DeviceSyncIdentity identity)
+    {
+        await Task.Yield();
+        await deviceSyncSendGate.WaitAsync();
+        try
+        {
+            if (!IsCurrentDeviceSyncIdentity(identity)
+                || !supportsSendResults
+                || !supportsDeviceSync)
+                return;
+            var targets = await GetDeviceSyncTargetsAsync(identity, refresh: true);
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+            _ = await ResolveOwnDeviceKeysAsync(identity, refresh: true);
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+            var snapshot = state.CreateDeviceSyncSnapshot();
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+
+            foreach (var target in targets)
+            {
+                var request = new DeviceSyncSnapshotRequest(
+                    Guid.NewGuid().ToString("n"), identity.DeviceId);
+                await SendDeviceSyncEnvelopeCoreAsync(
+                    identity,
+                    target,
+                    DeviceSyncKinds.EnvelopeSnapshotRequest,
+                    JsonSerializer.Serialize(request, Json),
+                    CancellationToken.None);
+                await SendDeviceSyncSnapshotCoreAsync(identity, target, snapshot, CancellationToken.None);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"device sync handshake failed: {ex.Message}");
+        }
+        finally
+        {
+            deviceSyncSendGate.Release();
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> GetDeviceSyncTargetsAsync(
+        DeviceSyncIdentity identity, bool refresh)
+    {
+        var cacheIdentity = $"{identity.NormalizedHandle}\n{identity.DeviceId}";
+        if (!refresh
+            && string.Equals(deviceSyncTargetCacheIdentity, cacheIdentity, StringComparison.Ordinal)
+            && DateTimeOffset.UtcNow - deviceSyncTargetCacheUpdated < DeviceSyncTargetCacheLifetime)
+            return deviceSyncTargetCache;
+
+        if (!IsCurrentDeviceSyncIdentity(identity)) return Array.Empty<string>();
+        var devices = await ListMyDevicesAsync();
+        if (!IsCurrentDeviceSyncIdentity(identity)) return Array.Empty<string>();
+        var targets = devices
+            .Select(device => device.DeviceId)
+            .Where(deviceId => !string.IsNullOrWhiteSpace(deviceId)
+                && !string.Equals(deviceId, identity.DeviceId, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        deviceSyncTargetCache = targets;
+        deviceSyncTargetCacheUpdated = DateTimeOffset.UtcNow;
+        deviceSyncTargetCacheIdentity = cacheIdentity;
+        return targets;
+    }
+
+    private async Task SendDeviceSyncSnapshotCoreAsync(
+        DeviceSyncIdentity identity,
+        string targetDeviceId,
+        IReadOnlyList<DeviceSyncOperation> snapshot,
+        CancellationToken ct)
+    {
+        for (var offset = 0; offset < snapshot.Count; offset += DeviceSyncSnapshotBatchSize)
+        {
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+            var count = Math.Min(DeviceSyncSnapshotBatchSize, snapshot.Count - offset);
+            var operations = snapshot.Skip(offset).Take(count).ToArray();
+            var batch = new DeviceSyncBatch(
+                Guid.NewGuid().ToString("n"), identity.DeviceId, true, operations);
+            await SendDeviceSyncEnvelopeCoreAsync(
+                identity,
+                targetDeviceId,
+                DeviceSyncKinds.EnvelopeOperation,
+                JsonSerializer.Serialize(batch, Json),
+                ct);
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> ResolveOwnDeviceKeysAsync(
+        DeviceSyncIdentity identity, bool refresh = false)
+    {
+        if (refresh)
+        {
+            keyCache.TryRemove(identity.NormalizedHandle, out _);
+            keyCacheUpdated.TryRemove(identity.NormalizedHandle, out _);
+        }
+        if (!refresh
+            && keyCache.TryGetValue(identity.NormalizedHandle, out var cached)
+            && keyCacheUpdated.TryGetValue(identity.NormalizedHandle, out var updated)
+            && DateTimeOffset.UtcNow - updated < GroupKeyCacheLifetime)
+            return cached;
+        if (!IsCurrentDeviceSyncIdentity(identity)) return Array.Empty<string>();
+        try
+        {
+            var http = httpFactory.CreateClient("relay");
+            var info = await http.GetFromJsonAsync<HandleInfo>(
+                $"{identity.RelayUrl}/handles/{Uri.EscapeDataString(identity.NormalizedHandle)}");
+            if (!IsCurrentDeviceSyncIdentity(identity)) return Array.Empty<string>();
+            var keys = info?.DevicePublicKeys
+                .Where(key => !string.IsNullOrWhiteSpace(key))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray() ?? Array.Empty<string>();
+            if (keys.Length > 0)
+            {
+                keyCache[identity.NormalizedHandle] = keys;
+                keyCacheUpdated[identity.NormalizedHandle] = DateTimeOffset.UtcNow;
+            }
+            return keys;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"device sync key resolution failed: {ex.Message}");
+            return Array.Empty<string>();
+        }
+    }
+
+    private async Task<bool> SendDeviceSyncEnvelopeCoreAsync(
+        DeviceSyncIdentity identity,
+        string targetDeviceId,
+        string kind,
+        string plaintext,
+        CancellationToken ct)
+    {
+        if (!supportsSendResults
+            || !supportsDeviceSync
+            || !IsCurrentDeviceSyncIdentity(identity)
+            || string.IsNullOrWhiteSpace(targetDeviceId)
+            || string.Equals(targetDeviceId, identity.DeviceId, StringComparison.Ordinal))
+            return false;
+
+        var keys = await ResolveOwnDeviceKeysAsync(identity);
+        if (!IsCurrentDeviceSyncIdentity(identity)) return false;
+        if (keys.Count == 0)
+        {
+            Log?.Invoke($"device sync {kind} to {targetDeviceId} failed: encryption keys unavailable");
+            return false;
+        }
+        var ciphertext = MessageCrypto.Encrypt(plaintext, keys);
+        if (ciphertext is null)
+        {
+            Log?.Invoke($"device sync {kind} to {targetDeviceId} failed: encryption failed");
+            return false;
+        }
+
+        var signature = IdentityService.Sign(identity.PrivateKey, ciphertext);
+        var envelope = MeshEnvelope.Create(
+            identity.Handle,
+            identity.NormalizedHandle,
+            kind,
+            ciphertext,
+            signature,
+            fromDevice: identity.DeviceId,
+            toDevice: targetDeviceId);
+        try
+        {
+            var result = await identity.Connection.InvokeAsync<MeshSendResult>(
+                MeshHubProtocol.SendEnvelope, envelope, ct);
+            if (result.Accepted) return true;
+            Log?.Invoke($"device sync {kind} to {targetDeviceId} rejected: {DescribeResult(result)}");
+            return false;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"device sync {kind} to {targetDeviceId} failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private async Task HandleInboundDeviceSyncAsync(
+        MeshEnvelope env, string from, CancellationToken ct)
+    {
+        var currentHandle = AppState.Norm(state.Profile.Handle);
+        var myDeviceId = MyDeviceId;
+        if (!supportsDeviceSync
+            || !string.Equals(from, currentHandle, StringComparison.Ordinal)
+            || string.IsNullOrWhiteSpace(env.FromDevice)
+            || string.Equals(env.FromDevice, myDeviceId, StringComparison.Ordinal)
+            || !string.Equals(env.ToDevice, myDeviceId, StringComparison.Ordinal))
+            return;
+        if (!MessageCrypto.IsEncrypted(env.Body))
+        {
+            Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: body was not encrypted");
+            return;
+        }
+        var (decrypted, plaintext) = MessageCrypto.TryDecrypt(
+            env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
+        if (!decrypted || plaintext is null)
+        {
+            Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: body could not be decrypted");
+            return;
+        }
+
+        try
+        {
+            if (env.Kind == DeviceSyncKinds.EnvelopeOperation)
+            {
+                var batch = JsonSerializer.Deserialize<DeviceSyncBatch>(plaintext, Json)
+                    ?? throw new JsonException("Device sync batch was null.");
+                ValidateDeviceSyncBatch(batch, env.FromDevice);
+                _ = state.ApplyDeviceSyncBatch(batch);
+                return;
+            }
+
+            var request = JsonSerializer.Deserialize<DeviceSyncSnapshotRequest>(plaintext, Json)
+                ?? throw new JsonException("Device sync snapshot request was null.");
+            if (string.IsNullOrWhiteSpace(request.RequestId)
+                || !string.Equals(request.RequestingDeviceId, env.FromDevice, StringComparison.Ordinal))
+                throw new JsonException("Snapshot requester did not match the sending device.");
+            var identity = authenticatedDeviceSyncIdentity;
+            if (identity is not null)
+                await RespondToDeviceSyncSnapshotRequestAsync(identity, env.FromDevice, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: invalid payload ({ex.Message})");
+        }
+    }
+
+    private async Task RespondToDeviceSyncSnapshotRequestAsync(
+        DeviceSyncIdentity identity, string requestingDeviceId, CancellationToken ct)
+    {
+        await deviceSyncSendGate.WaitAsync(ct);
+        try
+        {
+            if (!IsCurrentDeviceSyncIdentity(identity)
+                || !supportsSendResults
+                || !supportsDeviceSync)
+                return;
+            _ = await GetDeviceSyncTargetsAsync(identity, refresh: true);
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+            _ = await ResolveOwnDeviceKeysAsync(identity, refresh: true);
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+            var snapshot = state.CreateDeviceSyncSnapshot();
+            if (!IsCurrentDeviceSyncIdentity(identity)) return;
+            await SendDeviceSyncSnapshotCoreAsync(identity, requestingDeviceId, snapshot, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"device sync snapshot response to {requestingDeviceId} failed: {ex.Message}");
+        }
+        finally
+        {
+            deviceSyncSendGate.Release();
+        }
+    }
+
+    private static void ValidateDeviceSyncBatch(DeviceSyncBatch batch, string sourceDeviceId)
+    {
+        if (string.IsNullOrWhiteSpace(batch.BatchId)
+            || !string.Equals(batch.SourceDeviceId, sourceDeviceId, StringComparison.Ordinal)
+            || batch.Operations is null
+            || batch.Operations.Count is < 1 or > DeviceSyncSnapshotBatchSize)
+            throw new JsonException("Device sync batch shape or source was invalid.");
+        foreach (var operation in batch.Operations)
+        {
+            if (operation is null
+                || string.IsNullOrWhiteSpace(operation.OperationId)
+                || !string.Equals(operation.SourceDeviceId, sourceDeviceId, StringComparison.Ordinal)
+                || string.IsNullOrWhiteSpace(operation.Kind)
+                || string.IsNullOrWhiteSpace(operation.EntityId)
+                || string.IsNullOrWhiteSpace(operation.Version))
+                throw new JsonException("Device sync operation shape or source was invalid.");
+        }
     }
 
     private Task HandleInboundGroupAsync(MeshEnvelope env, string from)
@@ -1474,8 +1916,12 @@ public sealed class MeshClient(AppState state, AgentService agent, IHttpClientFa
         // ConnectAsync calls this then re-sets wantConnected, so a reconnect is unaffected.
         wantConnected = false;
         authenticated = false;
+        authenticatedDeviceSyncIdentity = null;
         keyCache.Clear();
         keyCacheUpdated.Clear();
+        deviceSyncTargetCache = Array.Empty<string>();
+        deviceSyncTargetCacheUpdated = default;
+        deviceSyncTargetCacheIdentity = "";
         var current = hub;
         hub = null;
         if (current is not null)
