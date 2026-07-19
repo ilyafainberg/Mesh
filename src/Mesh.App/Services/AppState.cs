@@ -50,6 +50,20 @@ public sealed class AppState
 
     // Handles with unread inbound person-messages (in-memory, cleared when the conversation is viewed).
     private readonly HashSet<string> unread = new(StringComparer.OrdinalIgnoreCase);
+    public DeepLink.Parsed? PendingPairingLink { get; private set; }
+
+    public void SetPendingPairingLink(DeepLink.Parsed link)
+    {
+        PendingPairingLink = link.Kind == DeepLink.Kind.Pairing ? link : null;
+        NotifyChanged();
+    }
+
+    public DeepLink.Parsed? ConsumePendingPairingLink()
+    {
+        var link = PendingPairingLink;
+        PendingPairingLink = null;
+        return link;
+    }
 
     public AppState(ISecretStore secrets)
     {

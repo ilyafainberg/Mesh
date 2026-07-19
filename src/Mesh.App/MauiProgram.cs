@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Mesh.App.Services;
+using ZXing.Net.Maui.Controls;
 #if WINDOWS
 using Microsoft.Maui.LifecycleEvents;
 #endif
@@ -13,6 +14,7 @@ public static class MauiProgram
 		var builder = MauiApp.CreateBuilder();
 		builder
 			.UseMauiApp<App>()
+			.UseBarcodeReader()
 			.ConfigureFonts(fonts =>
 			{
 				fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");

@@ -212,6 +212,11 @@ else
             key = State.GetOrCreateServiceConversation(link.Handle!, link.ServiceId!, link.ServiceName).Handle;
         else if (link.Kind == DeepLink.Kind.User && !string.IsNullOrEmpty(link.Handle))
             key = State.GetOrCreateConversation(link.Handle!).Handle;
+        else if (link.Kind == DeepLink.Kind.Pairing)
+        {
+            State.SetPendingPairingLink(link);
+            return;
+        }
         if (key is null) return;
 
         AppControl.ShowMainWindow();
