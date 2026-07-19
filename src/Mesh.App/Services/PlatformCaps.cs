@@ -11,6 +11,15 @@ public static class PlatformCaps
 {
     /// <summary>True on Android and iOS, where the app cannot spawn arbitrary child processes.</summary>
     public static bool IsMobile => OperatingSystem.IsAndroid() || OperatingSystem.IsIOS();
+
+    public static bool CanHostHomeAgent => !IsMobile;
+
+    public static string DevicePlatform =>
+        OperatingSystem.IsWindows() ? Mesh.Shared.DevicePlatforms.Windows :
+        OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS() ? Mesh.Shared.DevicePlatforms.MacOS :
+        OperatingSystem.IsAndroid() ? Mesh.Shared.DevicePlatforms.Android :
+        OperatingSystem.IsIOS() ? Mesh.Shared.DevicePlatforms.IOS :
+        Mesh.Shared.DevicePlatforms.Unknown;
 }
 
 /// <summary>Capability helpers for <see cref="LocalToolKind"/>.</summary>
@@ -29,6 +38,7 @@ public static class LocalToolKindExtensions
         LocalToolKind.CSharpScript => true,
         LocalToolKind.Browser => true,
         LocalToolKind.HeadlessBrowser => true,
+        LocalToolKind.WorkIq => true,
         _ => false
     };
 }
