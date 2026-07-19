@@ -28,5 +28,7 @@
     </array>
     <key>XSAppIconAssets</key>
     <string>Assets.xcassets/meshicon.appiconset</string>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
 </dict>
 </plist>
