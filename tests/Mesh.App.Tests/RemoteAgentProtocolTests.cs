@@ -54,4 +54,27 @@ public sealed class RemoteAgentProtocolTests
         Assert.AreEqual("home_device_offline", result.Code);
         Assert.AreEqual("request-1", result.RequestId);
     }
+
+    [TestMethod]
+    public void DeviceSyncVersion_OrdersByTimeThenDeviceAndOperation()
+    {
+        var earlier = DeviceSyncVersion.Create(
+            new DateTimeOffset(2026, 7, 19, 20, 0, 0, TimeSpan.Zero), "device-a", "op-a");
+        var later = DeviceSyncVersion.Create(
+            new DateTimeOffset(2026, 7, 19, 20, 0, 1, TimeSpan.Zero), "device-a", "op-b");
+        var tieBreak = DeviceSyncVersion.Create(
+            new DateTimeOffset(2026, 7, 19, 20, 0, 1, TimeSpan.Zero), "device-b", "op-a");
+
+        Assert.IsTrue(DeviceSyncVersion.IsNewer(later, earlier));
+        Assert.IsTrue(DeviceSyncVersion.IsNewer(tieBreak, later));
+        Assert.IsFalse(DeviceSyncVersion.IsNewer(later, tieBreak));
+    }
+
+    [TestMethod]
+    public void DeviceSyncEnvelopeKinds_AreRecognized()
+    {
+        Assert.IsTrue(DeviceSyncKinds.IsEnvelopeKind(DeviceSyncKinds.EnvelopeOperation));
+        Assert.IsTrue(DeviceSyncKinds.IsEnvelopeKind(DeviceSyncKinds.EnvelopeSnapshotRequest));
+        Assert.IsFalse(DeviceSyncKinds.IsEnvelopeKind(MeshKinds.Chat));
+    }
 }
