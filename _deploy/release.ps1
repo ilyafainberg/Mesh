@@ -311,6 +311,7 @@ function Publish-GitHubRelease([string]$exe) {
 function Push-GooglePlay([string]$aab) {
   Say "Google Play: upload to internal testing"
   $saJson = $env:GOOGLE_PLAY_SA_JSON
+  if (-not $saJson) { $saJson = [Environment]::GetEnvironmentVariable("GOOGLE_PLAY_SA_JSON", "User") }
   if (-not $saJson -or -not (Test-Path $saJson)) {
     Warn "skipped: set GOOGLE_PLAY_SA_JSON to a service-account key file to enable."
     return
