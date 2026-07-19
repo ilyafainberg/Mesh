@@ -133,9 +133,10 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
 // ---- Health ---------------------------------------------------------------
 var transportCapabilities = new
 {
-    protocolVersion = 2,
+    protocolVersion = 3,
     sendResults = true,
     fanout = true,
+    deviceSync = true,
     maxFanoutRecipients = FanoutProtocol.MaxRecipients
 };
 app.MapGet("/", () => Results.Ok(new

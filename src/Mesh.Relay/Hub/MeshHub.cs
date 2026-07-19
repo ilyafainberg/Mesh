@@ -96,6 +96,41 @@ public sealed class MeshHub(
         if (!MeshCrypto.Verify(state.PublicKey, env.Body, env.Signature ?? ""))
             return MeshSendResult.Reject("invalid_signature");
 
+        var isDeviceSync = DeviceSyncKinds.IsEnvelopeKind(env.Kind);
+        if (!isDeviceSync
+            && env.Kind?.StartsWith("device.sync.", StringComparison.OrdinalIgnoreCase) == true)
+            return MeshSendResult.Reject("sync_kind_unknown");
+
+        if (isDeviceSync)
+        {
+            if (Normalize(env.To) != state.Handle)
+                return MeshSendResult.Reject("sync_same_handle_required");
+            if (string.IsNullOrWhiteSpace(state.DeviceId))
+                return MeshSendResult.Reject("unauthenticated");
+            if (string.IsNullOrWhiteSpace(env.ToDevice))
+                return MeshSendResult.Reject("sync_target_required");
+            if (string.Equals(env.ToDevice, state.DeviceId, StringComparison.Ordinal))
+                return MeshSendResult.Reject("sync_self_target");
+
+            var registration = await store.GetHandleAsync(state.Handle, Context.ConnectionAborted);
+            var targetKnown = registration?.DevicePublicKeys.Any(publicKey =>
+                string.Equals(
+                    DeviceProtocol.DeviceId(publicKey),
+                    env.ToDevice,
+                    StringComparison.Ordinal)) == true;
+            if (!targetKnown)
+                return MeshSendResult.Reject("sync_target_unknown");
+
+            var syncEnvelope = env with
+            {
+                From = state.Handle,
+                FromDevice = state.DeviceId
+            };
+            await router.RouteToDeviceAsync(syncEnvelope);
+            metrics.MessageRouted();
+            return MeshSendResult.Ok();
+        }
+
         var (decision, policy) = await rateLimiter.TryAcquireAsync(
             state.Handle, MessageRateBucket.Direct, Context.ConnectionAborted);
         if (!policy.Enabled)
