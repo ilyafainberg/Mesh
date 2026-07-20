@@ -13,9 +13,9 @@
 @inject IUiModeService UiModeSvc
 @implements IDisposable
 
-@if (!State.IsOnboarded)
+@if (onboardingActive || !State.IsOnboarded)
 {
-    <Onboarding @key="State.PairingLinkGeneration" OnDone="Refresh" />
+    <Onboarding @key="State.PairingLinkGeneration" OnDone="CompleteOnboarding" />
 }
 else if (UiModeSvc.EffectiveMode == UiMode.Phone)
 {
@@ -101,11 +101,13 @@ else
         ? State.Profile.Handle : State.Profile.DisplayName;
 
     string ShellClass => "ui-mode-desktop";
+    bool onboardingActive;
 
     void CloseNav() => navOpen = false;
 
     protected override async Task OnInitializedAsync()
     {
+        onboardingActive = !State.IsOnboarded;
         _prevEffectiveMode = UiModeSvc.EffectiveMode;
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
@@ -162,7 +164,17 @@ else
     [JSInvokable]
     public Task OpenLocalFile(string uri) => LocalFileLauncher.OpenAsync(uri);
 
-    private void Refresh() => InvokeAsync(StateHasChanged);
+    private void Refresh()
+    {
+        if (!State.IsOnboarded) onboardingActive = true;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void CompleteOnboarding()
+    {
+        onboardingActive = false;
+        Refresh();
+    }
 
     // Raised from any thread by UiModeService; marshal to the UI thread.
     private void OnModeChanged(object? sender, EventArgs e)
