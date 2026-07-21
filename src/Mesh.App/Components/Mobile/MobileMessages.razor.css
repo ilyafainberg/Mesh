@@ -219,6 +219,26 @@ button:disabled {
     border-bottom: 1px solid var(--stroke-1);
 }
 
+.conversation-section {
+    display: flex;
+    flex-direction: column;
+}
+
+.conversation-section + .conversation-section {
+    border-top: 8px solid var(--bg-canvas);
+}
+
+.conversation-section-title {
+    margin: 0;
+    padding: 8px 16px 6px;
+    background: var(--bg-canvas);
+    color: var(--fg-3);
+    font-size: .72rem;
+    font-weight: 700;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+}
+
 .chat-row {
     position: relative;
     display: flex;
@@ -259,50 +279,6 @@ button:disabled {
     text-transform: uppercase;
 }
 
-.thread-grip {
-    flex: none;
-    align-self: stretch;
-    width: 38px;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: var(--fg-3);
-    font-size: 19px;
-    cursor: grab;
-    touch-action: none;
-    user-select: none;
-    -webkit-tap-highlight-color: transparent;
-}
-
-.thread-grip:active {
-    cursor: grabbing;
-    color: var(--brand);
-}
-
-.thread-dragging {
-    opacity: .52;
-}
-
-.thread-drop-before::before,
-.thread-drop-after::after {
-    content: "";
-    position: absolute;
-    left: 8px;
-    right: 8px;
-    height: 3px;
-    border-radius: 2px;
-    background: var(--brand);
-    z-index: 2;
-}
-
-.thread-drop-before::before {
-    top: -2px;
-}
-
-.thread-drop-after::after {
-    bottom: -2px;
-}
-
 .chat-main {
     flex: 1;
     min-width: 0;
@@ -337,6 +313,31 @@ button:disabled {
     border-radius: 50%;
     background: var(--brand);
     flex-shrink: 0;
+}
+
+.thread-pin {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--fg-3);
+    font-size: 1rem;
+    -webkit-tap-highlight-color: var(--brand-tint);
+}
+
+.thread-pin[aria-pressed="true"] {
+    color: var(--brand);
+}
+
+.thread-pin:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
 }
 
 .empty {

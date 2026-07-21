@@ -49,26 +49,34 @@
                         @onclick="() => conversationFilter = option.Value">@option.Label</button>
             }
         </div>
-        <div class="conversation-order-list" @ref="threadListEl">
-            @foreach (var c in FilteredConversations)
+        <div class="conversation-order-list">
+            @foreach (var section in ConversationSections)
             {
-                <div class="conv-item @(c.Handle == active ? "active" : "")" data-thread-id="@c.Handle" @key="c.Handle" @onclick="() => Select(c.Handle)">
-                    <button class="conversation-grip" data-thread-grip type="button" title="Drag to reorder"
-                            aria-label="Drag @State.DisplayNameFor(c.Handle) to reorder; use Up or Down arrow from the keyboard"
-                            aria-keyshortcuts="ArrowUp ArrowDown"
-                            @onkeydown="e => OnConversationGripKey(e, c.Handle)"
-                            @onclick:stopPropagation="true">
-                        <i class="bi bi-grip-vertical"></i>
-                    </button>
-                    <span class="conv-name">@State.DisplayNameFor(c.Handle)</span>
-                    @if (c.IsGroup) { <span class="tag group-thread-tag"><i class="bi bi-people-fill"></i> group</span> }
-                    @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
-                    @if (!c.IsGroup && !c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
-                    @if (State.IsUnread(c.Handle)) { <span class="conv-unread" title="Unread message"></span> }
-                </div>
+                var sectionHeadingId = $"desktop-{section.Id}-conversations";
+                <section class="conversation-section" aria-labelledby="@sectionHeadingId">
+                    <h3 id="@sectionHeadingId" class="conversation-section-title">@section.Title</h3>
+                    @foreach (var c in section.Items)
+                    {
+                        var displayName = State.DisplayNameFor(c.Handle);
+                        <div class="conv-item @(c.Handle == active ? "active" : "")" @key="c.Handle" @onclick="() => Select(c.Handle)">
+                            <span class="conv-name">@displayName</span>
+                            @if (c.IsGroup) { <span class="tag group-thread-tag"><i class="bi bi-people-fill"></i> group</span> }
+                            @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
+                            @if (!c.IsGroup && !c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
+                            @if (State.IsUnread(c.Handle)) { <span class="conv-unread" title="Unread message"></span> }
+                            <button class="conversation-pin" type="button"
+                                    title="@(c.IsPinned ? $"Unpin {displayName}" : $"Pin {displayName}")"
+                                    aria-label="@(c.IsPinned ? $"Unpin {displayName}" : $"Pin {displayName}")"
+                                    aria-pressed="@c.IsPinned"
+                                    @onclick="() => ToggleConversationPin(c)"
+                                    @onclick:stopPropagation="true">
+                                <i class="bi @(c.IsPinned ? "bi-pin-angle-fill" : "bi-pin-angle")" aria-hidden="true"></i>
+                            </button>
+                        </div>
+                    }
+                </section>
             }
         </div>
-        <div class="sr-only" aria-live="polite">@reorderStatus</div>
         @if (!FilteredConversations.Any())
         {
             <div class="empty conv-empty">@FilterEmptyText</div>
@@ -332,10 +340,8 @@
     string pinName = "";
     string? pinPrompt;
     string? pinError;
-    string reorderStatus = "";
     ElementReference scrollEl;
     ElementReference composerEl;
-    ElementReference threadListEl;
     Microsoft.JSInterop.DotNetObjectReference<Messages>? selfRef;
     bool composerWired;
     int lastCount = -1;
@@ -440,11 +446,6 @@
         if (firstRender)
             selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
 
-        if (selfRef is not null)
-        {
-            try { await JS.InvokeVoidAsync("meshUI.threadReorder", threadListEl, selfRef); } catch { }
-        }
-
         if (active is null) return;
 
         if (!composerWired)
@@ -467,34 +468,6 @@
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
     [Microsoft.JSInterop.JSInvokable]
     public Task SendFromComposer() => Send();
-
-    [Microsoft.JSInterop.JSInvokable]
-    public Task ReorderThread(string draggedId, string targetId, bool before)
-    {
-        var from = State.Profile.Conversations.FindIndex(c => c.Handle == draggedId);
-        var target = State.Profile.Conversations.FindIndex(c => c.Handle == targetId);
-        if (from < 0 || target < 0 || from == target) return Task.CompletedTask;
-        var destination = target + (before ? 0 : 1);
-        if (from < destination) destination--;
-        State.ReorderConversation(draggedId, destination);
-        return InvokeAsync(StateHasChanged);
-    }
-
-    async Task OnConversationGripKey(KeyboardEventArgs e, string handle)
-    {
-        if (e.Key is not ("ArrowUp" or "ArrowDown")) return;
-        var visible = FilteredConversations.ToList();
-        var index = visible.FindIndex(c => c.Handle == handle);
-        var targetIndex = e.Key == "ArrowUp" ? index - 1 : index + 1;
-        if (index < 0 || targetIndex < 0 || targetIndex >= visible.Count)
-        {
-            reorderStatus = $"{State.DisplayNameFor(handle)} cannot move further {(e.Key == "ArrowUp" ? "up" : "down")}.";
-            return;
-        }
-        await ReorderThread(handle, visible[targetIndex].Handle, before: e.Key == "ArrowUp");
-        var newPosition = State.Profile.Conversations.FindIndex(c => c.Handle == handle) + 1;
-        reorderStatus = $"{State.DisplayNameFor(handle)} moved to position {newPosition}.";
-    }
 
     /// <summary>
     /// Invoked from paste.js when a file is pasted into the composer. Stages the pasted bytes the
@@ -526,7 +499,7 @@
 
     // Handles offered for autocomplete when starting a conversation: contacts + existing threads.
     IEnumerable<string> KnownHandles => State.Profile.Contacts.Select(c => c.Handle)
-        .Concat(State.Profile.Conversations.Where(c => !c.IsGroup).Select(c => c.Handle))
+        .Concat(State.OrderedConversations.Where(c => !c.IsGroup).Select(c => c.Handle))
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .OrderBy(h => h);
 
@@ -799,13 +772,32 @@
         new(ConversationFilter.Services, "Services")
     ];
     ConversationFilter conversationFilter;
-    IEnumerable<Conversation> FilteredConversations => State.Profile.Conversations.Where(c => conversationFilter switch
+    IEnumerable<Conversation> FilteredConversations => State.OrderedConversations.Where(c => conversationFilter switch
     {
         ConversationFilter.Chats => !c.IsGroup && !c.IsService,
         ConversationFilter.Groups => c.IsGroup,
         ConversationFilter.Services => c.IsService,
         _ => true
     });
+    sealed record ConversationSection(string Id, string Title, IReadOnlyList<Conversation> Items);
+    IEnumerable<ConversationSection> ConversationSections
+    {
+        get
+        {
+            var conversations = FilteredConversations.ToList();
+            var pinned = conversations.Where(c => c.IsPinned).ToList();
+            var recent = conversations.Where(c => !c.IsPinned).ToList();
+            if (pinned.Count > 0) yield return new("pinned", "Pinned", pinned);
+            if (recent.Count > 0) yield return new("recent", "Recent", recent);
+        }
+    }
+    void ToggleConversationPin(Conversation conversation)
+    {
+        if (conversation.IsPinned)
+            State.SetConversationPinned(conversation.Handle, false);
+        else
+            State.PinConversation(conversation.Handle);
+    }
     string FilterEmptyText => conversationFilter switch
     {
         ConversationFilter.Chats => "No chats yet.",

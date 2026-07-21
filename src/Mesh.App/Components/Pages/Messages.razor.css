@@ -1,0 +1,45 @@
+.conversation-section {
+    display: flex;
+    flex-direction: column;
+}
+
+.conversation-section + .conversation-section {
+    margin-top: 10px;
+}
+
+.conversation-section-title {
+    margin: 0;
+    padding: 5px 12px;
+    color: var(--fg-3);
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+}
+
+.conversation-pin {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--fg-3);
+    cursor: pointer;
+}
+
+.conversation-pin:hover,
+.conversation-pin:focus-visible,
+.conversation-pin[aria-pressed="true"] {
+    background: var(--brand-tint);
+    color: var(--brand);
+}
+
+.conversation-pin:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 1px;
+}
