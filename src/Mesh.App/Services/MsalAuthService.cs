@@ -42,7 +42,9 @@ public sealed class MsalAuthService
 #if ANDROID
         builder = builder.WithParentActivityOrWindow(() => Microsoft.Maui.ApplicationModel.Platform.CurrentActivity!);
 #elif IOS
-        builder = builder.WithParentActivityOrWindow(() => Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController());
+        builder = builder
+            .WithParentActivityOrWindow(() => Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController())
+            .WithIosKeychainSecurityGroup("com.microsoft.adalcache");
 #endif
         app = builder.Build();
 

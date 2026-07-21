@@ -39,9 +39,16 @@ public sealed class AppState
         public List<AccountRef> Accounts { get; set; } = new();
     }
 
+    private sealed record PendingProfileOperation(
+        DeviceSyncOperation Operation,
+        MeshDb.SyncVersionWrite? Version,
+        MeshDb.SyncTombstoneWrite? Tombstone,
+        MeshDb.SyncCircleRenameWrite? CircleRename);
+
     private readonly ISecretStore secrets;
     private readonly string dir;
     private readonly string indexPath;
+    private readonly object profileSyncGate = new();
     private string? activeId;
     private List<AccountRef> accounts = new();
     private MeshDb? activeDb;
@@ -120,6 +127,7 @@ public sealed class AppState
                 {
                     activeDb = db;
                     Profile = loaded;
+                    ReconcileDeletedCircles();
                     RehydrateUnread();
                     return;
                 }
@@ -138,6 +146,26 @@ public sealed class AppState
         foreach (var h in Profile.UnreadFrom) unread.Add(Norm(h));
     }
 
+    private void ReconcileDeletedCircles()
+    {
+        if (activeDb is null) return;
+        var revoked = Profile.Circles
+            .Select(circle => CircleEntityId(circle.Name))
+            .Where(entityId => entityId.Length > 0
+                && !ProfileSyncState.IsCircleAvailable(
+                    true,
+                    activeDb.GetSyncVersion(SyncKey(DeviceSyncKinds.CircleUpsert, entityId)),
+                    activeDb.GetSyncTombstoneVersion(DeviceSyncKinds.CircleDelete, entityId)))
+            .ToHashSet(StringComparer.Ordinal);
+        if (revoked.Count == 0) return;
+        foreach (var entityId in revoked)
+        {
+            Profile.Circles.RemoveAll(circle => CircleEntityId(circle.Name) == entityId);
+            ProfileSyncState.DeleteCircleReferences(Profile, entityId);
+        }
+        activeDb.SaveProfileAndSyncState(Profile, [], []);
+    }
+
     private void WriteIndex()
     {
         try
@@ -151,6 +179,17 @@ public sealed class AppState
     private static string NewId() => Guid.NewGuid().ToString("n");
 
     public void Save()
+    {
+        PrepareProfileStorage();
+        if (activeId is not null)
+        {
+            UpdateActiveAccount();
+            activeDb?.SaveProfile(Profile);
+        }
+        WriteIndex();
+    }
+
+    private void PrepareProfileStorage()
     {
         // Adopt: onboarding/link just filled a fresh profile with no active id yet.
         if (activeId is null && Profile.IsOnboarded)
@@ -173,22 +212,148 @@ public sealed class AppState
                 foreach (var line in thread.Lines) activeDb.AppendOwnChat(thread.Id, line);
             }
         }
-
-        if (activeId is not null)
-        {
-            var acc = accounts.FirstOrDefault(a => a.Id == activeId);
-            if (acc is null) { acc = new AccountRef { Id = activeId }; accounts.Add(acc); }
-            acc.Handle = Profile.Handle;
-            acc.DisplayName = Profile.DisplayName;
-            activeDb?.SaveProfile(Profile);
-        }
-        WriteIndex();
     }
 
-    public void Mutate(Action<MeshProfile> change)
+    private void UpdateActiveAccount()
     {
-        change(Profile);
-        Save();
+        if (activeId is null) return;
+        var acc = accounts.FirstOrDefault(a => a.Id == activeId);
+        if (acc is null) { acc = new AccountRef { Id = activeId }; accounts.Add(acc); }
+        acc.Handle = Profile.Handle;
+        acc.DisplayName = Profile.DisplayName;
+    }
+
+    public void Mutate(Action<MeshProfile> change, string? renamedCircleFrom = null)
+    {
+        ArgumentNullException.ThrowIfNull(change);
+        IReadOnlyList<PendingProfileOperation> pending;
+        lock (profileSyncGate)
+            pending = MutateCore(change, renamedCircleFrom);
+        PublishProfileMutation(pending);
+    }
+
+    public bool RenameCircle(string oldName, string newName)
+    {
+        var oldEntityId = CircleEntityId(oldName);
+        var replacement = newName.Trim();
+        IReadOnlyList<PendingProfileOperation> pending;
+        lock (profileSyncGate)
+        {
+            var circle = Profile.Circles.FirstOrDefault(item =>
+                CircleEntityId(item.Name) == oldEntityId);
+            if (circle is null
+                || replacement.Length == 0
+                || Profile.Circles.Any(item =>
+                    !ReferenceEquals(item, circle)
+                    && CircleEntityId(item.Name) == CircleEntityId(replacement)))
+                return false;
+            var previousName = circle.Name;
+            pending = MutateCore(profile =>
+            {
+                circle.Name = replacement;
+                ProfileSyncState.RenameCircleReferences(profile, previousName, replacement);
+            }, previousName);
+        }
+        PublishProfileMutation(pending);
+        return true;
+    }
+
+    public bool DeleteCircle(string name)
+    {
+        var entityId = CircleEntityId(name);
+        IReadOnlyList<PendingProfileOperation> pending;
+        lock (profileSyncGate)
+        {
+            var circle = Profile.Circles.FirstOrDefault(item =>
+                CircleEntityId(item.Name) == entityId);
+            if (circle is null) return false;
+            var currentName = circle.Name;
+            pending = MutateCore(profile =>
+            {
+                profile.Circles.Remove(circle);
+                ProfileSyncState.DeleteCircleReferences(profile, currentName);
+            }, null);
+        }
+        PublishProfileMutation(pending);
+        return true;
+    }
+
+    private IReadOnlyList<PendingProfileOperation> MutateCore(
+        Action<MeshProfile> change,
+        string? renamedCircleFrom)
+    {
+        var previousProfile = CloneProfile(Profile);
+        var previousActiveId = activeId;
+        var previousActiveDb = activeDb;
+        var previousAccounts = accounts
+            .Select(account => new AccountRef
+            {
+                Id = account.Id,
+                Handle = account.Handle,
+                DisplayName = account.DisplayName
+            })
+            .ToList();
+        var before = ProfileSyncState.Snapshot(Profile);
+        IReadOnlyList<PendingProfileOperation> pending = Array.Empty<PendingProfileOperation>();
+        try
+        {
+            change(Profile);
+            var after = ProfileSyncState.Snapshot(Profile);
+            var profileChanged = HasProfileSyncChanges(before, after);
+            PrepareProfileStorage();
+            var deviceId = LocalDeviceId();
+            if (!applyingDeviceSync && profileChanged && activeDb is not null && deviceId is not null)
+            {
+                pending = PrepareProfileChanges(before, after, deviceId, renamedCircleFrom);
+                if (!activeDb.SaveProfileAndSyncState(
+                    Profile,
+                    pending.Where(item => item.Version is not null).Select(item => item.Version!).ToList(),
+                    pending.Where(item => item.Tombstone is not null).Select(item => item.Tombstone!).ToList(),
+                    circleRenames: pending
+                        .Where(item => item.CircleRename is not null)
+                        .Select(item => item.CircleRename!)
+                        .ToList()))
+                    throw new InvalidOperationException("The profile sync transaction was not accepted.");
+                UpdateActiveAccount();
+                WriteIndex();
+            }
+            else
+            {
+                Save();
+            }
+        }
+        catch
+        {
+            if (activeId != previousActiveId)
+            {
+                var failedId = activeId;
+                if (!ReferenceEquals(activeDb, previousActiveDb)) activeDb?.Dispose();
+                if (failedId is not null)
+                {
+                    try
+                    {
+                        var path = DbPath(failedId);
+                        if (File.Exists(path)) File.Delete(path);
+                    }
+                    catch
+                    {
+                    }
+                    secrets.DeleteDbKey(failedId);
+                }
+                activeId = previousActiveId;
+                activeDb = previousActiveDb;
+                accounts = previousAccounts;
+            }
+            Profile = previousProfile;
+            throw;
+        }
+        return pending;
+    }
+
+    private void PublishProfileMutation(IReadOnlyList<PendingProfileOperation> pending)
+    {
+        foreach (var item in pending)
+            DeviceSyncOperationCreated?.Invoke(item.Operation);
         NotifyChanged();
     }
 
@@ -301,6 +466,12 @@ public sealed class AppState
 
     public IReadOnlyList<DeviceSyncOperation> CreateDeviceSyncSnapshot()
     {
+        lock (profileSyncGate)
+            return CreateDeviceSyncSnapshotCore();
+    }
+
+    private IReadOnlyList<DeviceSyncOperation> CreateDeviceSyncSnapshotCore()
+    {
         var deviceId = LocalDeviceId();
         if (deviceId is null || activeDb is null) return Array.Empty<DeviceSyncOperation>();
 
@@ -369,6 +540,43 @@ public sealed class AppState
             }
         }
 
+        var profileState = ProfileSyncState.Snapshot(Profile);
+        foreach (var (entityId, projectedCircle) in profileState.Circles)
+        {
+            var renames = activeDb.GetSyncCircleRenames(entityId);
+            var circle = renames.Count == 0
+                ? projectedCircle
+                : projectedCircle with { Renames = renames };
+            var version = GetOrCreateLegacyProfileVersion(
+                SyncKey(DeviceSyncKinds.CircleUpsert, entityId),
+                deviceId,
+                DeviceSyncKinds.CircleUpsert,
+                entityId,
+                circle);
+            operations.Add(SnapshotOperation(
+                deviceId,
+                DeviceSyncKinds.CircleUpsert,
+                entityId,
+                version,
+                circle));
+        }
+
+        foreach (var (entityId, contact) in profileState.Contacts)
+        {
+            var version = GetOrCreateLegacyProfileVersion(
+                SyncKey(DeviceSyncKinds.ContactUpsert, entityId),
+                deviceId,
+                DeviceSyncKinds.ContactUpsert,
+                entityId,
+                contact);
+            operations.Add(SnapshotOperation(
+                deviceId,
+                DeviceSyncKinds.ContactUpsert,
+                entityId,
+                version,
+                contact));
+        }
+
         foreach (var tombstone in activeDb.GetSyncTombstones())
             operations.Add(new DeviceSyncOperation(
                 SnapshotOperationId(tombstone.Version, tombstone.Kind, tombstone.EntityId),
@@ -383,26 +591,42 @@ public sealed class AppState
 
     public bool ApplyDeviceSyncBatch(DeviceSyncBatch batch)
     {
-        if (batch is null || activeDb is null) return false;
+        (bool accepted, bool visibleChanged) result;
+        lock (profileSyncGate)
+            result = ApplyDeviceSyncBatchCore(batch);
+        if (result.visibleChanged) NotifyChanged();
+        return result.accepted;
+    }
+
+    private (bool accepted, bool visibleChanged) ApplyDeviceSyncBatchCore(DeviceSyncBatch batch)
+    {
+        if (batch is null || activeDb is null) return (false, false);
         var deviceId = LocalDeviceId();
         if (deviceId is null
             || string.IsNullOrWhiteSpace(batch.SourceDeviceId)
             || string.Equals(batch.SourceDeviceId, deviceId, StringComparison.Ordinal)
             || batch.Operations is null)
-            return false;
+            return (false, false);
 
+        var accepted = false;
         var visibleChanged = false;
         applyingDeviceSync = true;
         try
         {
-            foreach (var operation in batch.Operations
-                         .Where(operation => operation is not null)
-                         .OrderBy(operation => operation.Version, StringComparer.Ordinal))
+            foreach (var operation in ProfileSyncState.OrderForApplication(
+                         batch.Operations.Where(operation => operation is not null)))
             {
                 if (!IsValidOperation(operation, batch.SourceDeviceId, deviceId)) continue;
                 try
                 {
+                    var previousAcceptedVersion = AcceptedVersion(operation);
                     visibleChanged |= ApplyDeviceSyncOperation(operation);
+                    accepted |= DeviceSyncVersion.IsNewer(
+                                    operation.Version, previousAcceptedVersion)
+                                && string.Equals(
+                                    AcceptedVersion(operation),
+                                    operation.Version,
+                                    StringComparison.Ordinal);
                 }
                 catch (JsonException)
                 {
@@ -420,8 +644,7 @@ public sealed class AppState
             applyingDeviceSync = false;
         }
 
-        if (visibleChanged) NotifyChanged();
-        return visibleChanged;
+        return (accepted, visibleChanged);
     }
 
     private bool ApplyDeviceSyncOperation(DeviceSyncOperation operation)
@@ -436,6 +659,10 @@ public sealed class AppState
             DeviceSyncKinds.ConversationLineUpsert => ApplyConversationLineUpsert(operation),
             DeviceSyncKinds.ConversationClear => ApplyConversationClear(operation),
             DeviceSyncKinds.ConversationDelete => ApplyConversationDelete(operation),
+            DeviceSyncKinds.ContactUpsert => ApplyContactUpsert(operation),
+            DeviceSyncKinds.ContactDelete => ApplyContactDelete(operation),
+            DeviceSyncKinds.CircleUpsert => ApplyCircleUpsert(operation),
+            DeviceSyncKinds.CircleDelete => ApplyCircleDelete(operation),
             _ => false
         };
     }
@@ -660,6 +887,250 @@ public sealed class AppState
         return changed;
     }
 
+    private bool ApplyContactUpsert(DeviceSyncOperation operation)
+    {
+        var dto = DeserializePayload<DeviceSyncContact>(operation);
+        var unfiltered = ProfileSyncState.NormalizeContact(dto, dto.Circles ?? Array.Empty<string>());
+        if (unfiltered.Handle.Length == 0
+            || !string.Equals(unfiltered.Handle, operation.EntityId, StringComparison.Ordinal)
+            || dto.Circles is null
+            || dto.SigningKeys is null
+            || dto.Circles.Any(string.IsNullOrWhiteSpace)
+            || dto.SigningKeys.Any(string.IsNullOrWhiteSpace)
+            || unfiltered.Circles.Count != dto.Circles.Count
+            || unfiltered.SigningKeys.Count != dto.SigningKeys.Count
+            || IsBlockedByTombstone(DeviceSyncKinds.ContactDelete, unfiltered.Handle, operation.Version)
+            || !IsNewer(operation, DeviceSyncKinds.ContactUpsert))
+            return false;
+
+        var existing = Profile.Contacts.FirstOrDefault(
+            item => string.Equals(Norm(item.Handle), unfiltered.Handle, StringComparison.Ordinal));
+        var previousProfile = CloneProfile(Profile);
+        var retainedIncomingCircles = RetainedContactCircleNames(dto.Circles);
+        var retainedExistingCircles = RetainedContactCircleNames(
+            existing?.Circles ?? new List<string>());
+        var merged = ProfileSyncState.MergeContact(existing, dto, retainedIncomingCircles);
+        var changed = existing is null
+            || !ProfileSyncState.ContactEquals(
+                ProfileSyncState.ProjectContact(existing, retainedExistingCircles),
+                ProfileSyncState.NormalizeContact(dto, retainedIncomingCircles));
+        if (existing is null)
+        {
+            existing = merged;
+            Profile.Contacts.Add(existing);
+        }
+        else
+        {
+            CopyContact(merged, existing);
+        }
+        try
+        {
+            if (!activeDb!.SaveProfileAndSyncState(
+                Profile,
+                [new MeshDb.SyncVersionWrite(SyncKey(operation.Kind, operation.EntityId), operation.Version)],
+                []))
+            {
+                Profile = previousProfile;
+                return false;
+            }
+        }
+        catch
+        {
+            Profile = previousProfile;
+            throw;
+        }
+        return changed;
+    }
+
+    private bool ApplyContactDelete(DeviceSyncOperation operation)
+    {
+        var handle = Norm(operation.EntityId);
+        if (handle.Length == 0
+            || !string.Equals(handle, operation.EntityId, StringComparison.Ordinal)
+            || !CanApplyProfileDelete(operation, DeviceSyncKinds.ContactUpsert))
+            return false;
+
+        var previousProfile = CloneProfile(Profile);
+        var changed = Profile.Contacts.RemoveAll(
+            contact => string.Equals(Norm(contact.Handle), handle, StringComparison.Ordinal)) > 0;
+        try
+        {
+            if (!activeDb!.SaveProfileAndSyncState(
+                Profile,
+                [],
+                [new MeshDb.SyncTombstoneWrite(operation.Kind, handle, operation.Version)]))
+            {
+                Profile = previousProfile;
+                return false;
+            }
+        }
+        catch
+        {
+            Profile = previousProfile;
+            throw;
+        }
+        return changed;
+    }
+
+    private bool ApplyCircleUpsert(DeviceSyncOperation operation)
+    {
+        var dto = DeserializePayload<DeviceSyncCircle>(operation);
+        var name = dto.Name?.Trim() ?? "";
+        var entityId = CircleEntityId(name);
+        var incomingRenames = dto.Renames ?? Array.Empty<DeviceSyncCircleRename>();
+        var normalizedIncomingRenames = incomingRenames
+            .Where(rename => rename is not null)
+            .GroupBy(rename => CircleEntityId(rename.PreviousName), StringComparer.Ordinal)
+            .Select(group => group.Last())
+            .ToList();
+        if (name.Length == 0
+            || !string.Equals(entityId, operation.EntityId, StringComparison.Ordinal)
+            || normalizedIncomingRenames.Count != incomingRenames.Count
+            || normalizedIncomingRenames.Any(rename =>
+                CircleEntityId(rename.PreviousName).Length == 0
+                || CircleEntityId(rename.PreviousName) == entityId
+                || !IsVersion(rename.DeleteVersion))
+            || IsBlockedByTombstone(DeviceSyncKinds.CircleDelete, entityId, operation.Version)
+            || !IsNewer(operation, DeviceSyncKinds.CircleUpsert))
+            return false;
+        foreach (var rename in normalizedIncomingRenames)
+        {
+            var previousEntityId = CircleEntityId(rename.PreviousName);
+            if (!DeviceSyncVersion.IsNewer(
+                    rename.DeleteVersion,
+                    activeDb!.GetSyncVersion(SyncKey(
+                        DeviceSyncKinds.CircleUpsert, previousEntityId)))
+                || DeviceSyncVersion.Compare(
+                    rename.DeleteVersion,
+                    activeDb.GetSyncTombstoneVersion(
+                        DeviceSyncKinds.CircleDelete, previousEntityId)) < 0)
+                return false;
+        }
+        var entityTombstone = activeDb!.GetSyncTombstoneVersion(
+            DeviceSyncKinds.CircleDelete, entityId);
+        var currentEntityUpsert = activeDb.GetSyncVersion(
+            SyncKey(DeviceSyncKinds.CircleUpsert, entityId));
+        var recreated = entityTombstone is not null
+                        && DeviceSyncVersion.Compare(
+                            entityTombstone, currentEntityUpsert) >= 0
+                        && DeviceSyncVersion.IsNewer(operation.Version, entityTombstone);
+        IReadOnlyList<DeviceSyncCircleRename> persistedRenames = recreated
+            ? Array.Empty<DeviceSyncCircleRename>()
+            : activeDb.GetSyncCircleRenames(entityId)
+                .Where(rename =>
+                    DeviceSyncVersion.IsNewer(
+                        rename.DeleteVersion,
+                        activeDb.GetSyncVersion(SyncKey(
+                            DeviceSyncKinds.CircleUpsert,
+                            CircleEntityId(rename.PreviousName))))
+                    && DeviceSyncVersion.Compare(
+                        rename.DeleteVersion,
+                        activeDb.GetSyncTombstoneVersion(
+                            DeviceSyncKinds.CircleDelete,
+                            CircleEntityId(rename.PreviousName))) >= 0)
+                .ToList();
+        var normalizedRenames = persistedRenames
+            .Concat(normalizedIncomingRenames)
+            .GroupBy(rename => CircleEntityId(rename.PreviousName), StringComparer.Ordinal)
+            .Select(group => group
+                .OrderByDescending(rename => rename.DeleteVersion, StringComparer.Ordinal)
+                .First())
+            .ToList();
+
+        var previousProfile = CloneProfile(Profile);
+        var referenceChanged = normalizedRenames.Any(rename =>
+            ProfileSyncState.HasCircleReferences(Profile, rename.PreviousName));
+        var existing = Profile.Circles.FirstOrDefault(
+            circle => string.Equals(CircleEntityId(circle.Name), entityId, StringComparison.Ordinal));
+        var changed = existing is null
+            || !string.Equals(existing.Name, name, StringComparison.Ordinal)
+            || existing.RequireApproval != dto.RequireApproval;
+        if (existing is null)
+        {
+            existing = new Circle();
+            Profile.Circles.Add(existing);
+        }
+        else if (!string.Equals(existing.Name, name, StringComparison.Ordinal))
+        {
+            ProfileSyncState.RenameCircleReferences(Profile, existing.Name, name);
+        }
+        foreach (var rename in normalizedRenames)
+        {
+            var previousEntityId = CircleEntityId(rename.PreviousName);
+            ProfileSyncState.RenameCircleReferences(Profile, rename.PreviousName, name);
+            Profile.Circles.RemoveAll(circle =>
+                CircleEntityId(circle.Name) == previousEntityId);
+        }
+        existing.Name = name;
+        existing.RequireApproval = dto.RequireApproval;
+        try
+        {
+            var tombstones = normalizedRenames
+                .Where(rename => DeviceSyncVersion.IsNewer(
+                    rename.DeleteVersion,
+                    activeDb!.GetSyncTombstoneVersion(
+                        DeviceSyncKinds.CircleDelete,
+                        CircleEntityId(rename.PreviousName))))
+                .Select(rename => new MeshDb.SyncTombstoneWrite(
+                    DeviceSyncKinds.CircleDelete,
+                    CircleEntityId(rename.PreviousName),
+                    rename.DeleteVersion))
+                .ToList();
+            if (!activeDb!.SaveProfileAndSyncState(
+                Profile,
+                [new MeshDb.SyncVersionWrite(SyncKey(operation.Kind, operation.EntityId), operation.Version)],
+                tombstones,
+                circleRenames:
+                [
+                    new MeshDb.SyncCircleRenameWrite(
+                        entityId,
+                        normalizedRenames)
+                ]))
+            {
+                Profile = previousProfile;
+                return false;
+            }
+        }
+        catch
+        {
+            Profile = previousProfile;
+            throw;
+        }
+        return changed || referenceChanged;
+    }
+
+    private bool ApplyCircleDelete(DeviceSyncOperation operation)
+    {
+        var entityId = CircleEntityId(operation.EntityId);
+        if (entityId.Length == 0
+            || !string.Equals(entityId, operation.EntityId, StringComparison.Ordinal)
+            || !CanApplyProfileDelete(operation, DeviceSyncKinds.CircleUpsert))
+            return false;
+
+        var previousProfile = CloneProfile(Profile);
+        var referenceChanged = ProfileSyncState.HasCircleReferences(Profile, entityId);
+        var changed = Profile.Circles.RemoveAll(
+            circle => string.Equals(CircleEntityId(circle.Name), entityId, StringComparison.Ordinal)) > 0;
+        ProfileSyncState.DeleteCircleReferences(Profile, entityId);
+        try
+        {
+            if (!activeDb!.SaveProfileAndSyncState(
+                Profile,
+                [],
+                [new MeshDb.SyncTombstoneWrite(operation.Kind, entityId, operation.Version)]))
+            {
+                Profile = previousProfile;
+                return false;
+            }
+        }
+        catch
+        {
+            Profile = previousProfile;
+            throw;
+        }
+        return changed || referenceChanged;
+    }
+
     private void EmitTopicUpsert(OwnThread thread)
     {
         var sortOrder = Profile.OwnThreads.IndexOf(thread);
@@ -678,6 +1149,141 @@ public sealed class AppState
             handle,
             ToSyncConversation(conversation, Math.Max(0, Profile.Conversations.IndexOf(conversation))),
             DeviceSyncKinds.ConversationDelete);
+    }
+
+    private bool HasProfileSyncChanges(
+        ProfileSyncProjection before,
+        ProfileSyncProjection after)
+        => before.Circles.Count != after.Circles.Count
+           || before.Contacts.Count != after.Contacts.Count
+           || before.Circles.Any(item =>
+               !after.Circles.TryGetValue(item.Key, out var circle) || item.Value != circle)
+           || before.Contacts.Any(item =>
+               !after.Contacts.TryGetValue(item.Key, out var contact)
+               || !ProfileSyncState.ContactEquals(item.Value, contact));
+
+    private IReadOnlyList<PendingProfileOperation> PrepareProfileChanges(
+        ProfileSyncProjection before,
+        ProfileSyncProjection after,
+        string deviceId,
+        string? renamedCircleFrom)
+    {
+        var pending = new List<PendingProfileOperation>();
+        var circleDeletes = before.Circles.Keys
+            .Except(after.Circles.Keys, StringComparer.Ordinal)
+            .Order()
+            .Select(entityId => PrepareProfileDelete(
+                DeviceSyncKinds.CircleDelete,
+                DeviceSyncKinds.CircleUpsert,
+                entityId,
+                deviceId))
+            .ToList();
+        foreach (var (entityId, circle) in after.Circles.OrderBy(item => item.Key, StringComparer.Ordinal))
+            if (!before.Circles.TryGetValue(entityId, out var previous)
+                || previous != circle)
+            {
+                var existingRenames = before.Circles.ContainsKey(entityId)
+                    ? activeDb!.GetSyncCircleRenames(entityId)
+                    : Array.Empty<DeviceSyncCircleRename>();
+                var payload = circle with
+                {
+                    Renames = existingRenames.Count == 0 ? null : existingRenames
+                };
+                var previousEntityId = CircleEntityId(renamedCircleFrom);
+                if (previousEntityId.Length > 0
+                    && previousEntityId != entityId
+                    && before.Circles.TryGetValue(previousEntityId, out var renamedCircle)
+                    && !after.Circles.ContainsKey(previousEntityId)
+                    && !before.Circles.ContainsKey(entityId))
+                {
+                    var delete = circleDeletes.Single(item =>
+                        item.Tombstone?.EntityId == previousEntityId);
+                    var renames = activeDb!.GetSyncCircleRenames(previousEntityId)
+                        .Append(new DeviceSyncCircleRename(
+                            renamedCircle.Name,
+                            delete.Operation.Version))
+                        .GroupBy(item => CircleEntityId(item.PreviousName), StringComparer.Ordinal)
+                        .Select(group => group.Last())
+                        .ToList();
+                    payload = circle with
+                    {
+                        Renames = renames
+                    };
+                }
+                pending.Add(PrepareProfileUpsert(
+                    DeviceSyncKinds.CircleUpsert,
+                    DeviceSyncKinds.CircleDelete,
+                    entityId,
+                    payload,
+                    deviceId));
+            }
+        pending.AddRange(circleDeletes);
+
+        foreach (var entityId in before.Contacts.Keys.Except(after.Contacts.Keys, StringComparer.Ordinal).Order())
+            pending.Add(PrepareProfileDelete(
+                DeviceSyncKinds.ContactDelete,
+                DeviceSyncKinds.ContactUpsert,
+                entityId,
+                deviceId));
+        foreach (var (entityId, contact) in after.Contacts.OrderBy(item => item.Key, StringComparer.Ordinal))
+            if (!before.Contacts.TryGetValue(entityId, out var previous)
+                || !ProfileSyncState.ContactEquals(previous, contact))
+                pending.Add(PrepareProfileUpsert(
+                    DeviceSyncKinds.ContactUpsert,
+                    DeviceSyncKinds.ContactDelete,
+                    entityId,
+                    contact,
+                    deviceId));
+        return pending;
+    }
+
+    private PendingProfileOperation PrepareProfileUpsert<T>(
+        string kind,
+        string deleteKind,
+        string entityId,
+        T payload,
+        string deviceId)
+    {
+        var operationId = NewId();
+        var version = CreateNewerVersion(deviceId, operationId, new[]
+        {
+            activeDb!.GetSyncVersion(SyncKey(kind, entityId)),
+            activeDb.GetSyncTombstoneVersion(deleteKind, entityId)
+        });
+        return new PendingProfileOperation(
+            new DeviceSyncOperation(
+                operationId,
+                deviceId,
+                kind,
+                entityId,
+                version,
+                JsonSerializer.Serialize(payload, SyncJson)),
+            new MeshDb.SyncVersionWrite(SyncKey(kind, entityId), version),
+            null,
+            payload is DeviceSyncCircle circle
+                ? new MeshDb.SyncCircleRenameWrite(
+                    entityId,
+                    circle.Renames ?? Array.Empty<DeviceSyncCircleRename>())
+                : null);
+    }
+
+    private PendingProfileOperation PrepareProfileDelete(
+        string kind,
+        string upsertKind,
+        string entityId,
+        string deviceId)
+    {
+        var operationId = NewId();
+        var version = CreateNewerVersion(deviceId, operationId, new[]
+        {
+            activeDb!.GetSyncTombstoneVersion(kind, entityId),
+            activeDb.GetSyncVersion(SyncKey(upsertKind, entityId))
+        });
+        return new PendingProfileOperation(
+            new DeviceSyncOperation(operationId, deviceId, kind, entityId, version, ""),
+            null,
+            new MeshDb.SyncTombstoneWrite(kind, entityId, version),
+            null);
     }
 
     private void EmitLineUpsert(string kind, string parentId, ChatLine line)
@@ -737,7 +1343,11 @@ public sealed class AppState
                 ? activeDb?.GetSyncVersion(SyncKey(DeviceSyncKinds.TopicUpsert, entityId))
                 : kind is DeviceSyncKinds.ConversationDelete
                     ? activeDb?.GetSyncVersion(SyncKey(DeviceSyncKinds.ConversationUpsert, entityId))
-                    : null
+                    : kind is DeviceSyncKinds.ContactDelete
+                        ? activeDb?.GetSyncVersion(SyncKey(DeviceSyncKinds.ContactUpsert, entityId))
+                        : kind is DeviceSyncKinds.CircleDelete
+                            ? activeDb?.GetSyncVersion(SyncKey(DeviceSyncKinds.CircleUpsert, entityId))
+                            : null
         };
         if (kind == DeviceSyncKinds.TopicDelete)
             versions.Add(activeDb?.GetSyncTombstoneVersion(DeviceSyncKinds.TopicClear, entityId));
@@ -776,7 +1386,9 @@ public sealed class AppState
         if (kind is DeviceSyncKinds.TopicDelete
             or DeviceSyncKinds.TopicClear
             or DeviceSyncKinds.ConversationDelete
-            or DeviceSyncKinds.ConversationClear)
+            or DeviceSyncKinds.ConversationClear
+            or DeviceSyncKinds.ContactDelete
+            or DeviceSyncKinds.CircleDelete)
         {
             switch (kind)
             {
@@ -791,6 +1403,10 @@ public sealed class AppState
                     break;
                 case DeviceSyncKinds.ConversationClear:
                     activeDb.ApplyConversationClear(entityId, kind, version);
+                    break;
+                case DeviceSyncKinds.ContactDelete:
+                case DeviceSyncKinds.CircleDelete:
+                    if (!activeDb.SetSyncTombstone(kind, entityId, version)) return;
                     break;
             }
         }
@@ -817,6 +1433,21 @@ public sealed class AppState
         if (version is not null) return version;
         var operationId = LegacyOperationId(kind, entityId);
         version = DeviceSyncVersion.Create(at, "legacy", operationId);
+        activeDb.TryAdvanceSyncVersion(entityKey, version);
+        return version;
+    }
+
+    private string GetOrCreateLegacyProfileVersion<T>(
+        string entityKey,
+        string deviceId,
+        string kind,
+        string entityId,
+        T payload)
+    {
+        var version = activeDb!.GetSyncVersion(entityKey);
+        if (version is not null) return version;
+        var serialized = JsonSerializer.Serialize(payload, SyncJson);
+        version = ProfileSyncState.LegacyVersion(deviceId, kind, entityId, serialized);
         activeDb.TryAdvanceSyncVersion(entityKey, version);
         return version;
     }
@@ -872,6 +1503,35 @@ public sealed class AppState
             operation.Version,
             activeDb!.GetSyncVersion(SyncKey(kind, operation.EntityId)));
 
+    private string? AcceptedVersion(DeviceSyncOperation operation)
+        => operation.Kind switch
+        {
+            DeviceSyncKinds.TopicLineUpsert => activeDb!.GetSyncVersion(
+                LineSyncKey(operation.Kind, operation.EntityId, SyncLineId(operation))),
+            DeviceSyncKinds.ConversationLineUpsert => activeDb!.GetSyncVersion(
+                LineSyncKey(operation.Kind, operation.EntityId, SyncLineId(operation))),
+            DeviceSyncKinds.TopicClear
+                or DeviceSyncKinds.TopicDelete
+                or DeviceSyncKinds.ConversationClear
+                or DeviceSyncKinds.ConversationDelete
+                or DeviceSyncKinds.ContactDelete
+                or DeviceSyncKinds.CircleDelete
+                => activeDb!.GetSyncTombstoneVersion(operation.Kind, operation.EntityId),
+            _ => activeDb!.GetSyncVersion(SyncKey(operation.Kind, operation.EntityId))
+        };
+
+    private static string SyncLineId(DeviceSyncOperation operation)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<DeviceSyncLine>(operation.Payload, SyncJson)?.Id ?? "";
+        }
+        catch (JsonException)
+        {
+            return "";
+        }
+    }
+
     private bool IsBlockedByTombstone(string kind, string entityId, string version)
         => DeviceSyncVersion.Compare(
             activeDb!.GetSyncTombstoneVersion(kind, entityId),
@@ -904,6 +1564,12 @@ public sealed class AppState
                activeDb.GetSyncTombstoneVersion(clearKind, operation.EntityId))
            && IsNewerThanLines(operation.Version, lineKind, operation.EntityId, lines);
 
+    private bool CanApplyProfileDelete(DeviceSyncOperation operation, string upsertKind)
+        => CanApplyTombstone(operation)
+           && DeviceSyncVersion.IsNewer(
+               operation.Version,
+               activeDb!.GetSyncVersion(SyncKey(upsertKind, operation.EntityId)));
+
     private bool IsNewerThanLines(
         string version,
         string lineKind,
@@ -934,7 +1600,11 @@ public sealed class AppState
             or DeviceSyncKinds.ConversationUpsert
             or DeviceSyncKinds.ConversationLineUpsert
             or DeviceSyncKinds.ConversationClear
-            or DeviceSyncKinds.ConversationDelete;
+            or DeviceSyncKinds.ConversationDelete
+            or DeviceSyncKinds.ContactUpsert
+            or DeviceSyncKinds.ContactDelete
+            or DeviceSyncKinds.CircleUpsert
+            or DeviceSyncKinds.CircleDelete;
     }
 
     private static bool IsVersion(string? version)
@@ -983,6 +1653,100 @@ public sealed class AppState
             conversation.GroupOwnerHandle,
             conversation.GroupMembers.ToList(),
             conversation.GroupVersion);
+
+    private static string CircleEntityId(string? name)
+        => ProfileSyncState.CircleEntityId(name);
+
+    private IReadOnlyList<string> ActiveCircleNames()
+        => Profile.Circles
+            .Where(circle =>
+            {
+                var entityId = CircleEntityId(circle.Name);
+                if (entityId.Length == 0) return false;
+                var tombstone = activeDb!.GetSyncTombstoneVersion(
+                    DeviceSyncKinds.CircleDelete, entityId);
+                return ProfileSyncState.IsCircleAvailable(
+                    true,
+                    activeDb.GetSyncVersion(SyncKey(DeviceSyncKinds.CircleUpsert, entityId)),
+                    tombstone);
+            })
+            .Select(circle => circle.Name)
+            .ToList();
+
+    private IReadOnlyList<string> RetainedContactCircleNames(IEnumerable<string> names)
+        => names
+            .Where(name =>
+            {
+                var entityId = CircleEntityId(name);
+                if (entityId.Length == 0) return false;
+                var tombstone = activeDb!.GetSyncTombstoneVersion(
+                    DeviceSyncKinds.CircleDelete, entityId);
+                if (tombstone is null) return true;
+                var circleExists = Profile.Circles.Any(circle =>
+                    CircleEntityId(circle.Name) == entityId);
+                return ProfileSyncState.IsCircleAvailable(
+                    circleExists,
+                    activeDb.GetSyncVersion(SyncKey(DeviceSyncKinds.CircleUpsert, entityId)),
+                    tombstone);
+            })
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private static void CopyContact(Domain.Contact source, Domain.Contact destination)
+    {
+        destination.Handle = source.Handle;
+        destination.DisplayName = source.DisplayName;
+        destination.Circles = source.Circles.ToList();
+        destination.Allowed = source.Allowed;
+        destination.SigningKeys = source.SigningKeys.ToList();
+        destination.KeyChanged = source.KeyChanged;
+        destination.TokensSpent = source.TokensSpent;
+        destination.Muted = source.Muted;
+        destination.Blocked = source.Blocked;
+    }
+
+    private static MeshProfile CloneProfile(MeshProfile profile)
+    {
+        var clone = JsonSerializer.Deserialize<MeshProfile>(
+                        JsonSerializer.Serialize(profile, JsonOpts),
+                        JsonOpts)
+                    ?? throw new InvalidOperationException("The profile could not be cloned for rollback.");
+        CopyAttachments(profile.Conversations, clone.Conversations);
+        CopyAttachments(profile.OwnThreads, clone.OwnThreads);
+        return clone;
+    }
+
+    private static void CopyAttachments(
+        IEnumerable<Conversation> source,
+        IEnumerable<Conversation> destination)
+    {
+        var sourceByHandle = source.ToDictionary(
+            conversation => Norm(conversation.Handle),
+            StringComparer.Ordinal);
+        foreach (var conversation in destination)
+            if (sourceByHandle.TryGetValue(Norm(conversation.Handle), out var original))
+                CopyAttachments(original.Lines, conversation.Lines);
+    }
+
+    private static void CopyAttachments(
+        IEnumerable<OwnThread> source,
+        IEnumerable<OwnThread> destination)
+    {
+        var sourceById = source.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
+        foreach (var thread in destination)
+            if (sourceById.TryGetValue(thread.Id, out var original))
+                CopyAttachments(original.Lines, thread.Lines);
+    }
+
+    private static void CopyAttachments(
+        IEnumerable<ChatLine> source,
+        IEnumerable<ChatLine> destination)
+    {
+        var sourceById = source.ToDictionary(line => line.Id, StringComparer.Ordinal);
+        foreach (var line in destination)
+            if (sourceById.TryGetValue(line.Id, out var original))
+                line.Attachments = original.Attachments.ToList();
+    }
 
     private static DeviceSyncConversation NormalizeSyncConversation(
         DeviceSyncConversation dto,
@@ -1457,15 +2221,18 @@ public sealed class AppState
     {
         var total = Math.Max(0, promptTokens) + Math.Max(0, completionTokens);
         if (total <= 0) return;
-        var h = Norm(handle);
-        var contact = FindContact(h);
-        if (contact is null)
+        lock (profileSyncGate)
         {
-            contact = new Domain.Contact { Handle = h, Allowed = false };
-            Profile.Contacts.Add(contact);
+            var h = Norm(handle);
+            var contact = FindContact(h);
+            if (contact is null)
+            {
+                contact = new Domain.Contact { Handle = h, Allowed = false };
+                Profile.Contacts.Add(contact);
+            }
+            contact.TokensSpent += total;
+            Save();
         }
-        contact.TokensSpent += total;
-        Save();
         NotifyChanged();
     }
 

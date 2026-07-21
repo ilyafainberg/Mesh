@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Data.Sqlite;
 using Mesh.App.Domain;
+using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
@@ -17,6 +18,12 @@ namespace Mesh.App.Services;
 /// </summary>
 public sealed class MeshDb : IDisposable
 {
+    internal sealed record SyncVersionWrite(string EntityKey, string Version);
+    internal sealed record SyncTombstoneWrite(string Kind, string EntityId, string Version);
+    internal sealed record SyncCircleRenameWrite(
+        string EntityId,
+        IReadOnlyList<DeviceSyncCircleRename> Renames);
+
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private static bool nativeInit;
 
@@ -89,6 +96,12 @@ public sealed class MeshDb : IDisposable
                 entity_id TEXT NOT NULL,
                 version TEXT NOT NULL,
                 PRIMARY KEY(kind, entity_id));
+            CREATE TABLE IF NOT EXISTS sync_circle_renames(
+                entity_id TEXT NOT NULL,
+                previous_entity_id TEXT NOT NULL,
+                previous_name TEXT NOT NULL,
+                delete_version TEXT NOT NULL,
+                PRIMARY KEY(entity_id, previous_entity_id));
             INSERT OR IGNORE INTO meta(k, v) VALUES('schema_version', '1');");
 
         // Idempotent migration for databases created before line_id/status existed.
@@ -304,13 +317,113 @@ public sealed class MeshDb : IDisposable
     /// </summary>
     public void SaveProfile(MeshProfile profile)
     {
+        using var cmd = conn.CreateCommand();
+        SaveProfile(cmd, profile);
+    }
+
+    internal bool SaveProfileAndSyncState(
+        MeshProfile profile,
+        IReadOnlyList<SyncVersionWrite> versions,
+        IReadOnlyList<SyncTombstoneWrite> tombstones,
+        Action? beforeCommit = null,
+        IReadOnlyList<SyncCircleRenameWrite>? circleRenames = null)
+    {
+        using var transaction = conn.BeginTransaction(deferred: false);
+        var acceptedVersions = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var version in versions)
+        {
+            var current = acceptedVersions.TryGetValue(version.EntityKey, out var accepted)
+                ? accepted
+                : GetSyncVersion(transaction, version.EntityKey);
+            var opposing = TryGetDeleteIdentity(version.EntityKey, out var deleteKind, out var entityId)
+                ? GetSyncTombstoneVersion(transaction, deleteKind, entityId)
+                : null;
+            if (!DeviceSyncVersion.IsNewer(version.Version, Newest(current, opposing)))
+            {
+                transaction.Rollback();
+                return false;
+            }
+            acceptedVersions[version.EntityKey] = version.Version;
+        }
+        var acceptedTombstones = new Dictionary<(string Kind, string EntityId), string>();
+        foreach (var tombstone in tombstones)
+        {
+            var key = (tombstone.Kind, tombstone.EntityId);
+            var current = acceptedTombstones.TryGetValue(key, out var accepted)
+                ? accepted
+                : GetSyncTombstoneVersion(transaction, tombstone.Kind, tombstone.EntityId);
+            var opposing = TryGetUpsertKey(
+                tombstone.Kind, tombstone.EntityId, out var upsertKey)
+                ? acceptedVersions.TryGetValue(upsertKey, out var acceptedUpsert)
+                    ? acceptedUpsert
+                    : GetSyncVersion(transaction, upsertKey)
+                : null;
+            if (!DeviceSyncVersion.IsNewer(tombstone.Version, Newest(current, opposing)))
+            {
+                transaction.Rollback();
+                return false;
+            }
+            acceptedTombstones[key] = tombstone.Version;
+        }
+        using (var profileCommand = conn.CreateCommand())
+        {
+            profileCommand.Transaction = transaction;
+            SaveProfile(profileCommand, profile);
+        }
+        foreach (var version in versions)
+            UpsertSyncVersion(transaction, version.EntityKey, version.Version);
+        foreach (var tombstone in tombstones)
+            UpsertSyncTombstone(transaction, tombstone.Kind, tombstone.EntityId, tombstone.Version);
+        foreach (var rename in circleRenames ?? Array.Empty<SyncCircleRenameWrite>())
+            WriteCircleRename(transaction, rename);
+        beforeCommit?.Invoke();
+        transaction.Commit();
+        return true;
+    }
+
+    private static string? Newest(string? first, string? second)
+        => string.Compare(first, second, StringComparison.Ordinal) >= 0 ? first : second;
+
+    private static bool TryGetDeleteIdentity(
+        string entityKey,
+        out string deleteKind,
+        out string entityId)
+    {
+        const char separator = '\u001f';
+        var split = entityKey.IndexOf(separator);
+        var kind = split > 0 ? entityKey[..split] : "";
+        entityId = split > 0 && split + 1 < entityKey.Length ? entityKey[(split + 1)..] : "";
+        deleteKind = kind switch
+        {
+            DeviceSyncKinds.ContactUpsert => DeviceSyncKinds.ContactDelete,
+            DeviceSyncKinds.CircleUpsert => DeviceSyncKinds.CircleDelete,
+            _ => ""
+        };
+        return deleteKind.Length > 0 && entityId.Length > 0;
+    }
+
+    private static bool TryGetUpsertKey(
+        string deleteKind,
+        string entityId,
+        out string entityKey)
+    {
+        var upsertKind = deleteKind switch
+        {
+            DeviceSyncKinds.ContactDelete => DeviceSyncKinds.ContactUpsert,
+            DeviceSyncKinds.CircleDelete => DeviceSyncKinds.CircleUpsert,
+            _ => ""
+        };
+        entityKey = upsertKind.Length == 0 ? "" : upsertKind + "\u001f" + entityId;
+        return entityKey.Length > 0;
+    }
+
+    private static void SaveProfile(SqliteCommand cmd, MeshProfile profile)
+    {
         var node = JsonSerializer.SerializeToNode(profile, JsonOpts)!.AsObject();
         node.Remove("conversations");
         node.Remove("ownChat");
         node.Remove("ownThreads");
         var json = node.ToJsonString(JsonOpts);
-
-        using var cmd = conn.CreateCommand();
         cmd.CommandText = "INSERT INTO profile(id, json) VALUES(1, $j) ON CONFLICT(id) DO UPDATE SET json = $j;";
         cmd.Parameters.AddWithValue("$j", json);
         cmd.ExecuteNonQuery();
@@ -323,6 +436,15 @@ public sealed class MeshDb : IDisposable
     public string? GetSyncVersion(string entityKey)
     {
         using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT version FROM sync_versions WHERE entity_key = $key;";
+        cmd.Parameters.AddWithValue("$key", entityKey);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    private string? GetSyncVersion(SqliteTransaction transaction, string entityKey)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = "SELECT version FROM sync_versions WHERE entity_key = $key;";
         cmd.Parameters.AddWithValue("$key", entityKey);
         return cmd.ExecuteScalar() as string;
@@ -357,17 +479,7 @@ public sealed class MeshDb : IDisposable
             tx.Rollback();
             return false;
         }
-        using (var write = conn.CreateCommand())
-        {
-            write.Transaction = tx;
-            write.CommandText = """
-                INSERT INTO sync_versions(entity_key, version) VALUES($key, $version)
-                ON CONFLICT(entity_key) DO UPDATE SET version = excluded.version;
-                """;
-            write.Parameters.AddWithValue("$key", entityKey);
-            write.Parameters.AddWithValue("$version", version);
-            write.ExecuteNonQuery();
-        }
+        UpsertSyncVersion(tx, entityKey, version);
         tx.Commit();
         return true;
     }
@@ -383,9 +495,39 @@ public sealed class MeshDb : IDisposable
         return result;
     }
 
+    internal IReadOnlyList<DeviceSyncCircleRename> GetSyncCircleRenames(string entityId)
+    {
+        var result = new List<DeviceSyncCircleRename>();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT previous_name, delete_version
+            FROM sync_circle_renames
+            WHERE entity_id = $id
+            ORDER BY previous_entity_id;
+            """;
+        cmd.Parameters.AddWithValue("$id", entityId);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            result.Add(new DeviceSyncCircleRename(reader.GetString(0), reader.GetString(1)));
+        return result;
+    }
+
     public string? GetSyncTombstoneVersion(string kind, string entityId)
     {
         using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT version FROM sync_tombstones WHERE kind = $kind AND entity_id = $id;";
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    private string? GetSyncTombstoneVersion(
+        SqliteTransaction transaction,
+        string kind,
+        string entityId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = "SELECT version FROM sync_tombstones WHERE kind = $kind AND entity_id = $id;";
         cmd.Parameters.AddWithValue("$kind", kind);
         cmd.Parameters.AddWithValue("$id", entityId);
@@ -512,6 +654,55 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$id", entityId);
         cmd.Parameters.AddWithValue("$version", version);
         cmd.ExecuteNonQuery();
+    }
+
+    private void UpsertSyncVersion(
+        SqliteTransaction transaction,
+        string entityKey,
+        string version)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = """
+            INSERT INTO sync_versions(entity_key, version) VALUES($key, $version)
+            ON CONFLICT(entity_key) DO UPDATE SET version = excluded.version;
+            """;
+        cmd.Parameters.AddWithValue("$key", entityKey);
+        cmd.Parameters.AddWithValue("$version", version);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void WriteCircleRename(
+        SqliteTransaction transaction,
+        SyncCircleRenameWrite rename)
+    {
+        using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = transaction;
+            delete.CommandText = "DELETE FROM sync_circle_renames WHERE entity_id = $id;";
+            delete.Parameters.AddWithValue("$id", rename.EntityId);
+            delete.ExecuteNonQuery();
+        }
+        foreach (var ancestor in rename.Renames)
+        {
+            using var insert = conn.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO sync_circle_renames(
+                    entity_id, previous_entity_id, previous_name, delete_version)
+                VALUES($id, $previousId, $name, $version)
+                ON CONFLICT(entity_id, previous_entity_id) DO UPDATE SET
+                    previous_name = excluded.previous_name,
+                    delete_version = excluded.delete_version;
+                """;
+            insert.Parameters.AddWithValue("$id", rename.EntityId);
+            insert.Parameters.AddWithValue(
+                "$previousId",
+                ProfileSyncState.CircleEntityId(ancestor.PreviousName));
+            insert.Parameters.AddWithValue("$name", ancestor.PreviousName);
+            insert.Parameters.AddWithValue("$version", ancestor.DeleteVersion);
+            insert.ExecuteNonQuery();
+        }
     }
 
     /// <summary>Records that a conversation thread exists so an empty thread survives a reload.</summary>

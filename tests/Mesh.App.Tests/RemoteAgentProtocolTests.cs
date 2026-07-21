@@ -1,5 +1,6 @@
 using Mesh.Shared;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using System.Text.Json;
 
 namespace Mesh.App.Tests;
 
@@ -15,6 +16,27 @@ public sealed class RemoteAgentProtocolTests
         Assert.AreEqual("request-1", request.RequestId);
         Assert.AreEqual("thread-1", request.ThreadId);
         Assert.AreEqual("Check the server.", request.Prompt);
+    }
+
+    [TestMethod]
+    public void RequestEnvelope_RoundTripsSourceAndTargetDevices()
+    {
+        var envelope = MeshEnvelope.Create(
+            "owner",
+            "owner",
+            MeshKinds.RemoteAgentRequest,
+            RemoteAgentProtocol.RequestBody("request-1", "thread-1", "Check the server."),
+            fromDevice: "mobile-device",
+            toDevice: "desktop-device");
+
+        var json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        var roundTrip = JsonSerializer.Deserialize<MeshEnvelope>(
+            json,
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.IsNotNull(roundTrip);
+        Assert.AreEqual("mobile-device", roundTrip.FromDevice);
+        Assert.AreEqual("desktop-device", roundTrip.ToDevice);
     }
 
     [TestMethod]

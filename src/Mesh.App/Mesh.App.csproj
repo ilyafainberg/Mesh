@@ -40,10 +40,10 @@
         <ApplicationIcon>Platforms\Windows\appicon.ico</ApplicationIcon>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.6.8</ApplicationDisplayVersion>
-        <ApplicationVersion>47</ApplicationVersion>
+        <ApplicationDisplayVersion>1.7.0</ApplicationDisplayVersion>
+        <ApplicationVersion>48</ApplicationVersion>
         <!-- Drives AssemblyVersion/FileVersion/InformationalVersion, read by the self-updater. -->
-        <Version>1.6.8</Version>
+        <Version>1.7.0</Version>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
@@ -55,6 +55,10 @@
         <TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
     </PropertyGroup>
 
+    <PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">
+        <CodesignEntitlements>Platforms\iOS\Entitlements.plist</CodesignEntitlements>
+    </PropertyGroup>
+
     <!-- MainPage references the Razor-generated Routes component. On iOS, runtime inflation
          defers that type lookup until Razor components have been generated and loaded. -->
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">
@@ -62,8 +66,15 @@
     </ItemGroup>
 
     <ItemGroup>
-        <!-- App Icon: the Mesh logo (single flattened image, already has its own background) -->
-        <MauiIcon Include="Resources\AppIcon\meshicon.png" BaseSize="1024,1024" Color="#131316" />
+        <!-- Platform storefront artwork also becomes the installed app icon. -->
+        <MauiIcon Include="Resources\AppIcon\Android\meshicon.png" BaseSize="512,512" Color="#131316"
+                  Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'" />
+        <MauiIcon Include="Resources\AppIcon\iOS\meshicon.png" BaseSize="1024,1024" Color="#131316"
+                  Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'" />
+        <MauiIcon Include="Resources\AppIcon\MacCatalyst\meshicon.png" BaseSize="1024,1024" Color="#131316"
+                  Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'" />
+        <MauiIcon Include="Resources\AppIcon\Windows\meshicon.png" BaseSize="1024,1024" Color="#131316"
+                  Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'" />
 
         <!-- Splash Screen -->
         <MauiSplashScreen Include="Resources\AppIcon\meshicon.png" Color="#131316" BaseSize="180,180" />

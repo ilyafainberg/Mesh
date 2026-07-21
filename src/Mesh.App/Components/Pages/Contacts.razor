@@ -228,37 +228,11 @@
     {
         var newName = editCircleName.Trim();
         if (string.IsNullOrWhiteSpace(newName)) { editingCircle = null; return; }
-        var old = circle.Name;
-        State.Mutate(p =>
-        {
-            circle.Name = newName;
-            // cascade rename into contacts and visibility tags
-            foreach (var c in p.Contacts)
-            {
-                var i = c.Circles.IndexOf(old);
-                if (i >= 0) c.Circles[i] = newName;
-            }
-            foreach (var k in p.Knowledge)
-                if (k.Visibility == $"shared:{old}") k.Visibility = $"shared:{newName}";
-            foreach (var s in p.Skills)
-                if (s.Visibility == $"shared:{old}") s.Visibility = $"shared:{newName}";
-        });
-        editingCircle = null;
+        if (State.RenameCircle(circle.Name, newName))
+            editingCircle = null;
     }
 
-    void DeleteCircle(Circle circle)
-    {
-        State.Mutate(p =>
-        {
-            p.Circles.Remove(circle);
-            // cascade cleanup: remove from contacts, downgrade shared items to private
-            foreach (var c in p.Contacts) c.Circles.Remove(circle.Name);
-            foreach (var k in p.Knowledge)
-                if (k.Visibility == $"shared:{circle.Name}") k.Visibility = "private";
-            foreach (var s in p.Skills)
-                if (s.Visibility == $"shared:{circle.Name}") s.Visibility = "private";
-        });
-    }
+    void DeleteCircle(Circle circle) => State.DeleteCircle(circle.Name);
 
     public void Dispose() => State.Changed -= Refresh;
 }

@@ -455,6 +455,8 @@ public sealed class MeshClient
         var from = AppState.Norm(env.From);
         var isGroupKind = env.Kind is MeshKinds.GroupControl or MeshKinds.GroupMessage or MeshKinds.Fanout;
         var isDeviceSync = DeviceSyncKinds.IsEnvelopeKind(env.Kind);
+        var isOwnDeviceKind = isDeviceSync
+            || env.Kind is MeshKinds.RemoteAgentRequest or MeshKinds.RemoteAgentResponse;
         if (env.Kind == MeshKinds.Fanout
             && env.ToDevice is not null
             && !string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
@@ -475,14 +477,14 @@ public sealed class MeshClient
         // Client-side verification: check the sender's signature against their pinned signing
         // keys (trust on first use). This defends against a malicious or compromised relay
         // forging or tampering with messages. On first contact we fetch and pin the keys.
-        DeviceSyncIdentity? inboundSyncIdentity = null;
+        DeviceSyncIdentity? inboundOwnDeviceIdentity = null;
         List<string> pinned;
-        if (isDeviceSync)
+        if (isOwnDeviceKind)
         {
-            inboundSyncIdentity = authenticatedDeviceSyncIdentity;
-            if (inboundSyncIdentity is null) return;
-            pinned = (await ResolveOwnDeviceKeysAsync(inboundSyncIdentity)).ToList();
-            if (!IsCurrentDeviceSyncIdentity(inboundSyncIdentity)) return;
+            inboundOwnDeviceIdentity = authenticatedDeviceSyncIdentity;
+            if (inboundOwnDeviceIdentity is null) return;
+            pinned = (await ResolveOwnDeviceKeysAsync(inboundOwnDeviceIdentity)).ToList();
+            if (!IsCurrentDeviceSyncIdentity(inboundOwnDeviceIdentity)) return;
         }
         else
         {
@@ -490,23 +492,23 @@ public sealed class MeshClient
             if (pinned.Count == 0)
                 pinned = (await ResolveDeviceKeysAsync(from)).ToList();
         }
-        if ((isGroupKind || isDeviceSync) && pinned.Count == 0)
+        if ((isGroupKind || isOwnDeviceKind) && pinned.Count == 0)
         {
             Log?.Invoke($"dropped {env.Kind} from @{from}: no sender keys available for signature verification");
             return;
         }
         var signatureValid = pinned.Count == 0
             || MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? "");
-        if (!signatureValid && isDeviceSync && inboundSyncIdentity is not null)
+        if (!signatureValid && isOwnDeviceKind && inboundOwnDeviceIdentity is not null)
         {
-            pinned = (await ResolveOwnDeviceKeysAsync(inboundSyncIdentity, refresh: true)).ToList();
-            signatureValid = IsCurrentDeviceSyncIdentity(inboundSyncIdentity)
+            pinned = (await ResolveOwnDeviceKeysAsync(inboundOwnDeviceIdentity, refresh: true)).ToList();
+            signatureValid = IsCurrentDeviceSyncIdentity(inboundOwnDeviceIdentity)
                 && pinned.Count > 0
                 && MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? "");
         }
         if (!signatureValid)
         {
-            if (isDeviceSync)
+            if (isOwnDeviceKind)
                 Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: signature verification failed");
             // The sender's keys no longer match what we pinned: the contact's identity may have
             // changed (rotation, reinstall, or an impostor). Surface it for re-verification instead
@@ -549,13 +551,36 @@ public sealed class MeshClient
         // our own handle (the relay only routes same-handle envelopes between our linked devices).
         if (env.Kind == MeshKinds.RemoteAgentRequest)
         {
-            if (!string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal)
-                || !PlatformCaps.CanHostHomeAgent
-                || !state.Profile.ActAsRemoteAgent
-                || from != AppState.Norm(state.Profile.Handle)
-                || string.IsNullOrWhiteSpace(env.FromDevice)
-                || !RemoteAgentProtocol.TryParseRequest(text, out var request))
+            if (!string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
+            {
+                Log?.Invoke("dropped remote agent request: target device does not match this device");
                 return;
+            }
+            if (!PlatformCaps.CanHostHomeAgent)
+            {
+                Log?.Invoke("dropped remote agent request: this platform cannot host the home agent");
+                return;
+            }
+            if (!state.Profile.ActAsRemoteAgent)
+            {
+                Log?.Invoke("dropped remote agent request: acting as the home agent is disabled");
+                return;
+            }
+            if (from != AppState.Norm(state.Profile.Handle))
+            {
+                Log?.Invoke("dropped remote agent request: sender handle does not match the local handle");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(env.FromDevice))
+            {
+                Log?.Invoke("dropped remote agent request: source device is missing");
+                return;
+            }
+            if (!RemoteAgentProtocol.TryParseRequest(text, out var request))
+            {
+                Log?.Invoke("dropped remote agent request: payload is invalid");
+                return;
+            }
 
             var answer = await agent.AskAsRemoteAsync(request.Prompt, ct);
             var responseBody = RemoteAgentProtocol.ResponseBody(
@@ -1557,6 +1582,7 @@ public sealed class MeshClient
             MeshKinds.RemoteAgentRequest,
             wire,
             signature,
+            fromDevice: MyDeviceId,
             toDevice: homeDeviceId);
         try
         {

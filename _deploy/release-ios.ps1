@@ -468,18 +468,31 @@ function Test-Ipa {
       Invoke-Native "codesign" @("--verify", "--deep", "--strict", "--verbose=2", $app.FullName) `
         "codesign verification"
       Ok "Apple code signature verified"
+
+      $signedEntitlements = Invoke-NativeOutput "codesign" @(
+        "-d", "--entitlements", ":-", $app.FullName
+      ) "signed app entitlement inspection"
+      $keychainGroupPattern =
+        '(?s)<key>keychain-access-groups</key>\s*<array>(?:(?!</array>).)*<string>[^<]*com\.microsoft\.adalcache</string>(?:(?!</array>).)*</array>'
+      if ($signedEntitlements -notmatch $keychainGroupPattern) {
+        Fail "Signed IPA is missing com.microsoft.adalcache from keychain-access-groups. Refusing upload."
+      }
+      Ok "signed MSAL keychain entitlement verified"
     } else {
       # Parse the exact keys with plutil on the paired Mac. This avoids weak byte/string
       # searches against a binary plist while still validating the IPA copied back to Windows.
       $remoteId = [guid]::NewGuid().ToString("N")
       $remoteInfo = "/tmp/mesh-$remoteId-Info.plist"
       $remoteProfile = "/tmp/mesh-$remoteId.mobileprovision"
+      $remoteApp = "/tmp/mesh-$remoteId.app"
       $remoteHost = "$MacUser@$MacAddress"
       try {
         Invoke-Native "scp" @("-q", $infoPlist, "${remoteHost}:$remoteInfo") `
           "copy Info.plist to paired Mac"
         Invoke-Native "scp" @("-q", $profile, "${remoteHost}:$remoteProfile") `
           "copy provisioning profile to paired Mac"
+        Invoke-Native "scp" @("-q", "-r", $app.FullName, "${remoteHost}:$remoteApp") `
+          "copy app bundle to paired Mac"
 
         $actualBundle = Invoke-NativeOutput "ssh" @(
           $remoteHost, "plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-", $remoteInfo
@@ -502,10 +515,21 @@ function Test-Ipa {
         $profileText = Invoke-NativeOutput "ssh" @(
           $remoteHost, "security", "cms", "-D", "-i", $remoteProfile
         ) "remote provisioning profile decode"
+        Invoke-Native "ssh" @(
+          $remoteHost, "codesign", "--verify", "--deep", "--strict", "--verbose=2", $remoteApp
+        ) "remote codesign verification"
+        $signedEntitlements = Invoke-NativeOutput "ssh" @(
+          $remoteHost, "codesign", "-d", "--entitlements", ":-", $remoteApp
+        ) "remote signed app entitlement inspection"
+        $keychainGroupPattern =
+          '(?s)<key>keychain-access-groups</key>\s*<array>(?:(?!</array>).)*<string>[^<]*com\.microsoft\.adalcache</string>(?:(?!</array>).)*</array>'
+        if ($signedEntitlements -notmatch $keychainGroupPattern) {
+          Fail "Signed IPA is missing com.microsoft.adalcache from keychain-access-groups. Refusing upload."
+        }
+        Ok "remote Apple code signature and MSAL keychain entitlement verified"
       } finally {
-        & ssh $remoteHost "rm" "-f" $remoteInfo $remoteProfile *> $null
+        & ssh $remoteHost "rm" "-rf" $remoteInfo $remoteProfile $remoteApp *> $null
       }
-      Warn "Apple codesign cryptographic verification runs only in local Mac mode."
     }
 
     if ($profileText -notmatch [regex]::Escape("net.meshrelay.mesh")) {
