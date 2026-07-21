@@ -54,6 +54,7 @@ public interface IDeviceTopicTransport
     Task<TopicDispatchResult> DispatchAsync(
         string targetDeviceId,
         TopicRunRequestPayload request,
+        IReadOnlyList<ChatAttachment> attachments,
         CancellationToken cancellationToken);
 
     Task<bool> CancelAsync(
