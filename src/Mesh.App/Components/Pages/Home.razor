@@ -1,7 +1,7 @@
 ﻿@page "/"
 @inject AppState State
 @inject AgentService Agent
-@inject AgentRunCoordinator Runs
+@inject ITopicExecutionRouter TopicRouter
 @inject MeshClient Mesh
 @inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
@@ -11,20 +11,99 @@
 <div class="split">
     <div class="conv-list">
         <h2><i class="bi bi-person-badge"></i> Me</h2>
-        <div class="new-conv">
+        <div class="new-conv create-topic-row">
             <span class="muted" style="flex:1;">your private topic chats</span>
-            <button class="primary icon-primary" @onclick="NewThread" title="New chat" aria-label="New chat"><i class="bi bi-plus-lg"></i></button>
+            <div class="split-create">
+                <button class="primary new-chat-primary" @onclick="NewLocalThread"><i class="bi bi-plus-lg"></i> New chat</button>
+                <button class="primary new-chat-chevron" @ref="createMenuButton" @onclick="ToggleCreateMenu"
+                        aria-label="Choose device for new chat" aria-haspopup="menu"
+                        aria-expanded="@createMenuOpen" aria-controls="new-chat-device-menu">
+                    <i class="bi bi-chevron-down"></i>
+                </button>
+                @if (createMenuOpen)
+                {
+                    <button class="menu-scrim" tabindex="-1" aria-hidden="true" @onclick="CloseCreateMenu"></button>
+                    <div id="new-chat-device-menu" class="device-menu" role="menu" aria-label="Choose device for new chat" @onkeydown="OnCreateMenuKey">
+                        <div class="device-menu-title">Start a topic</div>
+                        @if (loadingDevices)
+                        {
+                            <div class="device-menu-state"><i class="bi bi-hourglass-split"></i> Loading devices...</div>
+                        }
+                        else
+                        {
+                            <button class="device-menu-item" role="menuitem" @onclick="() => CreateThreadOn(CurrentDevice)">
+                                <i class="bi @PlatformIcon(CurrentDevice.Platform)"></i>
+                                <span><b>Talk to this device</b><small>@DeviceName(CurrentDevice)</small></span>
+                                <span class="device-state online">online</span>
+                            </button>
+                            @foreach (var device in OtherEligibleDevices)
+                            {
+                                <button class="device-menu-item" role="menuitem" disabled="@(!device.Online)"
+                                        @onclick="() => CreateThreadOn(ToExecutionDevice(device))">
+                                    <i class="bi @PlatformIcon(device.Platform)"></i>
+                                    <span><b>Talk to @DeviceName(device)</b><small>@PlatformLabel(device.Platform)</small></span>
+                                    <span class="device-state @(device.Online ? "online" : "offline")">@(device.Online ? "online" : "offline")</span>
+                                </button>
+                            }
+                            @if (OtherEligibleDevices.Count == 0)
+                            {
+                                <div class="device-menu-state">No other agent-ready devices</div>
+                            }
+                        }
+                        @if (deviceError is not null)
+                        {
+                            <div class="device-menu-error" role="alert">@deviceError</div>
+                        }
+                    </div>
+                }
+            </div>
         </div>
-        <div class="thread-order-list" @ref="threadListEl">
-            @foreach (var t in Threads)
+        <div class="thread-groups">
+            @if (PinnedThreads.Count > 0)
             {
-                <div class="conv-item @(t.Id == activeThread ? "active" : "")" data-thread-id="@t.Id" @key="t.Id" @onclick="() => Select(t.Id)">
-                    <button class="thread-grip" data-thread-grip type="button" title="Drag to reorder" aria-label="Drag @(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title) to reorder" @onclick:stopPropagation="true">
-                        <i class="bi bi-grip-vertical"></i>
-                    </button>
-                    <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                    @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
-                </div>
+                <div class="thread-group-label">Pinned</div>
+                @foreach (var t in PinnedThreads)
+                {
+                    <div class="conv-item @(t.Id == activeThread ? "active" : "")" @key="t.Id"
+                         role="button" tabindex="0" aria-label="Open @(ThreadTitle(t))"
+                         @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
+                        <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                        @if (IsRemoteBound(t))
+                        {
+                            <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                  title="@DeviceStatusText(t)">
+                                <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
+                            </span>
+                        }
+                        @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                        <button class="thread-pin" title="Unpin topic" aria-label="Unpin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
+                            <i class="bi bi-pin-angle-fill"></i>
+                        </button>
+                    </div>
+                }
+            }
+            @if (RecentThreads.Count > 0)
+            {
+                <div class="thread-group-label">Recent</div>
+                @foreach (var t in RecentThreads)
+                {
+                    <div class="conv-item @(t.Id == activeThread ? "active" : "")" @key="t.Id"
+                         role="button" tabindex="0" aria-label="Open @(ThreadTitle(t))"
+                         @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
+                        <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                        @if (IsRemoteBound(t))
+                        {
+                            <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                  title="@DeviceStatusText(t)">
+                                <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
+                            </span>
+                        }
+                        @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                        <button class="thread-pin" title="Pin topic" aria-label="Pin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
+                            <i class="bi bi-pin-angle"></i>
+                        </button>
+                    </div>
+                }
             }
         </div>
         @if (State.Profile.OwnThreads.Count == 0)
@@ -44,12 +123,56 @@
             else
             {
                 <h2>@(Active is null ? "Me" : (string.IsNullOrWhiteSpace(Active.Title) ? "New chat" : Active.Title))</h2>
-                <span class="muted">your agent sees everything you know</span>
+                @if (Active is not null)
+                {
+                    <span class="topic-header-device @(!ActiveDeviceOnline ? "offline" : "")" title="@ActiveDeviceStatus">
+                        <i class="bi @PlatformIcon(Active.ExecutionDevicePlatform ?? CurrentDevice.Platform)"></i>
+                        @ActiveDeviceStatus
+                    </span>
+                }
             }
             <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
                 <TokenMeter Compact="true" />
                 @if (Active is not null && !renaming)
                 {
+                    <div class="header-device-actions">
+                        <button class="ghost move-topic-button" title="Move topic to another device" aria-label="Move topic to another device"
+                                aria-haspopup="menu" aria-expanded="@moveMenuOpen" aria-controls="move-topic-device-menu"
+                                @ref="moveMenuButton" @onclick="ToggleMoveMenu"><i class="bi bi-device-ssd"></i> Move topic to...</button>
+                        @if (moveMenuOpen)
+                        {
+                            <button class="menu-scrim" tabindex="-1" aria-hidden="true" @onclick="CloseMoveMenu"></button>
+                            <div id="move-topic-device-menu" class="device-menu header-device-menu" role="menu" aria-label="Move topic to" @onkeydown="OnMoveMenuKey">
+                                <div class="device-menu-title">Move topic to...</div>
+                                @if (loadingDevices)
+                                {
+                                    <div class="device-menu-state">Loading devices...</div>
+                                }
+                                else
+                                {
+                                    @foreach (var device in DeviceChoices)
+                                    {
+                                        var selected = Active.ExecutionDeviceId == device.DeviceId
+                                            || Active.ExecutionDeviceId is null && device.DeviceId == Mesh.MyDeviceId;
+                                        <button class="device-menu-item" role="menuitem" disabled="@(!device.Online || selected)"
+                                                @onclick="() => RequestMove(ToExecutionDevice(device))">
+                                            <i class="bi @PlatformIcon(device.Platform)"></i>
+                                            <span><b>@(device.DeviceId == Mesh.MyDeviceId ? "This device" : DeviceName(device))</b><small>@(selected ? "assigned" : PlatformLabel(device.Platform))</small></span>
+                                            <span class="device-state @(device.Online ? "online" : "offline")">@(device.Online ? "online" : "offline")</span>
+                                        </button>
+                                    }
+                                }
+                                @if (deviceError is not null)
+                                {
+                                    <div class="device-menu-error" role="alert">@deviceError</div>
+                                }
+                            </div>
+                        }
+                    </div>
+                    <button class="ghost icon-btn" title="@(Active.IsPinned ? "Unpin topic" : "Pin topic")"
+                            aria-label="@(Active.IsPinned ? "Unpin topic" : "Pin topic")" @onclick="() => TogglePin(Active)">
+                        <i class="bi @(Active.IsPinned ? "bi-pin-angle-fill" : "bi-pin-angle")"></i>
+                    </button>
                     <button class="ghost icon-btn" title="Rename chat" aria-label="Rename chat" @onclick="BeginRename"><i class="bi bi-pencil"></i></button>
                     @if (confirmDelete)
                     {
@@ -65,6 +188,14 @@
                 }
             </span>
         </header>
+        @if (pendingMove is not null)
+        {
+            <div class="move-confirm" role="alertdialog" aria-label="Confirm moving active topic">
+                <span>@pendingMove.TopicTitle has an active run. Stop it and move the topic to @DeviceName(pendingMove.Target)? History stays with the topic.</span>
+                <button class="primary" @onclick="ConfirmActiveMove">Stop and move</button>
+                <button class="ghost" @onclick="() => pendingMove = null">Cancel</button>
+            </div>
+        }
 
         <div class="messages" @ref="scrollEl">
             <div class="messages-wrap">
@@ -94,10 +225,6 @@
                             }
                             <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                             OnPin="html => PinWidget(html, line)" />
-                            @if (line.Via == "home-agent")
-                            {
-                                <div class="msg-tag home-agent-tag"><i class="bi bi-house-gear"></i> Home Agent</div>
-                            }
                             @if (IsQueued(line))
                             {
                                 <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
@@ -108,7 +235,63 @@
                 @if (ActiveBusy)
                 {
                     <div class="bubble assistant">
-                        @{ var run = Active is null ? null : State.AgentRunFor(Active.Id); }
+                        @{ var remote = Active is null ? null : State.GetRemoteRunProjection(Active.Id); }
+                        @if (remote is not null)
+                        {
+                            @if (!string.IsNullOrWhiteSpace(remote.Plan))
+                            {
+                                <div class="text md">@((MarkupString)Markdown.ToHtml(remote.Plan))</div>
+                            }
+                            @if (remote.Subtasks is { Count: > 0 })
+                            {
+                                <div class="agent-steps">
+                                    @foreach (var task in remote.Subtasks)
+                                    {
+                                        <div class="agent-step @RunItemClass(task.State)">
+                                            <i class="bi @RunItemIcon(task.State)"></i><span>@task.Title</span>
+                                        </div>
+                                    }
+                                </div>
+                            }
+                            @if (remote.Steps is { Count: > 0 })
+                            {
+                                <div class="agent-steps">
+                                    @foreach (var step in remote.Steps)
+                                    {
+                                        <div class="agent-step-item">
+                                            <div class="agent-step @RunItemClass(step.State)">
+                                                <i class="bi @RunItemIcon(step.State)"></i><span>@step.Label</span>
+                                            </div>
+                                            @if (showStepDetails && (!string.IsNullOrEmpty(step.Arguments) || !string.IsNullOrEmpty(step.Result)))
+                                            {
+                                                <div class="agent-step-detail">
+                                                    @if (!string.IsNullOrEmpty(step.Arguments))
+                                                    {
+                                                        <div class="step-detail-label">input</div>
+                                                        <pre class="step-detail-body">@step.Arguments</pre>
+                                                    }
+                                                    @if (!string.IsNullOrEmpty(step.Result))
+                                                    {
+                                                        <div class="step-detail-label">output</div>
+                                                        <pre class="step-detail-body">@step.Result</pre>
+                                                    }
+                                                </div>
+                                            }
+                                        </div>
+                                    }
+                                </div>
+                                <button class="step-details-toggle" @onclick="() => showStepDetails = !showStepDetails">
+                                    <i class="bi @(showStepDetails ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                                    @(showStepDetails ? "Hide details" : "Show details")
+                                </button>
+                            }
+                            <div class="msg-tag"><i class="bi bi-diagram-3"></i> @RemoteStatus(remote)</div>
+                            @if (remote.Queued > 0)
+                            {
+                                <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued @remote.Queued</div>
+                            }
+                        }
+                        @{ var run = remote is null && Active is not null ? State.AgentRunFor(Active.Id) : null; }
                         @if (run is not null)
                         {
                             @if (run.Phase == AgentRunPhase.Planning)
@@ -155,7 +338,7 @@
                                 @(showStepDetails ? "Hide details" : "Show details")
                             </button>
                         }
-                        @if (run?.Phase != AgentRunPhase.Planning)
+                        @if (remote is null && run?.Phase != AgentRunPhase.Planning)
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
@@ -252,13 +435,6 @@
                     <button class="ghost icon-btn plus-btn" @onclick="PickFile" disabled="@ActiveBusy" title="Attach an image or document" aria-label="Attach an image or document">
                         <i class="bi bi-paperclip"></i>
                     </button>
-                    @if (PlatformCaps.IsMobile)
-                    {
-                        <button class="ghost icon-btn plus-btn @(homeMode ? "on" : "")" @onclick="() => homeMode = !homeMode" disabled="@ActiveBusy"
-                                title="Ask my home agent (runs on my desktop with full tools)" aria-label="Ask my home agent">
-                            <i class="bi bi-house-gear"></i>
-                        </button>
-                    }
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
                               placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
                     @if (ActiveBusy)
@@ -269,12 +445,17 @@
                     }
                     else
                     {
-                        <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null)" title="Send" aria-label="Send">
+                        <button class="primary send-btn" @onclick="Send" disabled="@SendDisabled" title="@SendTitle" aria-label="@SendTitle">
                             <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
                         </button>
                     }
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
+                @if (dispatchError is not null) { <p class="err-text" role="alert">@dispatchError</p> }
+                @if (Active is not null && !ActiveDeviceOnline)
+                {
+                    <div class="warn-banner"><i class="bi bi-wifi-off"></i> @ActiveDeviceStatus is offline. Sending is unavailable until it reconnects, or move this topic to an online device.</div>
+                }
                 @if (!Agent.IsModelReady)
                 {
                     <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
@@ -301,7 +482,6 @@
     bool widgetMode;
     bool widgetPickerOpen;
     Widget? selectedWidget;
-    bool homeMode;
     bool confirmDelete;
     bool renaming;
     string renameText = "";
@@ -313,24 +493,35 @@
     string? pinError;
     ElementReference scrollEl;
     ElementReference composerEl;
-    ElementReference threadListEl;
+    ElementReference createMenuButton;
+    ElementReference moveMenuButton;
     Microsoft.JSInterop.DotNetObjectReference<Home>? selfRef;
     bool composerWired;
     int lastCount = -1;
     bool lastBusy;
-    bool disposed;
+    bool createMenuOpen;
+    bool moveMenuOpen;
+    bool loadingDevices;
+    string? deviceError;
+    string? dispatchError;
+    PendingTopicMove? pendingMove;
+    readonly List<global::Mesh.Shared.DeviceInfo> eligibleDevices = new();
+    sealed record PendingTopicMove(string ThreadId, string TopicTitle, string RunId, ExecutionDevice Target);
 
-    // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
-    bool ActiveBusy => Active is not null && State.IsThreadBusy(Active.Id);
+    bool ActiveBusy => Active is not null
+        && (State.IsThreadBusy(Active.Id)
+            || State.GetRemoteRunProjection(Active.Id) is not null
+            || IsRemoteBound(Active) && !string.IsNullOrWhiteSpace(Active.ExecutionRunId));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
-    string ComposerPlaceholder => homeMode
-        ? "Message your home assistant..."
-        : widgetMode
+    string ComposerPlaceholder => widgetMode
         ? "Describe the widget you want…"
         : selectedWidget is not null
             ? $"Use or change {selectedWidget.Name}…"
             : "Message your assistant…";
-    string ComposerAriaLabel => homeMode ? "Message your home assistant" : "Message your assistant";
+    string ComposerAriaLabel => "Message your assistant";
+    bool SendDisabled => (!ActiveDeviceOnline && Active is not null)
+        || string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null;
+    string SendTitle => Active is not null && !ActiveDeviceOnline ? "Assigned device is offline" : "Send";
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
@@ -354,16 +545,6 @@
         _ => "bi-dot"
     };
 
-    static string HomeAgentFailure(string code) => code.ToLowerInvariant() switch
-    {
-        "home_device_required" or "no-target" or "no_target" or "no-home-device" => "Select an online desktop in Settings first.",
-        "home_device_offline" or "offline" or "target-offline" or "target_offline" => "Your selected Home device is offline.",
-        "home_device_not_eligible" or "disabled" or "target-disabled" or "target_disabled" => "Home Agent is unavailable on the selected desktop.",
-        "not_connected" or "disconnected" or "not-connected" or "relay-disconnected" or "unreachable" => "Could not reach your Home device. Check its connection.",
-        "rejected" => "Your Home device rejected the request.",
-        _ => "Could not send this request to your Home device."
-    };
-
     // Tier-1 steerable input: messages submitted while a thread's turn is running are queued for that
     // thread (shown immediately as a subtle "queued" line) and answered together in ONE follow-up turn
     // after the current one finishes, in order. A thread never runs two of its own turns concurrently,
@@ -375,8 +556,27 @@
         public string SizeLabel => Human(Size);
     }
 
-    IReadOnlyList<OwnThread> Threads => State.Profile.OwnThreads;
+    IReadOnlyList<OwnThread> Threads => State.OrderedOwnThreads;
+    IReadOnlyList<OwnThread> PinnedThreads => Threads.Where(t => t.IsPinned).ToList();
+    IReadOnlyList<OwnThread> RecentThreads => Threads.Where(t => !t.IsPinned).ToList();
     OwnThread? Active => activeThread is null ? null : State.Profile.OwnThreads.FirstOrDefault(t => t.Id == activeThread);
+    ExecutionDevice CurrentDevice => new(Mesh.MyDeviceId, State.Profile.DeviceName, PlatformCaps.DevicePlatform);
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> OtherEligibleDevices => eligibleDevices
+        .Where(d => d.AgentReady && d.DeviceId != Mesh.MyDeviceId)
+        .OrderByDescending(d => d.Online).ThenBy(d => DeviceName(d), StringComparer.OrdinalIgnoreCase).ToList();
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices
+    {
+        get
+        {
+            var current = new global::Mesh.Shared.DeviceInfo(Mesh.MyDeviceId, State.Profile.DeviceName, true, PlatformCaps.DevicePlatform, true);
+            return new[] { current }.Concat(OtherEligibleDevices).ToList();
+        }
+    }
+    bool ActiveDeviceOnline => Active is null || Active.ExecutionDeviceId is null
+        || Active.ExecutionDeviceId == Mesh.MyDeviceId || IsDeviceOnline(Active.ExecutionDeviceId);
+    string ActiveDeviceStatus => Active is null ? "" : Active.ExecutionDeviceId is null
+        ? "This device on next send"
+        : $"{ThreadDeviceName(Active)} ({(ActiveDeviceOnline ? "online" : "offline")})";
 
     bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
@@ -403,6 +603,8 @@
             activeThread = State.Profile.OwnThreads[^1].Id;
         if (activeThread is not null) State.MarkThreadSeen(activeThread);
     }
+
+    protected override async Task OnInitializedAsync() => await LoadDevicesAsync();
 
     static string? ParseQueryValue(string queryString, string key)
     {
@@ -437,7 +639,6 @@
                 }
                 catch { }
             }
-            try { await JS.InvokeVoidAsync("meshUI.threadReorder", threadListEl, selfRef); } catch { }
         }
 
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
@@ -481,24 +682,17 @@
         return InvokeAsync(StateHasChanged);
     }
 
-    [Microsoft.JSInterop.JSInvokable]
-    public Task ReorderThread(string draggedId, string targetId, bool before)
-    {
-        var from = State.Profile.OwnThreads.FindIndex(t => t.Id == draggedId);
-        var target = State.Profile.OwnThreads.FindIndex(t => t.Id == targetId);
-        if (from < 0 || target < 0 || from == target) return Task.CompletedTask;
-        var destination = target + (before ? 0 : 1);
-        if (from < destination) destination--;
-        State.ReorderOwnThread(draggedId, destination);
-        return InvokeAsync(StateHasChanged);
-    }
-
     void Select(string id)
     {
         activeThread = id;
         confirmDelete = false;
         renaming = false;
         State.MarkThreadSeen(id);
+    }
+
+    void OnThreadKey(KeyboardEventArgs e, string id)
+    {
+        if (e.Key is "Enter" or " ") Select(id);
     }
 
     void OpenReport()
@@ -508,14 +702,156 @@
             l => l.Role == "assistant" ? "agent" : "me", State.CurrentModelKey());
     }
 
-    void NewThread()
+    void NewLocalThread() => CreateThreadOn(CurrentDevice);
+
+    void CreateThreadOn(ExecutionDevice device)
     {
-        var t = State.NewOwnThread();
+        if (device.DeviceId != Mesh.MyDeviceId && !IsDeviceOnline(device.DeviceId)) return;
+        var t = State.NewOwnThread("New chat", device);
         activeThread = t.Id;
         confirmDelete = false;
         renaming = false;
         input = "";
+        createMenuOpen = false;
     }
+
+    async Task LoadDevicesAsync()
+    {
+        loadingDevices = true;
+        deviceError = null;
+        try
+        {
+            eligibleDevices.Clear();
+            eligibleDevices.AddRange(await TopicRouter.ListEligibleDevicesAsync(CancellationToken.None));
+        }
+        catch
+        {
+            deviceError = "Could not load linked devices. Check your connection and try again.";
+        }
+        finally
+        {
+            loadingDevices = false;
+        }
+    }
+
+    async Task ToggleCreateMenu()
+    {
+        createMenuOpen = !createMenuOpen;
+        moveMenuOpen = false;
+        if (createMenuOpen) await LoadDevicesAsync();
+    }
+
+    async Task ToggleMoveMenu()
+    {
+        moveMenuOpen = !moveMenuOpen;
+        createMenuOpen = false;
+        if (moveMenuOpen) await LoadDevicesAsync();
+    }
+
+    async Task CloseCreateMenu()
+    {
+        createMenuOpen = false;
+        await createMenuButton.FocusAsync();
+    }
+
+    async Task CloseMoveMenu()
+    {
+        moveMenuOpen = false;
+        await moveMenuButton.FocusAsync();
+    }
+
+    async Task OnCreateMenuKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") await CloseCreateMenu();
+    }
+
+    async Task OnMoveMenuKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") await CloseMoveMenu();
+    }
+
+    void RequestMove(ExecutionDevice target)
+    {
+        moveMenuOpen = false;
+        if (Active is null) return;
+        if (ActiveBusy)
+        {
+            var runId = CurrentRunId(Active);
+            if (string.IsNullOrWhiteSpace(runId))
+            {
+                dispatchError = "The active run could not be identified. Wait for it to finish before moving this topic.";
+                return;
+            }
+            pendingMove = new PendingTopicMove(Active.Id, ThreadTitle(Active), runId, target);
+            return;
+        }
+        MoveActiveTo(target);
+    }
+
+    async Task ConfirmActiveMove()
+    {
+        var target = pendingMove;
+        pendingMove = null;
+        if (target is null) return;
+        if (!await TopicRouter.StopAsync(target.ThreadId, target.RunId, CancellationToken.None))
+        {
+            dispatchError = $"Could not stop {target.TopicTitle}. It was not moved.";
+            return;
+        }
+        State.MoveOwnThreadToDevice(target.ThreadId, target.Target);
+    }
+
+    void MoveActiveTo(ExecutionDevice target)
+    {
+        if (Active is null) return;
+        State.MoveOwnThreadToDevice(Active.Id, target);
+    }
+
+    void TogglePin(OwnThread thread) => State.SetOwnThreadPinned(thread.Id, !thread.IsPinned);
+
+    bool IsRemoteBound(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
+        && thread.ExecutionDeviceId != Mesh.MyDeviceId;
+    bool IsDeviceOnline(string? deviceId) => deviceId == Mesh.MyDeviceId
+        || eligibleDevices.Any(d => d.DeviceId == deviceId && d.Online && d.AgentReady);
+    string ThreadTitle(OwnThread thread) => string.IsNullOrWhiteSpace(thread.Title) ? "New chat" : thread.Title;
+    string ThreadDeviceName(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceName)
+        ? thread.ExecutionDeviceName : DeviceNameForId(thread.ExecutionDeviceId);
+    string DeviceNameForId(string? id) => eligibleDevices.FirstOrDefault(d => d.DeviceId == id) is { } d
+        ? DeviceName(d) : "Linked device";
+    string DeviceStatusText(OwnThread thread) => $"{ThreadDeviceName(thread)} is {(IsDeviceOnline(thread.ExecutionDeviceId) ? "online" : "offline")}";
+    static string DeviceName(global::Mesh.Shared.DeviceInfo device) => string.IsNullOrWhiteSpace(device.Name) ? "Linked device" : device.Name;
+    static string DeviceName(ExecutionDevice device) => string.IsNullOrWhiteSpace(device.DeviceName) ? "Linked device" : device.DeviceName;
+    static ExecutionDevice ToExecutionDevice(global::Mesh.Shared.DeviceInfo device) => new(device.DeviceId, device.Name, device.Platform);
+    static string PlatformLabel(string? platform) => platform?.ToLowerInvariant() switch
+    {
+        global::Mesh.Shared.DevicePlatforms.Windows => "Windows",
+        global::Mesh.Shared.DevicePlatforms.MacOS => "Mac",
+        global::Mesh.Shared.DevicePlatforms.Android => "Android",
+        global::Mesh.Shared.DevicePlatforms.IOS => "iPhone or iPad",
+        _ => "Device"
+    };
+    static string PlatformIcon(string? platform) => platform?.ToLowerInvariant() switch
+    {
+        global::Mesh.Shared.DevicePlatforms.Windows => "bi-windows",
+        global::Mesh.Shared.DevicePlatforms.MacOS => "bi-apple",
+        global::Mesh.Shared.DevicePlatforms.Android => "bi-android2",
+        global::Mesh.Shared.DevicePlatforms.IOS => "bi-phone",
+        _ => "bi-device-ssd"
+    };
+    string? CurrentRunId(OwnThread thread) => State.GetRemoteRunProjection(thread.Id)?.RunId
+        ?? State.AgentRunFor(thread.Id)?.RunId
+        ?? thread.ExecutionRunId;
+    static string RunItemClass(global::Mesh.Shared.TopicRunItemState state) => state.ToString().ToLowerInvariant();
+    static string RunItemIcon(global::Mesh.Shared.TopicRunItemState state) => state switch
+    {
+        global::Mesh.Shared.TopicRunItemState.Running => "bi-arrow-repeat spin",
+        global::Mesh.Shared.TopicRunItemState.Completed => "bi-check2",
+        global::Mesh.Shared.TopicRunItemState.Failed => "bi-exclamation-triangle",
+        global::Mesh.Shared.TopicRunItemState.Cancelled => "bi-x",
+        _ => "bi-circle"
+    };
+    static string RemoteStatus(RemoteRunProjection remote) => !string.IsNullOrWhiteSpace(remote.Status)
+        ? remote.Status : remote.Phase.ToString().ToLowerInvariant();
 
     void BeginRename()
     {
@@ -609,20 +945,28 @@
         return $"{size:0.#} {units[u]}";
     }
 
-    // Stops the active thread's running turn. Cancellation flows into the agent call and the provider
-    // tool loop, so the in-flight model request is actually aborted (not just hidden).
-    void StopActive()
+    async Task StopActive()
     {
-        if (Active is not null) State.CancelThreadTurn(Active.Id);
+        if (Active is null) return;
+        var runId = CurrentRunId(Active);
+        if (!string.IsNullOrWhiteSpace(runId))
+            await TopicRouter.StopAsync(Active.Id, runId, CancellationToken.None);
     }
 
     async Task Send()
     {
-        if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null) return;
-
-        // Ensure there is a thread to write into, and name a fresh one after its first message.
-        var thread = Active ?? State.NewOwnThread();
+        if (SendDisabled) return;
+        dispatchError = null;
+        var thread = Active ?? State.NewOwnThread("New chat", CurrentDevice);
         activeThread = thread.Id;
+        if (thread.ExecutionDeviceId is null)
+            State.BindOwnThreadForSend(thread.Id, CurrentDevice);
+        if (!ActiveDeviceOnline)
+        {
+            dispatchError = "The assigned device is offline. Move the topic to an online device to continue.";
+            return;
+        }
+
         var text = input;
         var chosenWidget = selectedWidget;
         var titleText = !string.IsNullOrWhiteSpace(text)
@@ -632,246 +976,115 @@
             State.RenameOwnThread(thread.Id, Titleize(titleText));
 
         var files = attachments.ToList();
-        // Capture the composer modes now, since they are reset immediately and the turn runs async.
         var wasWidget = widgetMode;
-        var wasHome = homeMode;
+        List<ChatAttachment> turnAttachments;
+        try
+        {
+            turnAttachments = await LoadAttachmentsAsync(files, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            dispatchError = ex.Message;
+            return;
+        }
+
+        var prompt = BuildTurnPrompt(text, chosenWidget, wasWidget);
+        var trigger = new ChatLine
+        {
+            Id = Guid.NewGuid().ToString("n"),
+            Role = "user",
+            Text = prompt,
+            Attachments = turnAttachments,
+            At = DateTimeOffset.UtcNow
+        };
+        var runId = Guid.NewGuid().ToString("n");
+        State.AddOwnChatLine(thread.Id, trigger);
+
         input = "";
         attachments.Clear();
         widgetMode = false;
-        homeMode = false;
         widgetPickerOpen = false;
         selectedWidget = null;
         _ = ResetComposer();
 
-        // This thread is already running a turn: queue this input for its next turn instead of
-        // starting a second concurrent call in the SAME thread. Show it immediately as a subtle
-        // "queued" user line; it is already in the thread history, so the drain answers it in order.
-        // Other threads are unaffected and keep running independently. The busy check is against the
-        // shared app state, so a page instance reopened mid-turn still queues instead of double-running.
-        if (State.IsThreadBusy(thread.Id))
-        {
-            // Widget creation/refinement is typed work, not a generic agent continuation. Preserve
-            // the composer state instead of degrading it into the normal queued-chat path.
-            if (wasWidget || chosenWidget is not null)
-            {
-                input = text;
-                attachments.AddRange(files);
-                widgetMode = wasWidget;
-                selectedWidget = chosenWidget;
-                attachError = "Wait for the current turn to finish before using or changing a widget.";
-                return;
-            }
-            var queuedImages = await LoadImageAttachmentsAsync(files, CancellationToken.None);
-            var qLine = new ChatLine
-            {
-                Role = "user",
-                Text = chosenWidget is null
-                    ? ComposeOwnerPrompt(text, files, queuedImages)
-                    : ComposeQueuedWidgetPrompt(chosenWidget, text, files, queuedImages),
-                Attachments = queuedImages
-            };
-            State.AddOwnChatLine(thread.Id, qLine);
-            State.EnqueueForThread(thread.Id, qLine);
-            return;
-        }
-
-        // Run this thread's turn WITHOUT awaiting it here, so sending in one Me topic never blocks
-        // (or visually freezes) another. Each thread manages its own busy state and queue drain.
-        _ = RunThreadTurnAsync(thread.Id, text, files, wasWidget, wasHome, chosenWidget);
-    }
-
-    // Runs one owner turn for a single thread, then drains that thread's queue. Independent of any
-    // other thread's turn (service scopes flow via AsyncLocal, so concurrent turns do not mix). Run
-    // state lives in AppState, so this task keeps the indicator correct even if the Me page is closed
-    // (navigated away) mid-turn; it only touches singletons, so it is safe after component disposal.
-    async Task RunThreadTurnAsync(string threadId, string text, List<StagedFile> files, bool widget, bool home, Widget? existingWidget)
-    {
-        var existingWidgetId = existingWidget?.Id;
-        var existingWidgetName = existingWidget?.Name;
-        var existingWidgetPrompt = existingWidget?.Prompt;
-        var existingWidgetHtml = existingWidget?.Html;
-        var ct = State.BeginThreadTurn(threadId, widget || existingWidget is not null);
+        var widgetContext = BuildWidgetContext(chosenWidget, wasWidget, text);
+        var draft = new TopicTurnDraft(
+            runId,
+            thread.Id,
+            trigger.Id,
+            State.Profile.Handle,
+            prompt,
+            trigger.At,
+            global::Mesh.Shared.TopicTurnMode.Single,
+            thread.ExecutionDeviceId,
+            chosenWidget?.Id,
+            widgetContext,
+            turnAttachments);
         try
         {
-            var imageFiles = await LoadImageAttachmentsAsync(files, ct);
-            Runs.Start(threadId, text, imageFiles.Count > 0, widget || existingWidget is not null);
-            Runs.Executing(threadId);
-            if (existingWidget is not null && string.IsNullOrWhiteSpace(text) && files.Count == 0)
+            var result = await TopicRouter.SubmitAsync(draft, null, CancellationToken.None);
+            if (!result.Accepted)
             {
-                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = $"Use widget: {existingWidgetName}" });
-                State.AddOwnChatLine(threadId, new ChatLine
-                {
-                    Role = "assistant",
-                    Text = AsWidgetResponse(existingWidgetHtml!),
-                    WidgetPrompt = existingWidgetPrompt
-                });
+                dispatchError = result.Error ?? DispatchFailure(result.Code);
+                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = $"[{dispatchError}]" });
             }
-            else if (existingWidget is not null && (!string.IsNullOrWhiteSpace(text) || files.Count > 0))
-            {
-                var changeRequest = ComposeOwnerPrompt(text, files, imageFiles);
-                State.AddOwnChatLine(threadId, new ChatLine
-                {
-                    Role = "user",
-                    Text = $"Update widget {existingWidgetName}: {changeRequest}",
-                    Attachments = imageFiles
-                });
-                var result = await Agent.RefineWidgetAsync(existingWidgetPrompt!, changeRequest, ct);
-                var combinedPrompt = CombineWidgetPrompt(existingWidgetPrompt!, changeRequest);
-                var appSegment = Markdown.Parse(result).FirstOrDefault(segment => segment.IsApp);
-                State.AddOwnChatLine(threadId, new ChatLine
-                {
-                    Role = "assistant",
-                    Text = result,
-                    WidgetPrompt = appSegment is not null ? combinedPrompt : existingWidgetPrompt
-                });
-                if (appSegment is not null)
-                {
-                    var savedUpdateApplied = false;
-                    State.Mutate(profile =>
-                    {
-                        var saved = profile.Widgets.FirstOrDefault(w => w.Id == existingWidgetId);
-                        if (saved is null) return;
-                        if (!string.Equals(saved.Prompt, existingWidgetPrompt, StringComparison.Ordinal)
-                            || !string.Equals(saved.Html, existingWidgetHtml, StringComparison.Ordinal))
-                            return;
-                        saved.PreviousHtml = saved.Html;
-                        saved.PreviousPrompt = saved.Prompt;
-                        saved.Html = appSegment.Content;
-                        saved.Prompt = combinedPrompt;
-                        saved.ModifiedAt = DateTimeOffset.UtcNow;
-                        savedUpdateApplied = true;
-                    });
-                    if (!savedUpdateApplied)
-                        State.AddOwnChatLine(threadId, new ChatLine
-                        {
-                            Role = "assistant",
-                            Text = "[This widget changed in another chat while the refinement was running, so this version was not saved.]"
-                        });
-                }
-            }
-            else if (widget)
-            {
-                var html = await Agent.BuildWidgetAsync(text, ct);
-                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = $"Build a widget: {text}" });
-                State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = html, WidgetPrompt = text });
-            }
-            else if (home)
-            {
-                State.AddOwnChatLine(threadId, new ChatLine { Role = "user", Text = text, Via = "home-agent" });
-                try
-                {
-                    var result = await Mesh.AskHomeAgentAsync(threadId, text, ct);
-                    if (!result.Accepted)
-                    {
-                        State.AddOwnChatLine(threadId, new ChatLine
-                        {
-                            Role = "assistant",
-                            Text = HomeAgentFailure(result.Code),
-                            Via = "home-agent"
-                        });
-                    }
-                }
-                catch (OperationCanceledException) { throw; }
-                catch
-                {
-                    State.AddOwnChatLine(threadId, new ChatLine
-                    {
-                        Role = "assistant",
-                        Text = "Could not reach your Home device. Check its connection.",
-                        Via = "home-agent"
-                    });
-                }
-            }
-
-            else
-            {
-                await Agent.AskAsOwnerAsync(threadId, ComposeOwnerPrompt(text, files, imageFiles), imageFiles, ct);
-            }
-
-            // Drain anything this thread queued while its turn ran. Each drain answers ALL of the
-            // thread's currently queued lines together in one continuation turn (they are consecutive
-            // user turns already in the history); loop in case more were queued while draining.
-            while (!ct.IsCancellationRequested && State.QueuedCountForThread(threadId) > 0)
-            {
-                State.ClearThreadQueue(threadId); // they are now being answered, not waiting
-                State.ClearThreadBuilding(threadId);
-                await Agent.ContinueAsOwnerAsync(threadId, ct);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            Runs.Complete(threadId, cancelled: true);
-            // The user pressed Stop. Cancellation of the running model request and tool loop is
-            // intentional, so record a clean stopped line rather than an error.
-            State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = "[stopped]" });
         }
         catch (Exception ex)
         {
-            Runs.Complete(threadId, failed: true);
-            State.AddOwnChatLine(threadId, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" });
-        }
-        finally
-        {
-            Runs.Complete(threadId);
-            State.EndThreadTurn(threadId);
-            if (disposed || activeThread != threadId)
-                State.MarkThreadCompleted(threadId);
-            else
-                State.MarkThreadSeen(threadId);
+            dispatchError = $"Could not submit this turn: {ex.Message}";
+            State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = $"[{dispatchError}]" });
         }
     }
 
-    private static readonly Dictionary<string, string> ImageMimes = new(StringComparer.OrdinalIgnoreCase)
+    static string BuildTurnPrompt(string text, Widget? widget, bool buildWidget)
+        => buildWidget ? $"Build a widget: {text}"
+            : widget is null ? text
+            : string.IsNullOrWhiteSpace(text) ? $"Use widget: {widget.Name}"
+            : $"Update widget {widget.Name}: {text}";
+
+    static string? BuildWidgetContext(Widget? widget, bool buildWidget, string request)
     {
-        [".png"] = "image/png", [".jpg"] = "image/jpeg", [".jpeg"] = "image/jpeg",
-        [".gif"] = "image/gif", [".webp"] = "image/webp", [".bmp"] = "image/bmp"
+        if (!buildWidget && widget is null) return null;
+        return System.Text.Json.JsonSerializer.Serialize(new
+        {
+            operation = buildWidget ? "build" : string.IsNullOrWhiteSpace(request) ? "use" : "refine",
+            widgetId = widget?.Id,
+            name = widget?.Name,
+            canonicalPrompt = widget?.Prompt,
+            html = widget?.Html,
+            request
+        });
+    }
+
+    static string DispatchFailure(string code) => code.ToLowerInvariant() switch
+    {
+        "offline" or "target-offline" or "target_offline" => "The assigned device is offline.",
+        "not-connected" or "not_connected" or "unreachable" => "Could not reach the assigned device.",
+        "busy" or "queued" => "This turn could not be queued.",
+        _ => "The assigned device rejected this turn."
     };
 
-    static async Task<List<ChatAttachment>> LoadImageAttachmentsAsync(List<StagedFile> files, CancellationToken ct)
+    private static readonly Dictionary<string, string> AttachmentMimes = new(StringComparer.OrdinalIgnoreCase)
     {
-        const long maxImageBytes = 20 * 1024 * 1024;
-        var images = new List<ChatAttachment>();
+        [".png"] = "image/png", [".jpg"] = "image/jpeg", [".jpeg"] = "image/jpeg",
+        [".gif"] = "image/gif", [".webp"] = "image/webp", [".bmp"] = "image/bmp",
+        [".pdf"] = "application/pdf", [".txt"] = "text/plain", [".md"] = "text/markdown",
+        [".json"] = "application/json", [".csv"] = "text/csv", [".xml"] = "application/xml"
+    };
+
+    static async Task<List<ChatAttachment>> LoadAttachmentsAsync(List<StagedFile> files, CancellationToken ct)
+    {
+        const long maxBytes = 20 * 1024 * 1024;
+        var result = new List<ChatAttachment>();
         foreach (var file in files)
         {
-            if (!ImageMimes.TryGetValue(System.IO.Path.GetExtension(file.Path), out var mime)) continue;
-            if (file.Size > maxImageBytes) throw new InvalidOperationException($"{file.Name} is larger than the 20 MB image limit.");
+            if (file.Size > maxBytes) throw new InvalidOperationException($"{file.Name} is larger than the 20 MB attachment limit.");
+            var mime = AttachmentMimes.GetValueOrDefault(System.IO.Path.GetExtension(file.Path), "application/octet-stream");
             var bytes = await System.IO.File.ReadAllBytesAsync(file.Path, ct);
-            images.Add(new ChatAttachment(file.Name, mime, bytes));
+            result.Add(new ChatAttachment(file.Name, mime, bytes));
         }
-        return images;
+        return result;
     }
-
-    // Non-images remain tool-readable paths. Images are sent as original bytes to the model and are
-    // intentionally omitted here, preventing the agent from launching Photos and taking a screenshot.
-    static string ComposeOwnerPrompt(string? text, List<StagedFile> files, IReadOnlyList<ChatAttachment>? images = null)
-    {
-        var prompt = text ?? "";
-        var imageNames = images?.Select(i => i.Name).ToHashSet(StringComparer.OrdinalIgnoreCase) ?? new();
-        var documents = files.Where(f => !imageNames.Contains(f.Name)).ToList();
-        if (documents.Count > 0)
-        {
-            var sb = new System.Text.StringBuilder(prompt);
-            if (sb.Length > 0) sb.Append("\n\n");
-            sb.Append("Attached local files (use the read_local_file tool to open any you need):");
-            foreach (var f in documents) sb.Append($"\n- {f.Path}");
-            prompt = sb.ToString();
-        }
-        return prompt;
-    }
-
-    static string ComposeQueuedWidgetPrompt(Widget widget, string text, List<StagedFile> files, IReadOnlyList<ChatAttachment> images)
-    {
-        var request = ComposeOwnerPrompt(text, files, images);
-        return string.IsNullOrWhiteSpace(request)
-            ? $"Use saved widget \"{widget.Name}\". Its canonical prompt is: {widget.Prompt}"
-            : $"Update saved widget \"{widget.Name}\". Canonical prompt: {widget.Prompt}\n\nChange request: {request}";
-    }
-
-    static string CombineWidgetPrompt(string canonicalPrompt, string changeRequest) =>
-        string.IsNullOrWhiteSpace(canonicalPrompt) ? changeRequest : $"{canonicalPrompt}; {changeRequest}";
-
-    static string AsWidgetResponse(string html) =>
-        Markdown.Parse(html).Any(segment => segment.IsApp) ? html : $"```html-app\n{html}\n```";
 
     // A short title from the first message of a new chat.
     static string Titleize(string text)
@@ -919,7 +1132,6 @@
 
     public void Dispose()
     {
-        disposed = true;
         State.Changed -= Refresh;
         selfRef?.Dispose();
     }

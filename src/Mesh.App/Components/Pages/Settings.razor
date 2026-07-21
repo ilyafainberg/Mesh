@@ -473,58 +473,14 @@
                 </div>
                 <label class="switch"><input type="checkbox" checked="@State.Profile.DoNotDisturb" @onchange="e => Toggle(p => p.DoNotDisturb = (bool)(e.Value ?? false))" aria-label="Do not disturb" /></label>
             </div>
-            @if (PlatformCaps.CanHostHomeAgent)
+            <div class="field">
+                <label>This device's name</label>
+                <input class="full" value="@State.Profile.DeviceName" @onchange="OnDeviceNameChanged" />
+                <div class="field-hint">Linked devices use this name in the Topic device chooser.</div>
+            </div>
+            @if (registrationError is not null)
             {
-                <div class="field-row">
-                    <div>
-                        <div class="field-label">Answer my other devices</div>
-                        <div class="field-sub">Let your linked mobile devices use this desktop's agent and full local tools.</div>
-                    </div>
-                    <label class="switch"><input type="checkbox" checked="@State.Profile.ActAsRemoteAgent" @onchange="OnRemoteAgentChanged" aria-label="Answer my other devices" /></label>
-                </div>
-                <div class="field">
-                    <label>This device's name</label>
-                    <input class="full" value="@State.Profile.DeviceName" @onchange="OnDeviceNameChanged" />
-                    <div class="field-hint">Shown to your linked mobile devices.</div>
-                </div>
-                @if (registrationError is not null)
-                {
-                    <div class="err-text" role="alert">@registrationError</div>
-                }
-            }
-            else if (PlatformCaps.IsMobile)
-            {
-                <div class="field-row">
-                    <div>
-                        <div class="field-label">Home device</div>
-                        <div class="field-sub">Choose the desktop that answers Home Agent requests.</div>
-                    </div>
-                    <div class="home-device-row">
-                        <select class="field" value="@(HasValidHomeDevice ? State.Profile.HomeDeviceId : "")"
-                                @onchange="OnHomeDeviceChanged" aria-label="Home device">
-                            <option value="">Select a desktop</option>
-                            @foreach (var d in EligibleHomeDevices)
-                            {
-                                var label = (string.IsNullOrWhiteSpace(d.Name) ? d.DeviceId : d.Name)
-                                    + (d.Online ? " - online" : " - offline");
-                                <option value="@d.DeviceId" disabled="@(!d.Online)">@label</option>
-                            }
-                        </select>
-                        <button class="ghost" @onclick="LoadDevicesAsync" disabled="@loadingDevices" aria-label="Refresh devices"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
-                    </div>
-                </div>
-                @if (HasStaleHomeDevice)
-                {
-                    <div class="err-text" role="alert">Your saved Home device is no longer available. Select an online desktop.</div>
-                }
-                else if (deviceDirectoryError is not null)
-                {
-                    <div class="err-text" role="alert">@deviceDirectoryError</div>
-                }
-                else if (!loadingDevices && EligibleHomeDevices.Count == 0)
-                {
-                    <div class="field-hint muted">No eligible desktop is available. Enable Answer my other devices on a linked desktop.</div>
-                }
+                <div class="err-text" role="alert">@registrationError</div>
             }
         </div>
 
@@ -895,51 +851,12 @@
         launchAtStartup = AppControl.IsLaunchAtStartupEnabled();
     }
 
-    List<Mesh.Shared.DeviceInfo> devices = new();
-    IReadOnlyList<Mesh.Shared.DeviceInfo> EligibleHomeDevices => devices
-        .Where(d => d.IsEligibleHomeAgent && d.DeviceId != Mesh.MyDeviceId)
-        .OrderByDescending(d => d.Online)
-        .ThenBy(d => d.Name)
-        .ToList();
-    bool HasValidHomeDevice => EligibleHomeDevices.Any(d => d.DeviceId == State.Profile.HomeDeviceId && d.Online);
-    bool HasStaleHomeDevice => !string.IsNullOrWhiteSpace(State.Profile.HomeDeviceId) && !HasValidHomeDevice;
-    bool loadingDevices;
-    string? deviceDirectoryError;
     string? registrationError;
 
     protected override async Task OnInitializedAsync()
     {
-        if (PlatformCaps.IsMobile)
-            await LoadDevicesAsync();
         if (provider == "GitHubCopilot")
             await LoadCopilotModelsAsync();
-    }
-
-    async Task LoadDevicesAsync()
-    {
-        if (!PlatformCaps.IsMobile) return;
-        loadingDevices = true;
-        deviceDirectoryError = null;
-        try
-        {
-            devices = (await Mesh.ListMyDevicesAsync()).ToList();
-        }
-        catch
-        {
-            devices = new();
-            deviceDirectoryError = "Could not refresh linked devices. Check your relay connection.";
-        }
-        finally
-        {
-            loadingDevices = false;
-            StateHasChanged();
-        }
-    }
-
-    async Task OnRemoteAgentChanged(ChangeEventArgs e)
-    {
-        Toggle(p => p.ActAsRemoteAgent = (bool)(e.Value ?? false));
-        await RefreshRegistrationAsync();
     }
 
     async Task OnDeviceNameChanged(ChangeEventArgs e)
@@ -957,13 +874,6 @@
                 registrationError = "Could not update this device on the relay. Check your connection and try again.";
         }
         catch { registrationError = "Could not update this device on the relay. Check your connection and try again."; }
-    }
-
-    void OnHomeDeviceChanged(ChangeEventArgs e)
-    {
-        var id = e.Value?.ToString() ?? string.Empty;
-        var selected = EligibleHomeDevices.FirstOrDefault(d => d.DeviceId == id && d.Online);
-        Toggle(p => p.HomeDeviceId = selected?.DeviceId);
     }
 
     bool launchAtStartup;
