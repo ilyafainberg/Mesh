@@ -1,5 +1,6 @@
 using Mesh.App.Domain;
 using Mesh.App.Services;
+using Mesh.Shared;
 using Microsoft.Data.Sqlite;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -119,7 +120,7 @@ public sealed class DeviceTopicDbTests
         var at = new DateTimeOffset(2026, 1, 15, 10, 0, 0, TimeSpan.Zero);
         using (var db = MeshDb.Open(databasePath, key))
         {
-            db.EnsureOwnThread("t4", "Activity Test", DateTimeOffset.UtcNow.AddDays(-1));
+            db.EnsureOwnThread("t4", "Activity Test", at.AddDays(-1));
             db.SetOwnThreadActivity("t4", at);
             SaveProfile(db);
         }
@@ -297,6 +298,97 @@ public sealed class DeviceTopicDbTests
         using var reopened = MeshDb.Open(databasePath, key);
         var conversation = reopened.LoadProfile()!.Conversations.Single(c => c.Handle == "created");
         Assert.AreEqual(accepted.UtcTicks, conversation.CreatedAt?.UtcTicks);
+    }
+
+    [TestMethod]
+    public void MetadataUpserts_CannotRegressActivityAcrossOffsets()
+    {
+        var newest = new DateTimeOffset(2026, 1, 1, 1, 0, 0, TimeSpan.FromHours(-12));
+        var stale = new DateTimeOffset(2026, 1, 2, 2, 0, 0, TimeSpan.FromHours(14));
+        Assert.IsTrue(newest > stale);
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread("monotonic-topic", "Topic", stale, 0, newest);
+            db.UpsertOwnThread("monotonic-topic", "Topic", stale, 0, stale);
+            db.UpsertConversation(
+                "monotonic-conversation", 0, null, null, null, null, null, null, [], 0,
+                stale, newest);
+            db.UpsertConversation(
+                "monotonic-conversation", 0, null, null, null, null, null, null, [], 0,
+                stale, stale);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var profile = reopened.LoadProfile()!;
+        Assert.AreEqual(
+            newest.UtcTicks,
+            profile.OwnThreads.Single(t => t.Id == "monotonic-topic").LastActivityAt?.UtcTicks);
+        Assert.AreEqual(
+            newest.UtcTicks,
+            profile.Conversations.Single(c => c.Handle == "monotonic-conversation")
+                .LastActivityAt?.UtcTicks);
+    }
+
+    [TestMethod]
+    public void InvalidSyncLine_HasZeroSideEffects_AndLaterOlderVersionApplies()
+    {
+        const string threadId = "sync-parent";
+        const string versionKey = "topic.line.upsert\u001fsync-parent\u001fline";
+        var parentAt = DateTimeOffset.UtcNow.AddDays(2);
+        var invalidVersion = DeviceSyncVersion.Create(
+            DateTimeOffset.UtcNow.AddMinutes(2), "remote", "invalid");
+        var validVersion = DeviceSyncVersion.Create(
+            DateTimeOffset.UtcNow.AddMinutes(1), "remote", "valid");
+
+        using var db = MeshDb.Open(databasePath, key);
+        db.UpsertOwnThread(threadId, "Parent", parentAt.AddDays(-1), 0, parentAt, true);
+        SaveProfile(db);
+        var invalid = new ChatLine
+        {
+            Id = "line", Role = "user", Text = "invalid", Via = "device",
+            Status = "sent", At = default
+        };
+
+        Assert.IsFalse(db.TryApplyOwnSyncLine(
+            threadId, invalid, versionKey, invalidVersion));
+        var unchanged = db.LoadProfile()!.OwnThreads.Single(t => t.Id == threadId);
+        Assert.AreEqual("Parent", unchanged.Title);
+        Assert.AreEqual(parentAt.UtcTicks, unchanged.LastActivityAt?.UtcTicks);
+        Assert.IsTrue(unchanged.IsPinned);
+        Assert.AreEqual(0, unchanged.Lines.Count);
+        Assert.IsNull(db.GetSyncVersion(versionKey));
+
+        var valid = new ChatLine
+        {
+            Id = "line", Role = "user", Text = "valid", Via = "device",
+            Status = "sent", At = parentAt.AddDays(-1)
+        };
+        Assert.IsTrue(db.TryApplyOwnSyncLine(
+            threadId, valid, versionKey, validVersion));
+        var applied = db.LoadProfile()!.OwnThreads.Single(t => t.Id == threadId);
+        Assert.HasCount(1, applied.Lines);
+        Assert.AreEqual("valid", applied.Lines[0].Text);
+        Assert.AreEqual(parentAt.UtcTicks, applied.LastActivityAt?.UtcTicks);
+        Assert.AreEqual(validVersion, db.GetSyncVersion(versionKey));
+    }
+
+    [TestMethod]
+    public void LegacyReorder_DoesNotChangeActivity()
+    {
+        var activity = DateTimeOffset.UtcNow.AddDays(1);
+        using var db = MeshDb.Open(databasePath, key);
+        db.UpsertOwnThread("first", "First", activity.AddDays(-2), 0, activity);
+        db.UpsertOwnThread("second", "Second", activity.AddDays(-1), 1, activity.AddHours(-1));
+        SaveProfile(db);
+
+        db.ReorderOwnThreads(["second", "first"], "first", DateTimeOffset.UtcNow);
+
+        var reordered = db.LoadProfile()!.OwnThreads;
+        Assert.AreEqual("second", reordered[0].Id);
+        Assert.AreEqual(activity.UtcTicks, reordered.Single(t => t.Id == "first").LastActivityAt?.UtcTicks);
     }
 
     private void ClearOwnThreadActivity()

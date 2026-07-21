@@ -807,7 +807,13 @@ public sealed class MeshDb : IDisposable
                 group_owner_handle = excluded.group_owner_handle,
                 group_members_json = excluded.group_members_json,
                 group_version = excluded.group_version,
-                last_activity_at = COALESCE(excluded.last_activity_at, last_activity_at),
+                last_activity_at = CASE
+                    WHEN excluded.last_activity_at IS NOT NULL
+                         AND (last_activity_at IS NULL
+                              OR julianday(excluded.last_activity_at) > julianday(last_activity_at))
+                    THEN excluded.last_activity_at
+                    ELSE last_activity_at
+                END,
                 is_pinned = excluded.is_pinned;
             """;
         cmd.Parameters.AddWithValue("$h", handle);
@@ -833,17 +839,29 @@ public sealed class MeshDb : IDisposable
     }
 
     public void SetConversationActivity(string handle, DateTimeOffset at)
-    {
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "UPDATE conversations SET last_activity_at = $at WHERE handle = $h;";
-        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
-        cmd.Parameters.AddWithValue("$h", handle);
-        cmd.ExecuteNonQuery();
-    }
+        => AdvanceConversationActivity(handle, at);
 
     private void AdvanceConversationActivity(string handle, DateTimeOffset at)
     {
         using var cmd = conn.CreateCommand();
+        AdvanceConversationActivity(cmd, handle, at);
+    }
+
+    private void AdvanceConversationActivity(
+        SqliteTransaction transaction,
+        string handle,
+        DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        AdvanceConversationActivity(cmd, handle, at);
+    }
+
+    private static void AdvanceConversationActivity(
+        SqliteCommand cmd,
+        string handle,
+        DateTimeOffset at)
+    {
         cmd.CommandText = """
             UPDATE conversations
             SET last_activity_at = $at
@@ -869,7 +887,11 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE conversations
-            SET is_pinned = $p, last_activity_at = $at
+            SET is_pinned = $p,
+                last_activity_at = CASE
+                    WHEN last_activity_at IS NULL OR julianday($at) > julianday(last_activity_at)
+                    THEN $at ELSE last_activity_at
+                END
             WHERE handle = $h;
             """;
         cmd.Parameters.AddWithValue("$p", pinned ? 1 : 0);
@@ -922,15 +944,6 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$o", i);
             cmd.Parameters.AddWithValue("$h", orderedHandles[i]);
             cmd.ExecuteNonQuery();
-        }
-        if (activityHandle is not null && activityAt.HasValue)
-        {
-            using var activity = conn.CreateCommand();
-            activity.Transaction = tx;
-            activity.CommandText = "UPDATE conversations SET last_activity_at = $at WHERE handle = $h;";
-            activity.Parameters.AddWithValue("$at", activityAt.Value.UtcDateTime.ToString("O"));
-            activity.Parameters.AddWithValue("$h", activityHandle);
-            activity.ExecuteNonQuery();
         }
         tx.Commit();
     }
@@ -1103,6 +1116,120 @@ public sealed class MeshDb : IDisposable
         tx.Commit();
     }
 
+    internal bool TryApplyOwnSyncLine(
+        string threadId,
+        ChatLine line,
+        string versionKey,
+        string version)
+    {
+        if (line.At == default) return false;
+        using var tx = conn.BeginTransaction();
+        if (!DeviceSyncVersion.IsNewer(version, GetSyncVersion(tx, versionKey)))
+            return false;
+
+        using (var parent = conn.CreateCommand())
+        {
+            parent.Transaction = tx;
+            parent.CommandText = """
+                INSERT OR IGNORE INTO own_threads(
+                    id, title, created_at, sort_order, last_activity_at)
+                VALUES(
+                    $id, '', $at,
+                    (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM own_threads),
+                    $at);
+                """;
+            parent.Parameters.AddWithValue("$id", threadId);
+            parent.Parameters.AddWithValue("$at", line.At.UtcDateTime.ToString("O"));
+            parent.ExecuteNonQuery();
+        }
+        int updated;
+        using (var update = conn.CreateCommand())
+        {
+            update.Transaction = tx;
+            update.CommandText = """
+                UPDATE own_chat
+                SET role = $r, text = $x, via = $v, status = $s, at = $a,
+                    internal = $internal, reasoning = $reasoning, sender_handle = $sender
+                WHERE thread_id = $tid AND line_id = $lid;
+                """;
+            AddOwnChatParameters(update, threadId, line);
+            updated = update.ExecuteNonQuery();
+        }
+        if (updated == 0)
+        {
+            using var insert = conn.CreateCommand();
+            insert.Transaction = tx;
+            insert.CommandText = """
+                INSERT INTO own_chat(
+                    line_id, thread_id, role, text, via, status, at, internal, reasoning, sender_handle)
+                VALUES($lid, $tid, $r, $x, $v, $s, $a, $internal, $reasoning, $sender);
+                """;
+            AddOwnChatParameters(insert, threadId, line);
+            insert.ExecuteNonQuery();
+        }
+        AdvanceOwnThreadActivity(tx, threadId, line.At);
+        UpsertSyncVersion(tx, versionKey, version);
+        tx.Commit();
+        return true;
+    }
+
+    internal bool TryApplyConversationSyncLine(
+        string handle,
+        ChatLine line,
+        string versionKey,
+        string version)
+    {
+        if (line.At == default) return false;
+        using var tx = conn.BeginTransaction();
+        if (!DeviceSyncVersion.IsNewer(version, GetSyncVersion(tx, versionKey)))
+            return false;
+
+        using (var parent = conn.CreateCommand())
+        {
+            parent.Transaction = tx;
+            parent.CommandText = """
+                INSERT OR IGNORE INTO conversations(
+                    handle, created_at, sort_order, last_activity_at)
+                VALUES(
+                    $h, $at,
+                    (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM conversations),
+                    $at);
+                """;
+            parent.Parameters.AddWithValue("$h", handle);
+            parent.Parameters.AddWithValue("$at", line.At.UtcDateTime.ToString("O"));
+            parent.ExecuteNonQuery();
+        }
+        int updated;
+        using (var update = conn.CreateCommand())
+        {
+            update.Transaction = tx;
+            update.CommandText = """
+                UPDATE chat_lines
+                SET role = $r, text = $x, via = $v, status = $s, at = $a,
+                    sender_handle = $sender, internal = $internal, reasoning = $reasoning
+                WHERE handle = $h AND line_id = $lid;
+                """;
+            AddChatLineParameters(update, handle, line);
+            updated = update.ExecuteNonQuery();
+        }
+        if (updated == 0)
+        {
+            using var insert = conn.CreateCommand();
+            insert.Transaction = tx;
+            insert.CommandText = """
+                INSERT INTO chat_lines(
+                    line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning)
+                VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning);
+                """;
+            AddChatLineParameters(insert, handle, line);
+            insert.ExecuteNonQuery();
+        }
+        AdvanceConversationActivity(tx, handle, line.At);
+        UpsertSyncVersion(tx, versionKey, version);
+        tx.Commit();
+        return true;
+    }
+
     private static void AddOwnChatParameters(SqliteCommand cmd, string threadId, ChatLine line)
     {
         cmd.Parameters.AddWithValue("$lid", line.Id);
@@ -1146,7 +1273,13 @@ public sealed class MeshDb : IDisposable
                 title = excluded.title,
                 created_at = excluded.created_at,
                 sort_order = excluded.sort_order,
-                last_activity_at = COALESCE(excluded.last_activity_at, last_activity_at),
+                last_activity_at = CASE
+                    WHEN excluded.last_activity_at IS NOT NULL
+                         AND (last_activity_at IS NULL
+                              OR julianday(excluded.last_activity_at) > julianday(last_activity_at))
+                    THEN excluded.last_activity_at
+                    ELSE last_activity_at
+                END,
                 is_pinned = excluded.is_pinned,
                 execution_device_id = CASE WHEN $replaceExecution = 1
                     THEN excluded.execution_device_id
@@ -1166,14 +1299,18 @@ public sealed class MeshDb : IDisposable
             """;
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$title", title);
-        cmd.Parameters.AddWithValue("$created", createdAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$created", createdAt.UtcDateTime.ToString("O"));
         cmd.Parameters.AddWithValue("$sort", sortOrder);
-        cmd.Parameters.AddWithValue("$activity", lastActivityAt.HasValue ? (object)lastActivityAt.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$activity", lastActivityAt.HasValue
+            ? lastActivityAt.Value.UtcDateTime.ToString("O")
+            : DBNull.Value);
         cmd.Parameters.AddWithValue("$pinned", isPinned ? 1 : 0);
         cmd.Parameters.AddWithValue("$execDevice", (object?)executionDeviceId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execName", (object?)executionDeviceName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execPlatform", (object?)executionDevicePlatform ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$execAt", executionAt.HasValue ? (object)executionAt.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$execAt", executionAt.HasValue
+            ? executionAt.Value.UtcDateTime.ToString("O")
+            : DBNull.Value);
         cmd.Parameters.AddWithValue("$execRun", (object?)executionRunId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$replaceExecution", replaceExecutionMetadata ? 1 : 0);
         cmd.ExecuteNonQuery();
@@ -1222,15 +1359,6 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$id", orderedIds[i]);
             cmd.ExecuteNonQuery();
         }
-        if (activityThreadId is not null && activityAt.HasValue)
-        {
-            using var activity = conn.CreateCommand();
-            activity.Transaction = tx;
-            activity.CommandText = "UPDATE own_threads SET last_activity_at = $at WHERE id = $id;";
-            activity.Parameters.AddWithValue("$at", activityAt.Value.UtcDateTime.ToString("O"));
-            activity.Parameters.AddWithValue("$id", activityThreadId);
-            activity.ExecuteNonQuery();
-        }
         tx.Commit();
     }
 
@@ -1245,17 +1373,29 @@ public sealed class MeshDb : IDisposable
     }
 
     public void SetOwnThreadActivity(string id, DateTimeOffset at)
-    {
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "UPDATE own_threads SET last_activity_at = $at WHERE id = $id;";
-        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.ExecuteNonQuery();
-    }
+        => AdvanceOwnThreadActivity(id, at);
 
     private void AdvanceOwnThreadActivity(string id, DateTimeOffset at)
     {
         using var cmd = conn.CreateCommand();
+        AdvanceOwnThreadActivity(cmd, id, at);
+    }
+
+    private void AdvanceOwnThreadActivity(
+        SqliteTransaction transaction,
+        string id,
+        DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        AdvanceOwnThreadActivity(cmd, id, at);
+    }
+
+    private static void AdvanceOwnThreadActivity(
+        SqliteCommand cmd,
+        string id,
+        DateTimeOffset at)
+    {
         cmd.CommandText = """
             UPDATE own_threads
             SET last_activity_at = $at
@@ -1281,7 +1421,11 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE own_threads
-            SET is_pinned = $p, last_activity_at = $at
+            SET is_pinned = $p,
+                last_activity_at = CASE
+                    WHEN last_activity_at IS NULL OR julianday($at) > julianday(last_activity_at)
+                    THEN $at ELSE last_activity_at
+                END
             WHERE id = $id;
             """;
         cmd.Parameters.AddWithValue("$p", pinned ? 1 : 0);
@@ -1377,7 +1521,11 @@ public sealed class MeshDb : IDisposable
                 execution_device_platform = $dplatform,
                 execution_at = NULL,
                 execution_run_id = NULL,
-                last_activity_at = $activity
+                last_activity_at = CASE
+                    WHEN last_activity_at IS NULL
+                         OR julianday($activity) > julianday(last_activity_at)
+                    THEN $activity ELSE last_activity_at
+                END
             WHERE id = $id;
             """;
         cmd.Parameters.AddWithValue("$did", deviceId);
@@ -1405,7 +1553,11 @@ public sealed class MeshDb : IDisposable
                 execution_device_platform = $dplatform,
                 execution_at = $at,
                 execution_run_id = $rid,
-                last_activity_at = $activity
+                last_activity_at = CASE
+                    WHEN last_activity_at IS NULL
+                         OR julianday($activity) > julianday(last_activity_at)
+                    THEN $activity ELSE last_activity_at
+                END
             WHERE id = $id;
             """;
         cmd.Parameters.AddWithValue("$did", (object?)deviceId ?? DBNull.Value);

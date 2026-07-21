@@ -129,4 +129,19 @@ public sealed class ActivityOrderingTests
         Assert.IsFalse(RemoteRunCorrelation.IsExpected(thread, "other-topic", "expected"));
         Assert.IsTrue(RemoteRunCorrelation.IsExpected(thread, "topic", "expected"));
     }
+
+    [TestMethod]
+    public void ClockBehindMetadataMutations_KeepFutureActivity()
+    {
+        var future = DateTimeOffset.UtcNow.AddDays(2);
+        var clockBehindPin = DateTimeOffset.UtcNow;
+        var clockBehindMove = clockBehindPin.AddMinutes(-1);
+        var clockBehindRename = clockBehindPin.AddMinutes(-2);
+
+        var activity = ActivityTimestamp.Advance(future, clockBehindPin);
+        activity = ActivityTimestamp.Advance(activity, clockBehindMove);
+        activity = ActivityTimestamp.Advance(activity, clockBehindRename);
+
+        Assert.AreEqual(future, activity);
+    }
 }
