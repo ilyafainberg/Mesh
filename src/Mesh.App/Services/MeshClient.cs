@@ -14,7 +14,7 @@ namespace Mesh.App.Services;
 /// keepalive and automatic reconnection; this client adds the device-key auth handshake,
 /// end-to-end encryption, and dispatch of inbound messages to the agent and UI.
 /// </summary>
-public sealed class MeshClient
+public sealed class MeshClient : IDeviceTopicTransport
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan GroupKeyCacheLifetime = TimeSpan.FromMinutes(5);
@@ -22,8 +22,15 @@ public sealed class MeshClient
     private const int DeviceSyncSnapshotBatchSize = 100;
     private readonly AppState state;
     private readonly AgentService agent;
+    private readonly ITopicTurnRunner topicTurnRunner;
     private readonly IHttpClientFactory httpFactory;
     private readonly INotifier notifier;
+    private readonly DeviceTopicAttachmentInbox attachmentInbox = new();
+    private readonly ConcurrentDictionary<string, ActiveTopicRun> activeTopicRuns = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> topicRunReplay = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> topicEnvelopeReplay = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<long, Task> backgroundTasks = new();
+    private long nextBackgroundTaskId;
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> keyCacheUpdated = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim deviceSyncSendGate = new(1, 1);
@@ -39,10 +46,16 @@ public sealed class MeshClient
     private DateTimeOffset deviceSyncTargetCacheUpdated;
     private string deviceSyncTargetCacheIdentity = "";
 
-    public MeshClient(AppState state, AgentService agent, IHttpClientFactory httpFactory, INotifier notifier)
+    public MeshClient(
+        AppState state,
+        AgentService agent,
+        ITopicTurnRunner topicTurnRunner,
+        IHttpClientFactory httpFactory,
+        INotifier notifier)
     {
         this.state = state;
         this.agent = agent;
+        this.topicTurnRunner = topicTurnRunner;
         this.httpFactory = httpFactory;
         this.notifier = notifier;
         state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
@@ -56,6 +69,17 @@ public sealed class MeshClient
         string PublicKey,
         string PrivateKey,
         string RelayUrl);
+
+    private sealed record ActiveTopicRun(
+        string RunId,
+        string ThreadId,
+        string SourceDeviceId,
+        CancellationTokenSource Cancellation)
+    {
+        public int TerminalSent;
+        public int TerminalSending;
+        public SemaphoreSlim SendGate { get; } = new(1, 1);
+    }
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
     public event Action? StateChanged;
@@ -110,7 +134,7 @@ public sealed class MeshClient
                     sig,
                     deviceName,
                     PlatformCaps.DevicePlatform,
-                    PlatformCaps.CanHostHomeAgent && p.ActAsRemoteAgent));
+                    PlatformCaps.CanRunAgent && agent.IsModelReady));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
             if (resp.IsSuccessStatusCode) return true;
 
@@ -325,7 +349,7 @@ public sealed class MeshClient
             Log?.Invoke("hub connected + authenticated");
             StateChanged?.Invoke();
             if (identity is not null)
-                _ = RunDeviceSyncHandshakeAsync(identity);
+                TrackBackground(RunDeviceSyncHandshakeAsync(identity), "device sync handshake");
         });
 
         connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
@@ -404,7 +428,7 @@ public sealed class MeshClient
     /// </summary>
     private void StartAuthWatchdog(HubConnection connection)
     {
-        _ = Task.Run(async () =>
+        TrackBackground(Task.Run(async () =>
         {
             await Task.Delay(TimeSpan.FromSeconds(12));
             if (!ReferenceEquals(hub, connection)) return; // superseded by a newer connection
@@ -414,7 +438,7 @@ public sealed class MeshClient
                 ScheduleRecovery();
                 try { await connection.StopAsync(); } catch { } // triggers Closed -> recovery loop
             }
-        });
+        }), "authentication watchdog");
     }
 
     /// <summary>
@@ -426,7 +450,7 @@ public sealed class MeshClient
     {
         if (!wantConnected) return;
         if (Interlocked.Exchange(ref reconnectScheduled, 1) == 1) return; // already running
-        _ = Task.Run(async () =>
+        TrackBackground(Task.Run(async () =>
         {
             try
             {
@@ -447,16 +471,26 @@ public sealed class MeshClient
                 }
             }
             finally { Interlocked.Exchange(ref reconnectScheduled, 0); }
-        });
+        }), "relay recovery");
     }
 
     private async Task HandleInboundAsync(MeshEnvelope env, CancellationToken ct)
     {
         var from = AppState.Norm(env.From);
+        if (env.Kind is MeshKinds.RemoteAgentRequest or MeshKinds.RemoteAgentResponse)
+        {
+            Log?.Invoke($"dropped retired home-agent envelope {env.Kind}");
+            return;
+        }
         var isGroupKind = env.Kind is MeshKinds.GroupControl or MeshKinds.GroupMessage or MeshKinds.Fanout;
         var isDeviceSync = DeviceSyncKinds.IsEnvelopeKind(env.Kind);
+        var isTopicKind = env.Kind is MeshKinds.TopicRunRequest
+            or MeshKinds.TopicRunUpdate
+            or MeshKinds.TopicRunCancel
+            or MeshKinds.AttachmentChunk
+            or MeshKinds.TopicAttachmentChunk;
         var isOwnDeviceKind = isDeviceSync
-            || env.Kind is MeshKinds.RemoteAgentRequest or MeshKinds.RemoteAgentResponse;
+            || isTopicKind;
         if (env.Kind == MeshKinds.Fanout
             && env.ToDevice is not null
             && !string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
@@ -485,6 +519,10 @@ public sealed class MeshClient
             if (inboundOwnDeviceIdentity is null) return;
             pinned = (await ResolveOwnDeviceKeysAsync(inboundOwnDeviceIdentity)).ToList();
             if (!IsCurrentDeviceSyncIdentity(inboundOwnDeviceIdentity)) return;
+            if (isTopicKind)
+                pinned = pinned.Where(key =>
+                        string.Equals(DeviceProtocol.DeviceId(key), env.FromDevice, StringComparison.Ordinal))
+                    .ToList();
         }
         else
         {
@@ -502,6 +540,10 @@ public sealed class MeshClient
         if (!signatureValid && isOwnDeviceKind && inboundOwnDeviceIdentity is not null)
         {
             pinned = (await ResolveOwnDeviceKeysAsync(inboundOwnDeviceIdentity, refresh: true)).ToList();
+            if (isTopicKind)
+                pinned = pinned.Where(key =>
+                        string.Equals(DeviceProtocol.DeviceId(key), env.FromDevice, StringComparison.Ordinal))
+                    .ToList();
             signatureValid = IsCurrentDeviceSyncIdentity(inboundOwnDeviceIdentity)
                 && pinned.Count > 0
                 && MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? "");
@@ -527,6 +569,12 @@ public sealed class MeshClient
             return;
         }
 
+        if (isTopicKind)
+        {
+            await HandleInboundTopicAsync(env, from, ct);
+            return;
+        }
+
         if (isGroupKind)
         {
             if (env.Kind == MeshKinds.Fanout)
@@ -544,87 +592,6 @@ public sealed class MeshClient
         {
             var (ok, plain) = MessageCrypto.TryDecrypt(env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
             text = ok ? plain! : "[encrypted message this device can't read]";
-        }
-
-        // Remote-to-desktop: a request from one of the owner's OWN devices (same handle) to run the
-        // full owner agent here and reply. Only honored when this device opted in and the sender is
-        // our own handle (the relay only routes same-handle envelopes between our linked devices).
-        if (env.Kind == MeshKinds.RemoteAgentRequest)
-        {
-            if (!string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
-            {
-                Log?.Invoke("dropped remote agent request: target device does not match this device");
-                return;
-            }
-            if (!PlatformCaps.CanHostHomeAgent)
-            {
-                Log?.Invoke("dropped remote agent request: this platform cannot host the home agent");
-                return;
-            }
-            if (!state.Profile.ActAsRemoteAgent)
-            {
-                Log?.Invoke("dropped remote agent request: acting as the home agent is disabled");
-                return;
-            }
-            if (from != AppState.Norm(state.Profile.Handle))
-            {
-                Log?.Invoke("dropped remote agent request: sender handle does not match the local handle");
-                return;
-            }
-            if (string.IsNullOrWhiteSpace(env.FromDevice))
-            {
-                Log?.Invoke("dropped remote agent request: source device is missing");
-                return;
-            }
-            if (!RemoteAgentProtocol.TryParseRequest(text, out var request))
-            {
-                Log?.Invoke("dropped remote agent request: payload is invalid");
-                return;
-            }
-
-            var answer = await agent.AskAsRemoteAsync(request.Prompt, ct);
-            var responseBody = RemoteAgentProtocol.ResponseBody(
-                request.RequestId, request.ThreadId, answer);
-            if (!await SendAsync(
-                    from,
-                    MeshKinds.RemoteAgentResponse,
-                    responseBody,
-                    toDevice: env.FromDevice))
-                Log?.Invoke($"home agent response {request.RequestId} could not be dispatched");
-            return;
-        }
-        if (env.Kind == MeshKinds.RemoteAgentResponse)
-        {
-            if (from != AppState.Norm(state.Profile.Handle)
-                || (env.ToDevice is not null
-                    && !string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
-                || !RemoteAgentProtocol.TryParseResponse(text, out var response)
-                || !state.Profile.OwnThreads.Any(thread =>
-                    string.Equals(thread.Id, response.ThreadId, StringComparison.Ordinal)))
-                return;
-
-            var thread = state.Profile.OwnThreads.First(item =>
-                string.Equals(item.Id, response.ThreadId, StringComparison.Ordinal));
-            if (thread.Lines.Any(line =>
-                    string.Equals(line.Id, response.RequestId, StringComparison.Ordinal)))
-                return;
-
-            state.AddOwnChatLine(response.ThreadId, new ChatLine
-            {
-                Id = response.RequestId,
-                Role = "assistant",
-                Text = response.Text,
-                Via = "home-agent",
-                AddressedToAgent = true
-            });
-            StateChanged?.Invoke();
-            if (!state.Profile.DoNotDisturb)
-                notifier.Notify(
-                    "Your home agent replied",
-                    Preview(response.Text),
-                    NotifyKind.Message,
-                    PlatformCaps.IsMobile ? "/m/me" : "/");
-            return;
         }
 
         // Public service invocation. Handled BEFORE the allow-list gate below: any handle may invoke a
@@ -734,7 +701,7 @@ public sealed class MeshClient
 
         // Acknowledge receipt of any real message so the sender sees "delivered".
         if (env.Kind is MeshKinds.DirectMessage or MeshKinds.Chat or MeshKinds.AgentRequest or MeshKinds.AgentResponse)
-            _ = SendReceiptAsync(from, env.Id);
+            TrackBackground(SendReceiptAsync(from, env.Id), "delivery receipt");
 
         // A person-to-person message to the human: mark unread and toast the owner (unless muted/DND).
         if (env.Kind == MeshKinds.DirectMessage)
@@ -816,6 +783,305 @@ public sealed class MeshClient
         StateChanged?.Invoke();
     }
 
+    private async Task HandleInboundTopicAsync(MeshEnvelope env, string from, CancellationToken ct)
+    {
+        var me = AppState.Norm(state.Profile.Handle);
+        if (!string.Equals(from, me, StringComparison.Ordinal)
+            || string.IsNullOrWhiteSpace(env.FromDevice)
+            || string.Equals(env.FromDevice, MyDeviceId, StringComparison.Ordinal)
+            || !string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal))
+        {
+            Log?.Invoke($"dropped {env.Kind}: own-device routing did not match");
+            return;
+        }
+        if (!MessageCrypto.IsEncrypted(env.Body))
+        {
+            Log?.Invoke($"dropped {env.Kind} from {env.FromDevice}: encryption is required");
+            return;
+        }
+        var (decrypted, plaintext) = MessageCrypto.TryDecrypt(
+            env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
+        if (!decrypted || plaintext is null)
+        {
+            Log?.Invoke($"dropped {env.Kind} from {env.FromDevice}: decryption failed");
+            return;
+        }
+        if (!RememberReplay(topicEnvelopeReplay, env.Id))
+        {
+            Log?.Invoke($"dropped replayed topic envelope {env.Id}");
+            return;
+        }
+
+        switch (env.Kind)
+        {
+            case MeshKinds.AttachmentChunk:
+            case MeshKinds.TopicAttachmentChunk:
+                if (!TopicRunProtocol.TryParseChunk(plaintext, out var chunk))
+                {
+                    Log?.Invoke($"dropped attachment chunk from {env.FromDevice}: invalid payload");
+                    return;
+                }
+                if (!attachmentInbox.TryAdd(env.FromDevice, chunk, out var chunkError))
+                    Log?.Invoke($"dropped attachment chunk from {env.FromDevice}: {chunkError}");
+                break;
+
+            case MeshKinds.TopicRunRequest:
+                if (!TopicRunProtocol.TryParseRequest(plaintext, out var request))
+                {
+                    Log?.Invoke($"dropped topic request from {env.FromDevice}: invalid payload");
+                    return;
+                }
+                var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
+                    string.Equals(item.Id, request.ThreadId, StringComparison.Ordinal));
+                if (thread is null
+                    || !string.Equals(request.TargetDeviceId, MyDeviceId, StringComparison.Ordinal)
+                    || !string.Equals(thread.ExecutionDeviceId, MyDeviceId, StringComparison.Ordinal)
+                    || !string.Equals(AppState.Norm(request.TriggerHandle), me, StringComparison.Ordinal))
+                {
+                    Log?.Invoke($"dropped topic request {request.RunId}: target or thread did not match");
+                    attachmentInbox.RejectRun(env.FromDevice, request.RunId);
+                    return;
+                }
+                if (!RememberReplay(topicRunReplay, request.RunId))
+                {
+                    Log?.Invoke($"ignored replayed topic run {request.RunId}");
+                    return;
+                }
+                var existingTrigger = thread.Lines.FirstOrDefault(line =>
+                    string.Equals(line.Id, request.TriggerLineId, StringComparison.Ordinal));
+                if (existingTrigger is not null
+                    && (!string.Equals(existingTrigger.Role, "user", StringComparison.Ordinal)
+                        || !string.Equals(existingTrigger.Text, request.TriggerText, StringComparison.Ordinal)
+                        || existingTrigger.At != request.TriggerAt))
+                {
+                    Log?.Invoke($"dropped topic request {request.RunId}: trigger line conflicted");
+                    attachmentInbox.RejectRun(env.FromDevice, request.RunId);
+                    return;
+                }
+                if (existingTrigger is null)
+                    state.AddOwnChatLine(request.ThreadId, new ChatLine
+                    {
+                        Id = request.TriggerLineId,
+                        Role = "user",
+                        Text = request.TriggerText,
+                        Via = "agent",
+                        AddressedToAgent = true,
+                        At = request.TriggerAt
+                    });
+
+                var active = new ActiveTopicRun(
+                    request.RunId, request.ThreadId, env.FromDevice, new CancellationTokenSource());
+                if (!activeTopicRuns.TryAdd(request.RunId, active))
+                {
+                    Log?.Invoke($"ignored duplicate active topic run {request.RunId}");
+                    return;
+                }
+                TrackBackground(
+                    ExecuteInboundTopicRunAsync(request, active),
+                    $"topic run {request.RunId}");
+                break;
+
+            case MeshKinds.TopicRunUpdate:
+                if (!TopicRunProtocol.TryParseUpdate(plaintext, out var update))
+                {
+                    Log?.Invoke($"dropped topic update from {env.FromDevice}: invalid payload");
+                    return;
+                }
+                var updateThread = state.Profile.OwnThreads.FirstOrDefault(item =>
+                    string.Equals(item.Id, update.ThreadId, StringComparison.Ordinal));
+                if (!RemoteRunCorrelation.IsExpected(updateThread, update.ThreadId, update.RunId)
+                    || !string.Equals(updateThread.ExecutionDeviceId, env.FromDevice, StringComparison.Ordinal))
+                {
+                    Log?.Invoke($"dropped uncorrelated topic update {update.RunId}");
+                    return;
+                }
+                state.ApplyRemoteRunUpdate(update);
+                StateChanged?.Invoke();
+                break;
+
+            case MeshKinds.TopicRunCancel:
+                if (!TopicRunProtocol.TryParseCancel(plaintext, out var cancel)
+                    || !activeTopicRuns.TryGetValue(cancel.RunId, out var activeRun)
+                    || !string.Equals(activeRun.ThreadId, cancel.ThreadId, StringComparison.Ordinal)
+                    || !string.Equals(activeRun.SourceDeviceId, env.FromDevice, StringComparison.Ordinal))
+                {
+                    Log?.Invoke("dropped uncorrelated topic cancellation");
+                    return;
+                }
+                activeRun.Cancellation.Cancel();
+                await SendTerminalOnceAsync(activeRun, new TopicRunUpdatePayload(
+                    cancel.RunId,
+                    cancel.ThreadId,
+                    TopicRunPhase.Cancelled,
+                    Status: "Cancelled",
+                    Timestamp: DateTimeOffset.UtcNow), ct);
+                break;
+        }
+    }
+
+    private async Task ExecuteInboundTopicRunAsync(
+        TopicRunRequestPayload request,
+        ActiveTopicRun active)
+    {
+        try
+        {
+            var attachments = await attachmentInbox.WaitForAsync(
+                active.SourceDeviceId,
+                request.RunId,
+                request.Attachments,
+                request.AttachmentIds,
+                active.Cancellation.Token);
+            var draft = new TopicTurnDraft(
+                request.RunId,
+                request.ThreadId,
+                request.TriggerLineId,
+                AppState.Norm(request.TriggerHandle),
+                request.TriggerText,
+                request.TriggerAt,
+                request.TurnMode,
+                request.TargetDeviceId,
+                request.WidgetId,
+                request.WidgetContext,
+                attachments);
+            var progress = new Progress<TopicRunUpdatePayload>(update =>
+            {
+                if (Volatile.Read(ref active.TerminalSent) == 0
+                    && Volatile.Read(ref active.TerminalSending) == 0)
+                    TrackBackground(
+                        SendProgressUpdateAsync(active, CorrelateUpdate(active, update)),
+                        $"topic progress {active.RunId}");
+            });
+            var completion = await topicTurnRunner.ExecuteAsync(
+                draft, progress, active.Cancellation.Token);
+            await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
+                active.RunId,
+                active.ThreadId,
+                completion.Phase,
+                Error: completion.Error,
+                FailureCode: completion.FailureCode,
+                Timestamp: completion.CompletedAt == default
+                    ? DateTimeOffset.UtcNow
+                    : completion.CompletedAt), CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
+                active.RunId,
+                active.ThreadId,
+                TopicRunPhase.Cancelled,
+                Status: "Cancelled",
+                Timestamp: DateTimeOffset.UtcNow), CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"topic run {active.RunId} failed: {ex.Message}");
+            await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
+                active.RunId,
+                active.ThreadId,
+                TopicRunPhase.Failed,
+                Error: "The remote device could not complete this run.",
+                FailureCode: "remote_execution_failed",
+                Timestamp: DateTimeOffset.UtcNow), CancellationToken.None);
+        }
+        finally
+        {
+            activeTopicRuns.TryRemove(active.RunId, out _);
+            attachmentInbox.RejectRun(active.SourceDeviceId, active.RunId);
+            active.Cancellation.Dispose();
+        }
+    }
+
+    private static TopicRunUpdatePayload CorrelateUpdate(
+        ActiveTopicRun active,
+        TopicRunUpdatePayload update)
+        => update with
+        {
+            RunId = active.RunId,
+            ThreadId = active.ThreadId,
+            Timestamp = update.Timestamp == default ? DateTimeOffset.UtcNow : update.Timestamp
+        };
+
+    private async Task SendProgressUpdateAsync(
+        ActiveTopicRun active,
+        TopicRunUpdatePayload update)
+    {
+        if (Volatile.Read(ref active.TerminalSent) != 0
+            || Volatile.Read(ref active.TerminalSending) != 0)
+            return;
+        await active.SendGate.WaitAsync();
+        try
+        {
+            if (Volatile.Read(ref active.TerminalSent) != 0
+                || Volatile.Read(ref active.TerminalSending) != 0)
+                return;
+            await SendTargetedTopicEnvelopeAsync(
+                active.SourceDeviceId,
+                MeshKinds.TopicRunUpdate,
+                TopicRunProtocol.UpdateBody(update),
+                CancellationToken.None);
+        }
+        finally
+        {
+            active.SendGate.Release();
+        }
+    }
+
+    private async Task SendTerminalOnceAsync(
+        ActiveTopicRun active,
+        TopicRunUpdatePayload update,
+        CancellationToken ct)
+    {
+        if (Interlocked.Exchange(ref active.TerminalSending, 1) != 0) return;
+        await active.SendGate.WaitAsync(ct);
+        try
+        {
+            if (Volatile.Read(ref active.TerminalSent) != 0) return;
+            if (await SendTargetedTopicEnvelopeAsync(
+                    active.SourceDeviceId,
+                    MeshKinds.TopicRunUpdate,
+                    TopicRunProtocol.UpdateBody(CorrelateUpdate(active, update)),
+                    ct))
+                Volatile.Write(ref active.TerminalSent, 1);
+        }
+        finally
+        {
+            Volatile.Write(ref active.TerminalSending, 0);
+            active.SendGate.Release();
+        }
+    }
+
+    private static bool RememberReplay(
+        ConcurrentDictionary<string, DateTimeOffset> cache,
+        string? id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return false;
+        var now = DateTimeOffset.UtcNow;
+        const int maxReplayEntries = DeviceTopicAttachmentInbox.MaxPendingRuns
+                                     * AttachmentChunkProtocol.MaxChunks
+                                     * 8;
+        if (cache.Count >= maxReplayEntries)
+        {
+            foreach (var pair in cache)
+                if (now - pair.Value > TimeSpan.FromHours(1))
+                    cache.TryRemove(pair.Key, out _);
+            if (cache.Count >= maxReplayEntries) return false;
+        }
+        return cache.TryAdd(id, now);
+    }
+
+    private void TrackBackground(Task task, string operation)
+    {
+        var id = Interlocked.Increment(ref nextBackgroundTaskId);
+        backgroundTasks[id] = task;
+        task.ContinueWith(completed =>
+        {
+            backgroundTasks.TryRemove(id, out _);
+            if (completed.IsFaulted)
+                Log?.Invoke($"{operation} failed: "
+                            + (completed.Exception?.GetBaseException().Message ?? "unknown error"));
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
     private DeviceSyncIdentity? CaptureDeviceSyncIdentity(HubConnection connection)
     {
         var p = state.Profile;
@@ -861,7 +1127,7 @@ public sealed class MeshClient
             Log?.Invoke("device sync live operation dropped: source device did not match current identity");
             return;
         }
-        _ = FanOutDeviceSyncOperationAsync(identity, operation);
+        TrackBackground(FanOutDeviceSyncOperationAsync(identity, operation), "device sync fan-out");
     }
 
     private async Task FanOutDeviceSyncOperationAsync(
@@ -1524,76 +1790,186 @@ public sealed class MeshClient
     public void RejectDraft(string approvalId)
         => state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
 
-    /// <summary>Dispatches an owner prompt to the selected, live home-agent desktop.</summary>
-    public async Task<RemoteAgentDispatchResult> AskHomeAgentAsync(
-        string threadId,
-        string prompt,
-        CancellationToken ct = default)
+    public async Task<TopicDispatchResult> DispatchAsync(
+        string targetDeviceId,
+        TopicRunRequestPayload request,
+        IReadOnlyList<ChatAttachment> attachments,
+        CancellationToken cancellationToken)
     {
-        var requestId = Guid.NewGuid().ToString("n");
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(attachments);
         if (!Connected)
-            return RemoteAgentDispatchResult.Reject("not_connected", requestId);
-        if (string.IsNullOrWhiteSpace(threadId))
-            return RemoteAgentDispatchResult.Reject("invalid_thread", requestId);
-        if (!state.Profile.OwnThreads.Any(thread =>
-                string.Equals(thread.Id, threadId, StringComparison.Ordinal)))
-            return RemoteAgentDispatchResult.Reject("invalid_thread", requestId);
-        if (string.IsNullOrWhiteSpace(prompt))
-            return RemoteAgentDispatchResult.Reject("invalid_prompt", requestId);
+            return TopicDispatchResult.Reject("not_connected", request.RunId);
+        if (!supportsSendResults)
+            return TopicDispatchResult.Reject("transport_ack_required", request.RunId);
+        if (attachments.Any(item => item.Data.LongLength > AttachmentChunkProtocol.MaxAttachmentBytes))
+            return TopicDispatchResult.Reject(
+                "attachment_too_large",
+                request.RunId,
+                $"Each attachment must be at most {AttachmentChunkProtocol.MaxAttachmentBytes} bytes.");
+        if (attachments.Sum(item => item.Data.LongLength) > DeviceTopicAttachmentInbox.MaxRunBytes)
+            return TopicDispatchResult.Reject(
+                "attachments_too_large",
+                request.RunId,
+                $"Attachments must total at most {DeviceTopicAttachmentInbox.MaxRunBytes} bytes.");
+        if (!string.Equals(targetDeviceId, request.TargetDeviceId, StringComparison.Ordinal)
+            || string.Equals(targetDeviceId, MyDeviceId, StringComparison.Ordinal)
+            || !string.Equals(
+                AppState.Norm(request.TriggerHandle),
+                AppState.Norm(state.Profile.Handle),
+                StringComparison.Ordinal)
+            || !TopicRunProtocol.TryParseRequest(TopicRunProtocol.RequestBody(request), out _))
+            return TopicDispatchResult.Reject("invalid_request", request.RunId);
 
-        var homeDeviceId = state.Profile.HomeDeviceId?.Trim();
-        if (string.IsNullOrWhiteSpace(homeDeviceId))
-            return RemoteAgentDispatchResult.Reject("home_device_required", requestId);
+        var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
+            string.Equals(item.Id, request.ThreadId, StringComparison.Ordinal));
+        if (thread is null
+            || !string.Equals(thread.ExecutionDeviceId, targetDeviceId, StringComparison.Ordinal))
+            return TopicDispatchResult.Reject("invalid_thread_target", request.RunId);
 
-        Mesh.Shared.DeviceInfo[] devices;
+        IReadOnlyList<Mesh.Shared.DeviceInfo> devices;
         try
         {
-            var http = httpFactory.CreateClient("relay");
-            devices = await http.GetFromJsonAsync<Mesh.Shared.DeviceInfo[]>(
-                $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(AppState.Norm(state.Profile.Handle))}/devices",
-                Json,
-                ct) ?? Array.Empty<Mesh.Shared.DeviceInfo>();
+            devices = await ListMyDevicesCoreAsync(cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Log?.Invoke($"home agent directory lookup failed: {ex.Message}");
-            return RemoteAgentDispatchResult.Reject("directory_unavailable", requestId);
+            Log?.Invoke($"topic directory lookup failed: {ex.Message}");
+            return TopicDispatchResult.Reject("directory_unavailable", request.RunId);
+        }
+        var target = devices.FirstOrDefault(device =>
+            string.Equals(device.DeviceId, targetDeviceId, StringComparison.Ordinal));
+        if (target is null || !target.IsAgentReady)
+            return TopicDispatchResult.Reject("target_not_ready", request.RunId);
+        if (!target.Online)
+            return TopicDispatchResult.Reject("target_offline", request.RunId);
+
+        var manifest = request.Attachments ?? Array.Empty<TopicRunAttachment>();
+        var ids = request.AttachmentIds ?? manifest.Select(item => item.Id).ToArray();
+        if (manifest.Count != attachments.Count
+            || ids.Count != attachments.Count
+            || manifest.Sum(item => item.Length) > DeviceTopicAttachmentInbox.MaxRunBytes
+            || manifest.Where((item, index) =>
+                    !string.Equals(item.Name, attachments[index].Name, StringComparison.Ordinal)
+                    || !string.Equals(item.MimeType, attachments[index].MimeType, StringComparison.Ordinal)
+                    || item.Length != attachments[index].Data.LongLength)
+                .Any())
+            return TopicDispatchResult.Reject("attachment_manifest_mismatch", request.RunId);
+
+        for (var attachmentIndex = 0; attachmentIndex < attachments.Count; attachmentIndex++)
+        {
+            var attachment = attachments[attachmentIndex];
+            var item = manifest[attachmentIndex];
+            var count = checked((int)((attachment.Data.LongLength
+                                       + AttachmentChunkProtocol.MaxChunkBytes - 1)
+                                      / AttachmentChunkProtocol.MaxChunkBytes));
+            for (var index = 0; index < count; index++)
+            {
+                var offset = index * AttachmentChunkProtocol.MaxChunkBytes;
+                var length = Math.Min(
+                    AttachmentChunkProtocol.MaxChunkBytes, attachment.Data.Length - offset);
+                var data = new byte[length];
+                Buffer.BlockCopy(attachment.Data, offset, data, 0, length);
+                var chunk = new AttachmentChunkPayload(
+                    request.RunId, item.Id, index, count, data, item.Name, item.MimeType);
+                if (!await SendTargetedTopicEnvelopeAsync(
+                        targetDeviceId,
+                        MeshKinds.AttachmentChunk,
+                        TopicRunProtocol.ChunkBody(chunk),
+                        cancellationToken))
+                    return TopicDispatchResult.Reject("attachment_transfer_failed", request.RunId);
+            }
         }
 
-        var selected = devices.FirstOrDefault(device =>
-            string.Equals(device.DeviceId, homeDeviceId, StringComparison.Ordinal));
-        if (selected is null || !selected.IsEligibleHomeAgent)
-            return RemoteAgentDispatchResult.Reject("home_device_not_eligible", requestId);
-        if (!selected.Online)
-            return RemoteAgentDispatchResult.Reject("home_device_offline", requestId);
-        if (!supportsSendResults)
-            return RemoteAgentDispatchResult.Reject("transport_ack_required", requestId);
+        return await SendTargetedTopicEnvelopeAsync(
+            targetDeviceId,
+            MeshKinds.TopicRunRequest,
+            TopicRunProtocol.RequestBody(request),
+            cancellationToken)
+            ? TopicDispatchResult.Ok(request.RunId)
+            : TopicDispatchResult.Reject("transport_error", request.RunId);
+    }
 
-        var body = RemoteAgentProtocol.RequestBody(requestId, threadId, prompt);
-        var wire = body;
-        var keys = await ResolveDeviceKeysAsync(AppState.Norm(state.Profile.Handle));
-        if (keys.Count > 0)
-            wire = MessageCrypto.Encrypt(body, keys) ?? body;
+    public async Task<bool> CancelAsync(
+        string targetDeviceId,
+        TopicRunCancelPayload cancel,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(cancel);
+        if (!TopicRunProtocol.TryParseCancel(TopicRunProtocol.CancelBody(cancel), out _))
+            return false;
+        var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
+            string.Equals(item.Id, cancel.ThreadId, StringComparison.Ordinal));
+        if (thread is null
+            || !string.Equals(thread.ExecutionDeviceId, targetDeviceId, StringComparison.Ordinal)
+            || !string.Equals(thread.ExecutionRunId, cancel.RunId, StringComparison.Ordinal))
+            return false;
+        return await SendTargetedTopicEnvelopeAsync(
+            targetDeviceId,
+            MeshKinds.TopicRunCancel,
+            TopicRunProtocol.CancelBody(cancel),
+            cancellationToken);
+    }
 
-        var signature = IdentityService.Sign(state.Profile.PrivateKey, wire);
+    public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
+        CancellationToken cancellationToken)
+        => (await ListMyDevicesCoreAsync(cancellationToken))
+            .Where(device => device.IsAgentReady)
+            .ToArray();
+
+    private async Task<bool> SendTargetedTopicEnvelopeAsync(
+        string targetDeviceId,
+        string kind,
+        string plaintext,
+        CancellationToken ct)
+    {
+        var identity = authenticatedDeviceSyncIdentity;
+        if (identity is null
+            || !supportsSendResults
+            || !IsCurrentDeviceSyncIdentity(identity)
+            || string.IsNullOrWhiteSpace(targetDeviceId)
+            || string.Equals(targetDeviceId, identity.DeviceId, StringComparison.Ordinal))
+            return false;
+
+        var keys = await ResolveOwnDeviceKeysAsync(identity);
+        var targetKeys = keys.Where(key =>
+                string.Equals(DeviceProtocol.DeviceId(key), targetDeviceId, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (targetKeys.Length == 0)
+        {
+            keys = await ResolveOwnDeviceKeysAsync(identity, refresh: true);
+            targetKeys = keys.Where(key =>
+                    string.Equals(DeviceProtocol.DeviceId(key), targetDeviceId, StringComparison.Ordinal))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+        }
+        if (!IsCurrentDeviceSyncIdentity(identity) || targetKeys.Length != 1)
+        {
+            Log?.Invoke($"topic {kind} to {targetDeviceId} failed: exact encryption key unavailable");
+            return false;
+        }
+        var ciphertext = MessageCrypto.Encrypt(plaintext, targetKeys);
+        if (ciphertext is null)
+        {
+            Log?.Invoke($"topic {kind} to {targetDeviceId} failed: encryption failed");
+            return false;
+        }
         var envelope = MeshEnvelope.Create(
-            state.Profile.Handle,
-            AppState.Norm(state.Profile.Handle),
-            MeshKinds.RemoteAgentRequest,
-            wire,
-            signature,
-            fromDevice: MyDeviceId,
-            toDevice: homeDeviceId);
+            identity.Handle,
+            identity.NormalizedHandle,
+            kind,
+            ciphertext,
+            IdentityService.Sign(identity.PrivateKey, ciphertext),
+            fromDevice: identity.DeviceId,
+            toDevice: targetDeviceId);
         try
         {
-            var result = await hub!.InvokeAsync<MeshSendResult>(
+            var result = await identity.Connection.InvokeAsync<MeshSendResult>(
                 MeshHubProtocol.SendEnvelope, envelope, ct);
-            if (!result.Accepted)
-            {
-                Log?.Invoke($"home agent dispatch rejected: {DescribeResult(result)}");
-                return RemoteAgentDispatchResult.Reject(result.Code, requestId);
-            }
-            return RemoteAgentDispatchResult.Ok(requestId);
+            if (result.Accepted) return true;
+            Log?.Invoke($"topic {kind} to {targetDeviceId} rejected: {DescribeResult(result)}");
+            return false;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -1601,8 +1977,8 @@ public sealed class MeshClient
         }
         catch (Exception ex)
         {
-            Log?.Invoke($"home agent dispatch failed: {ex.Message}");
-            return RemoteAgentDispatchResult.Reject("transport_error", requestId);
+            Log?.Invoke($"topic {kind} to {targetDeviceId} failed: {ex.Message}");
+            return false;
         }
     }
 
@@ -1613,16 +1989,23 @@ public sealed class MeshClient
     /// </summary>
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListMyDevicesAsync(CancellationToken ct = default)
     {
-        var h = AppState.Norm(state.Profile.Handle);
-        if (string.IsNullOrWhiteSpace(h)) return Array.Empty<Mesh.Shared.DeviceInfo>();
         try
         {
-            var http = httpFactory.CreateClient("relay");
-            var devices = await http.GetFromJsonAsync<Mesh.Shared.DeviceInfo[]>(
-                $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/devices", Json, ct);
-            return devices ?? Array.Empty<Mesh.Shared.DeviceInfo>();
+            return await ListMyDevicesCoreAsync(ct);
         }
         catch { return Array.Empty<Mesh.Shared.DeviceInfo>(); }
+    }
+
+    private async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListMyDevicesCoreAsync(CancellationToken ct)
+    {
+        var h = AppState.Norm(state.Profile.Handle);
+        if (string.IsNullOrWhiteSpace(h)) return Array.Empty<Mesh.Shared.DeviceInfo>();
+        var http = httpFactory.CreateClient("relay");
+        return await http.GetFromJsonAsync<Mesh.Shared.DeviceInfo[]>(
+                   $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/devices",
+                   Json,
+                   ct)
+               ?? Array.Empty<Mesh.Shared.DeviceInfo>();
     }
 
     /// <summary>
