@@ -41,6 +41,32 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     /// the queued guidance in order without ever running two turns concurrently.
     /// </summary>
     public async Task<string> ContinueAsOwnerAsync(string threadId, CancellationToken ct = default)
+        => await ContinueOwnerCoreAsync(
+            threadId, null, null, default, null, null, ct);
+
+    /// <summary>
+    /// Continues an existing owner thread using a caller-owned run identity. This does not append a
+    /// user line; callers can therefore correlate progress to the exact line they already persisted.
+    /// </summary>
+    public async Task<string> ContinueAsOwnerAsync(
+        string threadId,
+        string triggerLineId,
+        string runId,
+        DateTimeOffset startedAt,
+        IProgress<AgentRunState>? runProgress,
+        IProgress<AgentStep>? stepProgress,
+        CancellationToken ct = default)
+        => await ContinueOwnerCoreAsync(
+            threadId, triggerLineId, runId, startedAt, runProgress, stepProgress, ct);
+
+    private async Task<string> ContinueOwnerCoreAsync(
+        string threadId,
+        string? triggerLineId,
+        string? requestedRunId,
+        DateTimeOffset requestedStartedAt,
+        IProgress<AgentRunState>? runProgress,
+        IProgress<AgentStep>? stepProgress,
+        CancellationToken ct)
     {
         var thread = state.GetOrCreateOwnThread(threadId);
         var p = state.Profile;
@@ -49,32 +75,66 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider));
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
-        var history = Window(thread.Lines, p.Model.Provider).ToList();
+        IReadOnlyList<ChatLine> sourceHistory = thread.Lines;
+        if (triggerLineId is not null)
+        {
+            var triggerIndex = thread.Lines.FindIndex(line =>
+                string.Equals(line.Id, triggerLineId, StringComparison.Ordinal));
+            if (triggerIndex < 0)
+                throw new InvalidOperationException("The correlated trigger line was not found.");
+            sourceHistory = CorrelatedHistory(thread.Lines, triggerIndex);
+        }
+        var history = Window(sourceHistory, p.Model.Provider).ToList();
+        var previousRun = state.AgentRunFor(thread.Id);
+        if (requestedRunId is not null
+            && previousRun is not null
+            && !string.Equals(previousRun.RunId, requestedRunId, StringComparison.Ordinal))
+            previousRun = null;
+        var runId = requestedRunId
+                    ?? previousRun?.RunId
+                    ?? Guid.NewGuid().ToString("n");
+        var startedAt = requestedStartedAt != default
+            ? requestedStartedAt
+            : previousRun?.StartedAt ?? DateTimeOffset.UtcNow;
         if (p.PlanBeforeActing)
         {
-            var previousRun = state.AgentRunFor(thread.Id);
-            var runId = previousRun?.RunId ?? Guid.NewGuid().ToString("n");
-            var startedAt = previousRun?.StartedAt ?? DateTimeOffset.UtcNow;
-            state.SetAgentRun(new AgentRunState(
+            var planning = new AgentRunState(
                 runId,
                 thread.Id,
                 AgentRunPhase.Planning,
                 "**Planning...**",
                 previousRun?.Subtasks ?? Array.Empty<AgentSubtaskState>(),
-                startedAt));
+                startedAt);
+            state.SetAgentRun(planning);
+            runProgress?.Report(planning);
 
             var plan = await BuildVisiblePlanAsync(model, p, history, agentTools, ct);
             var hyperscale = previousRun?.Phase == AgentRunPhase.Hyperscaling
                 || plan.Contains("Plan - Hyperscale", StringComparison.OrdinalIgnoreCase);
-            state.SetAgentRun(new AgentRunState(
+            var executing = new AgentRunState(
                 runId,
                 thread.Id,
                 hyperscale ? AgentRunPhase.Hyperscaling : AgentRunPhase.Executing,
                 plan,
                 previousRun?.Subtasks ?? Array.Empty<AgentSubtaskState>(),
-                startedAt));
+                startedAt);
+            state.SetAgentRun(executing);
+            runProgress?.Report(executing);
             sys += "\nVISIBLE ACTION PLAN:\n" + plan
                 + "\nExecute this plan now. Adapt when needed, keep tool progress visible, and mention important deviations in the final answer.";
+        }
+
+        else
+        {
+            var executing = new AgentRunState(
+                runId,
+                thread.Id,
+                AgentRunPhase.Executing,
+                "",
+                Array.Empty<AgentSubtaskState>(),
+                startedAt);
+            state.SetAgentRun(executing);
+            runProgress?.Report(executing);
         }
 
         // In Hyperscale mode, spawn read-only specialist agents in parallel. They cannot call tools
@@ -98,16 +158,24 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
                 Text = "[internal Hyperscale specialist reports. Validate them; they are advice, not proof.]\n\n" +
                        "Specialist 1 - inspection:\n" + findings[0] + "\n\nSpecialist 2 - strategy:\n" + findings[1]
             });
-            state.UpdateAgentRun(thread.Id, AgentRunPhase.Integrating, new[]
+            var subtasks = new[]
             {
                 new AgentSubtaskState("inspect", "Inspect inputs and relevant components", AgentStepState.Done, findings[0]),
                 new AgentSubtaskState("strategy", "Design independent implementation workstreams", AgentStepState.Done, findings[1]),
                 new AgentSubtaskState("integrate", "Execute, integrate, and verify", AgentStepState.Started)
-            });
+            };
+            state.UpdateAgentRun(thread.Id, AgentRunPhase.Integrating, subtasks);
+            runProgress?.Report(new AgentRunState(
+                runId, thread.Id, AgentRunPhase.Integrating,
+                state.AgentRunFor(thread.Id)?.Plan ?? "", subtasks, startedAt));
         }
 
         state.BeginAgentSteps(thread.Id);
-        var progress = new Progress<AgentStep>(step => state.ReportAgentStep(thread.Id, step));
+        var progress = new InlineProgress<AgentStep>(step =>
+        {
+            state.ReportAgentStep(thread.Id, step);
+            stepProgress?.Report(step);
+        });
         using (media.BeginScope(out var images))
         {
             string answer;
@@ -128,6 +196,45 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = finalAnswer, Reasoning = reasoning });
             return finalAnswer;
         }
+    }
+
+    private static IReadOnlyList<ChatLine> CorrelatedHistory(
+        IReadOnlyList<ChatLine> lines,
+        int triggerIndex)
+    {
+        var throughTrigger = lines.Take(triggerIndex + 1).ToList();
+        var predecessorReplies = lines
+            .Skip(triggerIndex + 1)
+            .Where(line => !string.Equals(line.Role, "user", StringComparison.Ordinal))
+            .ToList();
+        if (predecessorReplies.Count == 0) return throughTrigger;
+
+        var userIndices = throughTrigger
+            .Select((line, index) => (line, index))
+            .Where(item => string.Equals(item.line.Role, "user", StringComparison.Ordinal))
+            .Select(item => item.index)
+            .ToList();
+        var pendingCount = Math.Min(predecessorReplies.Count + 1, userIndices.Count);
+        var pendingStart = userIndices[^pendingCount];
+        var result = throughTrigger.Take(pendingStart).ToList();
+        var pendingUsers = throughTrigger
+            .Skip(pendingStart)
+            .Where(line => string.Equals(line.Role, "user", StringComparison.Ordinal))
+            .ToList();
+        for (var index = 0; index < pendingUsers.Count; index++)
+        {
+            result.Add(pendingUsers[index]);
+            if (index < predecessorReplies.Count)
+                result.Add(predecessorReplies[index]);
+        }
+        if (predecessorReplies.Count > pendingUsers.Count)
+            result.AddRange(predecessorReplies.Skip(pendingUsers.Count));
+        return result;
+    }
+
+    private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
+    {
+        public void Report(T value) => report(value);
     }
 
     private static async Task<string> BuildVisiblePlanAsync(
