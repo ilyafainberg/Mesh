@@ -55,6 +55,13 @@ public sealed class AppState
     private bool applyingDeviceSync;
 
     public MeshProfile Profile { get; private set; } = new();
+    /// <summary>OwnThreads sorted by pin (pinned first), then activity (newest), then created (newest), then stable id.</summary>
+    public IReadOnlyList<OwnThread> OrderedOwnThreads
+        => OwnThreadOrdering.ByActivity(Profile.OwnThreads).ToList();
+
+    /// <summary>Conversations sorted by pin (pinned first), then activity (newest), then created (newest), then stable handle.</summary>
+    public IReadOnlyList<Conversation> OrderedConversations
+        => ConversationOrdering.ByActivity(Profile.Conversations).ToList();
 
     public event Action? Changed;
     public event Action<DeviceSyncOperation>? DeviceSyncOperationCreated;
@@ -202,13 +209,37 @@ public sealed class AppState
             foreach (var conv in Profile.Conversations)
             {
                 conv.Handle = PrepareConversationForPersistence(conv);
-                activeDb.EnsureConversation(conv.Handle);
+                DeriveActivityMetadata(conv);
+                activeDb.EnsureConversation(conv.Handle, conv.CreatedAt);
                 PersistConversationMetadata(activeDb, conv);
+                if (conv.LastActivityAt.HasValue)
+                    activeDb.SetConversationActivity(conv.Handle, conv.LastActivityAt.Value);
+                if (conv.IsPinned)
+                    activeDb.SetConversationPin(conv.Handle, true);
                 foreach (var line in conv.Lines) activeDb.AppendChatLine(Norm(conv.Handle), line);
             }
             foreach (var thread in Profile.OwnThreads)
             {
+                thread.LastActivityAt ??= thread.Lines.Count == 0
+                    ? thread.CreatedAt
+                    : thread.Lines.Max(line => line.At);
                 activeDb.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+                if (thread.LastActivityAt.HasValue)
+                    activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+                if (thread.IsPinned)
+                    activeDb.SetOwnThreadPin(thread.Id, true);
+                if (thread.ExecutionDeviceId is not null
+                    || thread.ExecutionDeviceName is not null
+                    || thread.ExecutionDevicePlatform is not null
+                    || thread.ExecutionAt.HasValue
+                    || thread.ExecutionRunId is not null)
+                    activeDb.SetOwnThreadExecution(
+                        thread.Id,
+                        thread.ExecutionDeviceId,
+                        thread.ExecutionAt,
+                        thread.ExecutionRunId,
+                        thread.ExecutionDeviceName,
+                        thread.ExecutionDevicePlatform);
                 foreach (var line in thread.Lines) activeDb.AppendOwnChat(thread.Id, line);
             }
         }
@@ -369,8 +400,12 @@ public sealed class AppState
     {
         var conv = GetOrCreateConversation(handle);
         conv.Lines.Add(line);
+        conv.LastActivityAt = ActivityTimestamp.Advance(conv.LastActivityAt, line.At);
         activeDb?.AppendChatLine(conv.Handle, line);
+        if (conv.LastActivityAt.HasValue)
+            activeDb?.SetConversationActivity(conv.Handle, conv.LastActivityAt.Value);
         EmitLineUpsert(DeviceSyncKinds.ConversationLineUpsert, conv.Handle, line);
+        EmitConversationUpsert(conv);
         NotifyChanged();
     }
 
@@ -379,8 +414,12 @@ public sealed class AppState
     {
         var thread = GetOrCreateOwnThread(threadId);
         thread.Lines.Add(line);
+        thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
         activeDb?.AppendOwnChat(thread.Id, line);
+        if (thread.LastActivityAt.HasValue)
+            activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
         EmitLineUpsert(DeviceSyncKinds.TopicLineUpsert, thread.Id, line);
+        EmitTopicUpsert(thread);
         NotifyChanged();
     }
 
@@ -397,30 +436,182 @@ public sealed class AppState
     }
 
     /// <summary>Creates a new empty "Me" thread and returns it.</summary>
-    public OwnThread NewOwnThread(string title = "New chat")
+    public OwnThread NewOwnThread(
+        string title = "New chat",
+        string? targetDeviceId = null,
+        DateTimeOffset? executionAt = null,
+        string? executionRunId = null,
+        DateTimeOffset? createdAt = null,
+        DateTimeOffset? lastActivityAt = null,
+        bool isPinned = false,
+        string? targetDeviceName = null,
+        string? targetDevicePlatform = null)
     {
-        var thread = new OwnThread { Title = title };
+        if (targetDeviceId is null
+            && (targetDeviceName is not null || targetDevicePlatform is not null))
+            throw new ArgumentException("Execution device metadata requires a device ID.");
+        if (targetDeviceId is not null)
+            ValidateExecutionDevice(new ExecutionDevice(
+                targetDeviceId,
+                targetDeviceName,
+                targetDevicePlatform ?? DevicePlatforms.Unknown));
+        var thread = new OwnThread
+        {
+            Title = title,
+            CreatedAt = createdAt ?? DateTimeOffset.UtcNow,
+            LastActivityAt = lastActivityAt,
+            IsPinned = isPinned,
+            ExecutionDeviceId = targetDeviceId,
+            ExecutionDeviceName = targetDeviceName,
+            ExecutionDevicePlatform = targetDevicePlatform,
+            ExecutionAt = executionAt,
+            ExecutionRunId = executionRunId
+        };
         Profile.OwnThreads.Add(thread);
-        activeDb?.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+        activeDb?.UpsertOwnThread(
+            thread.Id, thread.Title, thread.CreatedAt, Profile.OwnThreads.Count - 1,
+            thread.LastActivityAt, thread.IsPinned, thread.ExecutionDeviceId,
+            thread.ExecutionAt, thread.ExecutionRunId, replaceExecutionMetadata: true,
+            executionDeviceName: thread.ExecutionDeviceName,
+            executionDevicePlatform: thread.ExecutionDevicePlatform);
         EmitTopicUpsert(thread);
         NotifyChanged();
         return thread;
     }
 
+    public OwnThread NewOwnThread(
+        string title,
+        ExecutionDevice? executionDevice,
+        DateTimeOffset? createdAt = null,
+        DateTimeOffset? lastActivityAt = null,
+        bool isPinned = false)
+        => NewOwnThread(
+            title,
+            executionDevice?.DeviceId,
+            createdAt: createdAt,
+            lastActivityAt: lastActivityAt,
+            isPinned: isPinned,
+            targetDeviceName: executionDevice?.DeviceName,
+            targetDevicePlatform: executionDevice?.Platform);
+
     /// <summary>Renames a "Me" thread.</summary>
     /// <summary>Moves one private topic to the requested list position and persists the order.</summary>
     public void ReorderOwnThread(string threadId, int newIndex)
     {
-        var oldIndex = Profile.OwnThreads.FindIndex(t => t.Id == threadId);
-        if (oldIndex < 0 || Profile.OwnThreads.Count < 2) return;
-        newIndex = Math.Clamp(newIndex, 0, Profile.OwnThreads.Count - 1);
-        if (oldIndex == newIndex) return;
-        var thread = Profile.OwnThreads[oldIndex];
-        Profile.OwnThreads.RemoveAt(oldIndex);
-        Profile.OwnThreads.Insert(newIndex, thread);
-        activeDb?.ReorderOwnThreads(Profile.OwnThreads.Select(t => t.Id).ToList());
+        OwnThread? thread;
+        lock (profileSyncGate)
+        {
+            var oldIndex = Profile.OwnThreads.FindIndex(t => t.Id == threadId);
+            if (oldIndex < 0 || Profile.OwnThreads.Count < 2) return;
+            newIndex = Math.Clamp(newIndex, 0, Profile.OwnThreads.Count - 1);
+            if (oldIndex == newIndex) return;
+            thread = Profile.OwnThreads[oldIndex];
+            var ordered = Profile.OwnThreads.ToList();
+            ordered.RemoveAt(oldIndex);
+            ordered.Insert(newIndex, thread);
+            var at = DateTimeOffset.UtcNow;
+            activeDb?.ReorderOwnThreads(
+                ordered.Select(t => t.Id).ToList(), thread.Id, at);
+            Profile.OwnThreads.RemoveAt(oldIndex);
+            Profile.OwnThreads.Insert(newIndex, thread);
+            thread.LastActivityAt = at;
+        }
         foreach (var orderedThread in Profile.OwnThreads) EmitTopicUpsert(orderedThread);
         NotifyChanged();
+    }
+
+    /// <summary>Moves a private topic to the requested list position. Alias for ReorderOwnThread.</summary>
+    public void MoveOwnThread(string threadId, int newIndex) => ReorderOwnThread(threadId, newIndex);
+
+    /// <summary>Pins a private topic so it sorts first. Bumps activity.</summary>
+    public void PinOwnThread(string threadId)
+        => SetOwnThreadPinned(threadId, true);
+
+    public void SetOwnThreadPinned(string threadId, bool pinned)
+    {
+        OwnThread? thread;
+        lock (profileSyncGate)
+        {
+            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            if (thread is null || thread.IsPinned == pinned) return;
+            var at = DateTimeOffset.UtcNow;
+            activeDb?.SetOwnThreadPinAndActivity(thread.Id, pinned, at);
+            thread.IsPinned = pinned;
+            thread.LastActivityAt = at;
+        }
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+    }
+
+    /// <summary>Unpins a private topic. Bumps activity.</summary>
+    public void UnpinOwnThread(string threadId)
+        => SetOwnThreadPinned(threadId, false);
+
+    public void BindOwnThreadForSend(string threadId, ExecutionDevice target)
+    {
+        ValidateThreadId(threadId);
+        ValidateExecutionDevice(target);
+        OwnThread? thread;
+        lock (profileSyncGate)
+        {
+            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            if (thread is null)
+                throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
+            if (!string.IsNullOrWhiteSpace(thread.ExecutionDeviceId))
+                throw new InvalidOperationException("The topic is already bound to an execution device.");
+            if (activeDb is not null
+                && !activeDb.TryBindOwnThreadDevice(
+                    thread.Id, target.DeviceId, target.DeviceName, target.Platform))
+                throw new InvalidOperationException("The topic could not be bound atomically.");
+            thread.ExecutionDeviceId = target.DeviceId;
+            thread.ExecutionDeviceName = target.DeviceName;
+            thread.ExecutionDevicePlatform = target.Platform;
+        }
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+    }
+
+    public void MoveOwnThreadToDevice(
+        string threadId,
+        ExecutionDevice target,
+        DateTimeOffset? movedAt = null)
+    {
+        ValidateThreadId(threadId);
+        ValidateExecutionDevice(target);
+        var at = movedAt ?? DateTimeOffset.UtcNow;
+        if (at == default) throw new ArgumentException("A move timestamp is required.", nameof(movedAt));
+        OwnThread thread;
+        lock (profileSyncGate)
+        {
+            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId)
+                     ?? throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
+            if (activeDb is not null
+                && !activeDb.MoveOwnThreadToDevice(
+                    thread.Id, target.DeviceId, target.DeviceName, target.Platform, at))
+                throw new InvalidOperationException("The topic could not be moved atomically.");
+            thread.ExecutionDeviceId = target.DeviceId;
+            thread.ExecutionDeviceName = target.DeviceName;
+            thread.ExecutionDevicePlatform = target.Platform;
+            thread.ExecutionAt = null;
+            thread.ExecutionRunId = null;
+            thread.LastActivityAt = at;
+            remoteRuns.Remove(thread.Id);
+        }
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+    }
+
+    /// <summary>Compatibility alias. Prefer <see cref="BindOwnThreadForSend"/>.</summary>
+    public bool BindThreadDevice(string threadId, string deviceId)
+    {
+        try
+        {
+            BindOwnThreadForSend(threadId, new ExecutionDevice(deviceId, null, DevicePlatforms.Unknown));
+            return true;
+        }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return false; }
+        catch (KeyNotFoundException) { return false; }
     }
 
     public void RenameOwnThread(string threadId, string title)
@@ -428,7 +619,10 @@ public sealed class AppState
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
         if (thread is null) return;
         thread.Title = string.IsNullOrWhiteSpace(title) ? thread.Title : title.Trim();
+        var at = DateTimeOffset.UtcNow;
+        thread.LastActivityAt = at;
         activeDb?.RenameOwnThread(thread.Id, thread.Title);
+        activeDb?.SetOwnThreadActivity(thread.Id, at);
         EmitTopicUpsert(thread);
         NotifyChanged();
     }
@@ -490,7 +684,10 @@ public sealed class AppState
                 DeviceSyncKinds.TopicUpsert,
                 entityId,
                 version,
-                new DeviceSyncTopic(thread.Id, thread.Title, thread.CreatedAt, i)));
+                new DeviceSyncTopic(thread.Id, thread.Title, thread.CreatedAt, i,
+                    thread.ExecutionDeviceId, thread.ExecutionDeviceName, thread.ExecutionDevicePlatform,
+                    thread.LastActivityAt, thread.IsPinned, thread.ExecutionAt, thread.ExecutionRunId,
+                    HasExecutionMetadata: true)));
 
             foreach (var line in thread.Lines)
             {
@@ -678,9 +875,27 @@ public sealed class AppState
             return false;
 
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == dto.Id);
+        var hasMetadata = dto.HasExecutionMetadata
+                          || dto.ExecutionDeviceId is not null
+                          || dto.ExecutionDeviceName is not null
+                          || dto.ExecutionDevicePlatform is not null
+                          || dto.ExecutionAt.HasValue
+                          || dto.ExecutionRunId is not null
+                          || dto.LastActivityAt.HasValue
+                          || dto.IsPinned;
         var changed = thread is null
             || !string.Equals(thread.Title, dto.Title, StringComparison.Ordinal)
             || thread.CreatedAt != dto.CreatedAt
+            || hasMetadata
+               && (thread.ExecutionDeviceId != dto.ExecutionDeviceId
+                   || thread.ExecutionDeviceName != dto.ExecutionDeviceName
+                   || thread.ExecutionDevicePlatform != dto.ExecutionDevicePlatform
+                   || thread.ExecutionAt != dto.ExecutionAt
+                   || thread.ExecutionRunId != dto.ExecutionRunId
+                   || dto.LastActivityAt.HasValue
+                      && (!thread.LastActivityAt.HasValue
+                          || dto.LastActivityAt.Value > thread.LastActivityAt.Value)
+                   || thread.IsPinned != dto.IsPinned)
             || Profile.OwnThreads.IndexOf(thread) != Math.Min(dto.SortOrder, Profile.OwnThreads.Count - 1);
         if (thread is null)
         {
@@ -694,7 +909,31 @@ public sealed class AppState
         }
         thread.Title = dto.Title ?? "";
         thread.CreatedAt = dto.CreatedAt;
-        activeDb!.UpsertOwnThread(thread.Id, thread.Title, thread.CreatedAt, Profile.OwnThreads.IndexOf(thread));
+        if (hasMetadata)
+        {
+            thread.ExecutionDeviceId = dto.ExecutionDeviceId;
+            thread.ExecutionDeviceName = dto.ExecutionDeviceName;
+            thread.ExecutionDevicePlatform = dto.ExecutionDevicePlatform;
+            thread.ExecutionAt = dto.ExecutionAt;
+            thread.ExecutionRunId = dto.ExecutionRunId;
+            if (dto.LastActivityAt.HasValue)
+                thread.LastActivityAt = ActivityTimestamp.Advance(
+                    thread.LastActivityAt, dto.LastActivityAt.Value);
+            thread.IsPinned = dto.IsPinned;
+        }
+        activeDb!.UpsertOwnThread(
+            thread.Id,
+            thread.Title,
+            thread.CreatedAt,
+            Profile.OwnThreads.IndexOf(thread),
+            thread.LastActivityAt,
+            thread.IsPinned,
+            thread.ExecutionDeviceId,
+            thread.ExecutionAt,
+            thread.ExecutionRunId,
+            replaceExecutionMetadata: hasMetadata,
+            executionDeviceName: thread.ExecutionDeviceName,
+            executionDevicePlatform: thread.ExecutionDevicePlatform);
         activeDb.TryAdvanceSyncVersion(SyncKey(operation.Kind, operation.EntityId), operation.Version);
         activeDb.ReorderOwnThreads(Profile.OwnThreads.Select(t => t.Id).ToList());
         return changed;
@@ -717,7 +956,7 @@ public sealed class AppState
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
         if (thread is null)
         {
-            thread = new OwnThread { Id = threadId, CreatedAt = dto.At };
+            thread = new OwnThread { Id = threadId, CreatedAt = dto.At, LastActivityAt = dto.At };
             Profile.OwnThreads.Add(thread);
             activeDb!.UpsertOwnThread(thread.Id, thread.Title, thread.CreatedAt, Profile.OwnThreads.Count - 1);
         }
@@ -729,7 +968,10 @@ public sealed class AppState
             thread.Lines.Add(line);
         }
         MergeLine(line, dto);
+        thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, dto.At);
         activeDb!.UpsertOwnChat(threadId, line);
+        if (thread.LastActivityAt.HasValue)
+            activeDb.SetOwnThreadActivity(threadId, thread.LastActivityAt.Value);
         activeDb.TryAdvanceSyncVersion(
             LineSyncKey(operation.Kind, threadId, lineId), operation.Version);
         return changed;
@@ -782,8 +1024,18 @@ public sealed class AppState
         var normalized = NormalizeSyncConversation(dto, handle);
         var conversation = FindConversation(handle);
         var targetIndex = Math.Min(normalized.SortOrder, Math.Max(0, Profile.Conversations.Count - 1));
+        var hasActivityMetadata = dto.HasActivityMetadata
+                                  || dto.CreatedAt.HasValue
+                                  || dto.LastActivityAt.HasValue
+                                  || dto.IsPinned;
         var changed = conversation is null
-            || !ConversationEquals(conversation, normalized)
+            || !ConversationCoreEquals(conversation, normalized)
+            || hasActivityMetadata
+               && (dto.CreatedAt.HasValue && conversation.CreatedAt != dto.CreatedAt
+                   || dto.LastActivityAt.HasValue
+                      && (!conversation.LastActivityAt.HasValue
+                          || dto.LastActivityAt.Value > conversation.LastActivityAt.Value)
+                   || conversation.IsPinned != dto.IsPinned)
             || Profile.Conversations.IndexOf(conversation) != targetIndex;
         if (conversation is null)
         {
@@ -796,6 +1048,15 @@ public sealed class AppState
             Profile.Conversations.Insert(Math.Min(normalized.SortOrder, Profile.Conversations.Count), conversation);
         }
         MergeConversation(conversation, normalized);
+        if (hasActivityMetadata)
+        {
+            if (dto.CreatedAt.HasValue)
+                conversation.CreatedAt = dto.CreatedAt;
+            if (dto.LastActivityAt.HasValue)
+                conversation.LastActivityAt = ActivityTimestamp.Advance(
+                    conversation.LastActivityAt, dto.LastActivityAt.Value);
+            conversation.IsPinned = dto.IsPinned;
+        }
         activeDb!.UpsertConversation(
             handle,
             Profile.Conversations.IndexOf(conversation),
@@ -806,7 +1067,14 @@ public sealed class AppState
             conversation.GroupName,
             conversation.GroupOwnerHandle,
             conversation.GroupMembers,
-            conversation.GroupVersion);
+            conversation.GroupVersion,
+            conversation.CreatedAt,
+            conversation.LastActivityAt,
+            conversation.IsPinned,
+            replaceCreatedAt: dto.CreatedAt.HasValue);
+        if (conversation.LastActivityAt.HasValue)
+            activeDb.SetConversationActivity(handle, conversation.LastActivityAt.Value);
+        activeDb.SetConversationPin(handle, conversation.IsPinned);
         activeDb.TryAdvanceSyncVersion(SyncKey(operation.Kind, operation.EntityId), operation.Version);
         activeDb.ReorderConversations(Profile.Conversations.Select(c => c.Handle).ToList());
         return changed;
@@ -830,10 +1098,11 @@ public sealed class AppState
         var conversation = FindConversation(handle);
         if (conversation is null)
         {
-            conversation = new Conversation { Handle = handle };
+            conversation = new Conversation { Handle = handle, CreatedAt = dto.At };
             Profile.Conversations.Add(conversation);
             activeDb!.UpsertConversation(
-                handle, Profile.Conversations.Count - 1, null, null, null, null, null, null, Array.Empty<string>(), 0);
+                handle, Profile.Conversations.Count - 1, null, null, null, null, null, null,
+                Array.Empty<string>(), 0, conversation.CreatedAt, dto.At);
         }
         var line = conversation.Lines.FirstOrDefault(item => item.Id == lineId);
         var changed = line is null || !LineEquals(line, dto);
@@ -843,7 +1112,11 @@ public sealed class AppState
             conversation.Lines.Add(line);
         }
         MergeLine(line, dto);
+        conversation.LastActivityAt = ActivityTimestamp.Advance(
+            conversation.LastActivityAt, dto.At);
         activeDb!.UpsertChatLine(handle, line);
+        if (conversation.LastActivityAt.HasValue)
+            activeDb.SetConversationActivity(handle, conversation.LastActivityAt.Value);
         activeDb.TryAdvanceSyncVersion(
             LineSyncKey(operation.Kind, handle, lineId), operation.Version);
         return changed;
@@ -1137,7 +1410,10 @@ public sealed class AppState
         EmitUpsert(
             DeviceSyncKinds.TopicUpsert,
             thread.Id,
-            new DeviceSyncTopic(thread.Id, thread.Title, thread.CreatedAt, Math.Max(0, sortOrder)),
+            new DeviceSyncTopic(thread.Id, thread.Title, thread.CreatedAt, Math.Max(0, sortOrder),
+                thread.ExecutionDeviceId, thread.ExecutionDeviceName, thread.ExecutionDevicePlatform,
+                thread.LastActivityAt, thread.IsPinned, thread.ExecutionAt, thread.ExecutionRunId,
+                HasExecutionMetadata: true),
             DeviceSyncKinds.TopicDelete);
     }
 
@@ -1652,7 +1928,11 @@ public sealed class AppState
             conversation.GroupName,
             conversation.GroupOwnerHandle,
             conversation.GroupMembers.ToList(),
-            conversation.GroupVersion);
+            conversation.GroupVersion,
+            conversation.CreatedAt,
+            conversation.LastActivityAt,
+            conversation.IsPinned,
+            HasActivityMetadata: true);
 
     private static string CircleEntityId(string? name)
         => ProfileSyncState.CircleEntityId(name);
@@ -1821,7 +2101,7 @@ public sealed class AppState
         line.Attachments.Clear();
     }
 
-    private static bool ConversationEquals(Conversation conversation, DeviceSyncConversation dto)
+    private static bool ConversationCoreEquals(Conversation conversation, DeviceSyncConversation dto)
         => conversation.Handle == dto.Handle
            && conversation.ServiceId == dto.ServiceId
            && conversation.ServiceName == dto.ServiceName
@@ -2020,6 +2300,8 @@ public sealed class AppState
     private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
     private readonly HashSet<string> completedThreads = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RemoteRunProjection> remoteRuns = new(StringComparer.Ordinal);
+    private readonly HashSet<string> terminalRemoteRuns = new(StringComparer.Ordinal);
     // Cancellation source per running thread, so the user can STOP an in-progress turn. The token is
     // passed into the agent call and flows down through the provider tool loop (real cancellation of
     // the HTTP request, not just a UI change). Threads that were cancelled (rather than finishing on
@@ -2036,19 +2318,199 @@ public sealed class AppState
     public void SetAgentRun(AgentRunState run)
     {
         agentRuns[run.ThreadId] = run;
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == run.ThreadId);
+        if (thread is not null)
+        {
+            thread.ExecutionRunId = run.RunId;
+            thread.ExecutionAt = run.StartedAt;
+            thread.LastActivityAt = ActivityTimestamp.Advance(
+                thread.LastActivityAt, run.StartedAt);
+            activeDb?.SetOwnThreadExecutionAndActivity(
+                thread.Id,
+                thread.ExecutionDeviceId,
+                thread.ExecutionDeviceName,
+                thread.ExecutionDevicePlatform,
+                thread.ExecutionAt,
+                thread.ExecutionRunId,
+                thread.LastActivityAt!.Value);
+            EmitTopicUpsert(thread);
+        }
         NotifyChanged();
     }
 
     public void ClearAgentRun(string threadId)
     {
-        if (agentRuns.Remove(threadId)) NotifyChanged();
+        if (!agentRuns.Remove(threadId)) return;
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        if (thread is not null)
+        {
+            var at = DateTimeOffset.UtcNow;
+            thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
+            activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+            EmitTopicUpsert(thread);
+        }
+        NotifyChanged();
     }
 
-    public void UpdateAgentRun(string threadId, AgentRunPhase phase,
-        IReadOnlyList<AgentSubtaskState>? subtasks = null)
+    /// <summary>Gets the current remote run projection for a thread, or null.</summary>
+    public RemoteRunProjection? GetRemoteRunProjection(string threadId)
+        => remoteRuns.TryGetValue(threadId, out var p) ? p : null;
+
+    public void RegisterExpectedRemoteRun(
+        string threadId,
+        string runId,
+        ExecutionDevice target,
+        DateTimeOffset startedAt)
+    {
+        ValidateThreadId(threadId);
+        if (!TopicRunProtocol.IsValidIdentifier(runId))
+            throw new ArgumentException("A run ID is required.", nameof(runId));
+        ValidateExecutionDevice(target);
+        if (startedAt == default)
+            throw new ArgumentException("A run timestamp is required.", nameof(startedAt));
+
+        OwnThread thread;
+        lock (profileSyncGate)
+        {
+            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId)
+                     ?? throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
+            if (thread.ExecutionRunId is not null
+                && !string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
+                throw new InvalidOperationException("The topic already has a different active run.");
+            if (thread.ExecutionDeviceId is not null
+                && !string.Equals(thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
+                throw new InvalidOperationException("The run target does not match the bound execution device.");
+            var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, startedAt);
+            if (activeDb is not null
+                && !activeDb.SetOwnThreadExecutionAndActivity(
+                    thread.Id,
+                    target.DeviceId,
+                    target.DeviceName,
+                    target.Platform,
+                    startedAt,
+                    runId,
+                    activityAt))
+                throw new InvalidOperationException("The expected remote run could not be persisted.");
+            terminalRemoteRuns.Remove(threadId + "\0" + runId);
+            thread.ExecutionDeviceId = target.DeviceId;
+            thread.ExecutionDeviceName = target.DeviceName;
+            thread.ExecutionDevicePlatform = target.Platform;
+            thread.ExecutionRunId = runId;
+            thread.ExecutionAt = startedAt;
+            thread.LastActivityAt = activityAt;
+        }
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+    }
+
+    public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
+        => ApplyRemoteRunProjection(update.ThreadId, new RemoteRunProjection
+        {
+            RunId = update.RunId,
+            ThreadId = update.ThreadId,
+            Phase = update.Phase,
+            Status = update.Status,
+            Plan = update.Plan,
+            Subtasks = update.Subtasks,
+            Steps = update.Steps,
+            Queued = update.Queued,
+            Error = update.Error,
+            FailureCode = update.FailureCode,
+            Timestamp = update.Timestamp
+        });
+
+    /// <summary>Applies a remote run update projection for a thread and refreshes the UI.</summary>
+    public void ApplyRemoteRunProjection(string threadId, RemoteRunProjection projection)
+    {
+        var correlationKey = threadId + "\0" + projection.RunId;
+        if (!string.Equals(threadId, projection.ThreadId, StringComparison.Ordinal)
+            || string.IsNullOrWhiteSpace(projection.RunId)
+            || projection.Timestamp == default
+            || terminalRemoteRuns.Contains(correlationKey))
+            return;
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        if (!RemoteRunCorrelation.IsExpected(thread, threadId, projection.RunId)
+            || remoteRuns.TryGetValue(threadId, out var current)
+               && projection.Timestamp < current.Timestamp)
+            return;
+        thread.LastActivityAt = ActivityTimestamp.Advance(
+            thread.LastActivityAt, projection.Timestamp);
+        var terminal = projection.Phase is TopicRunPhase.Completed
+            or TopicRunPhase.Failed
+            or TopicRunPhase.Cancelled;
+        if (terminal)
+        {
+            remoteRuns.Remove(threadId);
+            terminalRemoteRuns.Add(correlationKey);
+            if (string.Equals(thread.ExecutionRunId, projection.RunId, StringComparison.Ordinal))
+                thread.ExecutionRunId = null;
+        }
+        else
+        {
+            remoteRuns[threadId] = projection;
+            thread.ExecutionRunId = projection.RunId;
+        }
+        if (!thread.ExecutionAt.HasValue)
+            thread.ExecutionAt = projection.Timestamp;
+        activeDb?.SetOwnThreadExecutionAndActivity(
+            thread.Id,
+            thread.ExecutionDeviceId,
+            thread.ExecutionDeviceName,
+            thread.ExecutionDevicePlatform,
+            thread.ExecutionAt,
+            thread.ExecutionRunId,
+            thread.LastActivityAt!.Value);
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+    }
+
+    /// <summary>Clears the remote run projection for a thread (run completed or cancelled).</summary>
+    public void ClearRemoteRunProjection(
+        string threadId,
+        string? runId = null,
+        DateTimeOffset? clearedAt = null)
+    {
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        remoteRuns.TryGetValue(threadId, out var projection);
+        var correlatedRunId = runId ?? projection?.RunId;
+        if (!TopicRunProtocol.IsValidIdentifier(correlatedRunId)
+            || !RemoteRunCorrelation.IsExpected(thread, threadId, correlatedRunId!)
+            || projection is not null
+               && !string.Equals(projection.RunId, correlatedRunId, StringComparison.Ordinal))
+            return;
+        remoteRuns.Remove(threadId);
+        terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
+        var at = clearedAt ?? DateTimeOffset.UtcNow;
+        thread.ExecutionRunId = null;
+        thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
+        activeDb?.SetOwnThreadExecutionAndActivity(
+            thread.Id,
+            thread.ExecutionDeviceId,
+            thread.ExecutionDeviceName,
+            thread.ExecutionDevicePlatform,
+            thread.ExecutionAt,
+            null,
+            thread.LastActivityAt.Value);
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+    }
+
+    public void UpdateAgentRun(
+        string threadId,
+        AgentRunPhase phase,
+        IReadOnlyList<AgentSubtaskState>? subtasks = null,
+        DateTimeOffset? updatedAt = null)
     {
         if (!agentRuns.TryGetValue(threadId, out var run)) return;
         agentRuns[threadId] = run with { Phase = phase, Subtasks = subtasks ?? run.Subtasks };
+        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+        if (thread is not null)
+        {
+            var at = updatedAt ?? DateTimeOffset.UtcNow;
+            thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
+            activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt!.Value);
+            EmitTopicUpsert(thread);
+        }
         NotifyChanged();
     }
 
@@ -2276,20 +2738,47 @@ public sealed class AppState
         foreach (var conv in imported.Conversations)
         {
             conv.Handle = PrepareConversationForPersistence(conv);
-            db.EnsureConversation(conv.Handle);
+            DeriveActivityMetadata(conv);
+            db.EnsureConversation(conv.Handle, conv.CreatedAt);
             PersistConversationMetadata(db, conv);
+            if (conv.LastActivityAt.HasValue)
+                db.SetConversationActivity(conv.Handle, conv.LastActivityAt.Value);
+            if (conv.IsPinned)
+                db.SetConversationPin(conv.Handle, true);
             foreach (var line in conv.Lines) db.AppendChatLine(Norm(conv.Handle), line);
         }
         // Migrate a legacy single OwnChat (older exports) into a thread so nothing is lost.
         if (imported.OwnChat.Count > 0)
         {
-            var legacy = new OwnThread { Title = "General", Lines = imported.OwnChat.ToList() };
+            var lines = imported.OwnChat.ToList();
+            var legacy = new OwnThread
+            {
+                Title = "General",
+                Lines = lines,
+                CreatedAt = lines.Count == 0 ? DateTimeOffset.UnixEpoch : lines.Min(line => line.At),
+                LastActivityAt = lines.Count == 0 ? DateTimeOffset.UnixEpoch : lines.Max(line => line.At)
+            };
             imported.OwnThreads.Insert(0, legacy);
             imported.OwnChat = new List<ChatLine>();
         }
         foreach (var thread in imported.OwnThreads)
         {
+            thread.LastActivityAt ??= thread.Lines.Count == 0
+                ? thread.CreatedAt
+                : thread.Lines.Max(line => line.At);
             db.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+            if (thread.LastActivityAt.HasValue)
+                db.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+            if (thread.IsPinned)
+                db.SetOwnThreadPin(thread.Id, true);
+            if (thread.ExecutionDeviceId is not null || thread.ExecutionAt.HasValue || thread.ExecutionRunId is not null)
+                db.SetOwnThreadExecution(
+                    thread.Id,
+                    thread.ExecutionDeviceId,
+                    thread.ExecutionAt,
+                    thread.ExecutionRunId,
+                    thread.ExecutionDeviceName,
+                    thread.ExecutionDevicePlatform);
             foreach (var line in thread.Lines) db.AppendOwnChat(thread.Id, line);
         }
         db.SaveProfile(imported);
@@ -2514,7 +3003,7 @@ public sealed class AppState
         var conv = Profile.Conversations.FirstOrDefault(c => c.Handle.Equals(handle, StringComparison.OrdinalIgnoreCase));
         if (conv is null)
         {
-            conv = new Conversation { Handle = handle };
+            conv = new Conversation { Handle = handle, CreatedAt = DateTimeOffset.UtcNow };
             Profile.Conversations.Add(conv);
             activeDb?.EnsureConversation(handle);
             EmitConversationUpsert(conv);
@@ -2525,20 +3014,59 @@ public sealed class AppState
     /// <summary>Moves one message conversation to the requested list position and persists the order.</summary>
     public void ReorderConversation(string handle, int newIndex)
     {
-        var normalized = Norm(handle);
-        var oldIndex = Profile.Conversations.FindIndex(
-            c => c.Handle.Equals(normalized, StringComparison.OrdinalIgnoreCase));
-        if (oldIndex < 0 || Profile.Conversations.Count < 2) return;
-        newIndex = Math.Clamp(newIndex, 0, Profile.Conversations.Count - 1);
-        if (oldIndex == newIndex) return;
-        var conversation = Profile.Conversations[oldIndex];
-        Profile.Conversations.RemoveAt(oldIndex);
-        Profile.Conversations.Insert(newIndex, conversation);
-        activeDb?.ReorderConversations(Profile.Conversations.Select(c => c.Handle).ToList());
+        Conversation conversation;
+        lock (profileSyncGate)
+        {
+            var normalized = Norm(handle);
+            var oldIndex = Profile.Conversations.FindIndex(
+                c => c.Handle.Equals(normalized, StringComparison.OrdinalIgnoreCase));
+            if (oldIndex < 0 || Profile.Conversations.Count < 2) return;
+            newIndex = Math.Clamp(newIndex, 0, Profile.Conversations.Count - 1);
+            if (oldIndex == newIndex) return;
+            conversation = Profile.Conversations[oldIndex];
+            var ordered = Profile.Conversations.ToList();
+            ordered.RemoveAt(oldIndex);
+            ordered.Insert(newIndex, conversation);
+            var at = DateTimeOffset.UtcNow;
+            activeDb?.ReorderConversations(
+                ordered.Select(c => c.Handle).ToList(), conversation.Handle, at);
+            Profile.Conversations.RemoveAt(oldIndex);
+            Profile.Conversations.Insert(newIndex, conversation);
+            conversation.LastActivityAt = at;
+        }
         foreach (var orderedConversation in Profile.Conversations)
             EmitConversationUpsert(orderedConversation);
         NotifyChanged();
     }
+
+    /// <summary>Moves a conversation to the requested list position. Alias for ReorderConversation.</summary>
+    public void MoveConversation(string handle, int newIndex) => ReorderConversation(handle, newIndex);
+
+    /// <summary>Pins a conversation so it sorts first. Bumps activity.</summary>
+    public void PinConversation(string handle)
+        => SetConversationPinned(handle, true);
+
+    public void SetConversationPinned(string handle, bool pinned)
+    {
+        Conversation? conv;
+        lock (profileSyncGate)
+        {
+            var h = Norm(handle);
+            conv = Profile.Conversations.FirstOrDefault(
+                c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
+            if (conv is null || conv.IsPinned == pinned) return;
+            var at = DateTimeOffset.UtcNow;
+            activeDb?.SetConversationPinAndActivity(h, pinned, at);
+            conv.IsPinned = pinned;
+            conv.LastActivityAt = at;
+        }
+        EmitConversationUpsert(conv);
+        NotifyChanged();
+    }
+
+    /// <summary>Unpins a conversation. Bumps activity.</summary>
+    public void UnpinConversation(string handle)
+        => SetConversationPinned(handle, false);
 
     /// <summary>Clears all message history for a conversation but keeps it in the list.</summary>
     public void ClearConversation(string handle)
@@ -2574,6 +3102,27 @@ public sealed class AppState
     }
 
     public static string Norm(string handle) => handle.Trim().TrimStart('@').ToLowerInvariant();
+
+    private static void ValidateThreadId(string threadId)
+    {
+        if (!TopicRunProtocol.IsValidIdentifier(threadId))
+            throw new ArgumentException("A valid topic ID is required.", nameof(threadId));
+    }
+
+    private static void ValidateExecutionDevice(ExecutionDevice target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        if (!TopicRunProtocol.IsValidIdentifier(target.DeviceId))
+            throw new ArgumentException("A valid execution device ID is required.", nameof(target));
+        if (target.DeviceName is not null
+            && (string.IsNullOrWhiteSpace(target.DeviceName)
+                || target.DeviceName.Length > TopicRunProtocol.MaxIdChars
+                || !string.Equals(target.DeviceName, target.DeviceName.Trim(), StringComparison.Ordinal)
+                || target.DeviceName.Any(char.IsControl)))
+            throw new ArgumentException("The execution device name is invalid.", nameof(target));
+        if (!TopicRunProtocol.IsValidIdentifier(target.Platform))
+            throw new ArgumentException("A valid execution device platform is required.", nameof(target));
+    }
 
     /// <summary>Friendly display name for a group/service thread, contact, or handle.</summary>
     public string DisplayNameFor(string handle)
@@ -2658,6 +3207,17 @@ public sealed class AppState
                     ?? throw new InvalidOperationException($"Group conversation '{conversation.Handle}' has no owner."),
                 conversation.GroupMembers,
                 conversation.GroupVersion);
+    }
+
+    private static void DeriveActivityMetadata(Conversation conversation)
+    {
+        if (conversation.CreatedAt is null)
+            conversation.CreatedAt = conversation.Lines.Count == 0
+                ? DateTimeOffset.UnixEpoch
+                : conversation.Lines.Min(line => line.At);
+        conversation.LastActivityAt ??= conversation.Lines.Count == 0
+            ? conversation.CreatedAt
+            : conversation.Lines.Max(line => line.At);
     }
 
     // ---- circles ----------------------------------------------------------

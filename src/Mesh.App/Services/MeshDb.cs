@@ -140,6 +140,18 @@ public sealed class MeshDb : IDisposable
         // User-defined topic order. Existing rows retain their creation order through the fallback sort.
         AddColumnIfMissing("own_threads", "sort_order", "INTEGER");
         NormalizeOwnThreadOrder();
+        // Phase 1: execution metadata and activity tracking.
+        AddColumnIfMissing("own_threads", "last_activity_at", "TEXT");
+        AddColumnIfMissing("own_threads", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("own_threads", "execution_device_id", "TEXT");
+        AddColumnIfMissing("own_threads", "execution_device_name", "TEXT");
+        AddColumnIfMissing("own_threads", "execution_device_platform", "TEXT");
+        AddColumnIfMissing("own_threads", "execution_at", "TEXT");
+        AddColumnIfMissing("own_threads", "execution_run_id", "TEXT");
+        MigrateOwnThreadActivity();
+        AddColumnIfMissing("conversations", "last_activity_at", "TEXT");
+        AddColumnIfMissing("conversations", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
+        MigrateConversationActivity();
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)
@@ -203,7 +215,8 @@ public sealed class MeshDb : IDisposable
         {
             cmd.CommandText = """
                 SELECT handle, service_id, service_name, provider_handle,
-                       group_id, group_name, group_owner_handle, group_members_json, group_version
+                       group_id, group_name, group_owner_handle, group_members_json, group_version,
+                       created_at, last_activity_at, is_pinned
                 FROM conversations ORDER BY sort_order, created_at, handle;
                 """;
             using var r = cmd.ExecuteReader();
@@ -220,6 +233,9 @@ public sealed class MeshDb : IDisposable
                     c.GroupMembers = JsonSerializer.Deserialize<List<string>>(r.GetString(7), JsonOpts)
                         ?? throw new InvalidOperationException($"Group members are invalid for conversation '{c.Handle}'.");
                 c.GroupVersion = r.GetInt32(8);
+                c.CreatedAt = r.IsDBNull(9) ? (DateTimeOffset?)null : ParseAt(r.GetString(9));
+                c.LastActivityAt = r.IsDBNull(10) ? null : ParseAt(r.GetString(10));
+                c.IsPinned = !r.IsDBNull(11) && r.GetInt64(11) != 0;
             }
         }
 
@@ -262,23 +278,59 @@ public sealed class MeshDb : IDisposable
         }
         if (legacyCount > 0)
         {
+            DateTimeOffset? first = null;
+            DateTimeOffset? last = null;
+            using (var timestamps = conn.CreateCommand())
+            {
+                timestamps.CommandText = """
+                    SELECT at FROM own_chat
+                    WHERE thread_id IS NULL
+                    ORDER BY julianday(at), id;
+                    """;
+                using var reader = timestamps.ExecuteReader();
+                while (reader.Read())
+                {
+                    var at = ParseAt(reader.GetString(0));
+                    first ??= at;
+                    last = at;
+                }
+            }
             var defaultId = Guid.NewGuid().ToString("n");
-            EnsureOwnThread(defaultId, "General", DateTimeOffset.UtcNow);
+            var createdAt = first ?? DateTimeOffset.UnixEpoch;
+            EnsureOwnThread(defaultId, "General", createdAt);
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "UPDATE own_chat SET thread_id = $tid WHERE thread_id IS NULL;";
             cmd.Parameters.AddWithValue("$tid", defaultId);
             cmd.ExecuteNonQuery();
+            if (last.HasValue) SetOwnThreadActivity(defaultId, last.Value);
         }
 
         var threads = new List<OwnThread>();
         var byId = new Dictionary<string, OwnThread>();
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT id, title, created_at FROM own_threads ORDER BY sort_order, created_at, id;";
+            cmd.CommandText = """
+                SELECT id, title, created_at, last_activity_at, is_pinned,
+                       execution_device_id, execution_device_name, execution_device_platform,
+                       execution_at, execution_run_id
+                FROM own_threads ORDER BY sort_order, created_at, id;
+                """;
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
-                var t = new OwnThread { Id = r.GetString(0), Title = r.GetString(1), CreatedAt = ParseAt(r.GetString(2)) };
+                var t = new OwnThread
+                {
+                    Id = r.GetString(0),
+                    Title = r.GetString(1),
+                    CreatedAt = ParseAt(r.GetString(2)),
+                    LastActivityAt = r.IsDBNull(3) ? null : ParseAt(r.GetString(3)),
+                    IsPinned = !r.IsDBNull(4) && r.GetInt64(4) != 0,
+                    ExecutionDeviceId = r.IsDBNull(5) ? null : r.GetString(5),
+                    ExecutionDeviceName = r.IsDBNull(6) ? null : r.GetString(6),
+                    ExecutionDevicePlatform = r.IsDBNull(7) ? null : r.GetString(7),
+                    ExecutionAt = r.IsDBNull(8) ? null : ParseAt(r.GetString(8)),
+                    ExecutionRunId = r.IsDBNull(9) ? null : r.GetString(9)
+                };
                 threads.Add(t);
                 byId[t.Id] = t;
             }
@@ -706,15 +758,15 @@ public sealed class MeshDb : IDisposable
     }
 
     /// <summary>Records that a conversation thread exists so an empty thread survives a reload.</summary>
-    public void EnsureConversation(string handle)
+    public void EnsureConversation(string handle, DateTimeOffset? createdAt = null)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT OR IGNORE INTO conversations(handle, created_at, sort_order)
-            VALUES($h, $t, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM conversations));
+            INSERT OR IGNORE INTO conversations(handle, created_at, sort_order, last_activity_at)
+            VALUES($h, $t, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM conversations), $t);
             """;
         cmd.Parameters.AddWithValue("$h", handle);
-        cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$t", (createdAt ?? DateTimeOffset.UtcNow).UtcDateTime.ToString("O"));
         cmd.ExecuteNonQuery();
     }
 
@@ -729,15 +781,23 @@ public sealed class MeshDb : IDisposable
         string? groupName,
         string? groupOwnerHandle,
         IReadOnlyList<string> groupMembers,
-        int groupVersion)
+        int groupVersion,
+        DateTimeOffset? createdAt = null,
+        DateTimeOffset? lastActivityAt = null,
+        bool isPinned = false,
+        bool replaceCreatedAt = false)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO conversations(
                 handle, created_at, sort_order, service_id, service_name, provider_handle,
-                group_id, group_name, group_owner_handle, group_members_json, group_version)
-            VALUES($h, $created, $sort, $sid, $sname, $provider, $gid, $gname, $owner, $members, $gversion)
+                group_id, group_name, group_owner_handle, group_members_json, group_version,
+                last_activity_at, is_pinned)
+            VALUES($h, $created, $sort, $sid, $sname, $provider, $gid, $gname, $owner, $members, $gversion,
+                $activity, $pinned)
             ON CONFLICT(handle) DO UPDATE SET
+                created_at = CASE WHEN $replaceCreated = 1
+                    THEN excluded.created_at ELSE created_at END,
                 sort_order = excluded.sort_order,
                 service_id = excluded.service_id,
                 service_name = excluded.service_name,
@@ -746,10 +806,15 @@ public sealed class MeshDb : IDisposable
                 group_name = excluded.group_name,
                 group_owner_handle = excluded.group_owner_handle,
                 group_members_json = excluded.group_members_json,
-                group_version = excluded.group_version;
+                group_version = excluded.group_version,
+                last_activity_at = COALESCE(excluded.last_activity_at, last_activity_at),
+                is_pinned = excluded.is_pinned;
             """;
         cmd.Parameters.AddWithValue("$h", handle);
-        cmd.Parameters.AddWithValue("$created", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue(
+            "$created",
+            (createdAt ?? DateTimeOffset.UnixEpoch).UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$replaceCreated", replaceCreatedAt ? 1 : 0);
         cmd.Parameters.AddWithValue("$sort", sortOrder);
         cmd.Parameters.AddWithValue("$sid", (object?)serviceId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$sname", (object?)serviceName ?? DBNull.Value);
@@ -761,6 +826,55 @@ public sealed class MeshDb : IDisposable
             ? (object)DBNull.Value
             : JsonSerializer.Serialize(groupMembers, JsonOpts));
         cmd.Parameters.AddWithValue("$gversion", groupVersion);
+        cmd.Parameters.AddWithValue("$activity",
+            lastActivityAt.HasValue ? lastActivityAt.Value.UtcDateTime.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$pinned", isPinned ? 1 : 0);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetConversationActivity(string handle, DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE conversations SET last_activity_at = $at WHERE handle = $h;";
+        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$h", handle);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void AdvanceConversationActivity(string handle, DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE conversations
+            SET last_activity_at = $at
+            WHERE handle = $h
+              AND (last_activity_at IS NULL OR julianday($at) > julianday(last_activity_at));
+            """;
+        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$h", handle);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetConversationPin(string handle, bool pinned)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE conversations SET is_pinned = $p WHERE handle = $h;";
+        cmd.Parameters.AddWithValue("$p", pinned ? 1 : 0);
+        cmd.Parameters.AddWithValue("$h", handle);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetConversationPinAndActivity(string handle, bool pinned, DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE conversations
+            SET is_pinned = $p, last_activity_at = $at
+            WHERE handle = $h;
+            """;
+        cmd.Parameters.AddWithValue("$p", pinned ? 1 : 0);
+        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$h", handle);
         cmd.ExecuteNonQuery();
     }
 
@@ -792,6 +906,12 @@ public sealed class MeshDb : IDisposable
 
     /// <summary>Persists the complete user-defined order of message conversations atomically.</summary>
     public void ReorderConversations(IReadOnlyList<string> orderedHandles)
+        => ReorderConversations(orderedHandles, null, null);
+
+    public void ReorderConversations(
+        IReadOnlyList<string> orderedHandles,
+        string? activityHandle,
+        DateTimeOffset? activityAt)
     {
         using var tx = conn.BeginTransaction();
         for (var i = 0; i < orderedHandles.Count; i++)
@@ -802,6 +922,15 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$o", i);
             cmd.Parameters.AddWithValue("$h", orderedHandles[i]);
             cmd.ExecuteNonQuery();
+        }
+        if (activityHandle is not null && activityAt.HasValue)
+        {
+            using var activity = conn.CreateCommand();
+            activity.Transaction = tx;
+            activity.CommandText = "UPDATE conversations SET last_activity_at = $at WHERE handle = $h;";
+            activity.Parameters.AddWithValue("$at", activityAt.Value.UtcDateTime.ToString("O"));
+            activity.Parameters.AddWithValue("$h", activityHandle);
+            activity.ExecuteNonQuery();
         }
         tx.Commit();
     }
@@ -869,6 +998,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$internal", line.Internal ? 1 : 0);
         cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
         cmd.ExecuteNonQuery();
+        AdvanceConversationActivity(handle, line.At);
     }
 
     /// <summary>Inserts or replaces one persisted conversation line by its stable id.</summary>
@@ -938,6 +1068,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$rz", (object?)line.Reasoning ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
         cmd.ExecuteNonQuery();
+        AdvanceOwnThreadActivity(threadId, line.At);
     }
 
     /// <summary>Inserts or replaces one persisted topic line by its stable id.</summary>
@@ -990,7 +1121,7 @@ public sealed class MeshDb : IDisposable
     public void EnsureOwnThread(string id, string title, DateTimeOffset createdAt)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT OR IGNORE INTO own_threads(id, title, created_at) VALUES($id, $t, $c);";
+        cmd.CommandText = "INSERT OR IGNORE INTO own_threads(id, title, created_at, last_activity_at) VALUES($id, $t, $c, $c);";
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$t", title);
         cmd.Parameters.AddWithValue("$c", createdAt.ToString("O"));
@@ -998,20 +1129,53 @@ public sealed class MeshDb : IDisposable
     }
 
     /// <summary>Upserts complete topic metadata and its explicit order.</summary>
-    public void UpsertOwnThread(string id, string title, DateTimeOffset createdAt, int sortOrder)
+    public void UpsertOwnThread(string id, string title, DateTimeOffset createdAt, int sortOrder,
+        DateTimeOffset? lastActivityAt = null, bool isPinned = false,
+        string? executionDeviceId = null, DateTimeOffset? executionAt = null,
+        string? executionRunId = null, bool replaceExecutionMetadata = false,
+        string? executionDeviceName = null, string? executionDevicePlatform = null)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO own_threads(id, title, created_at, sort_order) VALUES($id, $title, $created, $sort)
+            INSERT INTO own_threads(id, title, created_at, sort_order, last_activity_at, is_pinned,
+                execution_device_id, execution_device_name, execution_device_platform,
+                execution_at, execution_run_id)
+            VALUES($id, $title, $created, $sort, $activity, $pinned,
+                $execDevice, $execName, $execPlatform, $execAt, $execRun)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 created_at = excluded.created_at,
-                sort_order = excluded.sort_order;
+                sort_order = excluded.sort_order,
+                last_activity_at = COALESCE(excluded.last_activity_at, last_activity_at),
+                is_pinned = excluded.is_pinned,
+                execution_device_id = CASE WHEN $replaceExecution = 1
+                    THEN excluded.execution_device_id
+                    ELSE COALESCE(excluded.execution_device_id, execution_device_id) END,
+                execution_device_name = CASE WHEN $replaceExecution = 1
+                    THEN excluded.execution_device_name
+                    ELSE COALESCE(excluded.execution_device_name, execution_device_name) END,
+                execution_device_platform = CASE WHEN $replaceExecution = 1
+                    THEN excluded.execution_device_platform
+                    ELSE COALESCE(excluded.execution_device_platform, execution_device_platform) END,
+                execution_at = CASE WHEN $replaceExecution = 1
+                    THEN excluded.execution_at
+                    ELSE COALESCE(excluded.execution_at, execution_at) END,
+                execution_run_id = CASE WHEN $replaceExecution = 1
+                    THEN excluded.execution_run_id
+                    ELSE COALESCE(excluded.execution_run_id, execution_run_id) END;
             """;
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$title", title);
         cmd.Parameters.AddWithValue("$created", createdAt.ToString("O"));
         cmd.Parameters.AddWithValue("$sort", sortOrder);
+        cmd.Parameters.AddWithValue("$activity", lastActivityAt.HasValue ? (object)lastActivityAt.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$pinned", isPinned ? 1 : 0);
+        cmd.Parameters.AddWithValue("$execDevice", (object?)executionDeviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$execName", (object?)executionDeviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$execPlatform", (object?)executionDevicePlatform ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$execAt", executionAt.HasValue ? (object)executionAt.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$execRun", (object?)executionRunId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$replaceExecution", replaceExecutionMetadata ? 1 : 0);
         cmd.ExecuteNonQuery();
     }
 
@@ -1041,6 +1205,12 @@ public sealed class MeshDb : IDisposable
 
     /// <summary>Persists the complete user-defined order of "Me" threads atomically.</summary>
     public void ReorderOwnThreads(IReadOnlyList<string> orderedIds)
+        => ReorderOwnThreads(orderedIds, null, null);
+
+    public void ReorderOwnThreads(
+        IReadOnlyList<string> orderedIds,
+        string? activityThreadId,
+        DateTimeOffset? activityAt)
     {
         using var tx = conn.BeginTransaction();
         for (var i = 0; i < orderedIds.Count; i++)
@@ -1051,6 +1221,15 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$o", i);
             cmd.Parameters.AddWithValue("$id", orderedIds[i]);
             cmd.ExecuteNonQuery();
+        }
+        if (activityThreadId is not null && activityAt.HasValue)
+        {
+            using var activity = conn.CreateCommand();
+            activity.Transaction = tx;
+            activity.CommandText = "UPDATE own_threads SET last_activity_at = $at WHERE id = $id;";
+            activity.Parameters.AddWithValue("$at", activityAt.Value.UtcDateTime.ToString("O"));
+            activity.Parameters.AddWithValue("$id", activityThreadId);
+            activity.ExecuteNonQuery();
         }
         tx.Commit();
     }
@@ -1063,6 +1242,182 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$t", title);
         cmd.Parameters.AddWithValue("$id", id);
         cmd.ExecuteNonQuery();
+    }
+
+    public void SetOwnThreadActivity(string id, DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE own_threads SET last_activity_at = $at WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void AdvanceOwnThreadActivity(string id, DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET last_activity_at = $at
+            WHERE id = $id
+              AND (last_activity_at IS NULL OR julianday($at) > julianday(last_activity_at));
+            """;
+        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetOwnThreadPin(string id, bool pinned)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE own_threads SET is_pinned = $p WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$p", pinned ? 1 : 0);
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetOwnThreadPinAndActivity(string id, bool pinned, DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET is_pinned = $p, last_activity_at = $at
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$p", pinned ? 1 : 0);
+        cmd.Parameters.AddWithValue("$at", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetOwnThreadExecution(
+        string id,
+        string? deviceId,
+        DateTimeOffset? at,
+        string? runId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET execution_device_id = $did,
+                execution_at = $at,
+                execution_run_id = $rid
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$did", (object?)deviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$at",
+            at.HasValue ? at.Value.UtcDateTime.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$rid", (object?)runId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetOwnThreadExecution(
+        string id,
+        string? deviceId,
+        DateTimeOffset? at,
+        string? runId,
+        string? deviceName,
+        string? devicePlatform)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET execution_device_id = $did,
+                execution_device_name = $dname,
+                execution_device_platform = $dplatform,
+                execution_at = $at,
+                execution_run_id = $rid
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$did", (object?)deviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$dplatform", (object?)devicePlatform ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$at", at.HasValue ? (object)at.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$rid", (object?)runId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    public bool TryBindOwnThreadDevice(
+        string id,
+        string deviceId,
+        string? deviceName = null,
+        string? devicePlatform = null)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET execution_device_id = $did,
+                execution_device_name = $dname,
+                execution_device_platform = $dplatform
+            WHERE id = $id
+              AND (execution_device_id IS NULL OR trim(execution_device_id) = '');
+            """;
+        cmd.Parameters.AddWithValue("$did", deviceId);
+        cmd.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$dplatform", (object?)devicePlatform ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$id", id);
+        return cmd.ExecuteNonQuery() == 1;
+    }
+
+    public bool MoveOwnThreadToDevice(
+        string id,
+        string deviceId,
+        string? deviceName,
+        string? devicePlatform,
+        DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET execution_device_id = $did,
+                execution_device_name = $dname,
+                execution_device_platform = $dplatform,
+                execution_at = NULL,
+                execution_run_id = NULL,
+                last_activity_at = $activity
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$did", deviceId);
+        cmd.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$dplatform", (object?)devicePlatform ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$activity", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$id", id);
+        return cmd.ExecuteNonQuery() == 1;
+    }
+
+    public bool SetOwnThreadExecutionAndActivity(
+        string id,
+        string? deviceId,
+        string? deviceName,
+        string? devicePlatform,
+        DateTimeOffset? executionAt,
+        string? runId,
+        DateTimeOffset activityAt)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET execution_device_id = $did,
+                execution_device_name = $dname,
+                execution_device_platform = $dplatform,
+                execution_at = $at,
+                execution_run_id = $rid,
+                last_activity_at = $activity
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$did", (object?)deviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$dplatform", (object?)devicePlatform ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$at",
+            executionAt.HasValue ? executionAt.Value.UtcDateTime.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$rid", (object?)runId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$activity", activityAt.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$id", id);
+        return cmd.ExecuteNonQuery() == 1;
     }
 
     /// <summary>Clears a "Me" thread's messages but keeps the thread.</summary>
@@ -1181,6 +1536,34 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
+    }
+
+    private void MigrateOwnThreadActivity()
+    {
+        Exec("""
+            UPDATE own_threads
+            SET last_activity_at = COALESCE(
+                (SELECT c.at FROM own_chat c
+                 WHERE c.thread_id = own_threads.id
+                 ORDER BY julianday(c.at) DESC, c.id DESC LIMIT 1),
+                own_threads.created_at
+            )
+            WHERE last_activity_at IS NULL;
+            """);
+    }
+
+    private void MigrateConversationActivity()
+    {
+        Exec("""
+            UPDATE conversations
+            SET last_activity_at = COALESCE(
+                (SELECT l.at FROM chat_lines l
+                 WHERE l.handle = conversations.handle
+                 ORDER BY julianday(l.at) DESC, l.id DESC LIMIT 1),
+                conversations.created_at
+            )
+            WHERE last_activity_at IS NULL;
+            """);
     }
 
     public void Dispose()

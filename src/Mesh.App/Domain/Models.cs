@@ -488,6 +488,9 @@ public sealed class Conversation
 {
     public string Handle { get; set; } = "";
     public List<ChatLine> Lines { get; set; } = new();
+    public DateTimeOffset? CreatedAt { get; set; }
+    public DateTimeOffset? LastActivityAt { get; set; }
+    public bool IsPinned { get; set; }
 
     /// <summary>
     /// Client-only group metadata. Group threads use <c>grp:{normalizedGroupId}</c> as their
@@ -526,7 +529,58 @@ public sealed class OwnThread
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Title { get; set; } = "New chat";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? LastActivityAt { get; set; }
+    public bool IsPinned { get; set; }
+    public string? ExecutionDeviceId { get; set; }
+    public string? ExecutionDeviceName { get; set; }
+    public string? ExecutionDevicePlatform { get; set; }
+    public DateTimeOffset? ExecutionAt { get; set; }
+    public string? ExecutionRunId { get; set; }
     public List<ChatLine> Lines { get; set; } = new();
+}
+
+/// <summary>Immutable snapshot of the device that owns a topic execution run.</summary>
+public sealed record ExecutionDevice(string DeviceId, string? DeviceName, string Platform);
+
+/// <summary>
+/// A live projection of a remote execution run on an OwnThread, separate from the chat history.
+/// Applied when a topic.run.update arrives and cleared when the run reaches a terminal phase.
+/// </summary>
+public sealed class RemoteRunProjection
+{
+    public string RunId { get; set; } = "";
+    public string ThreadId { get; set; } = "";
+    public Mesh.Shared.TopicRunPhase Phase { get; set; }
+    public string? Status { get; set; }
+    public string? Plan { get; set; }
+    public IReadOnlyList<Mesh.Shared.TopicRunSubtask>? Subtasks { get; set; }
+    public IReadOnlyList<Mesh.Shared.TopicRunStep>? Steps { get; set; }
+    public int Queued { get; set; }
+    public string? Error { get; set; }
+    public string? FailureCode { get; set; }
+    public DateTimeOffset Timestamp { get; set; }
+}
+
+public static class ActivityTimestamp
+{
+    public static DateTimeOffset Advance(DateTimeOffset? current, DateTimeOffset candidate)
+    {
+        if (candidate == default)
+            throw new ArgumentException("An activity timestamp is required.", nameof(candidate));
+        return current.HasValue && candidate <= current.Value ? current.Value : candidate;
+    }
+}
+
+public static class RemoteRunCorrelation
+{
+    public static bool IsExpected(
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] OwnThread? thread,
+        string threadId,
+        string runId)
+        => thread is not null
+           && string.Equals(thread.Id, threadId, StringComparison.Ordinal)
+           && !string.IsNullOrWhiteSpace(runId)
+           && string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal);
 }
 
 /// <summary>
@@ -704,4 +758,28 @@ public sealed class MeshProfile
     public List<OwnThread> OwnThreads { get; set; } = new();
 
     [JsonIgnore] public bool IsOnboarded => !string.IsNullOrWhiteSpace(Handle) && !string.IsNullOrWhiteSpace(PrivateKey);
+}
+
+/// <summary>Stable ordering helpers for OwnThread and Conversation lists.</summary>
+public static class OwnThreadOrdering
+{
+    /// <summary>Sort: pinned first, then by activity (newest first), then by creation (newest first), then by id (stable).</summary>
+    public static IOrderedEnumerable<OwnThread> ByActivity(IEnumerable<OwnThread> threads)
+        => threads
+            .OrderByDescending(t => t.IsPinned)
+            .ThenByDescending(t => t.LastActivityAt ?? t.CreatedAt)
+            .ThenByDescending(t => t.CreatedAt)
+            .ThenBy(t => t.Id, StringComparer.Ordinal);
+}
+
+/// <summary>Stable ordering helpers for Conversation lists.</summary>
+public static class ConversationOrdering
+{
+    /// <summary>Sort: pinned first, then by activity (newest first), then by creation (newest first), then by handle (stable).</summary>
+    public static IOrderedEnumerable<Conversation> ByActivity(IEnumerable<Conversation> conversations)
+        => conversations
+            .OrderByDescending(c => c.IsPinned)
+            .ThenByDescending(c => c.LastActivityAt ?? c.CreatedAt ?? DateTimeOffset.MinValue)
+            .ThenByDescending(c => c.CreatedAt ?? DateTimeOffset.MinValue)
+            .ThenBy(c => c.Handle, StringComparer.OrdinalIgnoreCase);
 }

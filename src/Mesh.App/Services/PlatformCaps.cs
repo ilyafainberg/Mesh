@@ -12,6 +12,9 @@ public static class PlatformCaps
     /// <summary>True on Android and iOS, where the app cannot spawn arbitrary child processes.</summary>
     public static bool IsMobile => OperatingSystem.IsAndroid() || OperatingSystem.IsIOS();
 
+    /// <summary>True on all supported platforms: the agent execution coordinator is available everywhere.</summary>
+    public static bool CanRunAgent => true;
+
     public static bool CanHostHomeAgent => !IsMobile;
 
     public static string DevicePlatform =>
