@@ -234,7 +234,7 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
                     $"interactive apps: {profile.AllowInteractiveApps}; do not disturb: {profile.DoNotDisturb}; notification sound: {profile.NotificationSound}", null),
                 new SearchResult("setting", "agent", "Agent behavior",
                     $"approval mode: {profile.ApprovalMode}; daily auto-reply budget: {FormatLimit(profile.AgentDailyReplyBudget)}; "
-                    + $"used today: {profile.AgentRepliesUsedToday}; answer other devices: {profile.ActAsRemoteAgent}; home device selected: {profile.HomeDeviceId is not null}", null),
+                    + $"used today: {profile.AgentRepliesUsedToday}; agent ready: {profile.Model.IsConfigured}", null),
                 new SearchResult("setting", "circles", "Circles",
                     JoinOrNone(profile.Circles.Select(c => c.Name)), null)
             };

@@ -164,6 +164,15 @@ namespace Mesh.App.Tests
             };
             var router = new TopicExecutionRouter(state, runner, transport);
             var attachment = new ChatAttachment("notes.txt", "text/plain", [1, 2, 3]);
+            var offlineResult = await router.SubmitAsync(
+                Draft() with
+                {
+                    RunId = "run-offline",
+                    TriggerLineId = "line-offline",
+                    TargetDeviceId = "offline"
+                },
+                null,
+                CancellationToken.None);
             var draft = Draft() with
             {
                 TargetDeviceId = "target",
@@ -183,8 +192,11 @@ namespace Mesh.App.Tests
                 transport.Request.Attachments[0].Id,
                 transport.Request.AttachmentIds![0]);
             Assert.AreEqual(3L, transport.Request.Attachments[0].Length);
-            Assert.AreEqual(2, listed.Count);
-            Assert.AreEqual("target", listed[1].DeviceId);
+            Assert.IsFalse(offlineResult.Accepted);
+            Assert.AreEqual("device_not_eligible", offlineResult.Code);
+            Assert.AreEqual(3, listed.Count);
+            Assert.AreEqual("offline", listed[1].DeviceId);
+            Assert.AreEqual("target", listed[2].DeviceId);
             Assert.AreEqual(0, state.Profile.OwnThreads[0].Lines[0].Attachments.Count);
         }
 

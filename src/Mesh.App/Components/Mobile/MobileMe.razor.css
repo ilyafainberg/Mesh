@@ -124,14 +124,28 @@
     text-transform: uppercase;
 }
 
+.thread-swipe-shell {
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+    border-bottom: 1px solid var(--stroke-1);
+    background: var(--bg-1);
+}
+
 .thread-row {
     position: relative;
+    z-index: 1;
     display: flex;
     align-items: stretch;
     width: 100%;
     background: var(--bg-1);
-    border-bottom: 1px solid var(--stroke-1);
-    transition: background .12s ease;
+    touch-action: pan-y;
+    transition: transform .18s ease, background .12s ease;
+    will-change: transform;
+}
+
+.thread-row.revealed {
+    transform: translateX(-84px);
 }
 
 .thread-open {
@@ -147,25 +161,43 @@
     text-align: left;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
+    transition: margin-left .18s ease;
 }
 
-.thread-open:active,
-.thread-pin:active { background: var(--bg-3); }
+.thread-row.revealed .thread-open { margin-left: 84px; }
 
-.thread-pin {
-    flex: none;
-    width: 48px;
-    min-width: 48px;
-    min-height: 48px;
-    padding: 0;
+.thread-open:active { background: var(--bg-3); }
+
+.thread-swipe-action {
+    position: absolute;
+    inset: 0 0 0 auto;
+    z-index: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    width: 84px;
+    min-height: 64px;
+    padding: 0 8px;
     border: 0;
-    background: transparent;
-    color: var(--fg-3);
-    font-size: 17px;
+    background: var(--brand);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
 }
-.thread-pin .bi-pin-angle-fill { color: var(--brand); }
+
+.thread-swipe-action.unpin { background: var(--fg-2, #5b6470); }
+.thread-swipe-action i { font-size: 18px; }
+.thread-swipe-action:active { filter: brightness(.9); }
+
+.row-pin-status {
+    flex: none;
+    color: var(--brand);
+    font-size: 15px;
+}
 
 .row-avatar {
     display: flex;
@@ -272,27 +304,35 @@
 
 .thread-bar {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 12px;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 8px 10px 9px;
     padding-top: max(10px, env(safe-area-inset-top));
     background: var(--bg-1);
     border-bottom: 1px solid var(--stroke-1);
     flex: none;
+    position: relative;
+    z-index: 20;
 }
 
-.bar-title-wrap {
+.thread-heading {
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
+    gap: 4px;
     min-width: 0;
     flex: 1;
 }
 
-.bar-title {
-    max-width: 100%;
+.thread-title-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     min-width: 0;
+}
+
+.bar-title {
+    min-width: 0;
+    flex: 1;
     font-size: 16px;
     font-weight: 600;
     color: var(--fg-1);
@@ -301,11 +341,9 @@
     text-overflow: ellipsis;
 }
 
-.bar-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
+.more-btn {
     flex: none;
+    margin-top: -4px;
 }
 
 .bar-btn {
@@ -329,6 +367,63 @@
 .back-btn {
     color: var(--brand);
     font-size: 20px;
+    flex: none;
+    margin-top: -4px;
+}
+
+.thread-heading .device-pill {
+    max-width: min(220px, calc(100vw - 90px));
+    align-self: flex-start;
+}
+
+.topic-actions-menu {
+    position: absolute;
+    z-index: 100;
+    top: calc(100% - 4px);
+    right: 10px;
+    width: min(240px, calc(100vw - 24px));
+    padding: 6px;
+    border: 1px solid var(--stroke-1);
+    border-radius: 12px;
+    background: var(--bg-1);
+    box-shadow: var(--shadow-16);
+}
+
+.topic-actions-menu button {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 44px;
+    padding: 8px 12px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--fg-1);
+    text-align: left;
+}
+
+.topic-actions-menu button:active {
+    background: var(--bg-3);
+}
+
+.topic-actions-menu .danger-action {
+    color: var(--danger);
+}
+
+.topic-delete-bar,
+.rename-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--stroke-1);
+}
+
+.rename-row .rename-input {
+    flex: 1;
+    min-width: 0;
 }
 
 .text-btn { font-size: 13px; font-weight: 600; }
@@ -796,7 +891,6 @@
     .new-chat-device { max-width: 88px; }
     .thread-open { gap: 9px; padding-left: 12px; }
     .row-avatar { width: 38px; height: 38px; }
-    .bar-actions { gap: 0; }
     .bar-btn { min-width: 42px; padding-inline: 6px; }
-    .thread-bar { gap: 2px; padding-inline: 6px; }
+    .thread-bar { padding-inline: 6px; }
 }

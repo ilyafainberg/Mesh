@@ -97,10 +97,18 @@ public static class MauiProgram
 		builder.Services.AddSingleton<FileImporter>();
 		builder.Services.AddSingleton<AgentRunCoordinator>();
 		builder.Services.AddSingleton<AgentService>();
+		builder.Services.AddSingleton<TopicTurnRunner>();
+		builder.Services.AddSingleton<ITopicTurnRunner>(services =>
+			services.GetRequiredService<TopicTurnRunner>());
 		builder.Services.AddSingleton<SkillMarketplaceService>();
 		builder.Services.AddSingleton<ModelSetupService>();
 		builder.Services.AddSingleton<UpdateService>();
 		builder.Services.AddSingleton<MeshClient>();
+		builder.Services.AddSingleton<IDeviceTopicTransport>(services =>
+			services.GetRequiredService<MeshClient>());
+		builder.Services.AddSingleton<TopicExecutionRouter>();
+		builder.Services.AddSingleton<ITopicExecutionRouter>(services =>
+			services.GetRequiredService<TopicExecutionRouter>());
 		builder.Services.AddSingleton<DirectoryClient>();
 
 #if DEBUG

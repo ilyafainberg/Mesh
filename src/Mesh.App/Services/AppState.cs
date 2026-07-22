@@ -599,6 +599,57 @@ public sealed class AppState
         NotifyChanged();
     }
 
+    public OwnThread EnsureOwnThreadForDeviceRun(
+        string threadId,
+        ExecutionDevice target,
+        DateTimeOffset createdAt)
+    {
+        ValidateThreadId(threadId);
+        ValidateExecutionDevice(target);
+        if (createdAt == default)
+            throw new ArgumentException("A topic timestamp is required.", nameof(createdAt));
+
+        OwnThread thread;
+        lock (profileSyncGate)
+        {
+            thread = Profile.OwnThreads.FirstOrDefault(item => item.Id == threadId)
+                     ?? new OwnThread
+                     {
+                         Id = threadId,
+                         Title = "New chat",
+                         CreatedAt = createdAt,
+                         LastActivityAt = createdAt
+                     };
+            if (!Profile.OwnThreads.Contains(thread))
+                Profile.OwnThreads.Add(thread);
+            if (thread.ExecutionDeviceId is not null
+                && !string.Equals(thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
+                throw new InvalidOperationException("The topic is bound to another execution device.");
+
+            var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, createdAt);
+            activeDb?.UpsertOwnThread(
+                thread.Id,
+                thread.Title,
+                thread.CreatedAt,
+                Math.Max(0, Profile.OwnThreads.IndexOf(thread)),
+                activityAt,
+                thread.IsPinned,
+                target.DeviceId,
+                thread.ExecutionAt,
+                thread.ExecutionRunId,
+                replaceExecutionMetadata: true,
+                executionDeviceName: target.DeviceName,
+                executionDevicePlatform: target.Platform);
+            thread.ExecutionDeviceId = target.DeviceId;
+            thread.ExecutionDeviceName = target.DeviceName;
+            thread.ExecutionDevicePlatform = target.Platform;
+            thread.LastActivityAt = activityAt;
+        }
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+        return thread;
+    }
+
     /// <summary>Compatibility alias. Prefer <see cref="BindOwnThreadForSend"/>.</summary>
     public bool BindThreadDevice(string threadId, string deviceId)
     {
@@ -2350,7 +2401,12 @@ public sealed class AppState
 
     /// <summary>Gets the current remote run projection for a thread, or null.</summary>
     public RemoteRunProjection? GetRemoteRunProjection(string threadId)
-        => remoteRuns.TryGetValue(threadId, out var p) ? p : null;
+    {
+        lock (profileSyncGate)
+            return remoteRuns.TryGetValue(threadId, out var projection)
+                ? CloneRemoteRunProjection(projection)
+                : null;
+    }
 
     public void RegisterExpectedRemoteRun(
         string threadId,
@@ -2421,42 +2477,52 @@ public sealed class AppState
         var correlationKey = threadId + "\0" + projection.RunId;
         if (!string.Equals(threadId, projection.ThreadId, StringComparison.Ordinal)
             || string.IsNullOrWhiteSpace(projection.RunId)
-            || projection.Timestamp == default
-            || terminalRemoteRuns.Contains(correlationKey))
+            || projection.Timestamp == default)
             return;
-        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
-        if (!RemoteRunCorrelation.IsExpected(thread, threadId, projection.RunId)
-            || remoteRuns.TryGetValue(threadId, out var current)
-               && projection.Timestamp < current.Timestamp)
-            return;
-        thread.LastActivityAt = ActivityTimestamp.Advance(
-            thread.LastActivityAt, projection.Timestamp);
-        var terminal = projection.Phase is TopicRunPhase.Completed
-            or TopicRunPhase.Failed
-            or TopicRunPhase.Cancelled;
-        if (terminal)
+
+        OwnThread? thread;
+        lock (profileSyncGate)
         {
-            remoteRuns.Remove(threadId);
-            terminalRemoteRuns.Add(correlationKey);
-            if (string.Equals(thread.ExecutionRunId, projection.RunId, StringComparison.Ordinal))
-                thread.ExecutionRunId = null;
+            if (terminalRemoteRuns.Contains(correlationKey))
+                return;
+            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            if (!RemoteRunCorrelation.IsExpected(thread, threadId, projection.RunId)
+                || remoteRuns.TryGetValue(threadId, out var current)
+                   && projection.Timestamp < current.Timestamp)
+                return;
+
+            var activityAt = ActivityTimestamp.Advance(
+                thread!.LastActivityAt, projection.Timestamp);
+            var terminal = projection.Phase is TopicRunPhase.Completed
+                or TopicRunPhase.Failed
+                or TopicRunPhase.Cancelled;
+            var nextRunId = terminal ? null : projection.RunId;
+            var executionAt = thread.ExecutionAt ?? projection.Timestamp;
+            if (activeDb is not null
+                && !activeDb.SetOwnThreadExecutionAndActivity(
+                    thread.Id,
+                    thread.ExecutionDeviceId,
+                    thread.ExecutionDeviceName,
+                    thread.ExecutionDevicePlatform,
+                    executionAt,
+                    nextRunId,
+                    activityAt))
+                return;
+
+            thread.LastActivityAt = activityAt;
+            thread.ExecutionAt = executionAt;
+            thread.ExecutionRunId = nextRunId;
+            if (terminal)
+            {
+                remoteRuns.Remove(threadId);
+                terminalRemoteRuns.Add(correlationKey);
+            }
+            else
+            {
+                remoteRuns[threadId] = CloneRemoteRunProjection(projection);
+            }
         }
-        else
-        {
-            remoteRuns[threadId] = projection;
-            thread.ExecutionRunId = projection.RunId;
-        }
-        if (!thread.ExecutionAt.HasValue)
-            thread.ExecutionAt = projection.Timestamp;
-        activeDb?.SetOwnThreadExecutionAndActivity(
-            thread.Id,
-            thread.ExecutionDeviceId,
-            thread.ExecutionDeviceName,
-            thread.ExecutionDevicePlatform,
-            thread.ExecutionAt,
-            thread.ExecutionRunId,
-            thread.LastActivityAt!.Value);
-        EmitTopicUpsert(thread);
+        EmitTopicUpsert(thread!);
         NotifyChanged();
     }
 
@@ -2466,30 +2532,54 @@ public sealed class AppState
         string? runId = null,
         DateTimeOffset? clearedAt = null)
     {
-        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
-        remoteRuns.TryGetValue(threadId, out var projection);
-        var correlatedRunId = runId ?? projection?.RunId;
-        if (!TopicRunProtocol.IsValidIdentifier(correlatedRunId)
-            || !RemoteRunCorrelation.IsExpected(thread, threadId, correlatedRunId!)
-            || projection is not null
-               && !string.Equals(projection.RunId, correlatedRunId, StringComparison.Ordinal))
-            return;
-        remoteRuns.Remove(threadId);
-        terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
-        var at = clearedAt ?? DateTimeOffset.UtcNow;
-        thread.ExecutionRunId = null;
-        thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-        activeDb?.SetOwnThreadExecutionAndActivity(
-            thread.Id,
-            thread.ExecutionDeviceId,
-            thread.ExecutionDeviceName,
-            thread.ExecutionDevicePlatform,
-            thread.ExecutionAt,
-            null,
-            thread.LastActivityAt.Value);
-        EmitTopicUpsert(thread);
+        OwnThread? thread;
+        lock (profileSyncGate)
+        {
+            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            remoteRuns.TryGetValue(threadId, out var projection);
+            var correlatedRunId = runId ?? projection?.RunId;
+            if (!TopicRunProtocol.IsValidIdentifier(correlatedRunId)
+                || !RemoteRunCorrelation.IsExpected(thread, threadId, correlatedRunId!)
+                || projection is not null
+                   && !string.Equals(projection.RunId, correlatedRunId, StringComparison.Ordinal))
+                return;
+
+            var at = clearedAt ?? DateTimeOffset.UtcNow;
+            var activityAt = ActivityTimestamp.Advance(thread!.LastActivityAt, at);
+            if (activeDb is not null
+                && !activeDb.SetOwnThreadExecutionAndActivity(
+                    thread.Id,
+                    thread.ExecutionDeviceId,
+                    thread.ExecutionDeviceName,
+                    thread.ExecutionDevicePlatform,
+                    thread.ExecutionAt,
+                    null,
+                    activityAt))
+                return;
+            remoteRuns.Remove(threadId);
+            terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
+            thread.ExecutionRunId = null;
+            thread.LastActivityAt = activityAt;
+        }
+        EmitTopicUpsert(thread!);
         NotifyChanged();
     }
+
+    private static RemoteRunProjection CloneRemoteRunProjection(RemoteRunProjection projection)
+        => new()
+        {
+            RunId = projection.RunId,
+            ThreadId = projection.ThreadId,
+            Phase = projection.Phase,
+            Status = projection.Status,
+            Plan = projection.Plan,
+            Subtasks = projection.Subtasks?.ToArray(),
+            Steps = projection.Steps?.ToArray(),
+            Queued = projection.Queued,
+            Error = projection.Error,
+            FailureCode = projection.FailureCode,
+            Timestamp = projection.Timestamp
+        };
 
     public void UpdateAgentRun(
         string threadId,

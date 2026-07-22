@@ -15,8 +15,6 @@ public static class PlatformCaps
     /// <summary>True on all supported platforms: the agent execution coordinator is available everywhere.</summary>
     public static bool CanRunAgent => true;
 
-    public static bool CanHostHomeAgent => !IsMobile;
-
     public static string DevicePlatform =>
         OperatingSystem.IsWindows() ? Mesh.Shared.DevicePlatforms.Windows :
         OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS() ? Mesh.Shared.DevicePlatforms.MacOS :

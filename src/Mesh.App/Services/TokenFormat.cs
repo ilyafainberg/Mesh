@@ -19,6 +19,9 @@ public static class TokenFormat
     public static string ToMTokens(long tokens)
         => ToMTokensValue(tokens).ToString("0.0", CultureInfo.InvariantCulture) + " MTokens";
 
+    public static string ToMTokensCompact(long tokens)
+        => ToMTokensValue(tokens).ToString("0.0", CultureInfo.InvariantCulture) + " MT";
+
     /// <summary>MTokens (entered by the user) back to a raw token count. Negative inputs clamp to 0.</summary>
     public static long FromMTokens(double mtokens) => mtokens <= 0 ? 0 : (long)Math.Round(mtokens * Million);
 
@@ -27,4 +30,9 @@ public static class TokenFormat
         => total > 0
             ? $"{ToMTokensValue(spent).ToString("0.0", CultureInfo.InvariantCulture)} / {ToMTokensValue(total).ToString("0.0", CultureInfo.InvariantCulture)} MTokens"
             : $"{ToMTokensValue(spent).ToString("0.0", CultureInfo.InvariantCulture)} MTokens / unlimited";
+
+    public static string SpentOfTotalCompact(long spent, long total)
+        => total > 0
+            ? $"{ToMTokensValue(spent).ToString("0.0", CultureInfo.InvariantCulture)} / {ToMTokensValue(total).ToString("0.0", CultureInfo.InvariantCulture)} MT"
+            : $"{ToMTokensValue(spent).ToString("0.0", CultureInfo.InvariantCulture)} MT / unlimited";
 }

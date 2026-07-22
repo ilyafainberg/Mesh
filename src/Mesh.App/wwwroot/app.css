@@ -307,7 +307,7 @@ input[type=checkbox]:not(.switch input):checked::after {
 .composer { display: flex; gap: 8px; align-items: flex-end; }
 .composer input, .composer textarea { flex: 1; min-width: 0; }
 .composer .send-btn { width: 40px; height: 38px; padding: 0; justify-content: center; }
-/* Stop button: replaces send while a turn runs. Red to read as an interrupt, same footprint as send. */
+/* Stop remains beside Send while a turn runs so additional guidance can queue in order. */
 .composer .send-btn.stop-btn { background: var(--danger, #d13438); border-color: var(--danger, #d13438); }
 .composer .send-btn.stop-btn:hover { filter: brightness(0.94); }
 /* Auto-growing multiline composer: Enter sends, Shift+Enter adds a line (JS-managed height). */

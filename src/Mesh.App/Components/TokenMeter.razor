@@ -6,15 +6,19 @@
     // Always label with the CURRENTLY selected model, not the stored key (which is only the
     // reset trigger and can lag behind a model switch until the next token is recorded).
     var modelKey = State.CurrentModelKey();
-    var tip = $"{modelKey}\nPrompt {TokenFormat.ToMTokens(t.PromptTokens)} + Completion {TokenFormat.ToMTokens(t.CompletionTokens)} = {TokenFormat.ToMTokens(t.TotalTokens)}";
+    var usedTokens = UsedTokens ?? t.TotalTokens;
+    var compactText = BudgetTokens.HasValue
+        ? TokenFormat.SpentOfTotalCompact(usedTokens, BudgetTokens.Value)
+        : TokenFormat.ToMTokensCompact(usedTokens);
+    var tip = Tooltip ?? (UsedTokens.HasValue
+        ? compactText
+        : $"{modelKey}\nPrompt {TokenFormat.ToMTokens(t.PromptTokens)} + Completion {TokenFormat.ToMTokens(t.CompletionTokens)} = {TokenFormat.ToMTokens(t.TotalTokens)}");
 }
 
 @if (Compact)
 {
     <span class="tm-pill" title="@tip">
-        <span class="tm-bar" aria-hidden="true">▮</span>
-        <span class="tm-pill-count">@TokenFormat.ToMTokensValue(t.TotalTokens).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)</span>
-        <span class="tm-pill-unit">MTokens</span>
+        <span class="tm-pill-count">@compactText</span>
     </span>
 }
 else
@@ -34,6 +38,9 @@ else
 
 @code {
     [Parameter] public bool Compact { get; set; }
+    [Parameter] public long? UsedTokens { get; set; }
+    [Parameter] public long? BudgetTokens { get; set; }
+    [Parameter] public string? Tooltip { get; set; }
 
     protected override void OnInitialized()
     {

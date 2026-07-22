@@ -7,7 +7,7 @@ using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
-/// <summary>Validates and routes one owner topic turn without using legacy Home Agent routing.</summary>
+/// <summary>Validates and routes one owner topic turn to its bound execution device.</summary>
 public sealed class TopicExecutionRouter(
     AppState state,
     ITopicTurnRunner localRunner,
@@ -154,7 +154,7 @@ public sealed class TopicExecutionRouter(
     {
         var devices = await deviceTransport.ListEligibleDevicesAsync(cancellationToken);
         var eligible = devices
-            .Where(device => device.Online && device.IsAgentReady)
+            .Where(device => device.IsAgentReady)
             .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
             .Select(group => group.First())
             .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
@@ -198,7 +198,7 @@ public sealed class TopicExecutionRouter(
             var devices = await ListEligibleDevicesAsync(cancellationToken);
             target = devices.FirstOrDefault(device =>
                 string.Equals(device.DeviceId, targetId, StringComparison.Ordinal));
-            if (target is null)
+            if (target is null || !target.Online)
                 return TopicDispatchResult.Reject(
                     "device_not_eligible", draft.RunId,
                     "The selected device is offline or not agent-ready.");

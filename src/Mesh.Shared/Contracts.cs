@@ -349,8 +349,6 @@ public record DeviceInfo(
     [System.Text.Json.Serialization.JsonIgnore]
     public bool AgentReady => RemoteAgentEnabled;
 
-    [System.Text.Json.Serialization.JsonIgnore]
-    public bool IsEligibleHomeAgent => IsDesktop && RemoteAgentEnabled;
 }
 
 public static class DevicePlatforms
@@ -802,9 +800,7 @@ public static class MeshKinds
     public const string Receipt = "receipt";
 
     /// <summary>
-    /// A request from one of the owner's OWN devices to another (e.g. phone to home desktop) asking
-    /// the remote device's agent to answer with its full local toolset. Only honored between devices
-    /// sharing the same handle when the target has opted in (ActAsRemoteAgent).
+    /// Legacy request kind retained only so new clients can explicitly reject pre-1.8 callers.
     /// </summary>
     public const string RemoteAgentRequest = "remote.request";
 

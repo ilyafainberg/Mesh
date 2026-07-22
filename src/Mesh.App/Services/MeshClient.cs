@@ -479,7 +479,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         var from = AppState.Norm(env.From);
         if (env.Kind is MeshKinds.RemoteAgentRequest or MeshKinds.RemoteAgentResponse)
         {
-            Log?.Invoke($"dropped retired home-agent envelope {env.Kind}");
+            Log?.Invoke($"dropped retired remote-agent envelope {env.Kind}");
             return;
         }
         var isGroupKind = env.Kind is MeshKinds.GroupControl or MeshKinds.GroupMessage or MeshKinds.Fanout;
@@ -831,14 +831,31 @@ public sealed class MeshClient : IDeviceTopicTransport
                     Log?.Invoke($"dropped topic request from {env.FromDevice}: invalid payload");
                     return;
                 }
-                var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
-                    string.Equals(item.Id, request.ThreadId, StringComparison.Ordinal));
-                if (thread is null
-                    || !string.Equals(request.TargetDeviceId, MyDeviceId, StringComparison.Ordinal)
-                    || !string.Equals(thread.ExecutionDeviceId, MyDeviceId, StringComparison.Ordinal)
+                if (!string.Equals(request.TargetDeviceId, MyDeviceId, StringComparison.Ordinal)
                     || !string.Equals(AppState.Norm(request.TriggerHandle), me, StringComparison.Ordinal))
                 {
                     Log?.Invoke($"dropped topic request {request.RunId}: target or thread did not match");
+                    attachmentInbox.RejectRun(env.FromDevice, request.RunId);
+                    return;
+                }
+                OwnThread thread;
+                try
+                {
+                    thread = state.EnsureOwnThreadForDeviceRun(
+                        request.ThreadId,
+                        new ExecutionDevice(
+                            MyDeviceId,
+                            string.IsNullOrWhiteSpace(state.Profile.DeviceName)
+                                ? null
+                                : state.Profile.DeviceName,
+                            PlatformCaps.DevicePlatform),
+                        request.TriggerAt);
+                }
+                catch (Exception ex) when (ex is ArgumentException
+                                           or InvalidOperationException
+                                           or KeyNotFoundException)
+                {
+                    Log?.Invoke($"dropped topic request {request.RunId}: {ex.Message}");
                     attachmentInbox.RejectRun(env.FromDevice, request.RunId);
                     return;
                 }

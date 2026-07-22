@@ -138,9 +138,10 @@
                     var svc = State.Profile.PublishedServices.FirstOrDefault(s => s.Id == conv.ServiceId);
                     if (svc is not null)
                     {
-                        <span class="contact-tokens" title="Tokens spent vs this service's lifetime budget">
-                            <i class="bi bi-coin"></i> @TokenFormat.SpentOfTotal(svc.SpentTokens, svc.TotalTokenBudget)
-                        </span>
+                        <TokenMeter Compact="true"
+                                    UsedTokens="@svc.SpentTokens"
+                                    BudgetTokens="@svc.TotalTokenBudget"
+                                    Tooltip="Tokens spent vs this service's lifetime budget" />
                     }
                 }
                 else
@@ -149,9 +150,9 @@
                     var spent = State.FindContact(active)?.TokensSpent ?? 0;
                     if (spent > 0)
                     {
-                        <span class="contact-tokens" title="Tokens this contact's requests have cost your agent">
-                            <i class="bi bi-coin"></i> @TokenFormat.ToMTokens(spent)
-                        </span>
+                        <TokenMeter Compact="true"
+                                    UsedTokens="@spent"
+                                    Tooltip="Tokens this contact's requests have cost your agent" />
                     }
                 }
                 <div class="head-actions" style="margin-left:auto;">

@@ -151,13 +151,8 @@ else
                 }
                 else if (conv.IsService)
                 {
-                    var svc = State.Profile.PublishedServices.FirstOrDefault(s => s.Id == conv.ServiceId);
                     <span class="thread-sub">
                         public service - messages go to its sandboxed agent
-                        @if (svc is not null)
-                        {
-                            <span class="contact-tokens" title="Tokens spent vs this service's lifetime budget"><i class="bi bi-coin"></i> @TokenFormat.SpentOfTotal(svc.SpentTokens, svc.TotalTokenBudget)</span>
-                        }
                     </span>
                 }
                 else

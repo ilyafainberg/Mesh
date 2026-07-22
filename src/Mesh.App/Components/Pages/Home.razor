@@ -10,11 +10,13 @@
 
 <div class="split">
     <div class="conv-list">
-        <h2><i class="bi bi-person-badge"></i> Me</h2>
         <div class="new-conv create-topic-row">
-            <span class="muted" style="flex:1;">your private topic chats</span>
+            <h2><i class="bi bi-person-badge"></i> Me</h2>
             <div class="split-create">
-                <button class="primary new-chat-primary" @onclick="NewLocalThread"><i class="bi bi-plus-lg"></i> New chat</button>
+                <button class="primary new-chat-primary" @onclick="NewLocalThread" disabled="@(!Agent.IsModelReady)"
+                        title="@(Agent.IsModelReady ? "New chat on this device" : "Configure a model to use this device")">
+                    <i class="bi bi-plus-lg"></i> New chat
+                </button>
                 <button class="primary new-chat-chevron" @ref="createMenuButton" @onclick="ToggleCreateMenu"
                         aria-label="Choose device for new chat" aria-haspopup="menu"
                         aria-expanded="@createMenuOpen" aria-controls="new-chat-device-menu">
@@ -31,7 +33,8 @@
                         }
                         else
                         {
-                            <button class="device-menu-item" role="menuitem" @onclick="() => CreateThreadOn(CurrentDevice)">
+                            <button class="device-menu-item" role="menuitem" disabled="@(!Agent.IsModelReady)"
+                                    @onclick="() => CreateThreadOn(CurrentDevice)">
                                 <i class="bi @PlatformIcon(CurrentDevice.Platform)"></i>
                                 <span><b>Talk to this device</b><small>@DeviceName(CurrentDevice)</small></span>
                                 <span class="device-state online">online</span>
@@ -57,25 +60,27 @@
                     </div>
                 }
             </div>
+            <span class="muted topic-list-subtitle">your private topic chats</span>
         </div>
         <div class="thread-groups">
             @if (PinnedThreads.Count > 0)
             {
-                <div class="thread-group-label">Pinned</div>
+                <div class="thread-group-label"><i class="bi bi-pin-angle-fill"></i> Pinned</div>
                 @foreach (var t in PinnedThreads)
                 {
-                    <div class="conv-item @(t.Id == activeThread ? "active" : "")" @key="t.Id"
-                         role="button" tabindex="0" aria-label="Open @(ThreadTitle(t))"
-                         @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
-                        <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                        @if (IsRemoteBound(t))
-                        {
-                            <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
-                                  title="@DeviceStatusText(t)">
-                                <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
-                            </span>
-                        }
-                        @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                    <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
+                        <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
+                                @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
+                            <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                            @if (IsRemoteBound(t))
+                            {
+                                <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                      title="@DeviceStatusText(t)">
+                                    <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
+                                </span>
+                            }
+                            @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                        </button>
                         <button class="thread-pin" title="Unpin topic" aria-label="Unpin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
                             <i class="bi bi-pin-angle-fill"></i>
                         </button>
@@ -84,22 +89,23 @@
             }
             @if (RecentThreads.Count > 0)
             {
-                <div class="thread-group-label">Recent</div>
+                <div class="thread-group-label"><i class="bi bi-clock-history"></i> Recent</div>
                 @foreach (var t in RecentThreads)
                 {
-                    <div class="conv-item @(t.Id == activeThread ? "active" : "")" @key="t.Id"
-                         role="button" tabindex="0" aria-label="Open @(ThreadTitle(t))"
-                         @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
-                        <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                        @if (IsRemoteBound(t))
-                        {
-                            <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
-                                  title="@DeviceStatusText(t)">
-                                <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
-                            </span>
-                        }
-                        @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
-                        <button class="thread-pin" title="Pin topic" aria-label="Pin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
+                    <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
+                        <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
+                                @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
+                            <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                            @if (IsRemoteBound(t))
+                            {
+                                <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                      title="@DeviceStatusText(t)">
+                                    <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
+                                </span>
+                            }
+                            @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                        </button>
+                        <button class="thread-pin unpinned" title="Pin topic" aria-label="Pin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
                             <i class="bi bi-pin-angle"></i>
                         </button>
                     </div>
@@ -123,7 +129,7 @@
             else
             {
                 <h2>@(Active is null ? "Me" : (string.IsNullOrWhiteSpace(Active.Title) ? "New chat" : Active.Title))</h2>
-                @if (Active is not null)
+                @if (Active is not null && IsRemoteBound(Active))
                 {
                     <span class="topic-header-device @(!ActiveDeviceOnline ? "offline" : "")" title="@ActiveDeviceStatus">
                         <i class="bi @PlatformIcon(Active.ExecutionDevicePlatform ?? CurrentDevice.Platform)"></i>
@@ -439,16 +445,13 @@
                               placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
                     @if (ActiveBusy)
                     {
-                        <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop" aria-label="Stop">
+                        <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop current run" aria-label="Stop current run">
                             <i class="bi bi-stop-fill"></i>
                         </button>
                     }
-                    else
-                    {
-                        <button class="primary send-btn" @onclick="Send" disabled="@SendDisabled" title="@SendTitle" aria-label="@SendTitle">
-                            <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
-                        </button>
-                    }
+                    <button class="primary send-btn" @onclick="Send" disabled="@SendDisabled" title="@SendTitle" aria-label="@SendTitle">
+                        <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
+                    </button>
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 @if (dispatchError is not null) { <p class="err-text" role="alert">@dispatchError</p> }
@@ -456,11 +459,11 @@
                 {
                     <div class="warn-banner"><i class="bi bi-wifi-off"></i> @ActiveDeviceStatus is offline. Sending is unavailable until it reconnects, or move this topic to an online device.</div>
                 }
-                @if (!Agent.IsModelReady)
+                @if (ActiveUsesCurrentDevice && !Agent.IsModelReady)
                 {
                     <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
                 }
-                else if (QuotaExhausted)
+                else if (ActiveUsesCurrentDevice && QuotaExhausted)
                 {
                     <div class="warn-banner">
                         <i class="bi bi-hourglass-bottom"></i>
@@ -520,8 +523,13 @@
             : "Message your assistant…";
     string ComposerAriaLabel => "Message your assistant";
     bool SendDisabled => (!ActiveDeviceOnline && Active is not null)
+        || ActiveUsesCurrentDevice && !Agent.IsModelReady
         || string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null;
-    string SendTitle => Active is not null && !ActiveDeviceOnline ? "Assigned device is offline" : "Send";
+    string SendTitle => Active is not null && !ActiveDeviceOnline
+        ? "Assigned device is offline"
+        : ActiveUsesCurrentDevice && !Agent.IsModelReady
+            ? "Configure a model to use this device"
+            : "Send";
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
@@ -574,6 +582,8 @@
     }
     bool ActiveDeviceOnline => Active is null || Active.ExecutionDeviceId is null
         || Active.ExecutionDeviceId == Mesh.MyDeviceId || IsDeviceOnline(Active.ExecutionDeviceId);
+    bool ActiveUsesCurrentDevice => Active is null || Active.ExecutionDeviceId is null
+        || Active.ExecutionDeviceId == Mesh.MyDeviceId;
     string ActiveDeviceStatus => Active is null ? "" : Active.ExecutionDeviceId is null
         ? "This device on next send"
         : $"{ThreadDeviceName(Active)} ({(ActiveDeviceOnline ? "online" : "offline")})";
@@ -808,6 +818,7 @@
     }
 
     void TogglePin(OwnThread thread) => State.SetOwnThreadPinned(thread.Id, !thread.IsPinned);
+    static string ThreadRenderKey(OwnThread thread) => $"{(thread.IsPinned ? "pinned" : "recent")}:{thread.Id}";
 
     bool IsRemoteBound(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
         && thread.ExecutionDeviceId != Mesh.MyDeviceId;

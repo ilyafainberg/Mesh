@@ -23,7 +23,8 @@
         </header>
 
         <div class="new-chat-split">
-            <button class="new-chat-primary" @onclick="() => NewThread(CurrentDevice)" aria-label="New chat on this device">
+            <button class="new-chat-primary" @onclick="() => NewThread(CurrentDevice)"
+                    disabled="@(!Agent.IsModelReady)" aria-label="New chat on this device">
                 <span class="new-chat-icon"><i class="bi bi-plus-lg"></i></span>
                 <span class="new-chat-label">New chat</span>
                 <span class="new-chat-device">This device</span>
@@ -50,27 +51,36 @@
                     <h3 class="thread-section-title">@section.Label</h3>
                     @foreach (var t in section.Threads)
                     {
-                        <div class="thread-row" @key="t.Id">
-                            <button class="thread-open" @onclick="() => Select(t.Id)">
-                                <span class="row-avatar"><i class="bi bi-chat-text"></i></span>
-                                <span class="row-main">
-                                    <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                                    @if (IsAssignedElsewhere(t))
-                                    {
-                                        <span class="device-pill @(IsDeviceOnline(t.ExecutionDeviceId) ? "" : "offline")">
-                                            <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
-                                            @DeviceLabel(t)
-                                        </span>
-                                    }
-                                </span>
-                                @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
-                                <i class="bi bi-chevron-right row-chevron"></i>
+                        <div class="thread-swipe-shell" @key="ThreadRenderKey(t)">
+                            <button class="thread-swipe-action @(t.IsPinned ? "unpin" : "pin")"
+                                    tabindex="@(revealedThreadId == t.Id ? 0 : -1)"
+                                    aria-hidden="@(revealedThreadId != t.Id)"
+                                    aria-label="@(t.IsPinned ? "Unpin" : "Pin") @(ThreadTitle(t))"
+                                    @onclick="() => TogglePinFromSwipe(t)">
+                                <i class="bi @(t.IsPinned ? "bi-pin-angle" : "bi-pin-angle-fill")"></i>
+                                <span>@(t.IsPinned ? "Unpin" : "Pin")</span>
                             </button>
-                            <button class="thread-pin" @onclick="() => State.SetOwnThreadPinned(t.Id, !t.IsPinned)"
-                                    aria-label="@(t.IsPinned ? "Unpin" : "Pin") @(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)"
-                                    title="@(t.IsPinned ? "Unpin topic" : "Pin topic")">
-                                <i class="bi @(t.IsPinned ? "bi-pin-angle-fill" : "bi-pin-angle")"></i>
-                            </button>
+                            <div class="thread-row @(revealedThreadId == t.Id ? "revealed" : "")"
+                                 @ontouchstart="e => BeginSwipe(t.Id, e)"
+                                 @ontouchend="e => EndSwipe(t.Id, e)"
+                                 @ontouchcancel="CancelSwipe">
+                                <button class="thread-open" @onclick="() => OpenThread(t.Id)">
+                                    <span class="row-avatar"><i class="bi bi-chat-text"></i></span>
+                                    <span class="row-main">
+                                        <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                                        @if (IsAssignedElsewhere(t))
+                                        {
+                                            <span class="device-pill @(IsDeviceOnline(t.ExecutionDeviceId) ? "" : "offline")">
+                                                <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
+                                                @DeviceLabel(t)
+                                            </span>
+                                        }
+                                    </span>
+                                    @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                                    @if (t.IsPinned) { <i class="bi bi-pin-angle-fill row-pin-status" title="Pinned" aria-label="Pinned"></i> }
+                                    <i class="bi bi-chevron-right row-chevron"></i>
+                                </button>
+                            </div>
                         </div>
                     }
                 }
@@ -87,7 +97,8 @@
                 <h3>Start a new chat</h3>
                 @foreach (var device in DeviceChoices)
                 {
-                    <button class="device-choice" role="menuitem" disabled="@(!device.Online)"
+                    <button class="device-choice" role="menuitem"
+                            disabled="@(!device.Online || !device.AgentReady)"
                             @onclick="() => NewThread(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -108,45 +119,56 @@ else
             <button class="bar-btn back-btn" @onclick="() => activeThread = null" title="Back to chats" aria-label="Back to chats">
                 <i class="bi bi-chevron-left"></i>
             </button>
-            @if (renaming)
-            {
-                <input class="rename-input" @bind="renameText" @bind:event="oninput" @onkeydown="OnRenameKey" aria-label="Chat title" />
-                <button class="bar-btn" title="Save" @onclick="SaveRename" aria-label="Save title"><i class="bi bi-check-lg"></i></button>
-                <button class="bar-btn" title="Cancel" @onclick="() => renaming = false" aria-label="Cancel rename"><i class="bi bi-x-lg"></i></button>
-            }
-            else
-            {
-                <span class="bar-title-wrap">
+            <div class="thread-heading">
+                <div class="thread-title-row">
                     <span class="bar-title">@(string.IsNullOrWhiteSpace(Active.Title) ? "New chat" : Active.Title)</span>
-                    @if (IsAssignedElsewhere(Active))
+                    <button class="bar-btn more-btn" title="Topic actions" aria-label="Topic actions"
+                            aria-haspopup="menu" aria-expanded="@actionsMenuOpen"
+                            @onclick="ToggleActionsMenu"><i class="bi bi-three-dots-vertical"></i></button>
+                </div>
+                @if (IsAssignedElsewhere(Active))
+                {
+                    <span class="device-pill @(ActiveDeviceOnline ? "" : "offline")">
+                        <i class="bi @PlatformIcon(Active.ExecutionDevicePlatform)"></i>
+                        @DeviceLabel(Active)
+                    </span>
+                }
+            </div>
+            @if (actionsMenuOpen)
+            {
+                <div class="topic-actions-menu" role="menu" aria-label="Topic actions">
+                    <button role="menuitem" @onclick="ToggleActivePinFromActions">
+                        <i class="bi @(Active.IsPinned ? "bi-pin-angle" : "bi-pin-angle-fill")"></i>
+                        @(Active.IsPinned ? "Unpin topic" : "Pin topic")
+                    </button>
+                    <button role="menuitem" @onclick="BeginRenameFromMenu"><i class="bi bi-pencil"></i> Rename</button>
+                    <button role="menuitem" @onclick="OpenMoveMenuFromActions"><i class="bi bi-phone-flip"></i> Move to device</button>
+                    @if (Active.Lines.Count > 0)
                     {
-                        <span class="device-pill @(ActiveDeviceOnline ? "" : "offline")">
-                            <i class="bi @PlatformIcon(Active.ExecutionDevicePlatform)"></i>
-                            @DeviceLabel(Active)
-                        </span>
+                        <button role="menuitem" @onclick="OpenReportFromActions"><i class="bi bi-flag"></i> Report AI content</button>
                     }
-                </span>
-                <span class="bar-actions">
-                    <TokenMeter Compact="true" />
-                    <button class="bar-btn" title="Rename chat" aria-label="Rename chat" @onclick="BeginRename"><i class="bi bi-pencil"></i></button>
-                    <button class="bar-btn" title="Move topic" aria-label="Move topic to another device" @onclick="OpenMoveMenu"><i class="bi bi-phone-flip"></i></button>
-                    @if (confirmDelete)
-                    {
-                        <button class="bar-btn text-btn" title="Clear messages, keep the chat" @onclick="ClearActive">Clear</button>
-                        <button class="bar-btn danger-btn" title="Delete this chat and its history" @onclick="DeleteActive">Delete</button>
-                        <button class="bar-btn" title="Cancel" @onclick="() => confirmDelete = false" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
-                    }
-                    else
-                    {
-                        @if (Active.Lines.Count > 0)
-                        {
-                            <button class="bar-btn" title="Report AI content" aria-label="Report AI content" @onclick="OpenReport"><i class="bi bi-flag"></i></button>
-                        }
-                        <button class="bar-btn" title="Delete chat" aria-label="Delete chat" @onclick="() => confirmDelete = true"><i class="bi bi-trash"></i></button>
-                    }
-                </span>
+                    <button role="menuitem" class="danger-action" @onclick="ConfirmDeleteFromActions"><i class="bi bi-trash"></i> Clear or delete</button>
+                </div>
             }
         </header>
+
+        @if (confirmDelete)
+        {
+            <div class="topic-delete-bar">
+                <button class="ghost" title="Clear messages, keep the chat" @onclick="ClearActive">Clear</button>
+                <button class="danger" title="Delete this chat and its history" @onclick="DeleteActive">Delete</button>
+                <button class="ghost icon-btn" title="Cancel" @onclick="() => confirmDelete = false" aria-label="Cancel"><i class="bi bi-x-lg"></i></button>
+            </div>
+        }
+
+        @if (renaming)
+        {
+            <div class="rename-row">
+                <input class="rename-input" @bind="renameText" @bind:event="oninput" @onkeydown="OnRenameKey" aria-label="Chat title" />
+                <button class="primary" title="Save" @onclick="SaveRename" aria-label="Save title"><i class="bi bi-check-lg"></i> Save</button>
+                <button class="ghost" title="Cancel" @onclick="() => renaming = false" aria-label="Cancel rename">Cancel</button>
+            </div>
+        }
 
         <div class="messages" @ref="scrollEl">
             <div class="messages-wrap">
@@ -358,27 +380,24 @@ else
                               placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
                     @if (ActiveBusy)
                     {
-                        <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop" aria-label="Stop">
+                        <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop current run" aria-label="Stop current run">
                             <i class="bi bi-stop-fill"></i>
                         </button>
                     }
-                    else
-                    {
-                        <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend)" title="@SendTitle" aria-label="@SendTitle">
-                            <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
-                        </button>
-                    }
+                    <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend)" title="@SendTitle" aria-label="@SendTitle">
+                        <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
+                    </button>
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 @if (Active is not null && !ActiveDeviceOnline)
                 {
                     <div class="warn-banner" role="status"><i class="bi bi-wifi-off"></i> @DeviceLabel(Active) is offline. Sending is unavailable until it reconnects.</div>
                 }
-                @if (!Agent.IsModelReady)
+                @if (ActiveUsesCurrentDevice && !Agent.IsModelReady)
                 {
                     <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> No model configured. Go to <a href="settings">Settings</a>.</div>
                 }
-                else if (QuotaExhausted)
+                else if (ActiveUsesCurrentDevice && QuotaExhausted)
                 {
                     <div class="warn-banner">
                         <i class="bi bi-hourglass-bottom"></i>
@@ -399,7 +418,8 @@ else
                 <p class="sheet-copy">The full topic history stays with this chat.</p>
                 @foreach (var device in DeviceChoices)
                 {
-                    <button class="device-choice" role="menuitem" disabled="@(!device.Online || IsActiveDevice(device))"
+                    <button class="device-choice" role="menuitem"
+                            disabled="@(!device.Online || !device.AgentReady || IsActiveDevice(device))"
                             @onclick="() => ChooseMoveTarget(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -440,12 +460,19 @@ else
     Widget? selectedWidget;
     bool newDeviceMenuOpen;
     bool moveMenuOpen;
+    bool actionsMenuOpen;
     global::Mesh.Shared.DeviceInfo? pendingMove;
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> eligibleDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
     bool confirmDelete;
     bool renaming;
     string renameText = "";
     string? activeThread;
+    string? revealedThreadId;
+    string? swipeThreadId;
+    double swipeStartX;
+    double swipeStartY;
+    string? suppressOpenThreadId;
+    DateTimeOffset suppressOpenUntil;
     string? pinHtml;
     string pinName = "";
     string? pinPrompt;
@@ -472,9 +499,17 @@ else
     string ComposerAriaLabel => "Message your assistant";
     bool ActiveDeviceOnline => Active is null || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
         || IsDeviceOnline(Active.ExecutionDeviceId);
+    bool ActiveUsesCurrentDevice => Active is null
+        || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
+        || string.Equals(Active.ExecutionDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
     bool CanSend => ActiveDeviceOnline
+        && (!ActiveUsesCurrentDevice || Agent.IsModelReady)
         && (!string.IsNullOrWhiteSpace(input) || attachments.Count > 0 || selectedWidget is not null);
-    string SendTitle => ActiveDeviceOnline ? "Send" : $"{DeviceLabel(Active!)} is offline";
+    string SendTitle => !ActiveDeviceOnline
+        ? $"{DeviceLabel(Active!)} is offline"
+        : ActiveUsesCurrentDevice && !Agent.IsModelReady
+            ? "Configure a model to use this device"
+            : "Send";
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
@@ -519,6 +554,8 @@ else
     }
 
     sealed record ThreadSection(string Label, IReadOnlyList<OwnThread> Threads);
+    static string ThreadRenderKey(OwnThread thread) => $"{(thread.IsPinned ? "pinned" : "recent")}:{thread.Id}";
+    static string ThreadTitle(OwnThread thread) => string.IsNullOrWhiteSpace(thread.Title) ? "New chat" : thread.Title;
 
     IReadOnlyList<OwnThread> Threads => State.OrderedOwnThreads;
     IReadOnlyList<ThreadSection> ThreadSections
@@ -539,7 +576,7 @@ else
         string.IsNullOrWhiteSpace(State.Profile.DeviceName) ? "This device" : State.Profile.DeviceName,
         true,
         PlatformCaps.DevicePlatform,
-        true);
+        Agent.IsModelReady);
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => new[] { CurrentDevice }
         .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d)))
         .GroupBy(d => d.DeviceId, StringComparer.Ordinal)
@@ -676,9 +713,63 @@ else
     void Select(string id)
     {
         activeThread = id;
+        revealedThreadId = null;
+        actionsMenuOpen = false;
         confirmDelete = false;
         renaming = false;
         State.MarkThreadSeen(id);
+    }
+
+    void OpenThread(string id)
+    {
+        if (suppressOpenThreadId == id && DateTimeOffset.UtcNow < suppressOpenUntil)
+            return;
+
+        suppressOpenThreadId = null;
+        if (revealedThreadId == id)
+        {
+            revealedThreadId = null;
+            return;
+        }
+
+        Select(id);
+    }
+
+    void BeginSwipe(string id, TouchEventArgs e)
+    {
+        var touch = e.Touches.FirstOrDefault();
+        if (touch is null) return;
+        swipeThreadId = id;
+        swipeStartX = touch.ClientX;
+        swipeStartY = touch.ClientY;
+    }
+
+    void EndSwipe(string id, TouchEventArgs e)
+    {
+        if (swipeThreadId != id) return;
+        var touch = e.ChangedTouches.FirstOrDefault();
+        swipeThreadId = null;
+        if (touch is null) return;
+
+        var deltaX = touch.ClientX - swipeStartX;
+        var deltaY = touch.ClientY - swipeStartY;
+        if (Math.Abs(deltaX) < 44 || Math.Abs(deltaX) <= Math.Abs(deltaY) * 1.2)
+            return;
+
+        revealedThreadId = deltaX < 0 ? id : null;
+        suppressOpenThreadId = id;
+        suppressOpenUntil = DateTimeOffset.UtcNow.AddMilliseconds(500);
+    }
+
+    void CancelSwipe(TouchEventArgs _)
+    {
+        swipeThreadId = null;
+    }
+
+    void TogglePinFromSwipe(OwnThread thread)
+    {
+        revealedThreadId = null;
+        State.SetOwnThreadPinned(thread.Id, !thread.IsPinned);
     }
 
     async Task OpenNewDeviceMenu()
@@ -692,6 +783,7 @@ else
     {
         await LoadDevicesAsync();
         moveMenuOpen = true;
+        actionsMenuOpen = false;
         newDeviceMenuOpen = false;
     }
 
@@ -699,7 +791,47 @@ else
     {
         newDeviceMenuOpen = false;
         moveMenuOpen = false;
+        actionsMenuOpen = false;
         pendingMove = null;
+    }
+
+    void ToggleActionsMenu()
+    {
+        actionsMenuOpen = !actionsMenuOpen;
+        newDeviceMenuOpen = false;
+        moveMenuOpen = false;
+        confirmDelete = false;
+    }
+
+    void ToggleActivePinFromActions()
+    {
+        if (Active is null) return;
+        actionsMenuOpen = false;
+        State.SetOwnThreadPinned(Active.Id, !Active.IsPinned);
+    }
+
+    void BeginRenameFromMenu()
+    {
+        actionsMenuOpen = false;
+        BeginRename();
+    }
+
+    async Task OpenMoveMenuFromActions()
+    {
+        actionsMenuOpen = false;
+        await OpenMoveMenu();
+    }
+
+    void OpenReportFromActions()
+    {
+        actionsMenuOpen = false;
+        OpenReport();
+    }
+
+    void ConfirmDeleteFromActions()
+    {
+        actionsMenuOpen = false;
+        confirmDelete = true;
     }
 
     void OnDeviceMenuKey(KeyboardEventArgs e)
