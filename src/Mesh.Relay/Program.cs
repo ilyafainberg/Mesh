@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading.RateLimiting;
 using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
+using Mesh.Relay.Push;
 using Mesh.Relay.Observability;
 using Mesh.Relay.Quota;
 using Mesh.Relay.RateLimiting;
@@ -67,6 +68,7 @@ builder.Services.AddSingleton<IHandleRatePolicyProvider>(ratePolicyProvider);
 builder.Services.AddSingleton<IMessageRateLimiter>(messageRateLimiter);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
+builder.Services.AddMeshPush(builder.Configuration);
 builder.Services.AddSingleton<Mesh.Relay.RelayConnectorCatalog>();
 builder.Services.AddHostedService<PresenceRenewer>();
 
@@ -618,6 +620,50 @@ app.MapGet("/handles/{handle}/devices", async (string handle) =>
         .ToArray();
 
     return Results.Ok(devices);
+});
+
+// Register or refresh this device's push token (APNs/FCM) so the relay can wake it when a message arrives
+// while it is offline. Authenticated by the device key: the presented key must be registered under the handle
+// AND must have signed the (handle, deviceId, platform, token) tuple (proof of possession).
+app.MapPost("/handles/{handle}/push", async (string handle, SetDevicePushTokenRequest req) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    if (string.IsNullOrWhiteSpace(req.Platform) || string.IsNullOrWhiteSpace(req.Token))
+        return Results.BadRequest(new { error = "platform and token are required" });
+
+    var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
+    var platform = req.Platform.Trim().ToLowerInvariant();
+    var message = PushTokenProtocol.Message(key, deviceId, platform, req.Token);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    await store.SetDevicePushTokenAsync(key, deviceId, platform, req.Token);
+    return Results.Ok(new { registered = deviceId });
+});
+
+// Clear this device's push token (for example on sign-out). Same device-key proof of possession.
+app.MapDelete("/handles/{handle}/push", async (string handle, [Microsoft.AspNetCore.Mvc.FromBody] DeleteDevicePushTokenRequest req) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
+    var message = PushTokenProtocol.ClearMessage(key, deviceId);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    await store.RemoveDevicePushTokenAsync(key, deviceId);
+    return Results.Ok(new { cleared = deviceId });
 });
 
 app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.Mvc.FromBody] DeleteHandleRequest req) =>

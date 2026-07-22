@@ -88,6 +88,21 @@ public sealed class InMemoryRelayStore : IRelayStore
         return Task.CompletedTask;
     }
 
+    public Task SetDevicePushTokenAsync(string handle, string deviceId, string platform, string token, CancellationToken ct = default)
+    {
+        if (handles.TryGetValue(handle, out var rec))
+            lock (rec)
+                rec.DevicePushTokens[deviceId] = new DevicePushToken { Platform = platform, Token = token, UpdatedAt = DateTimeOffset.UtcNow };
+        return Task.CompletedTask;
+    }
+
+    public Task RemoveDevicePushTokenAsync(string handle, string deviceId, CancellationToken ct = default)
+    {
+        if (handles.TryGetValue(handle, out var rec))
+            lock (rec) rec.DevicePushTokens.Remove(deviceId);
+        return Task.CompletedTask;
+    }
+
     public Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))
@@ -254,7 +269,10 @@ public sealed class InMemoryRelayStore : IRelayStore
                 RecoveryPublicKey = r.RecoveryPublicKey,
                 DeviceNames = new Dictionary<string, string>(r.DeviceNames),
                 DevicePlatforms = new Dictionary<string, string>(r.DevicePlatforms),
-                DeviceRemoteAgentEnabled = new Dictionary<string, bool>(r.DeviceRemoteAgentEnabled)
+                DeviceRemoteAgentEnabled = new Dictionary<string, bool>(r.DeviceRemoteAgentEnabled),
+                DevicePushTokens = r.DevicePushTokens.ToDictionary(
+                    kv => kv.Key,
+                    kv => new DevicePushToken { Platform = kv.Value.Platform, Token = kv.Value.Token, UpdatedAt = kv.Value.UpdatedAt })
             };
     }
 }

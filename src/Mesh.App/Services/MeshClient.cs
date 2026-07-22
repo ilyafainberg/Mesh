@@ -25,6 +25,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     private readonly ITopicTurnRunner topicTurnRunner;
     private readonly IHttpClientFactory httpFactory;
     private readonly INotifier notifier;
+    private readonly IPushService push;
     private readonly DeviceTopicAttachmentInbox attachmentInbox = new();
     private readonly ConcurrentDictionary<string, ActiveTopicRun> activeTopicRuns = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> topicRunReplay = new(StringComparer.Ordinal);
@@ -51,13 +52,15 @@ public sealed class MeshClient : IDeviceTopicTransport
         AgentService agent,
         ITopicTurnRunner topicTurnRunner,
         IHttpClientFactory httpFactory,
-        INotifier notifier)
+        INotifier notifier,
+        IPushService push)
     {
         this.state = state;
         this.agent = agent;
         this.topicTurnRunner = topicTurnRunner;
         this.httpFactory = httpFactory;
         this.notifier = notifier;
+        this.push = push;
         state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
     }
 
@@ -350,6 +353,7 @@ public sealed class MeshClient : IDeviceTopicTransport
             StateChanged?.Invoke();
             if (identity is not null)
                 TrackBackground(RunDeviceSyncHandshakeAsync(identity), "device sync handshake");
+            TryRegisterPushToken();
         });
 
         connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
@@ -2336,6 +2340,81 @@ public sealed class MeshClient : IDeviceTopicTransport
         return clean.Length > 120 ? clean[..120] + "…" : clean;
     }
 
+    // ---- Push notifications (Option 1: relay-composed wake alerts) --------------------------------
+    // After authenticating, hand this device's APNs/FCM token to the relay so it can send a metadata-only
+    // wake ("Message from @sender" / "New group message") when a message is queued for this device while it
+    // is offline. The relay never sees message contents, only the cleartext Kind and From it already routes
+    // on. No-op on platforms without push (Windows/Mac) or until native token acquisition is provisioned
+    // (IPushService returns null), so behavior is unchanged there.
+    private volatile string? registeredPushToken;
+
+    private void TryRegisterPushToken()
+    {
+        if (!push.IsSupported) return;
+        TrackBackground(RegisterPushTokenAsync(), "push token registration");
+    }
+
+    private async Task RegisterPushTokenAsync()
+    {
+        string? token;
+        try { token = await push.RegisterAsync(); }
+        catch (Exception ex) { Log?.Invoke($"push token request failed: {ex.Message}"); return; }
+        if (string.IsNullOrWhiteSpace(token)) return;                       // unsupported, denied, or unprovisioned
+        var pushToken = token!;
+
+        var p = state.Profile;
+        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.PublicKey)) return;
+        if (string.Equals(pushToken, registeredPushToken, StringComparison.Ordinal)) return; // already current on relay
+
+        try
+        {
+            var platform = PlatformCaps.DevicePlatform;                     // "ios" / "android", already normalized
+            var deviceId = MyDeviceId;
+            var sig = IdentityService.Sign(p.PrivateKey, PushTokenProtocol.Message(p.Handle, deviceId, platform, pushToken));
+            var http = httpFactory.CreateClient("relay");
+            var resp = await http.PostAsJsonAsync(
+                $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(AppState.Norm(p.Handle))}/push",
+                new SetDevicePushTokenRequest(p.PublicKey, platform, pushToken, sig));
+            if (resp.IsSuccessStatusCode)
+            {
+                registeredPushToken = pushToken;
+                Log?.Invoke("push token registered with relay");
+            }
+            else
+            {
+                Log?.Invoke($"push token registration rejected: {(int)resp.StatusCode}");
+            }
+        }
+        catch (Exception ex) { Log?.Invoke($"push token registration failed: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Clears this device's push token on the relay so a signed-out device is no longer woken. Best-effort,
+    /// signed with the device key. Call before <see cref="DisconnectAsync"/> on an intentional sign-out (not
+    /// on a transient reconnect, which also goes through DisconnectAsync).
+    /// </summary>
+    public async Task UnregisterPushAsync()
+    {
+        registeredPushToken = null;
+        if (!push.IsSupported) return;
+        var p = state.Profile;
+        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.PublicKey)) return;
+        try
+        {
+            var h = AppState.Norm(p.Handle);
+            var deviceId = MyDeviceId;
+            var sig = IdentityService.Sign(p.PrivateKey, PushTokenProtocol.ClearMessage(p.Handle, deviceId));
+            var http = httpFactory.CreateClient("relay");
+            using var req = new HttpRequestMessage(HttpMethod.Delete, $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/push")
+            {
+                Content = JsonContent.Create(new DeleteDevicePushTokenRequest(p.PublicKey, sig))
+            };
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var resp = await http.SendAsync(req, cts.Token);
+            Log?.Invoke($"push token cleared: {(int)resp.StatusCode}");
+        }
+        catch (Exception ex) { Log?.Invoke($"push token clear failed: {ex.Message}"); }
+    }
     public async Task DisconnectAsync()
     {
         // Clear intent first so the Closed handler from StopAsync does not trigger auto-recovery.

@@ -679,6 +679,7 @@
         signingOut = true;
         try
         {
+            await Mesh.UnregisterPushAsync();
             await Mesh.DisconnectAsync();
             State.SignOut(); // keeps the identity saved; returns app to the picker
         }

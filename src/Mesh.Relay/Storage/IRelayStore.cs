@@ -34,6 +34,20 @@ public sealed class StoredHandle
 
     /// <summary>Remote-agent opt-in state keyed by stable device id.</summary>
     public Dictionary<string, bool> DeviceRemoteAgentEnabled { get; set; } = new();
+
+    /// <summary>
+    /// Push tokens keyed by stable device id, used to wake a backgrounded device via APNs/FCM.
+    /// The relay only sends a content-free/metadata alert; it never puts message contents here.
+    /// </summary>
+    public Dictionary<string, DevicePushToken> DevicePushTokens { get; set; } = new();
+}
+
+/// <summary>A registered push token for one device: the push platform and the opaque APNs/FCM token.</summary>
+public sealed class DevicePushToken
+{
+    public string Platform { get; set; } = "";
+    public string Token { get; set; } = "";
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 /// <summary>A pending device-link invite: single use, short lived, addressed to a handle.</summary>
@@ -104,6 +118,12 @@ public interface IRelayStore
     /// wins). This prevents a later attacker who has gained a device key from overwriting the
     /// recovery key. No-op if the handle is missing or already has a recovery key.
     /// </summary>
+    /// <summary>Registers or refreshes a device's push token (APNs/FCM) under a handle. No-op if the handle is missing.</summary>
+    Task SetDevicePushTokenAsync(string handle, string deviceId, string platform, string token, CancellationToken ct = default);
+
+    /// <summary>Removes a device's push token (for example on sign-out). No-op if absent.</summary>
+    Task RemoveDevicePushTokenAsync(string handle, string deviceId, CancellationToken ct = default);
+
     Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default);
 
     /// <summary>Stores a single-use invite. Expired invites are cleaned up opportunistically.</summary>

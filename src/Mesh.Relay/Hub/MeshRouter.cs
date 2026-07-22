@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.SignalR;
 using Mesh.Relay.Backplane;
+using Mesh.Relay.Push;
 using Mesh.Relay.Storage;
 using Mesh.Shared;
 
@@ -21,7 +22,8 @@ public sealed class MeshRouter(
     IHubContext<MeshHub> hub,
     ConnectionRegistry registry,
     IRelayStore store,
-    IBackplane backplane)
+    IBackplane backplane,
+    PushDispatcher push)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -53,6 +55,7 @@ public sealed class MeshRouter(
 
         // 3. Nobody is connected: queue for delivery on next connect.
         await store.EnqueueAsync(to, envelopeJson);
+        push.NotifyOffline(to, null, env);
     }
 
     /// <summary>
@@ -76,6 +79,7 @@ public sealed class MeshRouter(
         }
 
         await store.EnqueueAsync(DeviceInboxKey(to, env.ToDevice), envelopeJson);
+        push.NotifyOffline(to, env.ToDevice, env);
     }
 
     /// <summary>

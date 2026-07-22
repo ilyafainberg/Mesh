@@ -126,6 +126,21 @@
       <ProjectReference Include="..\Mesh.Shared\Mesh.Shared.csproj" />
     </ItemGroup>
 
+    <!-- Mobile push (Option 1 wake notifications). Off by default so the standard build needs no Firebase
+         provisioning and no google-services.json. To enable Android FCM: build with MeshPushEnabled=true and
+         drop a real google-services.json into Platforms\Android\ (its package_name must be net.meshrelay.mesh).
+         That defines MESH_FIREBASE, which compiles the Firebase code paths in FirebasePushService and
+         MeshFirebaseMessagingService. iOS push needs no build flag (it uses APNs via the Entitlements
+         aps-environment + a push-enabled provisioning profile). Align the package version below with the
+         installed .NET Android Firebase workload when you enable it. -->
+    <PropertyGroup Condition="'$(MeshPushEnabled)' == 'true' And $([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">
+        <DefineConstants>$(DefineConstants);MESH_FIREBASE</DefineConstants>
+    </PropertyGroup>
+    <ItemGroup Condition="'$(MeshPushEnabled)' == 'true' And $([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">
+        <PackageReference Include="Xamarin.Firebase.Messaging" Version="125.0.0" />
+        <GoogleServicesJson Include="Platforms\Android\google-services.json" />
+    </ItemGroup>
+
     <!-- Windows-only: system tray icon support + the tray icon asset next to the exe. -->
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
         <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />

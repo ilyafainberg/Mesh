@@ -75,3 +75,11 @@ Logo*.png
 LogoV*.png
 logo.aep
 1x/
+
+# Push notification provisioning secrets (APNs / FCM) - never commit
+*.p8
+AuthKey_*.p8
+google-services.json
+*service-account*.json
+mesh-fcm-service-account.json
+.mesh-secrets/

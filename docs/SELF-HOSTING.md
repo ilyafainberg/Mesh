@@ -104,6 +104,30 @@ If you do not set `MODEL_*`, the relay simply has no free model: clients on your
 relay bring their own model key (or run one on-device), which is the recommended
 setup for a private relay.
 
+## Push notifications (optional)
+
+The relay can wake an offline mobile device (APNs on iOS, FCM on Android) when a
+message is queued for it. The push is metadata-only: the relay composes it from what
+it already routes on and never includes message contents. Two alerts are sent:
+
+- "Message from @sender" for a direct message.
+- "New group message" for a group message (the relay never sees the group name; it is
+  end-to-end encrypted).
+
+Push is off until you configure at least one backend. Devices register their token
+with a signed `POST /handles/{handle}/push` and clear it with `DELETE`.
+
+| Env var | Config key | Purpose | Default |
+|---|---|---|---|
+| `APNS_KEY_ID` | `Push:Apns:KeyId` | APNs auth-key id (iOS). | none |
+| `APNS_TEAM_ID` | `Push:Apns:TeamId` | Apple Developer team id. | none |
+| `APNS_BUNDLE_ID` | `Push:Apns:BundleId` | App bundle id (sent as apns-topic). | none |
+| `APNS_PRIVATE_KEY` | `Push:Apns:PrivateKey` | The `.p8` key PEM contents, or a path to it. | none |
+| `APNS_PRODUCTION` | `Push:Apns:Production` | `true` for the production APNs host, else sandbox. | `false` |
+| `FCM_SERVICE_ACCOUNT_JSON` | `Push:Fcm:ServiceAccountJson` | Google service-account JSON, or a path to it. | none |
+
+Set the APNs group (all four required) to enable iOS, and/or `FCM_SERVICE_ACCOUNT_JSON`
+to enable Android. With none set, the relay behaves exactly as before (no push).
 ## Scaling
 
 - **Single small relay**: the defaults are fine. In-memory state, one container.

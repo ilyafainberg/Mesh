@@ -348,6 +348,84 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <inheritdoc />
+    public async Task SetDevicePushTokenAsync(string handle, string deviceId, string platform, string token, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            HandleDoc doc;
+            string etag;
+            try
+            {
+                var read = await handlesContainer
+                    .ReadItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return;
+            }
+
+            doc.DevicePushTokens ??= new Dictionary<string, DevicePushToken>();
+            doc.DevicePushTokens[deviceId] = new DevicePushToken { Platform = platform, Token = token, UpdatedAt = DateTimeOffset.UtcNow };
+
+            try
+            {
+                await handlesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    public async Task RemoveDevicePushTokenAsync(string handle, string deviceId, CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            HandleDoc doc;
+            string etag;
+            try
+            {
+                var read = await handlesContainer
+                    .ReadItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return;
+            }
+
+            if (doc.DevicePushTokens is null || !doc.DevicePushTokens.Remove(deviceId))
+                return;
+
+            try
+            {
+                await handlesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
     public async Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
@@ -859,7 +937,10 @@ public sealed class CosmosRelayStore : IRelayStore
         DevicePlatforms = doc.DevicePlatforms is null ? new Dictionary<string, string>() : new Dictionary<string, string>(doc.DevicePlatforms),
         DeviceRemoteAgentEnabled = doc.DeviceRemoteAgentEnabled is null
             ? new Dictionary<string, bool>()
-            : new Dictionary<string, bool>(doc.DeviceRemoteAgentEnabled)
+            : new Dictionary<string, bool>(doc.DeviceRemoteAgentEnabled),
+        DevicePushTokens = doc.DevicePushTokens is null
+            ? new Dictionary<string, DevicePushToken>()
+            : new Dictionary<string, DevicePushToken>(doc.DevicePushTokens)
     };
 
     private static string NormalizeHandle(string handle)
@@ -894,6 +975,9 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("deviceRemoteAgentEnabled")]
         public Dictionary<string, bool>? DeviceRemoteAgentEnabled { get; set; }
+
+        [JsonPropertyName("devicePushTokens")]
+        public Dictionary<string, DevicePushToken>? DevicePushTokens { get; set; }
     }
 
     /// <summary>
