@@ -45,26 +45,22 @@
         }
         else
         {
-            <div class="thread-rows">
+            <div class="thread-rows" @ref="threadRowsEl">
                 @foreach (var section in ThreadSections)
                 {
                     <h3 class="thread-section-title">@section.Label</h3>
                     @foreach (var t in section.Threads)
                     {
-                        <div class="thread-swipe-shell" @key="ThreadRenderKey(t)">
-                            <button class="thread-swipe-action @(t.IsPinned ? "unpin" : "pin")"
-                                    tabindex="@(revealedThreadId == t.Id ? 0 : -1)"
-                                    aria-hidden="@(revealedThreadId != t.Id)"
+                        <div class="thread-swipe-shell mobile-swipe-shell" data-swipe-id="@t.Id" @key="ThreadRenderKey(t)">
+                            <button class="thread-swipe-action mobile-swipe-action @(t.IsPinned ? "unpin" : "pin")"
+                                    tabindex="-1" aria-hidden="true"
                                     aria-label="@(t.IsPinned ? "Unpin" : "Pin") @(ThreadTitle(t))"
                                     @onclick="() => TogglePinFromSwipe(t)">
                                 <i class="bi @(t.IsPinned ? "bi-pin-angle" : "bi-pin-angle-fill")"></i>
                                 <span>@(t.IsPinned ? "Unpin" : "Pin")</span>
                             </button>
-                            <div class="thread-row @(revealedThreadId == t.Id ? "revealed" : "")"
-                                 @ontouchstart="e => BeginSwipe(t.Id, e)"
-                                 @ontouchend="e => EndSwipe(t.Id, e)"
-                                 @ontouchcancel="CancelSwipe">
-                                <button class="thread-open" @onclick="() => OpenThread(t.Id)">
+                            <div class="thread-row mobile-swipe-content">
+                                <button class="thread-open" @onclick="() => Select(t.Id)">
                                     <span class="row-avatar"><i class="bi bi-chat-text"></i></span>
                                     <span class="row-main">
                                         <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
@@ -79,6 +75,10 @@
                                     @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
                                     @if (t.IsPinned) { <i class="bi bi-pin-angle-fill row-pin-status" title="Pinned" aria-label="Pinned"></i> }
                                     <i class="bi bi-chevron-right row-chevron"></i>
+                                </button>
+                                <button class="swipe-accessible-pin" @onclick="() => TogglePinFromSwipe(t)"
+                                        aria-label="@(t.IsPinned ? "Unpin" : "Pin") @(ThreadTitle(t))">
+                                    @(t.IsPinned ? "Unpin" : "Pin")
                                 </button>
                             </div>
                         </div>
@@ -103,7 +103,7 @@
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "Talk to this device" : $"Talk to {FriendlyName(device)}")</strong>
-                            <small>@FriendlyName(device) · @(device.Online ? "Online" : "Offline")</small>
+                            <small>@(device.Online ? "Online" : "Offline")</small>
                         </span>
                     </button>
                 }
@@ -467,18 +467,13 @@ else
     bool renaming;
     string renameText = "";
     string? activeThread;
-    string? revealedThreadId;
-    string? swipeThreadId;
-    double swipeStartX;
-    double swipeStartY;
-    string? suppressOpenThreadId;
-    DateTimeOffset suppressOpenUntil;
     string? pinHtml;
     string pinName = "";
     string? pinPrompt;
     string? pinError;
     ElementReference scrollEl;
     ElementReference composerEl;
+    ElementReference threadRowsEl;
     Microsoft.JSInterop.DotNetObjectReference<MobileMe>? selfRef;
     bool composerWired;
     int lastCount = -1;
@@ -642,6 +637,15 @@ else
 
         // Wire each helper when its element actually exists. On mobile the list and composer are
         // mutually exclusive, so firstRender alone cannot initialize both.
+        if (Active is null)
+        {
+            try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false); } catch { }
+            try { await JS.InvokeVoidAsync("meshUI.swipeActions", threadRowsEl); } catch { }
+            return;
+        }
+
+        try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", true); } catch { }
+
         if (selfRef is not null)
         {
             if (!composerWired)
@@ -713,62 +717,14 @@ else
     void Select(string id)
     {
         activeThread = id;
-        revealedThreadId = null;
         actionsMenuOpen = false;
         confirmDelete = false;
         renaming = false;
         State.MarkThreadSeen(id);
     }
 
-    void OpenThread(string id)
-    {
-        if (suppressOpenThreadId == id && DateTimeOffset.UtcNow < suppressOpenUntil)
-            return;
-
-        suppressOpenThreadId = null;
-        if (revealedThreadId == id)
-        {
-            revealedThreadId = null;
-            return;
-        }
-
-        Select(id);
-    }
-
-    void BeginSwipe(string id, TouchEventArgs e)
-    {
-        var touch = e.Touches.FirstOrDefault();
-        if (touch is null) return;
-        swipeThreadId = id;
-        swipeStartX = touch.ClientX;
-        swipeStartY = touch.ClientY;
-    }
-
-    void EndSwipe(string id, TouchEventArgs e)
-    {
-        if (swipeThreadId != id) return;
-        var touch = e.ChangedTouches.FirstOrDefault();
-        swipeThreadId = null;
-        if (touch is null) return;
-
-        var deltaX = touch.ClientX - swipeStartX;
-        var deltaY = touch.ClientY - swipeStartY;
-        if (Math.Abs(deltaX) < 44 || Math.Abs(deltaX) <= Math.Abs(deltaY) * 1.2)
-            return;
-
-        revealedThreadId = deltaX < 0 ? id : null;
-        suppressOpenThreadId = id;
-        suppressOpenUntil = DateTimeOffset.UtcNow.AddMilliseconds(500);
-    }
-
-    void CancelSwipe(TouchEventArgs _)
-    {
-        swipeThreadId = null;
-    }
-
     void TogglePinFromSwipe(OwnThread thread)
     {
-        revealedThreadId = null;
         State.SetOwnThreadPinned(thread.Id, !thread.IsPinned);
     }
 
@@ -1236,6 +1192,7 @@ else
     public void Dispose()
     {
         disposed = true;
+        _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
         State.Changed -= Refresh;
         Mesh.StateChanged -= OnMeshStateChanged;
         selfRef?.Dispose();

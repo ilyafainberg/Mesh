@@ -57,7 +57,7 @@
                         @onclick="() => conversationFilter = option.Value">@option.Label</button>
             }
         </div>
-        <div class="chat-rows">
+        <div class="chat-rows" @ref="chatRowsEl">
             @foreach (var section in ConversationSections)
             {
                 var sectionHeadingId = $"mobile-{section.Id}-conversations";
@@ -67,26 +67,36 @@
                     {
                         var nm = State.DisplayNameFor(c.Handle);
                         var initial = string.IsNullOrEmpty(nm) ? "?" : nm.Substring(0, 1).ToUpperInvariant();
-                        <div class="chat-row @(c.Handle == active ? "active" : "")" @key="c.Handle" @onclick="() => Select(c.Handle)">
-                            @if (!c.IsGroup)
-                            {
-                                <span class="avatar">@initial</span>
-                            }
-                            <div class="chat-main">
-                                <span class="chat-name">@nm</span>
-                                @if (c.IsGroup) { <span class="tag group-thread-tag"><i class="bi bi-people-fill"></i> group</span> }
-                                @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
-                                @if (!c.IsGroup && !c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
-                            </div>
-                            @if (State.IsUnread(c.Handle)) { <span class="chat-unread" title="Unread message"></span> }
-                            <button class="thread-pin" type="button"
-                                    title="@(c.IsPinned ? $"Unpin {nm}" : $"Pin {nm}")"
+                        <div class="chat-swipe-shell mobile-swipe-shell" data-swipe-id="@c.Handle"
+                             @key="ConversationRenderKey(c)">
+                            <button class="chat-swipe-action mobile-swipe-action @(c.IsPinned ? "unpin" : "pin")"
+                                    tabindex="-1" aria-hidden="true"
                                     aria-label="@(c.IsPinned ? $"Unpin {nm}" : $"Pin {nm}")"
-                                    aria-pressed="@c.IsPinned"
-                                    @onclick="() => ToggleConversationPin(c)"
-                                    @onclick:stopPropagation="true">
-                                <i class="bi @(c.IsPinned ? "bi-pin-angle-fill" : "bi-pin-angle")" aria-hidden="true"></i>
+                                    @onclick="() => ToggleConversationPin(c)">
+                                <i class="bi @(c.IsPinned ? "bi-pin-angle" : "bi-pin-angle-fill")"></i>
+                                <span>@(c.IsPinned ? "Unpin" : "Pin")</span>
                             </button>
+                            <div class="chat-row mobile-swipe-content @(c.Handle == active ? "active" : "")"
+                                 @onclick="() => Select(c.Handle)">
+                                @if (!c.IsGroup)
+                                {
+                                    <span class="avatar">@initial</span>
+                                }
+                                <div class="chat-main">
+                                    <span class="chat-name">@nm</span>
+                                    @if (c.IsGroup) { <span class="tag group-thread-tag"><i class="bi bi-people-fill"></i> group</span> }
+                                    @if (c.IsService) { <span class="tag svc-thread-tag" title="A service you are talking to"><i class="bi bi-broadcast"></i> service</span> }
+                                    @if (!c.IsGroup && !c.IsService && !IsAllowed(c.Handle)) { <span class="tag">not allowed</span> }
+                                </div>
+                                @if (State.IsUnread(c.Handle)) { <span class="chat-unread" title="Unread message"></span> }
+                                @if (c.IsPinned) { <i class="bi bi-pin-angle-fill row-pin-status" title="Pinned" aria-label="Pinned"></i> }
+                                <i class="bi bi-chevron-right row-chevron"></i>
+                                <button class="swipe-accessible-pin" @onclick="() => ToggleConversationPin(c)"
+                                        @onclick:stopPropagation="true"
+                                        aria-label="@(c.IsPinned ? $"Unpin {nm}" : $"Pin {nm}")">
+                                    @(c.IsPinned ? "Unpin" : "Pin")
+                                </button>
+                            </div>
                         </div>
                     }
                 </section>
@@ -349,6 +359,7 @@ else
     string? pinError;
     ElementReference scrollEl;
     ElementReference composerEl;
+    ElementReference chatRowsEl;
     Microsoft.JSInterop.DotNetObjectReference<MobileMessages>? selfRef;
     bool composerWired;
     int lastCount = -1;
@@ -423,7 +434,14 @@ else
         if (firstRender)
             selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
 
-        if (active is null) return;
+        if (active is null)
+        {
+            try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false); } catch { }
+            try { await JS.InvokeVoidAsync("meshUI.swipeActions", chatRowsEl); } catch { }
+            return;
+        }
+
+        try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", true); } catch { }
 
         if (!composerWired)
         {
@@ -780,6 +798,8 @@ else
         _ => true
     });
     sealed record ConversationSection(string Id, string Title, IReadOnlyList<Conversation> Items);
+    static string ConversationRenderKey(Conversation conversation) =>
+        $"{(conversation.IsPinned ? "pinned" : "recent")}:{conversation.Handle}";
     IEnumerable<ConversationSection> ConversationSections
     {
         get
@@ -936,6 +956,7 @@ else
 
     public void Dispose()
     {
+        _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         selfRef?.Dispose();

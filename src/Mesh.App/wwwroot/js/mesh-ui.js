@@ -31,6 +31,169 @@ window.meshUI = {
       el._meshRo = ro;
     } catch (e) { /* ResizeObserver unavailable: the per-render scrollToBottom still runs */ }
   },
+
+  // Thread screens live inside MobileShell's scrollable body. iOS treats that body as a native
+  // scrolling layer, so a fixed child cannot reliably cover the sibling tab bar. Hide the tab bar
+  // and suspend body scrolling while a thread is open, then restore the list position on close.
+  setMobileThreadOpen: function (open) {
+    var root = document.documentElement;
+    var body = document.querySelector('.m-body');
+    if (open) {
+      if (body && !body.dataset.meshThreadScrollTop)
+        body.dataset.meshThreadScrollTop = String(body.scrollTop || 0);
+      if (body) body.scrollTop = 0;
+      root.classList.add('mesh-mobile-thread-open');
+      return;
+    }
+
+    root.classList.remove('mesh-mobile-thread-open');
+    if (body && body.dataset.meshThreadScrollTop) {
+      var top = Number(body.dataset.meshThreadScrollTop) || 0;
+      delete body.dataset.meshThreadScrollTop;
+      requestAnimationFrame(function () { body.scrollTop = top; });
+    }
+  },
+
+  // Native-feeling mobile list actions. The row follows the finger while horizontal intent is
+  // clear, vertical movement remains a normal scroll, and compositor-heavy action layers stay
+  // hidden until an actual horizontal drag begins.
+  swipeActions: function (container) {
+    if (!container || container.dataset.meshSwipeActions) return;
+    container.dataset.meshSwipeActions = '1';
+
+    var actionWidth = 84;
+    var drag = null;
+
+    function rows() {
+      return Array.prototype.slice.call(container.querySelectorAll('.mobile-swipe-shell'));
+    }
+
+    function content(row) {
+      return row && row.querySelector('.mobile-swipe-content');
+    }
+
+    function action(row) {
+      return row && row.querySelector('.mobile-swipe-action');
+    }
+
+    function setActionAccess(row, shown) {
+      var button = action(row);
+      if (!button) return;
+      button.tabIndex = shown ? 0 : -1;
+      button.setAttribute('aria-hidden', shown ? 'false' : 'true');
+    }
+
+    function applyOffset(row, offset, animate) {
+      var foreground = content(row);
+      if (!foreground) return;
+      foreground.style.transition = animate ? 'transform .18s ease' : 'none';
+      foreground.style.transform = 'translate3d(' + offset + 'px,0,0)';
+      var shown = offset < -0.5;
+      row.classList.toggle('swipe-action-visible', shown);
+      if (!shown) row.classList.remove('swipe-revealed');
+      setActionAccess(row, shown);
+    }
+
+    function settle(row, revealed) {
+      if (!row) return;
+      row.classList.remove('swipe-dragging');
+      row.classList.toggle('swipe-revealed', revealed);
+      applyOffset(row, revealed ? -actionWidth : 0, true);
+      if (!revealed) {
+        setTimeout(function () {
+          if (!row.classList.contains('swipe-revealed'))
+            row.classList.remove('swipe-action-visible');
+        }, 190);
+      }
+    }
+
+    function closeOthers(except) {
+      rows().forEach(function (row) {
+        if (row !== except && (row.classList.contains('swipe-revealed') ||
+          row.classList.contains('swipe-action-visible')))
+          settle(row, false);
+      });
+    }
+
+    container.addEventListener('touchstart', function (event) {
+      if (event.touches.length !== 1) return;
+      var target = event.target;
+      if (target && target.closest && target.closest('.mobile-swipe-action')) return;
+      var row = target && target.closest ? target.closest('.mobile-swipe-shell') : null;
+      if (!row || !container.contains(row)) return;
+      var touch = event.touches[0];
+      drag = {
+        row: row,
+        startX: touch.clientX,
+        startY: touch.clientY,
+        lastX: touch.clientX,
+        lastTime: performance.now(),
+        offset: row.classList.contains('swipe-revealed') ? -actionWidth : 0,
+        axis: null
+      };
+    }, { passive: true });
+
+    container.addEventListener('touchmove', function (event) {
+      if (!drag || event.touches.length !== 1) return;
+      var touch = event.touches[0];
+      var dx = touch.clientX - drag.startX;
+      var dy = touch.clientY - drag.startY;
+
+      if (!drag.axis) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) < 7) return;
+        drag.axis = Math.abs(dx) > Math.abs(dy) * 1.15 ? 'x' : 'y';
+        if (drag.axis === 'y') {
+          settle(drag.row, false);
+          drag = null;
+          closeOthers(null);
+          return;
+        }
+        closeOthers(drag.row);
+        drag.row.classList.add('swipe-dragging', 'swipe-action-visible');
+      }
+
+      if (drag.axis !== 'x') return;
+      event.preventDefault();
+      var offset = Math.max(-actionWidth, Math.min(0, drag.offset + dx));
+      applyOffset(drag.row, offset, false);
+      drag.currentOffset = offset;
+      drag.lastX = touch.clientX;
+      drag.lastTime = performance.now();
+    }, { passive: false });
+
+    function finish(event, cancelled) {
+      if (!drag) return;
+      var current = drag;
+      drag = null;
+      if (current.axis !== 'x') return;
+
+      var touch = event.changedTouches && event.changedTouches[0];
+      var dx = touch ? touch.clientX - current.startX : 0;
+      var offset = current.currentOffset == null ? current.offset : current.currentOffset;
+      var reveal = !cancelled && (offset <= -actionWidth / 2 || dx < -36);
+      if (!cancelled && current.offset < 0 && dx > 30) reveal = false;
+      current.row._meshSuppressClickUntil = Date.now() + 500;
+      settle(current.row, reveal);
+    }
+
+    container.addEventListener('touchend', function (event) { finish(event, false); }, { passive: true });
+    container.addEventListener('touchcancel', function (event) { finish(event, true); }, { passive: true });
+
+    // A tap on an open row closes it instead of navigating. Suppress the synthetic click after a
+    // horizontal swipe so releasing the finger never opens the thread.
+    container.addEventListener('click', function (event) {
+      var target = event.target;
+      var row = target && target.closest ? target.closest('.mobile-swipe-shell') : null;
+      if (!row || !container.contains(row)) return;
+      if (target.closest('.mobile-swipe-action') || target.closest('.swipe-accessible-pin')) return;
+      if ((row._meshSuppressClickUntil || 0) > Date.now() || row.classList.contains('swipe-revealed')) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        settle(row, false);
+      }
+    }, true);
+  },
+
   downloadFile: function (name, mime, b64) {
     try {
       var bin = atob(b64);

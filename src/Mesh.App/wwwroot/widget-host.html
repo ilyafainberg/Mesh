@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Mesh widget host</title>
+</head>
+<body>
+<script>
+(function () {
+    'use strict';
+    var nonce = decodeURIComponent(location.hash.slice(1));
+
+    addEventListener('message', function (event) {
+        var data = event.data;
+        if (event.source !== parent || !data || data.type !== 'mesh-widget-render' ||
+            data.nonce !== nonce || typeof data.html !== 'string') return;
+        try {
+            document.open();
+            document.write(data.html);
+            document.close();
+        } catch (error) {
+            parent.postMessage({
+                type: 'mesh-widget-error',
+                nonce: nonce,
+                message: error && error.message ? error.message : 'Widget host failed'
+            }, '*');
+        }
+    });
+
+    parent.postMessage({ type: 'mesh-widget-host-ready', nonce: nonce }, '*');
+})();
+</script>
+</body>
+</html>

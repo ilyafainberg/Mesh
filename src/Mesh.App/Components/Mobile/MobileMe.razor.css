@@ -125,27 +125,16 @@
 }
 
 .thread-swipe-shell {
-    position: relative;
-    width: 100%;
-    overflow: hidden;
     border-bottom: 1px solid var(--stroke-1);
     background: var(--bg-1);
 }
 
 .thread-row {
-    position: relative;
-    z-index: 1;
     display: flex;
     align-items: stretch;
     width: 100%;
     background: var(--bg-1);
     touch-action: pan-y;
-    transition: transform .18s ease, background .12s ease;
-    will-change: transform;
-}
-
-.thread-row.revealed {
-    transform: translateX(-84px);
 }
 
 .thread-open {
@@ -161,37 +150,9 @@
     text-align: left;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
-    transition: margin-left .18s ease;
 }
-
-.thread-row.revealed .thread-open { margin-left: 84px; }
 
 .thread-open:active { background: var(--bg-3); }
-
-.thread-swipe-action {
-    position: absolute;
-    inset: 0 0 0 auto;
-    z-index: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-    width: 84px;
-    min-height: 64px;
-    padding: 0 8px;
-    border: 0;
-    background: var(--brand);
-    color: #fff;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-}
-
-.thread-swipe-action.unpin { background: var(--fg-2, #5b6470); }
-.thread-swipe-action i { font-size: 18px; }
-.thread-swipe-action:active { filter: brightness(.9); }
 
 .row-pin-status {
     flex: none;
@@ -292,7 +253,7 @@
 .thread-overlay {
     position: fixed;
     inset: 0;
-    z-index: 1100;
+    z-index: 20;
     display: flex;
     flex-direction: column;
     background: var(--bg-1);

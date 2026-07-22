@@ -159,6 +159,76 @@ main { flex: 1; min-width: 0; display: flex; overflow: hidden; }
 .pane-scroll { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 24px; padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)); }
 .pane-narrow { max-width: var(--content-max); margin: 0 auto; width: 100%; }
 
+/* Shared mobile swipe actions used by Topics and Messages. Keep the action layer out of the iOS
+   compositor until a real horizontal drag starts so vertical scrolling never flashes pin buttons. */
+.mobile-swipe-shell {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  contain: paint;
+}
+.mobile-swipe-content {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  background: var(--bg-1);
+  transform: translate3d(0,0,0);
+  transition: transform .18s ease;
+  will-change: transform;
+  touch-action: pan-y;
+}
+.mobile-swipe-action {
+  position: absolute;
+  inset: 0 0 0 auto;
+  z-index: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 84px;
+  min-height: 100%;
+  padding: 0 8px;
+  border: 0;
+  background: var(--brand);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.mobile-swipe-action.unpin { background: var(--fg-2, #5b6470); }
+.mobile-swipe-action i { font-size: 18px; }
+.mobile-swipe-shell.swipe-action-visible .mobile-swipe-action {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+.mobile-swipe-shell.swipe-dragging .mobile-swipe-content { transition: none; }
+.mobile-swipe-shell.swipe-revealed .mobile-swipe-content { transform: translate3d(-84px,0,0); }
+.swipe-accessible-pin {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0,0,0,0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* A thread is an in-shell full-screen surface. Remove the tab bar and its scrolling layer so the
+   composer owns the iOS bottom safe area instead of sitting underneath the navigation panel. */
+.mesh-mobile-thread-open .m-tabbar { display: none !important; }
+.mesh-mobile-thread-open .m-body {
+  overflow: hidden !important;
+  -webkit-overflow-scrolling: auto !important;
+  padding-bottom: 0 !important;
+}
+
 .pane-head {
   display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
   padding: 18px 24px 12px; border-bottom: 1px solid var(--stroke-1);

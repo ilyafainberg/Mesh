@@ -105,6 +105,10 @@ window.sandboxFrame = (function () {
       /Android|iPhone|iPad|iPod/i.test(ua);
   }
 
+  function isIOSWebView() {
+    return /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+  }
+
   function isCurrent(iframe, state) {
     return frameStates.get(iframe) === state && iframe.dataset.widgetGeneration === String(state.generation);
   }
@@ -137,32 +141,23 @@ window.sandboxFrame = (function () {
     var mode = state.modes[state.attempt];
     var nonce = randomNonce() + '-' + state.generation + '-' + state.attempt;
     var content = secureDocument(state.html, nonce);
+    state.content = content;
     iframe.dataset.widgetNonce = nonce;
     delete iframe.dataset.widgetReady;
 
-    state.loadHandler = function () {
-      if (!isCurrent(iframe, state)) {
-        clearAttempt(iframe, state, false);
-        return;
-      }
-      clearAttempt(iframe, state, false);
-      iframe.dataset.widgetReady = 'true';
-      hideStatus(iframe);
-      iframe.dispatchEvent(new CustomEvent('mesh-widget-ready', {
-        detail: { type: 'mesh-widget-load-ready', generation: state.generation }
-      }));
-    };
     state.errorHandler = function () {
       if (isCurrent(iframe, state)) tryNext(iframe, state);
     };
-    iframe.addEventListener('load', state.loadHandler);
     iframe.addEventListener('error', state.errorHandler);
     state.timer = setTimeout(function () {
       if (isCurrent(iframe, state)) tryNext(iframe, state);
     }, readyTimeoutMs);
 
     try {
-      if (mode === 'srcdoc') {
+      if (mode === 'host') {
+        iframe.removeAttribute('srcdoc');
+        iframe.src = 'widget-host.html#' + encodeURIComponent(nonce);
+      } else if (mode === 'srcdoc') {
         iframe.removeAttribute('src');
         iframe.srcdoc = content;
       } else if (mode === 'blob') {
@@ -183,13 +178,30 @@ window.sandboxFrame = (function () {
 
   function onMessage(event) {
     var data = event.data;
-    if (!data || (data.type !== 'mesh-widget-error' && data.type !== 'mesh-widget-ready')) return;
+    if (!data || (data.type !== 'mesh-widget-error' && data.type !== 'mesh-widget-ready' &&
+      data.type !== 'mesh-widget-host-ready')) return;
     var frames = document.querySelectorAll('iframe[data-widget-nonce]');
     for (var i = 0; i < frames.length; i++) {
       var frame = frames[i];
       if (frame.contentWindow !== event.source || frame.dataset.widgetNonce !== data.nonce) continue;
       var state = frameStates.get(frame);
       if (!state || !isCurrent(frame, state)) continue;
+      if (data.type === 'mesh-widget-host-ready') {
+        clearAttempt(frame, state, false);
+        try {
+          frame.contentWindow.postMessage({
+            type: 'mesh-widget-render',
+            nonce: data.nonce,
+            html: state.content
+          }, '*');
+          state.timer = setTimeout(function () {
+            if (isCurrent(frame, state)) tryNext(frame, state);
+          }, readyTimeoutMs);
+        } catch (e) {
+          tryNext(frame, state);
+        }
+        break;
+      }
       clearAttempt(frame, state, false);
       if (data.type === 'mesh-widget-error') {
         var message = data.message || 'Unknown widget error';
@@ -220,8 +232,10 @@ window.sandboxFrame = (function () {
         var state = {
           generation: generation,
           html: html || '',
-          modes: isMobileWebView() ? ['srcdoc', 'blob', 'data'] : ['srcdoc', 'blob'],
+          modes: isIOSWebView() ? ['host', 'srcdoc', 'blob', 'data']
+            : isMobileWebView() ? ['srcdoc', 'blob', 'data'] : ['srcdoc', 'blob'],
           attempt: -1,
+          content: '',
           timer: null,
           loadHandler: null,
           errorHandler: null,

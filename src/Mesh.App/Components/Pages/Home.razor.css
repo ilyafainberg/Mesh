@@ -390,7 +390,35 @@
     gap: 5px;
     white-space: nowrap;
 }
-.header-device-menu { top: calc(100% + 6px); right: 0; }
+.header-device-menu {
+    top: calc(100% + 8px);
+    left: auto;
+    right: 0;
+    width: min(360px, calc(100vw - 32px));
+    min-width: min(320px, calc(100vw - 32px));
+    padding: 8px;
+}
+.header-device-menu .device-menu-title {
+    padding: 7px 10px 9px;
+    font-size: .74rem;
+}
+.header-device-menu .device-menu-item {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    gap: 10px;
+    min-height: 58px;
+    padding: 9px 11px;
+}
+.header-device-menu .device-menu-item b {
+    font-size: .86rem;
+}
+.header-device-menu .device-menu-item small {
+    margin-top: 3px;
+    font-size: .75rem;
+}
+.header-device-menu .device-state {
+    padding-left: 8px;
+    font-size: .72rem;
+}
 .move-confirm {
     display: flex;
     align-items: center;
