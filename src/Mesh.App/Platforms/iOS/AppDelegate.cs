@@ -21,7 +21,8 @@ public class AppDelegate : MauiUIApplicationDelegate
 
     // APNs issued this device a token: forward it to ApplePushService so the pending RegisterAsync completes.
     // The token is emitted as a lowercase hex string, which is exactly what the relay's APNs sender targets.
-    public override void RegisteredForRemoteNotifications(UIApplication application, NSData deviceToken)
+    [Export("application:didRegisterForRemoteNotificationsWithDeviceToken:")]
+    public void RegisteredForRemoteNotifications(UIApplication application, NSData deviceToken)
     {
         var bytes = deviceToken.ToArray();
         var hex = new global::System.Text.StringBuilder(bytes.Length * 2);
@@ -31,7 +32,8 @@ public class AppDelegate : MauiUIApplicationDelegate
 
     // APNs registration failed (missing entitlement, no network, restricted state): unblock any pending
     // RegisterAsync with a null token so the client simply proceeds without push.
-    public override void FailedToRegisterForRemoteNotifications(UIApplication application, NSError error)
+    [Export("application:didFailToRegisterForRemoteNotificationsWithError:")]
+    public void FailedToRegisterForRemoteNotifications(UIApplication application, NSError error)
     {
         ApplePushService.FailRegistration();
     }
