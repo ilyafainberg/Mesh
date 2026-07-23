@@ -92,7 +92,11 @@ builder.Services.AddSingleton(metrics);
 // so we do NOT call AddStackExchangeRedis here on purpose.
 builder.Services.AddSignalR(o =>
 {
-    o.MaximumReceiveMessageSize = 2 * 1024 * 1024; // hard OOM guard: no envelope may exceed the Cosmos 2 MB item limit (attachments go to blob, not inline)
+    // Transport must accept legacy inline snapshots long enough for MeshHub to return the structured
+    // message_too_large result. A 2 MB frame cap aborts old clients before the hub runs, which makes
+    // every device reconnect and resend forever. Persistence remains protected by the stricter
+    // MessageLimits.MaxEnvelopeBodyBytes check inside SendEnvelope and SendFanout.
+    o.MaximumReceiveMessageSize = MessageLimits.MaxTransportMessageBytes;
     o.EnableDetailedErrors = false;
 });
 

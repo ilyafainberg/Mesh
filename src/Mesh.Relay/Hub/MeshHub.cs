@@ -303,7 +303,11 @@ public sealed class MeshHub(
         if (counted)
         {
             metrics.ConnectionClosed();
-            logger.LogInformation("hub connection closed: {Handle}", handle ?? "unknown");
+            logger.LogInformation(
+                "hub connection closed: {Handle}; authenticated={Authenticated}; error={Error}",
+                handle ?? connection?.Handle ?? "unknown",
+                connection?.Authenticated == true,
+                exception?.Message ?? "none");
         }
         if (connection is { Authenticated: true, Handle: not null, DeviceId: not null }
             && registry.ConnectionsForDevice(connection.Handle, connection.DeviceId).Count == 0)
