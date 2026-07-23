@@ -30,6 +30,16 @@ IRelayStore store = string.IsNullOrWhiteSpace(cosmosConn)
     ? new InMemoryRelayStore()
     : new CosmosRelayStore(cosmosConn, Config(builder.Configuration, "COSMOS_DB", "Cosmos:Database") ?? "mesh");
 
+// Blob attachment storage (config-gated). When BLOB_CONNECTION is set, the relay issues short-lived SAS
+// URLs so clients upload/download end-to-end-encrypted attachment ciphertext directly to blob storage; the
+// envelope then carries only a pointer. Unset => attachments disabled (endpoints report not configured).
+var blobConn = Config(builder.Configuration, "BLOB_CONNECTION", "Blob:Connection");
+var attachmentsContainer = Config(builder.Configuration, "BLOB_ATTACHMENTS_CONTAINER", "Blob:AttachmentsContainer") ?? AttachmentProtocol.Container;
+IAttachmentStore attachmentStore = string.IsNullOrWhiteSpace(blobConn)
+    ? new DisabledAttachmentStore()
+    : new AzureBlobAttachmentStore(blobConn, attachmentsContainer, MessageLimits.MaxAttachmentBytes,
+        TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(10));
+
 IBackplane backplane = string.IsNullOrWhiteSpace(redisConn)
     ? new InMemoryBackplane()
     : new RedisBackplane(redisConn);
@@ -61,6 +71,7 @@ IMessageRateLimiter messageRateLimiter = new PerHandleRateLimiter(ratePolicyProv
 var adminKey = Config(builder.Configuration, "MESH_ADMIN_KEY", "Mesh:AdminKey");
 
 builder.Services.AddSingleton(store);
+builder.Services.AddSingleton(attachmentStore);
 builder.Services.AddSingleton(backplane);
 builder.Services.AddSingleton(quota);
 builder.Services.AddSingleton<IRateLimitStore>(rateLimitStore);
@@ -664,6 +675,60 @@ app.MapDelete("/handles/{handle}/push", async (string handle, [Microsoft.AspNetC
 
     await store.RemoveDevicePushTokenAsync(key, deviceId);
     return Results.Ok(new { cleared = deviceId });
+});
+
+// Issue a short-lived SAS URL to upload one end-to-end-encrypted attachment blob. The relay never sees
+// plaintext: the client encrypts locally and uploads ciphertext; the envelope carries only a pointer.
+// Authenticated by device-key proof of possession, exactly like push registration.
+app.MapPost("/handles/{handle}/attachments", async (string handle, AttachmentUploadRequest req) =>
+{
+    if (!attachmentStore.Enabled)
+        return Results.Json(new { error = "attachments not configured" }, statusCode: StatusCodes.Status501NotImplemented);
+
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    if (req.Size <= 0 || req.Size > attachmentStore.MaxBytes)
+        return Results.Json(new { error = "attachment_too_large", maxBytes = attachmentStore.MaxBytes },
+            statusCode: StatusCodes.Status413PayloadTooLarge);
+
+    var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
+    var message = AttachmentProtocol.UploadMessage(key, deviceId, req.Size);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var (blobId, uploadUrl, expiresAt) = attachmentStore.IssueUpload(req.Size);
+    return Results.Ok(new AttachmentUploadResponse(blobId, uploadUrl, expiresAt, attachmentStore.MaxBytes));
+});
+
+// Issue a short-lived SAS URL to download one attachment blob by id. The blob id is only ever revealed
+// inside the E2EE envelope body, so a caller must already be an intended recipient to know it. Same
+// device-key proof of possession, under the caller's own handle.
+app.MapPost("/handles/{handle}/attachments/{blobId}", async (string handle, string blobId, AttachmentDownloadRequest req) =>
+{
+    if (!attachmentStore.Enabled)
+        return Results.Json(new { error = "attachments not configured" }, statusCode: StatusCodes.Status501NotImplemented);
+    if (!AttachmentProtocol.IsValidBlobId(blobId))
+        return Results.BadRequest(new { error = "invalid blob id" });
+
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
+    var message = AttachmentProtocol.DownloadMessage(key, deviceId, blobId);
+    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var (downloadUrl, expiresAt) = attachmentStore.IssueDownload(blobId);
+    return Results.Ok(new AttachmentDownloadResponse(downloadUrl, expiresAt));
 });
 
 app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.Mvc.FromBody] DeleteHandleRequest req) =>

@@ -70,6 +70,8 @@ in-memory, single node, with no hosted model.
 | `COSMOS_CONNECTION` | `Cosmos:Connection` | Azure Cosmos connection string. Makes handles, rate policies, invites, and offline inbox durable. | in-memory |
 | `COSMOS_DB` | `Cosmos:Database` | Cosmos database name | `mesh` |
 | `REDIS_CONNECTION` | `Redis:Connection` | Shares presence, live Direct/Group buckets, quota, and cross-node routing across replicas. | in-memory |
+| `BLOB_CONNECTION` | `Blob:Connection` | Azure Storage connection string (with account key). Enables blob-backed attachments: clients upload encrypted attachment ciphertext to a relay-issued SAS URL and send only a pointer. Apply `_deploy/apply-attachments-lifecycle.ps1` for the 14-day auto-expiry. | disabled |
+| `BLOB_ATTACHMENTS_CONTAINER` | `Blob:AttachmentsContainer` | Private container for attachment ciphertext. | `attachments` |
 | `MODEL_ENDPOINT` | `Model:Endpoint` | OpenAI-compatible base URL for an optional hosted free model; inactive unless `MODEL_API_KEY` is set. | `https://openrouter.ai/api` |
 | `MODEL_API_KEY` | `Model:ApiKey` | Key for `MODEL_ENDPOINT`. | none |
 | `MODEL_NAME` | `Model:Model` | Model id to call. | `openrouter/auto` |

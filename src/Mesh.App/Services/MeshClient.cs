@@ -2250,6 +2250,9 @@ public sealed class MeshClient : IDeviceTopicTransport
         var ciphertext = MessageCrypto.Encrypt(content, allKeys)
             ?? throw new InvalidOperationException(
                 "Cannot send encrypted group traffic: no usable recipient device keys.");
+        if (System.Text.Encoding.UTF8.GetByteCount(ciphertext) > MessageLimits.MaxEnvelopeBodyBytes)
+            throw new InvalidOperationException(
+                $"Group message is too large; the limit is {MessageLimits.MaxEnvelopeBodyBytes} bytes. Send large content as a blob attachment.");
         var p = state.Profile;
         var signature = IdentityService.Sign(p.PrivateKey, ciphertext);
         return new MeshFanoutRequest(
@@ -2279,6 +2282,15 @@ public sealed class MeshClient : IDeviceTopicTransport
             if (enc is not null) wire = enc;
         }
 
+        // Client-side backstop for the relay's hard envelope cap: never inline large content. Large
+        // payloads must be sent as blob attachment pointers, so the body itself stays well under 2 MB.
+        var wireBytes = System.Text.Encoding.UTF8.GetByteCount(wire);
+        if (wireBytes > MessageLimits.MaxEnvelopeBodyBytes)
+        {
+            Log?.Invoke($"send rejected: message too large ({wireBytes} > {MessageLimits.MaxEnvelopeBodyBytes} bytes); send large content as a blob attachment");
+            if (lineId is not null) state.SetLineStatus(lineId, "failed");
+            return false;
+        }
         var sig = IdentityService.Sign(p.PrivateKey, wire);
         var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig, toDevice: toDevice);
         try
@@ -2386,6 +2398,93 @@ public sealed class MeshClient : IDeviceTopicTransport
             }
         }
         catch (Exception ex) { Log?.Invoke($"push token registration failed: {ex.Message}"); }
+    }
+
+    // ---- Blob attachments -------------------------------------------------------------------------
+    // Attachments never travel inline in an envelope (the relay caps bodies at ~2 MB). Each attachment is
+    // encrypted locally, uploaded as ciphertext to blob storage via a short-lived relay-issued SAS URL, and
+    // the envelope then carries only an AttachmentPointer inside its end-to-end-encrypted body.
+
+    /// <summary>Encrypts and uploads one attachment, returning a pointer to embed in an E2EE envelope, or null on failure.</summary>
+    public async Task<AttachmentPointer?> UploadAttachmentAsync(ChatAttachment attachment, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(attachment);
+        if (attachment.Data.LongLength > MessageLimits.MaxAttachmentBytes)
+            throw new InvalidOperationException(
+                $"Attachment '{attachment.Name}' is {attachment.Data.LongLength} bytes; the limit is {MessageLimits.MaxAttachmentBytes} bytes.");
+
+        var p = state.Profile;
+        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.PublicKey)) return null;
+
+        var (cipher, keyB64) = AttachmentCrypto.Seal(attachment.Data);
+        var http = httpFactory.CreateClient("relay");
+        var h = AppState.Norm(p.Handle);
+        var deviceId = MyDeviceId;
+        var sig = IdentityService.Sign(p.PrivateKey, AttachmentProtocol.UploadMessage(p.Handle, deviceId, cipher.LongLength));
+
+        var resp = await http.PostAsJsonAsync(
+            $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/attachments",
+            new AttachmentUploadRequest(p.PublicKey, cipher.LongLength, sig), ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            Log?.Invoke($"attachment upload request rejected: {(int)resp.StatusCode}");
+            return null;
+        }
+        var info = await resp.Content.ReadFromJsonAsync<AttachmentUploadResponse>(ct);
+        if (info is null) return null;
+
+        using var put = new HttpRequestMessage(HttpMethod.Put, info.UploadUrl)
+        {
+            Content = new ByteArrayContent(cipher),
+        };
+        put.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        var up = await http.SendAsync(put, ct);
+        if (!up.IsSuccessStatusCode)
+        {
+            Log?.Invoke($"attachment blob upload failed: {(int)up.StatusCode}");
+            return null;
+        }
+
+        return new AttachmentPointer(
+            info.BlobId, attachment.Name, attachment.MimeType, attachment.Data.LongLength,
+            keyB64, AttachmentCrypto.Sha256B64(attachment.Data));
+    }
+
+    /// <summary>Downloads and decrypts one attachment referenced by a pointer, or null on failure/integrity mismatch.</summary>
+    public async Task<ChatAttachment?> DownloadAttachmentAsync(AttachmentPointer pointer, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(pointer);
+        if (pointer.Size > MessageLimits.MaxAttachmentBytes) return null;
+
+        var p = state.Profile;
+        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.PublicKey)) return null;
+
+        var http = httpFactory.CreateClient("relay");
+        var h = AppState.Norm(p.Handle);
+        var deviceId = MyDeviceId;
+        var sig = IdentityService.Sign(p.PrivateKey, AttachmentProtocol.DownloadMessage(p.Handle, deviceId, pointer.BlobId));
+
+        var resp = await http.PostAsJsonAsync(
+            $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/attachments/{Uri.EscapeDataString(pointer.BlobId)}",
+            new AttachmentDownloadRequest(p.PublicKey, sig), ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            Log?.Invoke($"attachment download request rejected: {(int)resp.StatusCode}");
+            return null;
+        }
+        var info = await resp.Content.ReadFromJsonAsync<AttachmentDownloadResponse>(ct);
+        if (info is null) return null;
+
+        var cipher = await http.GetByteArrayAsync(info.DownloadUrl, ct);
+        byte[] plain;
+        try { plain = AttachmentCrypto.Open(cipher, pointer.Key); }
+        catch (Exception ex) { Log?.Invoke($"attachment decrypt failed: {ex.Message}"); return null; }
+        if (!string.Equals(AttachmentCrypto.Sha256B64(plain), pointer.Sha256, StringComparison.Ordinal))
+        {
+            Log?.Invoke("attachment integrity check failed");
+            return null;
+        }
+        return new ChatAttachment(pointer.Name, pointer.MimeType, plain);
     }
 
     /// <summary>

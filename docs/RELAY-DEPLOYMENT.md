@@ -342,6 +342,18 @@ with no hosted model. Only the settings you actually provide change behaviour.
 | `COSMOS_CONNECTION` | `Cosmos:Connection` | Azure Cosmos DB connection string. When set, the handle registry, invites, and offline inbox become durable. | in-memory |
 | `COSMOS_DB` | `Cosmos:Database` | Cosmos database name. | `mesh` |
 | `REDIS_CONNECTION` | `Redis:Connection` | Redis connection string. When set, presence, live Direct/Group token buckets, per-handle quota, and cross-node routing are shared across replicas. | in-memory |
+| `BLOB_CONNECTION` | `Blob:Connection` | Azure Storage connection string (must include an account key). When set, the relay issues short-lived SAS URLs so clients upload and download end-to-end-encrypted attachment ciphertext directly to blob storage; the envelope carries only a pointer. Unset disables attachments. | disabled |
+| `BLOB_ATTACHMENTS_CONTAINER` | `Blob:AttachmentsContainer` | Private container holding attachment ciphertext. Created on demand. | `attachments` |
+
+Attachments never travel inline: the relay caps every envelope body under the 2 MB Cosmos item
+limit, so clients upload each attachment (encrypted, up to 20 MB) to blob storage through a
+relay-issued SAS URL and send only a pointer. Apply a lifecycle rule so attachment blobs auto-delete
+14 days after creation, matching the offline-inbox TTL, so a stored attachment never outlives its
+message:
+
+```powershell
+pwsh _deploy/apply-attachments-lifecycle.ps1 -Account <storage-account> -ResourceGroup <rg>
+```
 
 ### Hosted model (optional free model)
 
