@@ -81,7 +81,7 @@ builder.Services.AddSingleton(metrics);
 // so we do NOT call AddStackExchangeRedis here on purpose.
 builder.Services.AddSignalR(o =>
 {
-    o.MaximumReceiveMessageSize = 12 * 1024 * 1024; // room for an encrypted attachment payload
+    o.MaximumReceiveMessageSize = 2 * 1024 * 1024; // hard OOM guard: no envelope may exceed the Cosmos 2 MB item limit (attachments go to blob, not inline)
     o.EnableDetailedErrors = false;
 });
 

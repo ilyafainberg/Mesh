@@ -96,6 +96,12 @@ public sealed class MeshHub(
         if (!MeshCrypto.Verify(state.PublicKey, env.Body, env.Signature ?? ""))
             return MeshSendResult.Reject("invalid_signature");
 
+        // Reject oversized envelopes before routing: the relay persists each one as a single Cosmos
+        // item (hard 2 MB), so a body over the shared cap can never be stored. Large payloads must be
+        // sent as blob attachment pointers, not inlined.
+        if (System.Text.Encoding.UTF8.GetByteCount(env.Body ?? string.Empty) > MessageLimits.MaxEnvelopeBodyBytes)
+            return MeshSendResult.Reject("message_too_large");
+
         var isDeviceSync = DeviceSyncKinds.IsEnvelopeKind(env.Kind);
         if (!isDeviceSync
             && env.Kind?.StartsWith("device.sync.", StringComparison.OrdinalIgnoreCase) == true)
@@ -211,6 +217,10 @@ public sealed class MeshHub(
             return MeshSendResult.Reject("too_many_recipients");
         if (!MeshCrypto.Verify(state.PublicKey, request.Body, request.Signature))
             return MeshSendResult.Reject("invalid_signature");
+
+        // Same 2 MB envelope ceiling applies to the fan-out body stored per recipient inbox.
+        if (System.Text.Encoding.UTF8.GetByteCount(request.Body) > MessageLimits.MaxEnvelopeBodyBytes)
+            return MeshSendResult.Reject("message_too_large");
 
         var recipients = new List<string>(request.Recipients.Count);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

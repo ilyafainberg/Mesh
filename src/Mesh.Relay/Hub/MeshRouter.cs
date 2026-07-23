@@ -53,9 +53,17 @@ public sealed class MeshRouter(
             && await backplane.PublishToOwnerAsync(owner, to, envelopeJson))
             return;
 
-        // 3. Nobody is connected: queue for delivery on next connect.
-        await store.EnqueueAsync(to, envelopeJson);
-        push.NotifyOffline(to, null, env);
+        // 3. Nobody is connected: queue for delivery on next connect. The offline push wake fires in a
+        // finally so a transient enqueue failure still attempts to wake the device (it reconnects and
+        // drains) instead of silently swallowing the notification.
+        try
+        {
+            await store.EnqueueAsync(to, envelopeJson);
+        }
+        finally
+        {
+            push.NotifyOffline(to, null, env);
+        }
     }
 
     /// <summary>
@@ -78,8 +86,14 @@ public sealed class MeshRouter(
                 return;
         }
 
-        await store.EnqueueAsync(DeviceInboxKey(to, env.ToDevice), envelopeJson);
-        push.NotifyOffline(to, env.ToDevice, env);
+        try
+        {
+            await store.EnqueueAsync(DeviceInboxKey(to, env.ToDevice), envelopeJson);
+        }
+        finally
+        {
+            push.NotifyOffline(to, env.ToDevice, env);
+        }
     }
 
     /// <summary>
