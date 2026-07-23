@@ -13,16 +13,41 @@ namespace Mesh.App.Services;
 /// </summary>
 public sealed class TokenMeter(AppState state)
 {
+    internal sealed record UsageContext(
+        string ModelKey,
+        SynchronizationContext? DispatchContext,
+        Action<long, long>? ScopedSink);
+
     private readonly AsyncLocal<Action<long, long>?> scopedSink = new();
+    private readonly AsyncLocal<SynchronizationContext?> dispatchContext = new();
 
     /// <summary>Records usage for the currently selected model. Zero or negative counts are ignored.</summary>
     public void Record(long promptTokens, long completionTokens)
+        => Record(promptTokens, completionTokens, CaptureContext());
+
+    internal UsageContext CaptureContext()
+        => new(state.CurrentModelKey(), dispatchContext.Value, scopedSink.Value);
+
+    internal void Record(
+        long promptTokens,
+        long completionTokens,
+        UsageContext context)
     {
         if (promptTokens <= 0 && completionTokens <= 0) return;
         var p = Math.Max(0, promptTokens);
         var c = Math.Max(0, completionTokens);
-        state.AddTokens(state.CurrentModelKey(), p, c);
-        scopedSink.Value?.Invoke(p, c);
+        void Apply()
+        {
+            state.AddTokens(context.ModelKey, p, c);
+            context.ScopedSink?.Invoke(p, c);
+        }
+        if (context.DispatchContext is null
+            || SynchronizationContext.Current == context.DispatchContext)
+            Apply();
+        else
+            context.DispatchContext.Post(
+                static callback => ((Action)callback!).Invoke(),
+                (Action)Apply);
     }
 
     /// <summary>
@@ -37,8 +62,22 @@ public sealed class TokenMeter(AppState state)
         return new Scope(this, previous);
     }
 
+    internal IDisposable BeginDispatchContext(SynchronizationContext? context)
+    {
+        var previous = dispatchContext.Value;
+        dispatchContext.Value = context;
+        return new DispatchScope(this, previous);
+    }
+
     private sealed class Scope(TokenMeter meter, Action<long, long>? previous) : IDisposable
     {
         public void Dispose() => meter.scopedSink.Value = previous;
+    }
+
+    private sealed class DispatchScope(
+        TokenMeter meter,
+        SynchronizationContext? previous) : IDisposable
+    {
+        public void Dispose() => meter.dispatchContext.Value = previous;
     }
 }

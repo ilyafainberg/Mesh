@@ -8,8 +8,8 @@ using Mesh.App.Domain;
 
 namespace Mesh.App.Services;
 
-/// <summary>Managed ACP v1 client for the desktop GitHub Copilot CLI provider.</summary>
-public sealed class CopilotAcpHost(
+/// <summary>One serialized ACP v1 process lane for the desktop GitHub Copilot CLI provider.</summary>
+internal sealed class CopilotAcpLane(
     ILogger<CopilotAcpHost> logger,
     CopilotMcpBridge mcpBridge,
     TokenMeter tokenMeter) : IAsyncDisposable
@@ -26,6 +26,7 @@ public sealed class CopilotAcpHost(
         public StringBuilder Answer { get; } = new();
         public StringBuilder Thought { get; } = new();
         public IProgress<AgentStep>? Progress { get; init; }
+        public required TokenMeter.UsageContext UsageContext { get; init; }
         public HashSet<string> AllowedToolNames { get; init; } = new(StringComparer.Ordinal);
         public HashSet<string> MeshToolCallIds { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, ToolProgress> ToolCalls { get; } = new(StringComparer.Ordinal);
@@ -60,10 +61,10 @@ public sealed class CopilotAcpHost(
     private readonly SemaphoreSlim turnGate = new(1, 1);
     private readonly SemaphoreSlim processGate = new(1, 1);
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> pending = new();
-    private readonly object writeGate = new();
     private readonly object stderrGate = new();
     private Process? process;
     private StreamWriter? input;
+    private CopilotAcpPipeWriter? pipeWriter;
     private Task? readerTask;
     private Task? stderrTask;
     private CancellationTokenSource? processCts;
@@ -77,24 +78,30 @@ public sealed class CopilotAcpHost(
     private string? modelsExecutable;
     private IReadOnlyList<CopilotModelOption>? modelCache;
 
-    public async Task<IReadOnlyList<CopilotModelOption>> GetModelsAsync(
+    public Task<IReadOnlyList<CopilotModelOption>> GetModelsAsync(
         string executable,
         bool force = false,
         CancellationToken ct = default)
+        => GetModelsCoreAsync(executable, force, ct);
+
+    private async Task<IReadOnlyList<CopilotModelOption>> GetModelsCoreAsync(
+        string executable,
+        bool force,
+        CancellationToken ct)
     {
         if (!force && modelCache is not null
             && string.Equals(modelsExecutable, executable, StringComparison.OrdinalIgnoreCase)
             && DateTimeOffset.UtcNow - modelsCachedAt < TimeSpan.FromMinutes(5))
             return modelCache;
 
-        await turnGate.WaitAsync(ct);
+        await turnGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var config = new CopilotAcpConfig(executable, "auto", "auto");
-            await EnsureProcessAsync(config, ct);
-            var session = await NewSessionAsync(ct);
+            await EnsureProcessAsync(config, ct).ConfigureAwait(false);
+            var session = await NewSessionAsync(ct).ConfigureAwait(false);
             var models = CopilotAcpProtocol.ParseModels(session);
-            await CloseSessionAsync(SessionId(session), ct);
+            await CloseSessionAsync(SessionId(session), ct).ConfigureAwait(false);
             modelCache = models;
             modelsExecutable = executable;
             modelsCachedAt = DateTimeOffset.UtcNow;
@@ -106,19 +113,25 @@ public sealed class CopilotAcpHost(
         }
     }
 
-    public async Task<(bool Ok, string Message)> CheckAsync(
+    public Task<(bool Ok, string Message)> CheckAsync(
         CopilotAcpConfig config,
         CancellationToken ct = default)
+        => CheckCoreAsync(config, ct);
+
+    private async Task<(bool Ok, string Message)> CheckCoreAsync(
+        CopilotAcpConfig config,
+        CancellationToken ct)
     {
         try
         {
-            var result = await CompleteAsync(
+            var result = await CompleteCoreAsync(
                 config,
                 "You are a connection test.",
                 new[] { ("user", "Reply with exactly OK") },
                 Array.Empty<(string MimeType, byte[] Data)>(),
                 Array.Empty<IAgentTool>(),
-                ct: ct);
+                progress: null,
+                ct).ConfigureAwait(false);
             return string.IsNullOrWhiteSpace(result)
                 ? (false, "GitHub Copilot CLI returned an empty response.")
                 : (true, "GitHub Copilot CLI is working.");
@@ -129,7 +142,7 @@ public sealed class CopilotAcpHost(
         }
     }
 
-    public async Task<string> CompleteAsync(
+    public Task<string> CompleteAsync(
         CopilotAcpConfig config,
         string systemPrompt,
         IReadOnlyList<(string Role, string Text)> history,
@@ -137,8 +150,19 @@ public sealed class CopilotAcpHost(
         IReadOnlyList<IAgentTool> tools,
         IProgress<AgentStep>? progress = null,
         CancellationToken ct = default)
+        => CompleteCoreAsync(
+            config, systemPrompt, history, images, tools, progress, ct);
+
+    private async Task<string> CompleteCoreAsync(
+        CopilotAcpConfig config,
+        string systemPrompt,
+        IReadOnlyList<(string Role, string Text)> history,
+        IReadOnlyList<(string MimeType, byte[] Data)> images,
+        IReadOnlyList<IAgentTool> tools,
+        IProgress<AgentStep>? progress,
+        CancellationToken ct)
     {
-        await turnGate.WaitAsync(ct);
+        await turnGate.WaitAsync(ct).ConfigureAwait(false);
         CopilotMcpBridge.Registration? mcpRegistration = null;
         string? sessionId = null;
         try
@@ -146,9 +170,9 @@ public sealed class CopilotAcpHost(
             var toolFilter = string.Join(",",
                 tools.Select(tool => $"mesh-{tool.Name}").OrderBy(name => name, StringComparer.Ordinal));
             var effectiveConfig = config with { ToolFilter = toolFilter };
-            await EnsureProcessAsync(effectiveConfig, ct);
-            mcpRegistration = await mcpBridge.RegisterAsync(tools, ct);
-            var session = await NewSessionAsync(mcpRegistration, ct);
+            await EnsureProcessAsync(effectiveConfig, ct).ConfigureAwait(false);
+            mcpRegistration = await mcpBridge.RegisterAsync(tools, ct).ConfigureAwait(false);
+            var session = await NewSessionAsync(mcpRegistration, ct).ConfigureAwait(false);
             sessionId = SessionId(session);
             var content = new List<object>
             {
@@ -169,6 +193,7 @@ public sealed class CopilotAcpHost(
             activeTurn = new TurnState
             {
                 Progress = progress,
+                UsageContext = tokenMeter.CaptureContext(),
                 AllowedToolNames = tools
                     .SelectMany(tool => new[] { tool.Name, $"mesh-{tool.Name}" })
                     .ToHashSet(StringComparer.Ordinal)
@@ -177,7 +202,8 @@ public sealed class CopilotAcpHost(
             {
                 _ = SendNotificationAsync("session/cancel", new { sessionId }, CancellationToken.None);
             });
-            var result = await RequestAsync("session/prompt", new { sessionId, prompt = content }, ct);
+            var result = await RequestAsync(
+                "session/prompt", new { sessionId, prompt = content }, ct).ConfigureAwait(false);
             RecordUsage(result, activeTurn);
             var stopReason = result.TryGetProperty("stopReason", out var stop) ? stop.GetString() : null;
             if (string.Equals(stopReason, "cancelled", StringComparison.OrdinalIgnoreCase))
@@ -195,7 +221,7 @@ public sealed class CopilotAcpHost(
         {
             activeTurn = null;
             if (!string.IsNullOrWhiteSpace(sessionId))
-                await CloseSessionAsync(sessionId, CancellationToken.None);
+                await CloseSessionBestEffortAsync(sessionId).ConfigureAwait(false);
             mcpBridge.Unregister(mcpRegistration);
             turnGate.Release();
         }
@@ -203,11 +229,11 @@ public sealed class CopilotAcpHost(
 
     private async Task EnsureProcessAsync(CopilotAcpConfig config, CancellationToken ct)
     {
-        await processGate.WaitAsync(ct);
+        await processGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             if (process is { HasExited: false } && activeConfig == config) return;
-            await StopProcessAsync();
+            await StopProcessAsync().ConfigureAwait(false);
 
             var executable = ResolveExecutable(config.Executable);
             var start = new ProcessStartInfo
@@ -242,10 +268,20 @@ public sealed class CopilotAcpHost(
             }
 
             input = process.StandardInput;
-            input.AutoFlush = true;
+            input.AutoFlush = false;
+            pipeWriter = new CopilotAcpPipeWriter(input);
             processCts = new CancellationTokenSource();
-            readerTask = ReadLoopAsync(process.StandardOutput, processCts.Token);
-            stderrTask = ReadStderrAsync(process.StandardError, processCts.Token);
+            var startedProcess = process;
+            var startedProcessToken = processCts.Token;
+            using (ExecutionContext.SuppressFlow())
+            {
+                readerTask = Task.Run(
+                    () => ReadLoopAsync(startedProcess.StandardOutput, startedProcessToken),
+                    CancellationToken.None);
+                stderrTask = Task.Run(
+                    () => ReadStderrAsync(startedProcess.StandardError, startedProcessToken),
+                    CancellationToken.None);
+            }
             activeConfig = config;
 
             var initialized = await RequestAsync("initialize", new
@@ -253,7 +289,7 @@ public sealed class CopilotAcpHost(
                 protocolVersion = 1,
                 clientCapabilities = new { },
                 clientInfo = new { name = "mesh", title = "Mesh", version = "1" }
-            }, ct);
+            }, ct).ConfigureAwait(false);
             var version = initialized.TryGetProperty("protocolVersion", out var pv) && pv.TryGetInt32(out var v) ? v : 0;
             if (version != 1)
                 throw new InvalidOperationException($"GitHub Copilot CLI selected unsupported ACP version {version}.");
@@ -268,7 +304,7 @@ public sealed class CopilotAcpHost(
         }
         catch
         {
-            await StopProcessAsync();
+            await StopProcessAsync().ConfigureAwait(false);
             throw;
         }
         finally
@@ -309,6 +345,12 @@ public sealed class CopilotAcpHost(
         catch { }
     }
 
+    private async Task CloseSessionBestEffortAsync(string sessionId)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await CloseSessionAsync(sessionId, timeout.Token).ConfigureAwait(false);
+    }
+
     private static string SessionId(JsonElement result)
         => result.TryGetProperty("sessionId", out var id) && id.ValueKind == JsonValueKind.String
             ? id.GetString() ?? throw new InvalidOperationException("ACP session id was empty.")
@@ -323,8 +365,9 @@ public sealed class CopilotAcpHost(
         pending[id] = completion;
         try
         {
-            await WriteAsync(new { jsonrpc = "2.0", id, method, @params = parameters }, ct);
-            return await completion.Task.WaitAsync(ct);
+            await WriteAsync(
+                new { jsonrpc = "2.0", id, method, @params = parameters }, ct).ConfigureAwait(false);
+            return await completion.Task.WaitAsync(ct).ConfigureAwait(false);
         }
         finally
         {
@@ -338,14 +381,9 @@ public sealed class CopilotAcpHost(
     private async Task WriteAsync(object message, CancellationToken ct)
     {
         var json = JsonSerializer.Serialize(message);
-        lock (writeGate)
-        {
-            if (input is null) throw new InvalidOperationException("GitHub Copilot CLI input is unavailable.");
-            input.WriteLine(json);
-            input.Flush();
-        }
-        await Task.CompletedTask;
-        ct.ThrowIfCancellationRequested();
+        var writer = pipeWriter
+            ?? throw new InvalidOperationException("GitHub Copilot CLI input is unavailable.");
+        await writer.WriteLineAsync(json, ct).ConfigureAwait(false);
     }
 
     private async Task ReadLoopAsync(StreamReader output, CancellationToken ct)
@@ -354,7 +392,7 @@ public sealed class CopilotAcpHost(
         {
             while (!ct.IsCancellationRequested)
             {
-                var line = await output.ReadLineAsync(ct);
+                var line = await output.ReadLineAsync(ct).ConfigureAwait(false);
                 if (line is null) break;
                 using var document = JsonDocument.Parse(line);
                 var root = document.RootElement;
@@ -362,7 +400,7 @@ public sealed class CopilotAcpHost(
                 {
                     if (root.TryGetProperty("method", out _))
                     {
-                        await HandleClientRequestAsync(root, id, ct);
+                        await HandleClientRequestAsync(root, id, ct).ConfigureAwait(false);
                         continue;
                     }
                     if (!pending.TryGetValue(id, out var completion)) continue;
@@ -418,7 +456,8 @@ public sealed class CopilotAcpHost(
             object outcome = optionId is null
                 ? new { outcome = "cancelled" }
                 : new { outcome = "selected", optionId };
-            await WriteAsync(new { jsonrpc = "2.0", id, result = new { outcome } }, ct);
+            await WriteAsync(
+                new { jsonrpc = "2.0", id, result = new { outcome } }, ct).ConfigureAwait(false);
             return;
         }
         await WriteAsync(new
@@ -426,7 +465,7 @@ public sealed class CopilotAcpHost(
             jsonrpc = "2.0",
             id,
             error = new { code = -32601, message = $"Method not supported: {method}" }
-        }, ct);
+        }, ct).ConfigureAwait(false);
     }
 
     private void HandleNotification(JsonElement root)
@@ -551,7 +590,7 @@ public sealed class CopilotAcpHost(
         {
             while (!ct.IsCancellationRequested)
             {
-                var line = await error.ReadLineAsync(ct);
+                var line = await error.ReadLineAsync(ct).ConfigureAwait(false);
                 if (line is null) break;
                 lock (stderrGate)
                 {
@@ -585,7 +624,10 @@ public sealed class CopilotAcpHost(
     {
         if (!CopilotAcpProtocol.TryParseUsage(element, out var usage)) return;
         var delta = turn.Usage.Apply(usage);
-        tokenMeter.Record(delta.PromptTokens, delta.CompletionTokens);
+        tokenMeter.Record(
+            delta.PromptTokens,
+            delta.CompletionTokens,
+            turn.UsageContext);
     }
 
     private void FailPending(string message)
@@ -635,21 +677,29 @@ public sealed class CopilotAcpHost(
     private async Task StopProcessAsync()
     {
         processCts?.Cancel();
-        if (process is { HasExited: false })
+        var activeProcess = process;
+        FailPending("GitHub Copilot CLI was stopped.");
+        try { input?.BaseStream.Close(); } catch { }
+        if (activeProcess is { HasExited: false })
         {
-            try { process.StandardInput.Close(); } catch { }
+            try { activeProcess.Kill(entireProcessTree: true); } catch { }
             try
             {
-                if (!process.WaitForExit(1500)) process.Kill(entireProcessTree: true);
+                await activeProcess.WaitForExitAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(2))
+                    .ConfigureAwait(false);
             }
             catch { }
         }
-        if (readerTask is not null) try { await readerTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
-        if (stderrTask is not null) try { await stderrTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+        if (readerTask is not null)
+            try { await readerTask.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
+        if (stderrTask is not null)
+            try { await stderrTask.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
         process?.Dispose();
         processCts?.Dispose();
         process = null;
         input = null;
+        pipeWriter = null;
         readerTask = null;
         stderrTask = null;
         processCts = null;
@@ -661,8 +711,8 @@ public sealed class CopilotAcpHost(
 
     public async ValueTask DisposeAsync()
     {
-        await processGate.WaitAsync();
-        try { await StopProcessAsync(); }
+        await processGate.WaitAsync().ConfigureAwait(false);
+        try { await StopProcessAsync().ConfigureAwait(false); }
         finally { processGate.Release(); }
         processGate.Dispose();
         turnGate.Dispose();

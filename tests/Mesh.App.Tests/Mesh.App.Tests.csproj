@@ -14,6 +14,9 @@
          without a MAUI build dependency. The file compiles cleanly against net10.0 and
          Microsoft.Extensions.Logging.Abstractions. -->
     <Compile Include="..\..\src\Mesh.App\Services\UiModeService.cs" Link="UiModeService.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\AsyncWorkerPool.cs" Link="AsyncWorkerPool.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\CopilotAcpPipeWriter.cs" Link="CopilotAcpPipeWriter.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ModelCallDispatcher.cs" Link="ModelCallDispatcher.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\CopilotAcpProtocol.cs" Link="CopilotAcpProtocol.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.cs" Link="MeshDb.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProfileSyncState.cs" Link="ProfileSyncState.cs" />

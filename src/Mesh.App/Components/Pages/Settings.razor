@@ -195,7 +195,11 @@
                     {
                         <input class="full" style="margin-top:8px;" @bind="model" placeholder="Model ID, for example gpt-5.4" />
                     }
-                    <div class="field-hint">The list comes from the installed CLI and reflects models enabled for your Copilot account. Automatic lets Copilot choose.</div>
+                    <div class="field-hint">
+                        The list comes from the installed CLI and reflects models enabled for your Copilot account.
+                        Automatic lets Copilot choose. Up to 3 Copilot topics run at the same time; additional Copilot
+                        topics wait in a queue.
+                    </div>
                     @if (!string.IsNullOrWhiteSpace(copilotModelsError))
                     {
                         <div class="err-text" role="alert">@copilotModelsError</div>

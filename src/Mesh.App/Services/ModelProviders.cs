@@ -219,23 +219,62 @@ internal static class ReasoningControls
 /// <summary>Builds an <see cref="IChatModel"/> for the configured provider.</summary>
 public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state, TokenMeter meter, BrowserModelService browserModel, CopilotAcpHost copilot)
 {
-    public IChatModel Create(ModelConfig cfg) => cfg.Provider switch
+    public IChatModel Create(ModelConfig cfg)
+        => new OffUiChatModel(CreateCore(cfg), meter);
+
+    private IChatModel CreateCore(ModelConfig cfg) => cfg.Provider switch
+        {
+            ModelProvider.Anthropic => new AnthropicModel(httpFactory.CreateClient("model"), cfg, meter),
+            ModelProvider.Gemini => new GeminiModel(httpFactory.CreateClient("model"), cfg, meter),
+            ModelProvider.FoundryLocal => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithFoundryDefault(cfg), meter),
+            ModelProvider.Grok => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.x.ai"), meter),
+            ModelProvider.Groq => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.groq.com/openai"), meter),
+            // OpenRouter: the user's OpenRouter account (key) decides the model/provider routing, so
+            // Mesh always requests "openrouter/auto" and lets OpenRouter route.
+            ModelProvider.OpenRouter => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), OpenRouterConfig(cfg), meter),
+            ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg, meter),
+            ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg, meter),
+            ModelProvider.Browser => new BrowserChatModel(browserModel, cfg),
+            ModelProvider.GitHubCopilot => new CopilotAcpModel(copilot, cfg),
+            _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg, meter),
+        };
+
+    private sealed class OffUiChatModel(IChatModel inner, TokenMeter tokenMeter) : IChatModel
     {
-        ModelProvider.Anthropic => new AnthropicModel(httpFactory.CreateClient("model"), cfg, meter),
-        ModelProvider.Gemini => new GeminiModel(httpFactory.CreateClient("model"), cfg, meter),
-        ModelProvider.FoundryLocal => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithFoundryDefault(cfg), meter),
-        ModelProvider.Grok => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.x.ai"), meter),
-        ModelProvider.Groq => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), WithEndpoint(cfg, "https://api.groq.com/openai"), meter),
-        // OpenRouter: the user's OpenRouter account (key) decides the model/provider routing, so the
-        // client never sends a specific model; it always requests "openrouter/auto" and lets OpenRouter
-        // route. We do not replicate any OpenRouter settings in the client.
-        ModelProvider.OpenRouter => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), OpenRouterConfig(cfg), meter),
-        ModelProvider.MeshHosted => new MeshHostedModel(httpFactory.CreateClient("model"), state, cfg, meter),
-        ModelProvider.AzureOpenAI => new AzureOpenAiModel(httpFactory.CreateClient("model"), cfg, meter),
-        ModelProvider.Browser => new BrowserChatModel(browserModel, cfg),
-        ModelProvider.GitHubCopilot => new CopilotAcpModel(copilot, cfg),
-        _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg, meter),
-    };
+        public Task<string> CompleteAsync(
+            string systemPrompt,
+            IReadOnlyList<ChatLine> history,
+            CompletionOptions? options = null,
+            CancellationToken ct = default)
+        {
+            var context = SynchronizationContext.Current;
+            return ModelCallDispatcher.RunAsync(async () =>
+            {
+                using var scope = tokenMeter.BeginDispatchContext(context);
+                return await inner.CompleteAsync(
+                    systemPrompt, history, options, ct).ConfigureAwait(false);
+            }, ct);
+        }
+
+        public Task<string> CompleteWithToolsAsync(
+            string systemPrompt,
+            IReadOnlyList<ChatLine> history,
+            IReadOnlyList<IAgentTool> tools,
+            IProgress<AgentStep>? progress = null,
+            CompletionOptions? options = null,
+            CancellationToken ct = default)
+        {
+            var context = SynchronizationContext.Current;
+            var marshalledProgress = ModelCallDispatcher.MarshalProgress(progress, context);
+            return ModelCallDispatcher.RunAsync(async () =>
+            {
+                using var scope = tokenMeter.BeginDispatchContext(context);
+                return await inner.CompleteWithToolsAsync(
+                    systemPrompt, history, tools, marshalledProgress, options, ct)
+                    .ConfigureAwait(false);
+            }, ct);
+        }
+    }
 
     /// <summary>Applies a default endpoint for OpenAI-compatible hosts (Grok/Groq) when none set.</summary>
     private static ModelConfig WithEndpoint(ModelConfig cfg, string defaultEndpoint)

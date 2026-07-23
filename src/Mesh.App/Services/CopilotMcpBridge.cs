@@ -31,7 +31,7 @@ public sealed class CopilotMcpBridge(ILogger<CopilotMcpBridge> logger) : IAsyncD
         CancellationToken ct)
     {
         if (tools.Count == 0) return null;
-        await EnsureStartedAsync(ct);
+        await EnsureStartedAsync(ct).ConfigureAwait(false);
         var token = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
         scopes[token] = new ToolScope(
             tools.GroupBy(tool => tool.Name, StringComparer.Ordinal)
@@ -49,7 +49,7 @@ public sealed class CopilotMcpBridge(ILogger<CopilotMcpBridge> logger) : IAsyncD
     private async Task EnsureStartedAsync(CancellationToken ct)
     {
         if (listener is { IsListening: true }) return;
-        await startGate.WaitAsync(ct);
+        await startGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             if (listener is { IsListening: true }) return;
@@ -89,7 +89,7 @@ public sealed class CopilotMcpBridge(ILogger<CopilotMcpBridge> logger) : IAsyncD
         {
             while (!ct.IsCancellationRequested)
             {
-                var context = await activeListener.GetContextAsync().WaitAsync(ct);
+                var context = await activeListener.GetContextAsync().WaitAsync(ct).ConfigureAwait(false);
                 _ = Task.Run(() => HandleAsync(context, ct), CancellationToken.None);
             }
         }
