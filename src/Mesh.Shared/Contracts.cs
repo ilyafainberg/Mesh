@@ -909,7 +909,10 @@ public sealed record TopicRunAttachment(
     string Id,
     string Name,
     string MimeType,
-    long Length);
+    long Length,
+    string? BlobId = null,
+    string? Key = null,
+    string? Sha256 = null);
 
 public sealed record TopicRunRequestPayload(
     string RunId,
@@ -1139,7 +1142,19 @@ public static class TopicRunProtocol
             && attachment.Name.Length <= MaxIdChars
             && !string.IsNullOrWhiteSpace(attachment.MimeType)
             && attachment.MimeType.Length <= MaxIdChars
-            && attachment.Length is >= 0 and <= AttachmentChunkProtocol.MaxAttachmentBytes);
+            && attachment.Length is >= 0 and <= MessageLimits.MaxAttachmentBytes
+            && ValidAttachmentPointer(attachment));
+    }
+
+    // When an attachment carries a blob pointer, all three parts (BlobId, Key, Sha256) must be present
+    // and the blob id well-formed. Attachments travel as blob ciphertext; the pointer rides the E2EE body.
+    private static bool ValidAttachmentPointer(TopicRunAttachment attachment)
+    {
+        if (attachment.BlobId is null && attachment.Key is null && attachment.Sha256 is null)
+            return true;
+        return AttachmentProtocol.IsValidBlobId(attachment.BlobId)
+               && !string.IsNullOrEmpty(attachment.Key)
+               && !string.IsNullOrEmpty(attachment.Sha256);
     }
 
     private static bool ValidSubtasks(IReadOnlyList<TopicRunSubtask>? items)

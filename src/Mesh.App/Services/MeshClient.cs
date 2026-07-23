@@ -946,12 +946,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     {
         try
         {
-            var attachments = await attachmentInbox.WaitForAsync(
-                active.SourceDeviceId,
-                request.RunId,
-                request.Attachments,
-                request.AttachmentIds,
-                active.Cancellation.Token);
+            var attachments = await FetchInboundAttachmentsAsync(request, active);
             var draft = new TopicTurnDraft(
                 request.RunId,
                 request.ThreadId,
@@ -1010,6 +1005,39 @@ public sealed class MeshClient : IDeviceTopicTransport
             attachmentInbox.RejectRun(active.SourceDeviceId, active.RunId);
             active.Cancellation.Dispose();
         }
+    }
+
+    // Retrieves a topic run's attachments. Senders upload each attachment to blob storage and carry an
+    // encrypted pointer in the request, which we download and decrypt here. The legacy chunk-staging
+    // path remains only for a request that somehow arrives without pointers.
+    private async Task<IReadOnlyList<ChatAttachment>> FetchInboundAttachmentsAsync(
+        TopicRunRequestPayload request,
+        ActiveTopicRun active)
+    {
+        var manifest = request.Attachments ?? Array.Empty<TopicRunAttachment>();
+        if (manifest.Count > 0 && manifest.All(item => AttachmentProtocol.IsValidBlobId(item.BlobId)))
+        {
+            var downloaded = new List<ChatAttachment>(manifest.Count);
+            foreach (var item in manifest)
+            {
+                var attachment = await DownloadAttachmentAsync(
+                    new AttachmentPointer(
+                        item.BlobId!, item.Name, item.MimeType, item.Length, item.Key!, item.Sha256!),
+                    active.Cancellation.Token);
+                if (attachment is null)
+                    throw new InvalidDataException(
+                        $"Attachment '{item.Name}' could not be retrieved from storage.");
+                downloaded.Add(attachment);
+            }
+            return downloaded;
+        }
+
+        return await attachmentInbox.WaitForAsync(
+            active.SourceDeviceId,
+            request.RunId,
+            request.Attachments,
+            request.AttachmentIds,
+            active.Cancellation.Token);
     }
 
     private static TopicRunUpdatePayload CorrelateUpdate(
@@ -1823,11 +1851,11 @@ public sealed class MeshClient : IDeviceTopicTransport
             return TopicDispatchResult.Reject("not_connected", request.RunId);
         if (!supportsSendResults)
             return TopicDispatchResult.Reject("transport_ack_required", request.RunId);
-        if (attachments.Any(item => item.Data.LongLength > AttachmentChunkProtocol.MaxAttachmentBytes))
+        if (attachments.Any(item => item.Data.LongLength > MessageLimits.MaxAttachmentBytes))
             return TopicDispatchResult.Reject(
                 "attachment_too_large",
                 request.RunId,
-                $"Each attachment must be at most {AttachmentChunkProtocol.MaxAttachmentBytes} bytes.");
+                $"Each attachment must be at most {MessageLimits.MaxAttachmentBytes} bytes.");
         if (attachments.Sum(item => item.Data.LongLength) > DeviceTopicAttachmentInbox.MaxRunBytes)
             return TopicDispatchResult.Reject(
                 "attachments_too_large",
@@ -1877,35 +1905,40 @@ public sealed class MeshClient : IDeviceTopicTransport
                 .Any())
             return TopicDispatchResult.Reject("attachment_manifest_mismatch", request.RunId);
 
+        // Upload each attachment to blob storage and carry only an encrypted pointer in the (E2EE)
+        // request. Attachments no longer travel inline or as SignalR chunks, so a large attachment can
+        // never inflate an envelope past the relay's 2 MB Cosmos item limit.
+        var pointers = new List<TopicRunAttachment>(attachments.Count);
         for (var attachmentIndex = 0; attachmentIndex < attachments.Count; attachmentIndex++)
         {
-            var attachment = attachments[attachmentIndex];
-            var item = manifest[attachmentIndex];
-            var count = checked((int)((attachment.Data.LongLength
-                                       + AttachmentChunkProtocol.MaxChunkBytes - 1)
-                                      / AttachmentChunkProtocol.MaxChunkBytes));
-            for (var index = 0; index < count; index++)
+            AttachmentPointer? pointer;
+            try
             {
-                var offset = index * AttachmentChunkProtocol.MaxChunkBytes;
-                var length = Math.Min(
-                    AttachmentChunkProtocol.MaxChunkBytes, attachment.Data.Length - offset);
-                var data = new byte[length];
-                Buffer.BlockCopy(attachment.Data, offset, data, 0, length);
-                var chunk = new AttachmentChunkPayload(
-                    request.RunId, item.Id, index, count, data, item.Name, item.MimeType);
-                if (!await SendTargetedTopicEnvelopeAsync(
-                        targetDeviceId,
-                        MeshKinds.AttachmentChunk,
-                        TopicRunProtocol.ChunkBody(chunk),
-                        cancellationToken))
-                    return TopicDispatchResult.Reject("attachment_transfer_failed", request.RunId);
+                pointer = await UploadAttachmentAsync(attachments[attachmentIndex], cancellationToken);
             }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log?.Invoke($"topic attachment upload failed: {ex.Message}");
+                return TopicDispatchResult.Reject("attachment_transfer_failed", request.RunId);
+            }
+            if (pointer is null)
+                return TopicDispatchResult.Reject("attachment_transfer_failed", request.RunId);
+            pointers.Add(manifest[attachmentIndex] with
+            {
+                BlobId = pointer.BlobId,
+                Key = pointer.Key,
+                Sha256 = pointer.Sha256,
+            });
         }
+
+        var outbound = attachments.Count == 0
+            ? request
+            : request with { Attachments = pointers, AttachmentIds = pointers.Select(item => item.Id).ToList() };
 
         return await SendTargetedTopicEnvelopeAsync(
             targetDeviceId,
             MeshKinds.TopicRunRequest,
-            TopicRunProtocol.RequestBody(request),
+            TopicRunProtocol.RequestBody(outbound),
             cancellationToken)
             ? TopicDispatchResult.Ok(request.RunId)
             : TopicDispatchResult.Reject("transport_error", request.RunId);
