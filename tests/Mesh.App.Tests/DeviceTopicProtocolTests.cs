@@ -38,6 +38,40 @@ public sealed class DeviceTopicProtocolTests
     }
 
     [TestMethod]
+    public void Update_RoundTripsStreamingDeltaAndRejectsInvalid()
+    {
+        var update = new TopicRunUpdatePayload(
+            "run-1",
+            "thread-1",
+            TopicRunPhase.Executing,
+            Timestamp: new DateTimeOffset(2026, 7, 21, 10, 0, 0, TimeSpan.Zero),
+            DeltaSeq: 3,
+            DeltaKind: TopicRunDeltaKind.Answer,
+            Delta: "hello");
+
+        var body = TopicRunProtocol.UpdateBody(update);
+
+        StringAssert.Contains(body, "\"deltaKind\":\"answer\"");
+        Assert.IsTrue(TopicRunProtocol.TryParseUpdate(body, out var parsed));
+        Assert.AreEqual(3, parsed.DeltaSeq);
+        Assert.AreEqual(TopicRunDeltaKind.Answer, parsed.DeltaKind);
+        Assert.AreEqual("hello", parsed.Delta);
+
+        // A fragment with no stream kind is rejected.
+        Assert.IsFalse(TopicRunProtocol.TryParseUpdate(
+            body.Replace("\"deltaKind\":\"answer\"", "\"deltaKind\":null", StringComparison.Ordinal),
+            out _));
+        // Integer enum values are rejected (stable string enums only).
+        Assert.IsFalse(TopicRunProtocol.TryParseUpdate(
+            body.Replace("\"answer\"", "1", StringComparison.Ordinal),
+            out _));
+        // A fragment must carry a positive per-run sequence number.
+        Assert.IsFalse(TopicRunProtocol.TryParseUpdate(
+            TopicRunProtocol.UpdateBody(update with { DeltaSeq = 0 }),
+            out _));
+    }
+
+    [TestMethod]
     public void ChunkParser_EnforcesChunkBoundsAndMetadata()
     {
         var valid = new AttachmentChunkPayload(

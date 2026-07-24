@@ -494,6 +494,65 @@ public enum AgentDeltaKind { Reasoning, Answer }
 /// </summary>
 public sealed record AgentDelta(AgentDeltaKind Kind, string Text);
 
+/// <summary>
+/// Coalesces the fine-grained <see cref="AgentDelta"/> fragments a model streams (often one per token)
+/// into larger chunks before they are forwarded to a viewing device. Forwarding every token as its own
+/// end-to-end-encrypted envelope would hammer the seal/sign path and the relay, so fragments are buffered
+/// until the buffer reaches a character budget or a time budget elapses, whichever comes first. A change
+/// of stream (reasoning to answer or back) always flushes first so the two are never mixed in one chunk.
+/// This type is deliberately pure and single-threaded: a turn reports its deltas sequentially.
+/// </summary>
+public sealed class AgentDeltaCoalescer
+{
+    private readonly int flushChars;
+    private readonly int flushMillis;
+    private readonly System.Text.StringBuilder buffer = new();
+    private AgentDeltaKind kind;
+    private long? lastFlushMillis;
+
+    public AgentDeltaCoalescer(int flushChars = 48, int flushMillis = 100)
+    {
+        this.flushChars = flushChars > 0 ? flushChars : 1;
+        this.flushMillis = flushMillis >= 0 ? flushMillis : 0;
+    }
+
+    /// <summary>
+    /// Buffers one streamed fragment and returns a coalesced fragment to forward now, or null to keep
+    /// buffering. <paramref name="nowMillis"/> is a monotonic millisecond clock (for example
+    /// <see cref="Environment.TickCount64"/>) used only for the time budget, so callers can inject it.
+    /// </summary>
+    public AgentDelta? Accept(AgentDelta delta, long nowMillis)
+    {
+        ArgumentNullException.ThrowIfNull(delta);
+        if (string.IsNullOrEmpty(delta.Text)) return null;
+        AgentDelta? flushed = null;
+        if (buffer.Length > 0 && delta.Kind != kind)
+            flushed = Take(nowMillis);
+        if (buffer.Length == 0)
+        {
+            kind = delta.Kind;
+            lastFlushMillis ??= nowMillis;
+        }
+        buffer.Append(delta.Text);
+        if (flushed is null
+            && (buffer.Length >= flushChars
+                || nowMillis - (lastFlushMillis ?? nowMillis) >= flushMillis))
+            return Take(nowMillis);
+        return flushed;
+    }
+
+    /// <summary>Returns any buffered fragment at the end of a turn, or null when nothing is buffered.</summary>
+    public AgentDelta? Flush() => buffer.Length > 0 ? Take(null) : null;
+
+    private AgentDelta Take(long? nowMillis)
+    {
+        var fragment = new AgentDelta(kind, buffer.ToString());
+        buffer.Clear();
+        if (nowMillis is { } value) lastFlushMillis = value;
+        return fragment;
+    }
+}
+
 public sealed class Conversation
 {
     public string Handle { get; set; } = "";

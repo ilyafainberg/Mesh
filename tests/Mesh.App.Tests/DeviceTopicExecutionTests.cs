@@ -74,6 +74,8 @@ namespace Mesh.App.Services
         public Func<string, string, CancellationToken, Task<string>> Continue { get; set; } =
             static (_, _, _) => Task.FromResult("");
 
+        public Action<IProgress<AgentDelta>?>? Stream { get; set; }
+
         public Task<string> ContinueAsOwnerAsync(
             string threadId,
             string triggerLineId,
@@ -81,8 +83,12 @@ namespace Mesh.App.Services
             DateTimeOffset startedAt,
             IProgress<AgentRunState>? runProgress,
             IProgress<AgentStep>? stepProgress,
+            IProgress<AgentDelta>? deltaProgress,
             CancellationToken cancellationToken = default)
-            => Continue(threadId, runId, cancellationToken);
+        {
+            Stream?.Invoke(deltaProgress);
+            return Continue(threadId, runId, cancellationToken);
+        }
 
         public Task<string> BuildWidgetAsync(
             string description,
@@ -282,6 +288,56 @@ namespace Mesh.App.Tests
                 update.RunId == "run-1" && update.ThreadId == "thread-1"));
             Assert.IsTrue(secondProgress.Updates.All(update =>
                 update.RunId == "run-2" && update.ThreadId == "thread-1"));
+        }
+
+        [TestMethod]
+        public async Task Runner_ForwardsCoalescedStreamingDeltas()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.Lines.Add(new ChatLine { Id = "line-1", Role = "user", Text = "hi" });
+            var agent = new AgentService
+            {
+                Stream = delta =>
+                {
+                    for (var i = 0; i < 120; i++)
+                        delta?.Report(new AgentDelta(AgentDeltaKind.Reasoning, "x"));
+                    for (var i = 0; i < 120; i++)
+                        delta?.Report(new AgentDelta(AgentDeltaKind.Answer, "y"));
+                }
+            };
+            var runner = new TopicTurnRunner(agent, state);
+            var progress = new RecordingProgress();
+            var at = new DateTimeOffset(2026, 7, 21, 16, 0, 0, TimeSpan.Zero);
+            var draft = new TopicTurnDraft(
+                "run-1", "thread-1", "line-1", "owner", "hi", at, TopicTurnMode.Single);
+
+            await runner.ExecuteAsync(draft, progress, CancellationToken.None);
+
+            var deltas = progress.Updates.Where(update => update.Delta is not null).ToList();
+            Assert.IsTrue(deltas.Count >= 4, "the stream should be coalesced into several fragments");
+            Assert.IsTrue(deltas.Count < 240, "coalescing should send far fewer envelopes than tokens");
+            for (var i = 1; i < deltas.Count; i++)
+                Assert.IsTrue(
+                    deltas[i].DeltaSeq > deltas[i - 1].DeltaSeq,
+                    "delta sequence numbers must be strictly increasing");
+            Assert.IsTrue(deltas.All(update =>
+                update.DeltaKind is not null
+                && update.RunId == "run-1"
+                && update.ThreadId == "thread-1"));
+            Assert.IsTrue(
+                deltas.All(update =>
+                    update.Delta!.All(character => character == 'x')
+                    || update.Delta!.All(character => character == 'y')),
+                "reasoning and answer must never be mixed inside one fragment");
+            var reasoning = string.Concat(deltas
+                .Where(update => update.DeltaKind == TopicRunDeltaKind.Reasoning)
+                .Select(update => update.Delta));
+            var answer = string.Concat(deltas
+                .Where(update => update.DeltaKind == TopicRunDeltaKind.Answer)
+                .Select(update => update.Delta));
+            Assert.AreEqual(new string('x', 120), reasoning);
+            Assert.AreEqual(new string('y', 120), answer);
         }
 
         private static Mesh.App.Services.AppState StateWithThread()

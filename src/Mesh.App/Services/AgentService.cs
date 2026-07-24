@@ -42,7 +42,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     /// </summary>
     public async Task<string> ContinueAsOwnerAsync(string threadId, CancellationToken ct = default)
         => await ContinueOwnerCoreAsync(
-            threadId, null, null, default, null, null, ct);
+            threadId, null, null, default, null, null, null, ct);
 
     /// <summary>
     /// Continues an existing owner thread using a caller-owned run identity. This does not append a
@@ -55,9 +55,10 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         DateTimeOffset startedAt,
         IProgress<AgentRunState>? runProgress,
         IProgress<AgentStep>? stepProgress,
+        IProgress<AgentDelta>? deltaProgress,
         CancellationToken ct = default)
         => await ContinueOwnerCoreAsync(
-            threadId, triggerLineId, runId, startedAt, runProgress, stepProgress, ct);
+            threadId, triggerLineId, runId, startedAt, runProgress, stepProgress, deltaProgress, ct);
 
     private async Task<string> ContinueOwnerCoreAsync(
         string threadId,
@@ -66,6 +67,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         DateTimeOffset requestedStartedAt,
         IProgress<AgentRunState>? runProgress,
         IProgress<AgentStep>? stepProgress,
+        IProgress<AgentDelta>? deltaProgress,
         CancellationToken ct)
     {
         var thread = state.GetOrCreateOwnThread(threadId);
@@ -177,8 +179,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             state.ReportAgentStep(thread.Id, step);
             stepProgress?.Report(step);
         });
-        var delta = new InlineProgress<AgentDelta>(
-            fragment => state.AppendAssistantDelta(thread.Id, fragment));
+        var delta = new InlineProgress<AgentDelta>(fragment =>
+        {
+            state.AppendAssistantDelta(thread.Id, fragment);
+            deltaProgress?.Report(fragment);
+        });
         using (media.BeginScope(out var images))
         {
             string answer;

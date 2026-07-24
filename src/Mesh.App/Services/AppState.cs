@@ -2405,6 +2405,9 @@ public sealed class AppState
     private readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
     private readonly Dictionary<string, RemoteRunProjection> remoteRuns = new(StringComparer.Ordinal);
     private readonly HashSet<string> terminalRemoteRuns = new(StringComparer.Ordinal);
+    // Last applied streamed-delta sequence per remote run (key: threadId \0 runId), so a viewing device
+    // applies each forwarded reply fragment once and in order and ignores duplicates or reordered ones.
+    private readonly Dictionary<string, int> remoteDeltaSeq = new(StringComparer.Ordinal);
     // Cancellation source per running thread, so the user can STOP an in-progress turn. The token is
     // passed into the agent call and flows down through the provider tool loop (real cancellation of
     // the HTTP request, not just a UI change). Threads that were cancelled (rather than finishing on
@@ -2512,7 +2515,15 @@ public sealed class AppState
     }
 
     public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
-        => ApplyRemoteRunProjection(update.ThreadId, new RemoteRunProjection
+    {
+        // A streamed reply fragment rides the same channel as run-state updates but is applied to the
+        // live draft, not the run projection, so it never disturbs the phase/steps the viewer is showing.
+        if (update.Delta is { Length: > 0 })
+        {
+            ApplyRemoteAssistantDelta(update);
+            return;
+        }
+        ApplyRemoteRunProjection(update.ThreadId, new RemoteRunProjection
         {
             RunId = update.RunId,
             ThreadId = update.ThreadId,
@@ -2526,6 +2537,43 @@ public sealed class AppState
             FailureCode = update.FailureCode,
             Timestamp = update.Timestamp
         });
+    }
+
+    // Applies one reply fragment forwarded by the executing device into this device's live draft so the
+    // reasoning and answer build up incrementally on a viewer instead of arriving as one block when the
+    // committed line finally syncs. The executing device shows its own locally streamed draft, so this
+    // no-ops there (guarded by busyThreads) to avoid double counting the fragments echoed back through the
+    // local projected-progress sink. Fragments ride a live-only stream: a viewer disconnected mid-turn
+    // simply misses some and still gets the whole answer via device sync of the committed line, while the
+    // per-run sequence keeps what does arrive ordered and applied exactly once.
+    private void ApplyRemoteAssistantDelta(TopicRunUpdatePayload update)
+    {
+        if (update.Delta is not { Length: > 0 } || update.DeltaKind is null)
+            return;
+        var threadId = update.ThreadId;
+        var correlationKey = threadId + "\0" + update.RunId;
+        var appended = false;
+        lock (profileSyncGate)
+        {
+            if (busyThreads.Contains(threadId)
+                || terminalRemoteRuns.Contains(correlationKey))
+                return;
+            var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            if (!RemoteRunCorrelation.IsExpected(thread, threadId, update.RunId))
+                return;
+            if (remoteDeltaSeq.TryGetValue(correlationKey, out var lastSeq)
+                && update.DeltaSeq <= lastSeq)
+                return;
+            remoteDeltaSeq[correlationKey] = update.DeltaSeq;
+            var kind = update.DeltaKind == TopicRunDeltaKind.Reasoning
+                ? AgentDeltaKind.Reasoning
+                : AgentDeltaKind.Answer;
+            if (!assistantDrafts.TryGetValue(threadId, out var draft))
+                assistantDrafts[threadId] = draft = new AssistantDraft();
+            appended = draft.Append(new AgentDelta(kind, update.Delta));
+        }
+        if (appended) NotifyChanged();
+    }
 
     /// <summary>Applies a remote run update projection for a thread and refreshes the UI.</summary>
     public void ApplyRemoteRunProjection(string threadId, RemoteRunProjection projection)
@@ -2572,6 +2620,8 @@ public sealed class AppState
             {
                 remoteRuns.Remove(threadId);
                 terminalRemoteRuns.Add(correlationKey);
+                remoteDeltaSeq.Remove(correlationKey);
+                assistantDrafts.Remove(threadId);
             }
             else
             {
@@ -2657,6 +2707,8 @@ public sealed class AppState
             }
             remoteRuns.Remove(thread.Id);
             terminalRemoteRuns.Add(thread.Id + "\0" + projection.RunId);
+            remoteDeltaSeq.Remove(thread.Id + "\0" + projection.RunId);
+            assistantDrafts.Remove(thread.Id);
             return true;
         }
     }

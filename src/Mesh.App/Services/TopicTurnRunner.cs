@@ -238,6 +238,19 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
                 step.Label, steps: steps.ToList());
         });
 
+        // Stream the reply to viewing devices as it is generated. The executing device renders its own
+        // draft locally; here we coalesce the model's token-level fragments and forward them on the same
+        // topic.run.update channel (a live-only stream) so a viewer sees the answer build up instead of
+        // receiving one block. Per-run DeltaSeq gives the viewer ordered, exactly-once application.
+        var coalescer = new AgentDeltaCoalescer();
+        var deltaSeq = 0;
+        var deltaProgress = new InlineProgress<AgentDelta>(fragment =>
+        {
+            var chunk = coalescer.Accept(fragment, Environment.TickCount64);
+            if (chunk is not null)
+                ReportDelta(progress, draft, ++deltaSeq, chunk);
+        });
+
         await agent.ContinueAsOwnerAsync(
             draft.ThreadId,
             draft.TriggerLineId,
@@ -245,7 +258,12 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             draft.TriggerAt,
             runProgress,
             stepProgress,
+            deltaProgress,
             cancellationToken);
+
+        var tail = coalescer.Flush();
+        if (tail is not null)
+            ReportDelta(progress, draft, ++deltaSeq, tail);
     }
 
     private async Task ExecuteWidgetAsync(
@@ -498,6 +516,22 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
 
     private static string? Bound(string? value, int maxLength)
         => value is null || value.Length <= maxLength ? value : value[..maxLength];
+
+    private static void ReportDelta(
+        IProgress<TopicRunUpdatePayload> progress,
+        TopicTurnDraft draft,
+        int seq,
+        AgentDelta delta)
+        => progress.Report(new TopicRunUpdatePayload(
+            draft.RunId,
+            draft.ThreadId,
+            TopicRunPhase.Executing,
+            Timestamp: DateTimeOffset.UtcNow,
+            DeltaSeq: seq,
+            DeltaKind: delta.Kind == AgentDeltaKind.Reasoning
+                ? TopicRunDeltaKind.Reasoning
+                : TopicRunDeltaKind.Answer,
+            Delta: Bound(delta.Text, TopicRunProtocol.MaxDeltaChars)));
 
     private static TopicRunCompletion Complete(
         IProgress<TopicRunUpdatePayload> progress,
