@@ -154,7 +154,7 @@ public sealed class TopicExecutionRouter(
     {
         var devices = await deviceTransport.ListEligibleDevicesAsync(cancellationToken);
         var eligible = devices
-            .Where(device => device.IsAgentReady)
+            .Where(device => device.CanHostRemoteTurn)
             .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
             .Select(group => group.First())
             .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)

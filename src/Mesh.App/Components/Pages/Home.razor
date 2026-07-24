@@ -593,7 +593,7 @@
     OwnThread? Active => activeThread is null ? null : State.Profile.OwnThreads.FirstOrDefault(t => t.Id == activeThread);
     ExecutionDevice CurrentDevice => new(Mesh.MyDeviceId, State.Profile.DeviceName, PlatformCaps.DevicePlatform);
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> OtherEligibleDevices => eligibleDevices
-        .Where(d => d.AgentReady && d.DeviceId != Mesh.MyDeviceId)
+        .Where(d => d.CanHostRemoteTurn && d.DeviceId != Mesh.MyDeviceId)
         .OrderByDescending(d => d.Online).ThenBy(d => DeviceName(d), StringComparer.OrdinalIgnoreCase).ToList();
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices
     {
@@ -846,7 +846,7 @@
     bool IsRemoteBound(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
         && thread.ExecutionDeviceId != Mesh.MyDeviceId;
     bool IsDeviceOnline(string? deviceId) => deviceId == Mesh.MyDeviceId
-        || eligibleDevices.Any(d => d.DeviceId == deviceId && d.Online && d.AgentReady);
+        || eligibleDevices.Any(d => d.DeviceId == deviceId && d.Online && d.CanHostRemoteTurn);
     string ThreadTitle(OwnThread thread) => string.IsNullOrWhiteSpace(thread.Title) ? "New chat" : thread.Title;
     string ThreadDeviceName(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceName)
         ? thread.ExecutionDeviceName : DeviceNameForId(thread.ExecutionDeviceId);

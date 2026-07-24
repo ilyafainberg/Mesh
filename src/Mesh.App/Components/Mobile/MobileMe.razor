@@ -98,7 +98,7 @@
                 @foreach (var device in DeviceChoices)
                 {
                     <button class="device-choice" role="menuitem"
-                            disabled="@(!device.Online || !device.AgentReady)"
+                            disabled="@(!CanRunHere(device))"
                             @onclick="() => NewThread(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -437,7 +437,7 @@ else
                 @foreach (var device in DeviceChoices)
                 {
                     <button class="device-choice" role="menuitem"
-                            disabled="@(!device.Online || !device.AgentReady || IsActiveDevice(device))"
+                            disabled="@(!CanRunHere(device) || IsActiveDevice(device))"
                             @onclick="() => ChooseMoveTarget(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -594,7 +594,7 @@ else
         string.IsNullOrWhiteSpace(State.Profile.DeviceName) ? "This device" : State.Profile.DeviceName,
         true,
         PlatformCaps.DevicePlatform,
-        Agent.IsModelReady);
+        PlatformCaps.CanRunAgent && Agent.IsModelReady);
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => new[] { CurrentDevice }
         .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d)))
         .GroupBy(d => d.DeviceId, StringComparer.Ordinal)
@@ -1125,6 +1125,15 @@ else
 
     bool IsCurrentDevice(global::Mesh.Shared.DeviceInfo device) =>
         string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+
+    // Whether a device can be chosen to run a topic. The current device runs the turn locally (in the
+    // foreground), so it only needs a ready local model. This holds on mobile, which can run its own
+    // chats but cannot host a remote turn for another device. Any other device must be an online,
+    // eligible remote host (a desktop with the remote agent enabled).
+    bool CanRunHere(global::Mesh.Shared.DeviceInfo device) =>
+        IsCurrentDevice(device)
+            ? Agent.IsModelReady
+            : device.Online && device.CanHostRemoteTurn;
 
     bool IsAssignedElsewhere(OwnThread thread) =>
         !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
