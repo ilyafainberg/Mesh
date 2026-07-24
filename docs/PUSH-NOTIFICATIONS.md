@@ -1,9 +1,12 @@
 # Push notifications (mobile wake)
 
 Mesh mobile clients (iOS and Android) can be woken by a push notification when a
-message is queued for them while they are offline (app backgrounded, screen off,
-or suspended by the OS). This document explains the privacy model, how it works
-end to end, and the provisioning an operator and a client build need.
+notifiable message reaches their handle while that device is offline (app
+backgrounded, screen off, or suspended by the OS). This holds even when the
+message was just delivered live to another of the owner's devices, such as an
+open desktop, so a phone is still notified rather than staying silent until the
+desktop is closed. This document explains the privacy model, how it works end to
+end, and the provisioning an operator and a client build need.
 
 Push is optional. With nothing configured, the relay behaves exactly as before:
 messages still queue in the per-device inbox and are delivered when the client
@@ -34,10 +37,18 @@ was sent to a device, plus the small alert text above.
    device already authorized under the handle can register a token for it.
 2. The relay stores `(deviceId -> platform, token)` alongside the handle record
    (durable when Cosmos is configured).
-3. When `MeshRouter` queues an envelope for an offline recipient, it fires a
-   fire-and-forget wake through the matching sender (APNs or FCM). The category
-   is derived purely from the cleartext `Kind` (group vs direct). Sync, receipt,
-   and topic-internal kinds never push.
+3. When `MeshRouter` handles a notifiable envelope it fires a fire-and-forget
+   wake through the matching sender (APNs or FCM) to every one of the recipient's
+   registered devices that is not currently connected on any relay instance:
+     - If no device is connected, the envelope is also queued in the offline
+       inbox and every registered device is woken.
+     - If it was delivered live to one device (for example an open desktop), the
+       handle's other offline devices are still woken. Those siblings are not
+       queued a copy; they receive the content by device sync when they
+       reconnect.
+   Device presence is read from the backplane, so the online/offline split is
+   correct across replicas. The category is derived purely from the cleartext
+   `Kind` (group vs direct); sync, receipt, and topic-internal kinds never push.
 4. On sign-out the client calls `DELETE /handles/{handle}/push` (also signed) so
    a signed-out device is no longer woken.
 
@@ -48,7 +59,7 @@ was sent to a device, plus the small alert text above.
 - Silent background wake-and-enrich (replacing the alert with friendlier text on
   the device) is deliberately not relied on. iOS throttles and may drop silent
   pushes, and never delivers them after a force-quit. A dropped push is not a
-  lost message: the inbox still delivers it on the next reconnect.
+  lost message: the inbox or device sync still delivers it on the next reconnect.
 
 ## Relay configuration
 

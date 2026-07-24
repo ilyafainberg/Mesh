@@ -1,3 +1,4 @@
+using Mesh.Relay.Backplane;
 using Mesh.Relay.Storage;
 using Mesh.Shared;
 
@@ -36,6 +37,7 @@ public interface IPushSender
 /// </summary>
 public sealed class PushDispatcher(
     IRelayStore store,
+    IBackplane backplane,
     IEnumerable<IPushSender> senders,
     ILogger<PushDispatcher> logger)
 {
@@ -69,6 +71,20 @@ public sealed class PushDispatcher(
         _ = SafeSendAsync(toHandle, deviceId, env.Kind, env.From);
     }
 
+    /// <summary>
+    /// Fire-and-forget wake for the recipient's OFFLINE devices after a notifiable message was
+    /// delivered live to at least one of their other (online) devices. Registered push tokens whose
+    /// device is currently connected on any instance are skipped; the rest are woken, so a phone is
+    /// notified even while a desktop is open. Safe on the hot routing path: returns immediately and
+    /// never throws. Never enqueues; offline siblings receive the content via device sync on reconnect.
+    /// </summary>
+    public void NotifyOfflineSiblings(string toHandle, MeshEnvelope env)
+    {
+        if (!Enabled) return;
+        if (Classify(env.Kind) == PushCategory.None) return;
+        _ = WakeOfflineSiblingsAsync(toHandle, env.Kind, env.From);
+    }
+
     private async Task SafeSendAsync(string toHandle, string? deviceId, string kind, string from)
     {
         try
@@ -76,7 +92,8 @@ public sealed class PushDispatcher(
             var alert = Compose(Classify(kind), from);
             if (alert is null) return;
 
-            var rec = await store.GetHandleAsync(toHandle).ConfigureAwait(false);
+            var handle = Normalize(toHandle);
+            var rec = await store.GetHandleAsync(handle).ConfigureAwait(false);
             if (rec is null || rec.DevicePushTokens.Count == 0) return;
 
             var targets = deviceId is null
@@ -84,22 +101,60 @@ public sealed class PushDispatcher(
                 : rec.DevicePushTokens.Where(kv => string.Equals(kv.Key, deviceId, StringComparison.Ordinal));
 
             foreach (var (_, tok) in targets)
+                await TrySendAsync(handle, tok, alert).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "push dispatch failed");
+        }
+    }
+
+    /// <summary>
+    /// Pushes the recipient's registered tokens whose device is NOT currently connected on any
+    /// instance (offline = registered push-token devices minus live device presence). Presence is
+    /// read from the backplane, so this is correct for both a single node and multiple replicas.
+    /// Exposed (and self-guarded so it never throws) so the router can fire it, and so the offline-set
+    /// computation is unit testable.
+    /// </summary>
+    public async Task WakeOfflineSiblingsAsync(string toHandle, string kind, string from)
+    {
+        try
+        {
+            var alert = Compose(Classify(kind), from);
+            if (alert is null) return;
+
+            var handle = Normalize(toHandle);
+            var rec = await store.GetHandleAsync(handle).ConfigureAwait(false);
+            if (rec is null || rec.DevicePushTokens.Count == 0) return;
+
+            foreach (var (deviceId, tok) in rec.DevicePushTokens)
             {
-                if (string.IsNullOrWhiteSpace(tok.Token)) continue;
-                if (!byPlatform.TryGetValue(tok.Platform, out var sender)) continue;
-                try
-                {
-                    await sender.SendAsync(tok.Token, alert).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "push send failed (platform {Platform})", tok.Platform);
-                }
+                var owner = await backplane.GetInstanceForDeviceAsync(handle, deviceId).ConfigureAwait(false);
+                if (owner is not null) continue; // device is connected somewhere; no wake needed
+                await TrySendAsync(handle, tok, alert).ConfigureAwait(false);
             }
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "push dispatch failed");
+        }
+    }
+
+    // Sends one composed alert to one device token. Logs a delivered wake at info (so success is
+    // observable in the relay logs) and swallows a single bad token as a warning so one failure
+    // cannot abort the rest of the batch.
+    private async Task TrySendAsync(string handle, DevicePushToken tok, PushAlert alert)
+    {
+        if (string.IsNullOrWhiteSpace(tok.Token)) return;
+        if (!byPlatform.TryGetValue(tok.Platform, out var sender)) return;
+        try
+        {
+            await sender.SendAsync(tok.Token, alert).ConfigureAwait(false);
+            logger.LogInformation("push sent to {Handle} (platform {Platform})", handle, tok.Platform);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "push send failed (platform {Platform})", tok.Platform);
         }
     }
 

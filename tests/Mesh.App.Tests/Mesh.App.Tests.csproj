@@ -7,6 +7,7 @@
     <IsPackable>false</IsPackable>
     <RootNamespace>Mesh.App.Tests</RootNamespace>
     <DefineConstants>$(DefineConstants);DEVICE_TOPIC_EXECUTION_TESTS</DefineConstants>
+    <NoWarn>$(NoWarn);NETSDK1150</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -30,13 +31,14 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="MSTest.TestAdapter" Version="3.9.2" />
     <PackageReference Include="MSTest.TestFramework" Version="3.9.2" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.3" />
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="9.0.0" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlcipher" Version="2.1.11" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Mesh.Shared\Mesh.Shared.csproj" />
+    <ProjectReference Include="..\..\src\Mesh.Relay\Mesh.Relay.csproj" />
   </ItemGroup>
 
 </Project>

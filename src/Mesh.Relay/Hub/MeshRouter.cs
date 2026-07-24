@@ -44,18 +44,33 @@ public sealed class MeshRouter(
         }
 
         var envelopeJson = JsonSerializer.Serialize(env, Json);
+
         // 1. Local delivery to any of the recipient's connections on this instance.
-        if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId)) return;
+        var delivered = await DeliverLocalAsync(to, envelopeJson, excludeConnectionId);
 
         // 2. Directed cross-instance forward to whichever instance holds the socket.
-        var owner = await backplane.GetInstanceForAsync(to);
-        if (owner is not null && owner != backplane.InstanceId
-            && await backplane.PublishToOwnerAsync(owner, to, envelopeJson))
-            return;
+        if (!delivered)
+        {
+            var owner = await backplane.GetInstanceForAsync(to);
+            if (owner is not null && owner != backplane.InstanceId)
+                delivered = await backplane.PublishToOwnerAsync(owner, to, envelopeJson);
+        }
 
-        // 3. Nobody is connected: queue for delivery on next connect. The offline push wake fires in a
-        // finally so a transient enqueue failure still attempts to wake the device (it reconnects and
-        // drains) instead of silently swallowing the notification.
+        // Delivered live to at least one connected device: still wake the recipient's OFFLINE devices
+        // (registered push tokens whose device is not connected on any instance) so, for example, a
+        // phone is notified while a desktop is open. This never enqueues; offline siblings pick up the
+        // content via device sync on reconnect. Self-sends (from == to) are skipped so a device does
+        // not push its own owner for its own action (its sending device is online and skipped anyway).
+        if (delivered)
+        {
+            if (Normalize(env.From) != to)
+                push.NotifyOfflineSiblings(to, env);
+            return;
+        }
+
+        // 3. Nobody is connected anywhere: queue for delivery on next connect. The offline push wake
+        // fires in a finally so a transient enqueue failure still attempts to wake the device (it
+        // reconnects and drains) instead of silently swallowing the notification.
         try
         {
             await store.EnqueueAsync(to, envelopeJson);
