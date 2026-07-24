@@ -501,7 +501,8 @@ else
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
     RemoteRunProjection? RemoteRun => Active is null ? null : State.GetRemoteRunProjection(Active.Id);
     bool ActiveBusy => Active is not null &&
-        (State.IsThreadBusy(Active.Id) || RemoteRun is not null
+        (State.IsThreadBusy(Active.Id)
+         || RemoteRun is { } activeRemoteRun && RemoteRunActivity.IsProjectionFresh(activeRemoteRun, DateTimeOffset.UtcNow)
          || IsAssignedElsewhere(Active) && RemoteRunActivity.IsPersistedRunFresh(Active, DateTimeOffset.UtcNow));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
     string ComposerPlaceholder => widgetMode

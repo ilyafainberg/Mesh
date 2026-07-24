@@ -623,6 +623,40 @@ public static class RemoteRunActivity
         var last = thread.LastActivityAt ?? thread.ExecutionAt;
         return last.HasValue && now - last.Value < StaleAfter;
     }
+
+    /// <summary>
+    /// True when a LIVE remote-run projection's last update is within <see cref="StaleAfter"/> of
+    /// <paramref name="now"/>. Mirrors <see cref="IsPersistedRunFresh"/> for the in-memory projection:
+    /// a genuinely live run keeps advancing <see cref="RemoteRunProjection.Timestamp"/>, so a projection
+    /// whose terminal update was missed (that update is delivered live-only and is dropped when the
+    /// viewing device is briefly disconnected) self-heals to idle once it goes stale instead of pinning
+    /// the "thinking" bubble forever.
+    /// </summary>
+    public static bool IsProjectionFresh(RemoteRunProjection projection, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(projection);
+        return projection.Timestamp != default && now - projection.Timestamp < StaleAfter;
+    }
+}
+
+/// <summary>
+/// Decides whether a committed assistant answer that just synced in from the executing device should
+/// finalize a lingering LIVE remote-run projection on a viewing device. The terminal topic.run.update
+/// is delivered live-only (no relay enqueue or retry), so a viewer briefly disconnected at completion
+/// keeps a non-terminal projection and shows a phantom "thinking" bubble though the answer has already
+/// synced in durably. The durable answer is the terminal truth.
+/// </summary>
+public static class RemoteRunReconciliation
+{
+    /// <summary>
+    /// True when <paramref name="projection"/> exists and <paramref name="answerAt"/> is not older than
+    /// the projection's last update, so the answer finalizes it. A genuinely newer run carries a
+    /// projection timestamp ahead of this answer and is deliberately left running.
+    /// </summary>
+    public static bool ShouldFinalizeOnAnswer(RemoteRunProjection? projection, DateTimeOffset answerAt)
+        => projection is not null
+           && answerAt != default
+           && answerAt >= projection.Timestamp;
 }
 
 /// <summary>

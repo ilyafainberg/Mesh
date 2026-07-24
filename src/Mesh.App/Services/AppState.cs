@@ -1016,7 +1016,13 @@ public sealed class AppState
         }
         MergeLine(line, dto);
         thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, dto.At);
-        return changed;
+        // A committed assistant answer syncing in from the executing device is the terminal truth for a
+        // remote run: the terminal topic.run.update is live-only and may have been missed, so reconcile
+        // any lingering projection here to clear the phantom "thinking" bubble on this viewing device.
+        var reconciled = string.Equals(dto.Role, "assistant", StringComparison.Ordinal)
+                         && !dto.Internal
+                         && ReconcileRemoteRunWithAnswer(thread, dto.At);
+        return changed || reconciled;
     }
 
     private bool ApplyTopicClear(DeviceSyncOperation operation)
@@ -2613,6 +2619,46 @@ public sealed class AppState
         }
         EmitTopicUpsert(thread!);
         NotifyChanged();
+    }
+
+    /// <summary>
+    /// Finalizes a lingering LIVE remote-run projection when the executing device's committed assistant
+    /// answer arrives via device sync. The terminal topic.run.update is delivered live-only
+    /// (RouteToOnlineDeviceAsync: no enqueue, no retry), so a viewer briefly disconnected at completion
+    /// never receives it and keeps showing a phantom "thinking" bubble though the answer already synced
+    /// in. The durable answer is the terminal truth: drop the projection, null the persisted run id, and
+    /// mark the run terminal so a late replay of a non-terminal update for the same run cannot resurrect
+    /// it. Runs while applying a device-sync batch (under profileSyncGate, which is reentrant) so it must
+    /// not re-broadcast: it mutates local state only and returns true so the caller refreshes the UI.
+    /// </summary>
+    private bool ReconcileRemoteRunWithAnswer(OwnThread thread, DateTimeOffset answerAt)
+    {
+        lock (profileSyncGate)
+        {
+            if (!remoteRuns.TryGetValue(thread.Id, out var projection)
+                || !RemoteRunReconciliation.ShouldFinalizeOnAnswer(projection, answerAt))
+                return false;
+
+            if (RemoteRunCorrelation.IsExpected(thread, thread.Id, projection.RunId))
+            {
+                var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, answerAt);
+                if (activeDb is not null
+                    && !activeDb.SetOwnThreadExecutionAndActivity(
+                        thread.Id,
+                        thread.ExecutionDeviceId,
+                        thread.ExecutionDeviceName,
+                        thread.ExecutionDevicePlatform,
+                        thread.ExecutionAt ?? answerAt,
+                        null,
+                        activityAt))
+                    return false;
+                thread.LastActivityAt = activityAt;
+                thread.ExecutionRunId = null;
+            }
+            remoteRuns.Remove(thread.Id);
+            terminalRemoteRuns.Add(thread.Id + "\0" + projection.RunId);
+            return true;
+        }
     }
 
     private static RemoteRunProjection CloneRemoteRunProjection(RemoteRunProjection projection)

@@ -158,6 +158,45 @@ public sealed class ActivityOrderingTests
         Assert.IsTrue(RemoteRunActivity.IsPersistedRunFresh(thread, now));
     }
 
+    private static RemoteRunProjection Projection(string runId, string threadId, DateTimeOffset timestamp)
+        => new() { RunId = runId, ThreadId = threadId, Timestamp = timestamp };
+
+    [TestMethod]
+    public void RemoteRunActivity_ProjectionIsFreshOnlyWithinWindow()
+    {
+        var now = new DateTimeOffset(2026, 7, 24, 3, 0, 0, TimeSpan.Zero);
+
+        // No timestamp: not fresh (cannot pin the indicator).
+        Assert.IsFalse(RemoteRunActivity.IsProjectionFresh(Projection("run-1", "topic", default), now));
+
+        // Recent update: fresh (a live remote run keeps advancing this).
+        Assert.IsTrue(RemoteRunActivity.IsProjectionFresh(
+            Projection("run-1", "topic", now.AddMinutes(-1)), now));
+
+        // Stale update (the terminal update was missed): not fresh, so the phantom self-heals.
+        Assert.IsFalse(RemoteRunActivity.IsProjectionFresh(
+            Projection("run-1", "topic", now - RemoteRunActivity.StaleAfter - TimeSpan.FromMinutes(1)), now));
+    }
+
+    [TestMethod]
+    public void RemoteRunReconciliation_AnswerFinalizesOnlyWhenNotOlderThanProjection()
+    {
+        var at = new DateTimeOffset(2026, 7, 24, 3, 0, 0, TimeSpan.Zero);
+
+        // No live projection: nothing to finalize.
+        Assert.IsFalse(RemoteRunReconciliation.ShouldFinalizeOnAnswer(null, at));
+
+        // Answer with no timestamp: cannot finalize.
+        Assert.IsFalse(RemoteRunReconciliation.ShouldFinalizeOnAnswer(Projection("run-1", "topic", at), default));
+
+        // Answer at or after the projection's last update finalizes the missed-terminal run.
+        Assert.IsTrue(RemoteRunReconciliation.ShouldFinalizeOnAnswer(Projection("run-1", "topic", at.AddSeconds(-5)), at));
+        Assert.IsTrue(RemoteRunReconciliation.ShouldFinalizeOnAnswer(Projection("run-1", "topic", at), at));
+
+        // A genuinely newer run (projection timestamp ahead of this answer) is left running.
+        Assert.IsFalse(RemoteRunReconciliation.ShouldFinalizeOnAnswer(Projection("run-2", "topic", at.AddSeconds(5)), at));
+    }
+
     [TestMethod]
     public void ClockBehindMetadataMutations_KeepFutureActivity()
     {
