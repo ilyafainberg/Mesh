@@ -26,6 +26,7 @@ internal sealed class CopilotAcpLane(
         public StringBuilder Answer { get; } = new();
         public StringBuilder Thought { get; } = new();
         public IProgress<AgentStep>? Progress { get; init; }
+        public IProgress<AgentDelta>? Delta { get; init; }
         public required TokenMeter.UsageContext UsageContext { get; init; }
         public HashSet<string> AllowedToolNames { get; init; } = new(StringComparer.Ordinal);
         public HashSet<string> MeshToolCallIds { get; } = new(StringComparer.Ordinal);
@@ -34,15 +35,15 @@ internal sealed class CopilotAcpLane(
         private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
         private readonly List<string> messageOrder = new();
 
-        public void AppendAnswer(string? messageId, string? text)
+        public string? AppendAnswer(string? messageId, string? text)
         {
-            if (string.IsNullOrEmpty(text)) return;
+            if (string.IsNullOrEmpty(text)) return null;
             if (text.StartsWith("Info: Disabled tools:", StringComparison.Ordinal)
                 || text.StartsWith("Info: Unknown tool name in the tool allowlist:", StringComparison.Ordinal))
-                return;
+                return null;
             text = CopilotAcpProtocol.NormalizeText(text);
             Answer.Append(text);
-            if (string.IsNullOrWhiteSpace(messageId)) return;
+            if (string.IsNullOrWhiteSpace(messageId)) return text;
             if (!messages.TryGetValue(messageId, out var message))
             {
                 message = new StringBuilder();
@@ -50,6 +51,7 @@ internal sealed class CopilotAcpLane(
                 messageOrder.Add(messageId);
             }
             message.Append(text);
+            return text;
         }
 
         public string FinalAnswer()
@@ -131,6 +133,7 @@ internal sealed class CopilotAcpLane(
                 Array.Empty<(string MimeType, byte[] Data)>(),
                 Array.Empty<IAgentTool>(),
                 progress: null,
+                delta: null,
                 ct).ConfigureAwait(false);
             return string.IsNullOrWhiteSpace(result)
                 ? (false, "GitHub Copilot CLI returned an empty response.")
@@ -149,9 +152,10 @@ internal sealed class CopilotAcpLane(
         IReadOnlyList<(string MimeType, byte[] Data)> images,
         IReadOnlyList<IAgentTool> tools,
         IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
         CancellationToken ct = default)
         => CompleteCoreAsync(
-            config, systemPrompt, history, images, tools, progress, ct);
+            config, systemPrompt, history, images, tools, progress, delta, ct);
 
     private async Task<string> CompleteCoreAsync(
         CopilotAcpConfig config,
@@ -160,6 +164,7 @@ internal sealed class CopilotAcpLane(
         IReadOnlyList<(string MimeType, byte[] Data)> images,
         IReadOnlyList<IAgentTool> tools,
         IProgress<AgentStep>? progress,
+        IProgress<AgentDelta>? delta,
         CancellationToken ct)
     {
         await turnGate.WaitAsync(ct).ConfigureAwait(false);
@@ -193,6 +198,7 @@ internal sealed class CopilotAcpLane(
             activeTurn = new TurnState
             {
                 Progress = progress,
+                Delta = delta,
                 UsageContext = tokenMeter.CaptureContext(),
                 AllowedToolNames = tools
                     .SelectMany(tool => new[] { tool.Name, $"mesh-{tool.Name}" })
@@ -493,8 +499,19 @@ internal sealed class CopilotAcpLane(
                 var messageId = update.TryGetProperty("messageId", out var idValue)
                     ? idValue.GetString()
                     : null;
-                if (kind == "agent_message_chunk") turn.AppendAnswer(messageId, text.GetString());
-                else turn.Thought.Append(CopilotAcpProtocol.NormalizeText(text.GetString()));
+                if (kind == "agent_message_chunk")
+                {
+                    var appended = turn.AppendAnswer(messageId, text.GetString());
+                    if (!string.IsNullOrEmpty(appended))
+                        turn.Delta?.Report(new AgentDelta(AgentDeltaKind.Answer, appended));
+                }
+                else
+                {
+                    var thought = CopilotAcpProtocol.NormalizeText(text.GetString());
+                    turn.Thought.Append(thought);
+                    if (!string.IsNullOrEmpty(thought))
+                        turn.Delta?.Report(new AgentDelta(AgentDeltaKind.Reasoning, thought));
+                }
             }
             return;
         }

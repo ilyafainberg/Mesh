@@ -2337,6 +2337,56 @@ public sealed class AppState
         if (agentSteps.Remove(key)) NotifyChanged();
     }
 
+    // Transient streamed assistant draft (reasoning + answer) for a thread's in-flight turn. Mirrors
+    // agentSteps: never persisted and never sent to peers, cleared when the turn ends and the final
+    // ChatLine is committed. It lets the UI show the model's reasoning and answer building up live
+    // instead of appearing all at once when the turn finishes.
+    private readonly Dictionary<string, AssistantDraft> assistantDrafts = new(StringComparer.Ordinal);
+
+    /// <summary>A thread's live streamed reply: reasoning and answer accumulated as chunks arrive.</summary>
+    public sealed class AssistantDraft
+    {
+        private readonly StringBuilder reasoning = new();
+        private readonly StringBuilder answer = new();
+        public string Reasoning => reasoning.ToString();
+        public string Answer => answer.ToString();
+        public bool HasReasoning => reasoning.Length > 0;
+        public bool HasAnswer => answer.Length > 0;
+
+        /// <summary>Appends one fragment; returns true when it added visible text.</summary>
+        public bool Append(AgentDelta delta)
+        {
+            if (string.IsNullOrEmpty(delta.Text)) return false;
+            (delta.Kind == AgentDeltaKind.Reasoning ? reasoning : answer).Append(delta.Text);
+            return true;
+        }
+    }
+
+    /// <summary>The live streamed draft for the given thread's turn, or null when none is streaming.</summary>
+    public AssistantDraft? AssistantDraftFor(string key)
+        => assistantDrafts.TryGetValue(key, out var draft) ? draft : null;
+
+    /// <summary>Starts a fresh streamed draft for a thread at the start of a turn.</summary>
+    public void BeginAssistantDraft(string key)
+    {
+        assistantDrafts[key] = new AssistantDraft();
+        NotifyChanged();
+    }
+
+    /// <summary>Appends one streamed reasoning/answer fragment to a thread's live draft.</summary>
+    public void AppendAssistantDelta(string key, AgentDelta delta)
+    {
+        if (!assistantDrafts.TryGetValue(key, out var draft))
+            assistantDrafts[key] = draft = new AssistantDraft();
+        if (draft.Append(delta)) NotifyChanged();
+    }
+
+    /// <summary>Clears a thread's streamed draft once its turn ends and the final line is committed.</summary>
+    public void EndAssistantDraft(string key)
+    {
+        if (assistantDrafts.Remove(key)) NotifyChanged();
+    }
+
     // Per-thread owner-turn run state, held here (in the singleton app state) rather than in the Me
     // page component so it SURVIVES NAVIGATION: a turn keeps running when the user leaves the Me
     // section, and the busy/thinking indicator, the widget-building label, and the steerable-input

@@ -171,11 +171,14 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         }
 
         state.BeginAgentSteps(thread.Id);
+        state.BeginAssistantDraft(thread.Id);
         var progress = new InlineProgress<AgentStep>(step =>
         {
             state.ReportAgentStep(thread.Id, step);
             stepProgress?.Report(step);
         });
+        var delta = new InlineProgress<AgentDelta>(
+            fragment => state.AppendAssistantDelta(thread.Id, fragment));
         using (media.BeginScope(out var images))
         {
             string answer;
@@ -183,11 +186,12 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             {
                 // Tool execution is intentionally unbounded. The user's Stop button cancels ct,
                 // which aborts model requests and tool execution at any point in the loop.
-                answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, ct: ct);
+                answer = await model.CompleteWithToolsAsync(sys, history, agentTools, progress, delta, ct: ct);
             }
             finally
             {
                 state.EndAgentSteps(thread.Id);
+                state.EndAssistantDraft(thread.Id);
             }
 
             var (reasoning, finalAnswer) = ReasoningExtract.FromText(answer);

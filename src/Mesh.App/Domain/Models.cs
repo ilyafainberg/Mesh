@@ -484,6 +484,16 @@ public sealed record AgentRunState(
 public sealed record AgentStep(string Tool, string Label, AgentStepState State,
     string? Arguments = null, string? Result = null);
 
+/// <summary>Which live stream a chunk belongs to: the model's reasoning, or its answer.</summary>
+public enum AgentDeltaKind { Reasoning, Answer }
+
+/// <summary>
+/// One streamed fragment of a model turn, surfaced live so the UI can show reasoning and the answer
+/// building up separately as they arrive, rather than all at once when the turn finishes. Providers
+/// that do not stream simply never report deltas; the buffered final answer is unchanged.
+/// </summary>
+public sealed record AgentDelta(AgentDeltaKind Kind, string Text);
+
 public sealed class Conversation
 {
     public string Handle { get; set; } = "";

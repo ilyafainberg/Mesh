@@ -55,10 +55,13 @@ public interface IChatModel
     /// each call is executed and fed back until it produces a final text answer.
     /// Default implementation ignores tools (for models without tool support).
     /// When <paramref name="progress"/> is supplied, an <see cref="AgentStep"/> is reported as each
-    /// tool call starts and finishes so the UI can show a live step trace.
+    /// tool call starts and finishes so the UI can show a live step trace. When <paramref name="delta"/>
+    /// is supplied, reasoning and answer fragments are reported live as they stream; providers that do
+    /// not stream leave it unused and return the full answer when the turn ends.
     /// </summary>
     Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
         => CompleteAsync(systemPrompt, history, options, ct);
 }
@@ -261,16 +264,18 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
             IReadOnlyList<ChatLine> history,
             IReadOnlyList<IAgentTool> tools,
             IProgress<AgentStep>? progress = null,
+            IProgress<AgentDelta>? delta = null,
             CompletionOptions? options = null,
             CancellationToken ct = default)
         {
             var context = SynchronizationContext.Current;
             var marshalledProgress = ModelCallDispatcher.MarshalProgress(progress, context);
+            var marshalledDelta = ModelCallDispatcher.MarshalProgress(delta, context);
             return ModelCallDispatcher.RunAsync(async () =>
             {
                 using var scope = tokenMeter.BeginDispatchContext(context);
                 return await inner.CompleteWithToolsAsync(
-                    systemPrompt, history, tools, marshalledProgress, options, ct)
+                    systemPrompt, history, tools, marshalledProgress, marshalledDelta, options, ct)
                     .ConfigureAwait(false);
             }, ct);
         }
@@ -288,15 +293,16 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
     {
         public Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
             CompletionOptions? options = null, CancellationToken ct = default)
-            => CompleteCoreAsync(systemPrompt, history, Array.Empty<IAgentTool>(), progress: null, options, ct);
+            => CompleteCoreAsync(systemPrompt, history, Array.Empty<IAgentTool>(), progress: null, delta: null, options, ct);
 
         public Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
             IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+            IProgress<AgentDelta>? delta = null,
             CompletionOptions? options = null, CancellationToken ct = default)
-            => CompleteCoreAsync(systemPrompt, history, tools, progress, options, ct);
+            => CompleteCoreAsync(systemPrompt, history, tools, progress, delta, options, ct);
 
         private Task<string> CompleteCoreAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
-            IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress, CompletionOptions? options, CancellationToken ct)
+            IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress, IProgress<AgentDelta>? delta, CompletionOptions? options, CancellationToken ct)
         {
             var promptLines = history.Select(line => (line.Role, line.Text)).ToList();
             var images = history
@@ -310,7 +316,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
                 string.IsNullOrWhiteSpace(cfg.CopilotExecutable) ? "copilot" : cfg.CopilotExecutable.Trim(),
                 string.IsNullOrWhiteSpace(cfg.Model) ? "auto" : cfg.Model.Trim(),
                 cfg.CopilotEffort.ToString());
-            return host.CompleteAsync(config, system, promptLines, images, tools, progress, ct);
+            return host.CompleteAsync(config, system, promptLines, images, tools, progress, delta, ct);
         }
     }
 
@@ -367,6 +373,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
@@ -490,6 +497,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
@@ -622,6 +630,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
     /// </summary>
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
@@ -756,6 +765,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
 
     public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
     {
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);

@@ -252,6 +252,23 @@ else
                                 @(showStepDetails ? "Hide details" : "Show details")
                             </button>
                         }
+                        @{ var draft = Active is null ? null : State.AssistantDraftFor(Active.Id); }
+                        @if (draft is { HasReasoning: true })
+                        {
+                            <button class="reasoning-toggle" @onclick="ToggleDraftReasoning" aria-label="Show reasoning">
+                                <i class="bi bi-lightbulb"></i>
+                                <span>Reasoning</span>
+                                <i class="bi @(draftReasoningExpanded ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                            </button>
+                            @if (draftReasoningExpanded)
+                            {
+                                <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(draft.Reasoning))</div>
+                            }
+                        }
+                        @if (draft is { HasAnswer: true })
+                        {
+                            <div class="text md">@((MarkupString)Markdown.ToHtml(draft.Answer))</div>
+                        }
                         @if (RemoteRun is { } remote)
                         {
                             @if (!string.IsNullOrWhiteSpace(remote.Plan))
@@ -279,7 +296,8 @@ else
                                 <div class="msg-tag"><i class="bi bi-hourglass-split"></i> @remote.Queued queued</div>
                             }
                         }
-                        else if (run?.Phase != AgentRunPhase.Planning)
+                        else if (run?.Phase != AgentRunPhase.Planning
+                                 && (draft is null or { HasReasoning: false, HasAnswer: false }))
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
@@ -525,6 +543,11 @@ else
     {
         if (!expandedReasoning.Remove(line)) expandedReasoning.Add(line);
     }
+
+    // The in-flight streamed reasoning section starts expanded so thoughts are visible as they stream.
+    bool draftReasoningExpanded = true;
+
+    void ToggleDraftReasoning() => draftReasoningExpanded = !draftReasoningExpanded;
 
     static string StepIcon(AgentStepState state) => state switch
     {
