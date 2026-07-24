@@ -437,7 +437,7 @@ You can point Mesh at a **different relay**. Set the **Relay URL** (in onboardin
 
 ### Home device (mobile)
 
-You can designate a **home device**. When you use "ask my home agent" from mobile, the request reaches that **one** designated device rather than all of your devices. Set this under **Settings**. This is handy when one device (say, your always-on desktop) holds the tools and knowledge you want your phone to reach.
+You can designate a **home device**. When you use "ask my home agent" from mobile, the request reaches that **one** designated device rather than all of your devices. Set this under **Settings**. This is handy when one device (say, your always-on desktop) holds the tools and knowledge you want your phone to reach. Only a desktop device (Windows or macOS) can act as that host and run a turn for another device; a phone or tablet runs its own chats locally but is never offered as a device that runs another device's turn.
 
 ### Updates (Windows)
 

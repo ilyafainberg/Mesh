@@ -159,4 +159,22 @@ public sealed class DeviceTopicProtocolTests
             updateBody.Replace("\"running\"", "1", StringComparison.Ordinal),
             out _));
     }
-}
+
+    [TestMethod]
+    public void CanHostRemoteTurn_RequiresDesktopAndAgentReady()
+    {
+        // Directory honesty: only a desktop that advertised the capability may host a remote turn.
+        Assert.IsTrue(DevicePlatforms.CanHostRemoteAgent(true, DevicePlatforms.Windows));
+        Assert.IsTrue(DevicePlatforms.CanHostRemoteAgent(true, DevicePlatforms.MacOS));
+        Assert.IsFalse(DevicePlatforms.CanHostRemoteAgent(true, DevicePlatforms.Android));
+        Assert.IsFalse(DevicePlatforms.CanHostRemoteAgent(true, DevicePlatforms.IOS));
+        Assert.IsFalse(DevicePlatforms.CanHostRemoteAgent(true, null));
+        Assert.IsFalse(DevicePlatforms.CanHostRemoteAgent(false, DevicePlatforms.Windows));
+
+        var phone = new DeviceInfo("d1", "Phone", true, DevicePlatforms.Android, RemoteAgentEnabled: true);
+        var desktop = new DeviceInfo("d2", "PC", true, DevicePlatforms.Windows, RemoteAgentEnabled: true);
+        var desktopNoModel = new DeviceInfo("d3", "PC2", true, DevicePlatforms.Windows, RemoteAgentEnabled: false);
+        Assert.IsFalse(phone.CanHostRemoteTurn, "a mobile device is never an eligible remote host");
+        Assert.IsTrue(desktop.CanHostRemoteTurn);
+        Assert.IsFalse(desktopNoModel.CanHostRemoteTurn);
+    }}

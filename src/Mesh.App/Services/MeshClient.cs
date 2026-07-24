@@ -1968,7 +1968,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken)
         => (await ListMyDevicesCoreAsync(cancellationToken))
-            .Where(device => device.IsAgentReady)
+            .Where(device => device.CanHostRemoteTurn)
             .ToArray();
 
     private async Task<bool> SendTargetedTopicEnvelopeAsync(

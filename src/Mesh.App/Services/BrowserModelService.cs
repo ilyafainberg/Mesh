@@ -318,6 +318,7 @@ public sealed class BrowserChatModel(BrowserModelService service, ModelConfig cf
 
     public Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
         => service.CompleteAsync(cfg, systemPrompt, history, tools, ct);
 }

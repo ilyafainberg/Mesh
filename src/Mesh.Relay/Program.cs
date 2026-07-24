@@ -327,7 +327,9 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
                 deviceId,
                 req.DeviceName,
                 req.DevicePlatform.Trim().ToLowerInvariant(),
-                req.RemoteAgentEnabled);
+                // Directory honesty: never let a device (an old client, or one on the wrong platform) advertise
+                // mobile remote hosting. The stored flag is clamped to desktop-only regardless of what was sent.
+                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()));
         }
         metrics.HandleRegistered();
         app.Logger.LogInformation("handle registered: {Handle}", handle);
@@ -354,7 +356,9 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
                 deviceId,
                 req.DeviceName,
                 req.DevicePlatform.Trim().ToLowerInvariant(),
-                req.RemoteAgentEnabled);
+                // Directory honesty: never let a device (an old client, or one on the wrong platform) advertise
+                // mobile remote hosting. The stored flag is clamped to desktop-only regardless of what was sent.
+                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()));
         }
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), existing.RegisteredAt));
     }

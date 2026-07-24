@@ -98,7 +98,7 @@
                 @foreach (var device in DeviceChoices)
                 {
                     <button class="device-choice" role="menuitem"
-                            disabled="@(!device.Online || !device.AgentReady)"
+                            disabled="@(!CanRunHere(device))"
                             @onclick="() => NewThread(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -252,6 +252,23 @@ else
                                 @(showStepDetails ? "Hide details" : "Show details")
                             </button>
                         }
+                        @{ var draft = Active is null ? null : State.AssistantDraftFor(Active.Id); }
+                        @if (draft is { HasReasoning: true })
+                        {
+                            <button class="reasoning-toggle" @onclick="ToggleDraftReasoning" aria-label="Show reasoning">
+                                <i class="bi bi-lightbulb"></i>
+                                <span>Reasoning</span>
+                                <i class="bi @(draftReasoningExpanded ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                            </button>
+                            @if (draftReasoningExpanded)
+                            {
+                                <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(draft.Reasoning))</div>
+                            }
+                        }
+                        @if (draft is { HasAnswer: true })
+                        {
+                            <div class="text md">@((MarkupString)Markdown.ToHtml(draft.Answer))</div>
+                        }
                         @if (RemoteRun is { } remote)
                         {
                             @if (!string.IsNullOrWhiteSpace(remote.Plan))
@@ -279,7 +296,8 @@ else
                                 <div class="msg-tag"><i class="bi bi-hourglass-split"></i> @remote.Queued queued</div>
                             }
                         }
-                        else if (run?.Phase != AgentRunPhase.Planning)
+                        else if (run?.Phase != AgentRunPhase.Planning
+                                 && (draft is null or { HasReasoning: false, HasAnswer: false }))
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
@@ -419,7 +437,7 @@ else
                 @foreach (var device in DeviceChoices)
                 {
                     <button class="device-choice" role="menuitem"
-                            disabled="@(!device.Online || !device.AgentReady || IsActiveDevice(device))"
+                            disabled="@(!CanRunHere(device) || IsActiveDevice(device))"
                             @onclick="() => ChooseMoveTarget(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -484,7 +502,7 @@ else
     RemoteRunProjection? RemoteRun => Active is null ? null : State.GetRemoteRunProjection(Active.Id);
     bool ActiveBusy => Active is not null &&
         (State.IsThreadBusy(Active.Id) || RemoteRun is not null
-         || IsAssignedElsewhere(Active) && !string.IsNullOrWhiteSpace(Active.ExecutionRunId));
+         || IsAssignedElsewhere(Active) && RemoteRunActivity.IsPersistedRunFresh(Active, DateTimeOffset.UtcNow));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
     string ComposerPlaceholder => widgetMode
         ? "Describe the widget you want…"
@@ -525,6 +543,11 @@ else
     {
         if (!expandedReasoning.Remove(line)) expandedReasoning.Add(line);
     }
+
+    // The in-flight streamed reasoning section starts expanded so thoughts are visible as they stream.
+    bool draftReasoningExpanded = true;
+
+    void ToggleDraftReasoning() => draftReasoningExpanded = !draftReasoningExpanded;
 
     static string StepIcon(AgentStepState state) => state switch
     {
@@ -571,7 +594,7 @@ else
         string.IsNullOrWhiteSpace(State.Profile.DeviceName) ? "This device" : State.Profile.DeviceName,
         true,
         PlatformCaps.DevicePlatform,
-        Agent.IsModelReady);
+        PlatformCaps.CanRunAgent && Agent.IsModelReady);
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => new[] { CurrentDevice }
         .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d)))
         .GroupBy(d => d.DeviceId, StringComparer.Ordinal)
@@ -942,7 +965,11 @@ else
         if (thread is null || string.IsNullOrWhiteSpace(runId)) return;
         try
         {
-            await TopicRouter.StopAsync(thread.Id, runId, CancellationToken.None);
+            var stopped = await TopicRouter.StopAsync(thread.Id, runId, CancellationToken.None);
+            // No live run to cancel (a stranded run id from a completed or lost remote run): reconcile
+            // locally so the phantom "thinking" indicator and Stop button clear immediately.
+            if (!stopped && RemoteRun is null && IsAssignedElsewhere(thread))
+                State.ClearRemoteRunProjection(thread.Id, runId);
         }
         catch (Exception ex)
         {
@@ -1098,6 +1125,15 @@ else
 
     bool IsCurrentDevice(global::Mesh.Shared.DeviceInfo device) =>
         string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+
+    // Whether a device can be chosen to run a topic. The current device runs the turn locally (in the
+    // foreground), so it only needs a ready local model. This holds on mobile, which can run its own
+    // chats but cannot host a remote turn for another device. Any other device must be an online,
+    // eligible remote host (a desktop with the remote agent enabled).
+    bool CanRunHere(global::Mesh.Shared.DeviceInfo device) =>
+        IsCurrentDevice(device)
+            ? Agent.IsModelReady
+            : device.Online && device.CanHostRemoteTurn;
 
     bool IsAssignedElsewhere(OwnThread thread) =>
         !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)

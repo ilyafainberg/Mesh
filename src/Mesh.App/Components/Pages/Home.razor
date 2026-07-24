@@ -344,7 +344,25 @@
                                 @(showStepDetails ? "Hide details" : "Show details")
                             </button>
                         }
-                        @if (remote is null && run?.Phase != AgentRunPhase.Planning)
+                        @{ var draft = Active is null ? null : State.AssistantDraftFor(Active.Id); }
+                        @if (draft is { HasReasoning: true })
+                        {
+                            <button class="reasoning-toggle" @onclick="ToggleDraftReasoning" aria-label="Show reasoning">
+                                <i class="bi bi-lightbulb"></i>
+                                <span>Reasoning</span>
+                                <i class="bi @(draftReasoningExpanded ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                            </button>
+                            @if (draftReasoningExpanded)
+                            {
+                                <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(draft.Reasoning))</div>
+                            }
+                        }
+                        @if (draft is { HasAnswer: true })
+                        {
+                            <div class="text md">@((MarkupString)Markdown.ToHtml(draft.Answer))</div>
+                        }
+                        @if (remote is null && run?.Phase != AgentRunPhase.Planning
+                             && (draft is null or { HasReasoning: false, HasAnswer: false }))
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
@@ -514,7 +532,7 @@
     bool ActiveBusy => Active is not null
         && (State.IsThreadBusy(Active.Id)
             || State.GetRemoteRunProjection(Active.Id) is not null
-            || IsRemoteBound(Active) && !string.IsNullOrWhiteSpace(Active.ExecutionRunId));
+            || IsRemoteBound(Active) && RemoteRunActivity.IsPersistedRunFresh(Active, DateTimeOffset.UtcNow));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
     string ComposerPlaceholder => widgetMode
         ? "Describe the widget you want…"
@@ -545,6 +563,11 @@
         if (!expandedReasoning.Remove(line)) expandedReasoning.Add(line);
     }
 
+    // The in-flight streamed reasoning section starts expanded so thoughts are visible as they stream.
+    bool draftReasoningExpanded = true;
+
+    void ToggleDraftReasoning() => draftReasoningExpanded = !draftReasoningExpanded;
+
     static string StepIcon(AgentStepState state) => state switch
     {
         AgentStepState.Started => "bi-arrow-repeat spin",
@@ -570,7 +593,7 @@
     OwnThread? Active => activeThread is null ? null : State.Profile.OwnThreads.FirstOrDefault(t => t.Id == activeThread);
     ExecutionDevice CurrentDevice => new(Mesh.MyDeviceId, State.Profile.DeviceName, PlatformCaps.DevicePlatform);
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> OtherEligibleDevices => eligibleDevices
-        .Where(d => d.AgentReady && d.DeviceId != Mesh.MyDeviceId)
+        .Where(d => d.CanHostRemoteTurn && d.DeviceId != Mesh.MyDeviceId)
         .OrderByDescending(d => d.Online).ThenBy(d => DeviceName(d), StringComparer.OrdinalIgnoreCase).ToList();
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices
     {
@@ -823,7 +846,7 @@
     bool IsRemoteBound(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
         && thread.ExecutionDeviceId != Mesh.MyDeviceId;
     bool IsDeviceOnline(string? deviceId) => deviceId == Mesh.MyDeviceId
-        || eligibleDevices.Any(d => d.DeviceId == deviceId && d.Online && d.AgentReady);
+        || eligibleDevices.Any(d => d.DeviceId == deviceId && d.Online && d.CanHostRemoteTurn);
     string ThreadTitle(OwnThread thread) => string.IsNullOrWhiteSpace(thread.Title) ? "New chat" : thread.Title;
     string ThreadDeviceName(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceName)
         ? thread.ExecutionDeviceName : DeviceNameForId(thread.ExecutionDeviceId);
@@ -959,9 +982,14 @@
     async Task StopActive()
     {
         if (Active is null) return;
-        var runId = CurrentRunId(Active);
-        if (!string.IsNullOrWhiteSpace(runId))
-            await TopicRouter.StopAsync(Active.Id, runId, CancellationToken.None);
+        var thread = Active;
+        var runId = CurrentRunId(thread);
+        if (string.IsNullOrWhiteSpace(runId)) return;
+        var stopped = await TopicRouter.StopAsync(thread.Id, runId, CancellationToken.None);
+        // No live run to cancel (a stranded run id from a completed or lost remote run): reconcile
+        // locally so the phantom "thinking" indicator and Stop button clear immediately.
+        if (!stopped && State.GetRemoteRunProjection(thread.Id) is null && IsRemoteBound(thread))
+            State.ClearRemoteRunProjection(thread.Id, runId);
     }
 
     async Task Send()

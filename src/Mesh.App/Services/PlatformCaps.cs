@@ -12,8 +12,13 @@ public static class PlatformCaps
     /// <summary>True on Android and iOS, where the app cannot spawn arbitrary child processes.</summary>
     public static bool IsMobile => OperatingSystem.IsAndroid() || OperatingSystem.IsIOS();
 
-    /// <summary>True on all supported platforms: the agent execution coordinator is available everywhere.</summary>
-    public static bool CanRunAgent => true;
+    /// <summary>
+    /// True only on desktop platforms (Windows, macOS). A device advertises this as its remote-agent
+    /// host capability at registration: it can host an agent turn for another of the owner's devices.
+    /// Mobile devices run their own chats locally but cannot host a remote turn (no reliable background
+    /// execution), so they never advertise the capability and are never offered as a remote host.
+    /// </summary>
+    public static bool CanRunAgent => !IsMobile;
 
     public static string DevicePlatform =>
         OperatingSystem.IsWindows() ? Mesh.Shared.DevicePlatforms.Windows :
