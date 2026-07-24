@@ -131,6 +131,34 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void RemoteRunActivity_PersistedRunIsFreshOnlyWithinWindow()
+    {
+        var now = new DateTimeOffset(2026, 7, 24, 3, 0, 0, TimeSpan.Zero);
+        var thread = Thread("topic", now.AddHours(-1));
+
+        // No persisted run id: never busy from persisted state.
+        Assert.IsFalse(RemoteRunActivity.IsPersistedRunFresh(thread, now));
+
+        thread.ExecutionRunId = "run-1";
+
+        // Run id set but no timestamps: not fresh (cannot pin the indicator).
+        Assert.IsFalse(RemoteRunActivity.IsPersistedRunFresh(thread, now));
+
+        // Recent activity: fresh (a live remote run keeps advancing this).
+        thread.LastActivityAt = now.AddMinutes(-1);
+        Assert.IsTrue(RemoteRunActivity.IsPersistedRunFresh(thread, now));
+
+        // Stale activity (a stranded run id from a prior session): not fresh.
+        thread.LastActivityAt = now - RemoteRunActivity.StaleAfter - TimeSpan.FromMinutes(1);
+        Assert.IsFalse(RemoteRunActivity.IsPersistedRunFresh(thread, now));
+
+        // Falls back to ExecutionAt when LastActivityAt is absent.
+        thread.LastActivityAt = null;
+        thread.ExecutionAt = now.AddMinutes(-2);
+        Assert.IsTrue(RemoteRunActivity.IsPersistedRunFresh(thread, now));
+    }
+
+    [TestMethod]
     public void ClockBehindMetadataMutations_KeepFutureActivity()
     {
         var future = DateTimeOffset.UtcNow.AddDays(2);

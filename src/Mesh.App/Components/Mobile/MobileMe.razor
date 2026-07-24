@@ -502,7 +502,7 @@ else
     RemoteRunProjection? RemoteRun => Active is null ? null : State.GetRemoteRunProjection(Active.Id);
     bool ActiveBusy => Active is not null &&
         (State.IsThreadBusy(Active.Id) || RemoteRun is not null
-         || IsAssignedElsewhere(Active) && !string.IsNullOrWhiteSpace(Active.ExecutionRunId));
+         || IsAssignedElsewhere(Active) && RemoteRunActivity.IsPersistedRunFresh(Active, DateTimeOffset.UtcNow));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
     string ComposerPlaceholder => widgetMode
         ? "Describe the widget you want…"
@@ -965,7 +965,11 @@ else
         if (thread is null || string.IsNullOrWhiteSpace(runId)) return;
         try
         {
-            await TopicRouter.StopAsync(thread.Id, runId, CancellationToken.None);
+            var stopped = await TopicRouter.StopAsync(thread.Id, runId, CancellationToken.None);
+            // No live run to cancel (a stranded run id from a completed or lost remote run): reconcile
+            // locally so the phantom "thinking" indicator and Stop button clear immediately.
+            if (!stopped && RemoteRun is null && IsAssignedElsewhere(thread))
+                State.ClearRemoteRunProjection(thread.Id, runId);
         }
         catch (Exception ex)
         {

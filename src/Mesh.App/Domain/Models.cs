@@ -594,6 +594,38 @@ public static class RemoteRunCorrelation
 }
 
 /// <summary>
+/// Decides whether a topic bound to another device, carrying a persisted <see cref="OwnThread.ExecutionRunId"/>
+/// but with no live run projection on this device, should still count as an active (busy) remote run.
+/// A persisted run id is only cleared by a terminal topic.run.update from the executing device; if that
+/// signal is missed (this device was offline at completion, the executor closed before emitting it, or it
+/// was dropped) the id lingers indefinitely and the topic would otherwise show a permanent "thinking"
+/// bubble and a dead Stop button. We therefore honor the persisted-only binding only while the run is
+/// still "fresh": a genuinely live remote run keeps emitting updates that advance the timestamp, while a
+/// dead or finished-but-missed run goes stale and the topic falls back to idle.
+/// </summary>
+public static class RemoteRunActivity
+{
+    /// <summary>
+    /// Freshness budget for a persisted-only remote run. Deliberately generous: far longer than the gap
+    /// between a live run's updates, but finite so a stranded run id cannot pin the busy indicator across
+    /// sessions (a phantom from a prior run carries an old timestamp and reads as idle immediately).
+    /// </summary>
+    public static readonly TimeSpan StaleAfter = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// True when the topic carries a persisted run id whose last sign of life is within
+    /// <see cref="StaleAfter"/> of <paramref name="now"/>.
+    /// </summary>
+    public static bool IsPersistedRunFresh(OwnThread thread, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(thread);
+        if (string.IsNullOrWhiteSpace(thread.ExecutionRunId)) return false;
+        var last = thread.LastActivityAt ?? thread.ExecutionAt;
+        return last.HasValue && now - last.Value < StaleAfter;
+    }
+}
+
+/// <summary>
 /// Cumulative token usage for the currently selected model. Tracks the model the counts belong
 /// to so the counter can auto-reset when the model changes.
 /// </summary>
