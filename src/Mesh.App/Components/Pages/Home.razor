@@ -63,6 +63,10 @@
             <span class="muted topic-list-subtitle">your private topic chats</span>
         </div>
         <div class="thread-groups">
+            @if (Mesh.IsDeviceSnapshotSyncing)
+            {
+                <DeviceSyncPlaceholder Text="More chats are syncing..." />
+            }
             @if (PinnedThreads.Count > 0)
             {
                 <div class="thread-group-label"><i class="bi bi-pin-angle-fill"></i> Pinned</div>
@@ -130,7 +134,7 @@
                 }
             }
         </div>
-        @if (State.Profile.OwnThreads.Count == 0)
+        @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsDeviceSnapshotSyncing)
         {
             <div class="empty conv-empty">No chats yet. Start one with the + above, or just type below.</div>
         }
@@ -221,8 +225,9 @@
             </div>
         }
 
-        <div class="messages" @ref="scrollEl">
-            <div class="messages-wrap">
+        <div class="messages-frame">
+            <div class="messages" @ref="scrollEl">
+                <div class="messages-wrap">
                 @if (Active is null || Active.Lines.Count == 0)
                 {
                     <div class="empty">
@@ -397,7 +402,12 @@
                         <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
                     </div>
                 }
+                </div>
             </div>
+            <button type="button" class="scroll-to-latest" @ref="scrollToLatestEl" hidden aria-hidden="true"
+                    title="Jump to latest message" aria-label="Jump to latest message" @onclick="ScrollToLatest">
+                <i class="bi bi-arrow-down"></i>
+            </button>
         </div>
 
         <div class="composer-area">
@@ -525,7 +535,17 @@
 <ReportDialog @ref="reportDialog" />
 
 @code {
-    string input = "";
+    string inputValue = "";
+    string input
+    {
+        get => inputValue;
+        set
+        {
+            if (string.Equals(inputValue, value, StringComparison.Ordinal)) return;
+            inputValue = value;
+            if (activeThreadValue is not null) State.SetTopicDraft(activeThreadValue, value);
+        }
+    }
     // Per-thread run state (busy/building/queue) lives in AppState (the singleton), NOT here, so a
     // running turn and its thinking indicator survive navigating away from and back to the Me section,
     // and a fresh page instance never starts a second concurrent turn for an already-running thread.
@@ -535,19 +555,31 @@
     bool confirmDelete;
     bool renaming;
     string renameText = "";
-    string? activeThread;
+    string? activeThreadValue;
+    string? activeThread
+    {
+        get => activeThreadValue;
+        set
+        {
+            if (string.Equals(activeThreadValue, value, StringComparison.Ordinal)) return;
+            activeThreadValue = value;
+            inputValue = value is null ? "" : State.GetTopicDraft(value);
+        }
+    }
     ReportDialog? reportDialog;
     string? pinHtml;
     string pinName = "";
     string? pinPrompt;
     string? pinError;
     ElementReference scrollEl;
+    ElementReference scrollToLatestEl;
     ElementReference composerEl;
     ElementReference createMenuButton;
     ElementReference moveMenuButton;
     Microsoft.JSInterop.DotNetObjectReference<Home>? selfRef;
     bool composerWired;
     int lastCount = -1;
+    string? lastScrolledThread;
     bool lastBusy;
     bool createMenuOpen;
     bool moveMenuOpen;
@@ -658,6 +690,7 @@
     protected override void OnInitialized()
     {
         State.Changed += Refresh;
+        Mesh.DeviceSyncStateChanged += Refresh;
         // Deep-link: /?thread=id opens that topic (used by Search). Otherwise land in the most recent.
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
         var wanted = ParseQueryValue(uri.Query, "thread");
@@ -705,20 +738,33 @@
             }
         }
 
+        try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
+
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
         // (busy true->false): the reply is added while the thread is still busy, so tracking that
         // transition guarantees the final answer scrolls into view even if its line count collides
         // with an earlier render.
         var count = Active?.Lines.Count ?? 0;
-        if (firstRender || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
+        var activeChanged = activeThread != lastScrolledThread;
+        if (activeChanged)
+        {
+            try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
+        }
+        if (firstRender || activeChanged || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
         {
             lastCount = count;
             lastBusy = ActiveBusy;
-            // autoScroll is idempotent: it attaches the sticky observer the first time scrollEl is real,
-            // then keeps the pane pinned to the bottom as the step trace and reply grow.
-            try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl); } catch { }
-            try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
+            lastScrolledThread = activeThread;
+            var method = firstRender || activeChanged
+                ? "meshUI.scrollToBottom"
+                : "meshUI.scrollToBottomIfPinned";
+            try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
         }
+    }
+
+    async Task ScrollToLatest()
+    {
+        try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
     }
 
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
@@ -985,6 +1031,18 @@
         try { await JS.InvokeVoidAsync("meshUI.resetComposer", composerEl); } catch { }
     }
 
+    bool ClearSubmittedDraft(string threadId, string submittedText)
+    {
+        if (!string.Equals(activeThread, threadId, StringComparison.Ordinal))
+        {
+            State.SetTopicDraft(threadId, "");
+            return false;
+        }
+        if (!string.Equals(input, submittedText, StringComparison.Ordinal)) return false;
+        input = "";
+        return true;
+    }
+
     async Task PickFile()
     {
         attachError = null;
@@ -1032,8 +1090,10 @@
     {
         if (SendDisabled) return;
         dispatchError = null;
+        var text = input;
         var thread = Active ?? State.NewOwnThread("New chat", CurrentDevice);
         activeThread = thread.Id;
+        input = text;
         if (thread.ExecutionDeviceId is null)
             State.BindOwnThreadForSend(thread.Id, CurrentDevice);
         if (!ActiveDeviceOnline)
@@ -1042,7 +1102,6 @@
             return;
         }
 
-        var text = input;
         var chosenWidget = selectedWidget;
         var titleText = !string.IsNullOrWhiteSpace(text)
             ? text
@@ -1075,12 +1134,12 @@
         var runId = Guid.NewGuid().ToString("n");
         State.AddOwnChatLine(thread.Id, trigger);
 
-        input = "";
+        var clearedVisibleDraft = ClearSubmittedDraft(thread.Id, text);
         attachments.Clear();
         widgetMode = false;
         widgetPickerOpen = false;
         selectedWidget = null;
-        _ = ResetComposer();
+        if (clearedVisibleDraft) _ = ResetComposer();
 
         var widgetContext = BuildWidgetContext(chosenWidget, wasWidget, text);
         var draft = new TopicTurnDraft(
@@ -1218,6 +1277,7 @@
     public void Dispose()
     {
         State.Changed -= Refresh;
+        Mesh.DeviceSyncStateChanged -= Refresh;
         selfRef?.Dispose();
     }
 }

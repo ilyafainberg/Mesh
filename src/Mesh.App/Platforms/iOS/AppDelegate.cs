@@ -70,8 +70,8 @@ public class AppDelegate : MauiUIApplicationDelegate
     }
 }
 
-// Presents notifications while the app is in the foreground so the user still sees the relay-composed
-// "Message from @sender" / "New group message" banner rather than having it silently dropped by iOS.
+// Presents notifications while the app is in the foreground so the user still sees relay-composed
+// message, group, and topic-response banners rather than having them silently dropped by iOS.
 public sealed class MeshNotificationCenterDelegate : UNUserNotificationCenterDelegate
 {
     public override void WillPresentNotification(

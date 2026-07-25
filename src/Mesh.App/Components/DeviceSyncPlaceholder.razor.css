@@ -1,0 +1,41 @@
+.device-sync-placeholder {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 52px;
+    box-sizing: border-box;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--stroke-1);
+    background: var(--bg-1);
+    color: var(--fg-2);
+    font-size: .84rem;
+    font-weight: 600;
+}
+
+.device-sync-icon {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    flex: none;
+    color: var(--brand);
+}
+
+.device-sync-icon i {
+    font-size: 14px;
+}
+
+.device-sync-spinner {
+    position: absolute;
+    inset: 0;
+    border: 2px solid var(--brand-tint-2);
+    border-top-color: var(--brand);
+    border-radius: 50%;
+    animation: device-sync-spin .8s linear infinite;
+}
+
+@keyframes device-sync-spin {
+    to { transform: rotate(360deg); }
+}

@@ -1,0 +1,13 @@
+<div class="device-sync-placeholder" role="status" aria-live="polite" aria-atomic="true">
+    <span class="device-sync-icon" aria-hidden="true">
+        <span class="device-sync-spinner"></span>
+        <i class="bi bi-cloud-arrow-down"></i>
+    </span>
+    <span>@Text</span>
+</div>
+
+@code {
+    [Parameter]
+    [EditorRequired]
+    public string Text { get; set; } = "";
+}

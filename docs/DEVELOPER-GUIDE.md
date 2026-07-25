@@ -232,6 +232,7 @@ The envelope is the unit of routing:
 | `Body` | The payload. May be an encrypted JSON payload (see 4.1.2) or plaintext, depending on kind. |
 | `FromDevice` (optional, trailing) | Sending device's routing id. Stamped by the relay from the authenticated connection. |
 | `ToDevice` (optional, trailing) | Target device routing id; enables per-device delivery with broadcast fallback. |
+| `PushHint` (optional, trailing) | Metadata-only notification hint. `topic.response` is valid only on a same-handle, device-targeted `topic.run.update`; the encrypted body remains opaque. |
 
 #### 4.2.2 MeshKinds
 

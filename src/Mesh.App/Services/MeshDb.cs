@@ -25,6 +25,8 @@ public sealed class MeshDb : IDisposable
         IReadOnlyList<DeviceSyncCircleRename> Renames);
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
+    private const string ConversationDraftKind = "conversation";
+    private const string TopicDraftKind = "topic";
     private static bool nativeInit;
 
     private readonly SqliteConnection conn;
@@ -89,6 +91,11 @@ public sealed class MeshDb : IDisposable
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS composer_drafts(
+                kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                PRIMARY KEY(kind, entity_id));
             CREATE TABLE IF NOT EXISTS sync_versions(
                 entity_key TEXT PRIMARY KEY,
                 version TEXT NOT NULL);
@@ -175,6 +182,59 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM profile;";
         return Convert.ToInt64(cmd.ExecuteScalar()) == 0;
+    }
+
+    // ---- composer drafts ---------------------------------------------------
+
+    public string GetConversationDraft(string handle)
+        => GetComposerDraft(ConversationDraftKind, handle);
+
+    public void SetConversationDraft(string handle, string text)
+        => SetComposerDraft(ConversationDraftKind, handle, text);
+
+    public string GetTopicDraft(string threadId)
+        => GetComposerDraft(TopicDraftKind, threadId);
+
+    public void SetTopicDraft(string threadId, string text)
+        => SetComposerDraft(TopicDraftKind, threadId, text);
+
+    private string GetComposerDraft(string kind, string entityId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT text FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        return cmd.ExecuteScalar() as string ?? "";
+    }
+
+    private void SetComposerDraft(string kind, string entityId, string text)
+    {
+        using var cmd = conn.CreateCommand();
+        if (text.Length == 0)
+        {
+            cmd.CommandText = "DELETE FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
+        }
+        else
+        {
+            cmd.CommandText = """
+                INSERT INTO composer_drafts(kind, entity_id, text) VALUES($kind, $id, $text)
+                ON CONFLICT(kind, entity_id) DO UPDATE SET text = excluded.text;
+                """;
+            cmd.Parameters.AddWithValue("$text", text);
+        }
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void DeleteComposerDraft(SqliteTransaction transaction, string kind, string entityId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = "DELETE FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        cmd.ExecuteNonQuery();
     }
 
     // ---- profile + history --------------------------------------------------
@@ -654,6 +714,7 @@ public sealed class MeshDb : IDisposable
             topic.Parameters.AddWithValue("$id", id);
             topic.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, TopicDraftKind, id);
         UpsertSyncTombstone(tx, kind, id, version);
         tx.Commit();
     }
@@ -689,6 +750,7 @@ public sealed class MeshDb : IDisposable
             conversation.Parameters.AddWithValue("$handle", handle);
             conversation.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, ConversationDraftKind, handle);
         UpsertSyncTombstone(tx, kind, handle, version);
         tx.Commit();
     }
@@ -1606,6 +1668,7 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$id", id);
             cmd.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, TopicDraftKind, id);
         tx.Commit();
     }
 
@@ -1656,6 +1719,7 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$h", handle);
             cmd.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, ConversationDraftKind, handle);
         tx.Commit();
     }
 

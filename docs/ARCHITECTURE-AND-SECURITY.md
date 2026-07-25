@@ -375,6 +375,7 @@ After the handshake, the relay knows the authenticated handle (and device) behin
 | `Body` | The E2E-encrypted payload (ciphertext); the relay never inspects plaintext |
 | `FromDevice` (optional) | Authenticated sending device, stamped by the relay |
 | `ToDevice` (optional) | Target a specific device for directed routing (for example home-device routing) |
+| `PushHint` (optional) | Metadata-only notification discriminator. Currently `topic.response` indicates successful topic completion without exposing content. |
 
 Because `From`/`FromDevice` are relay-stamped from the authenticated connection, a sender **cannot spoof identity**. A device sending to its **own** handle is **not echoed back** to the sending connection.
 
@@ -571,6 +572,7 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 | **Handle directory** (handle to device public keys) | Yes | Needed for routing and multi-recipient encryption target resolution |
 | **Presence** (who is online) | Yes | Short-TTL entries in Redis |
 | **Traffic metadata** (who talks to whom, and when) | Yes | Direct envelope metadata; for fan-out, sender, transient recipient cohort, timing, and ciphertext size |
+| **Successful topic completion** | Yes, when push is requested | `PushHint = topic.response` reveals completion between the owner's devices, but not the topic, prompt, response, or progress |
 | **Inner fan-out type** | No | `GroupControl` / `GroupMessage` is inside encrypted `MeshFanoutContent`; the outer request is generic fan-out |
 | **Group ID, name, membership metadata, roles, or version** | No explicit protocol field | These values exist only inside E2E-encrypted content; the relay has no group-state schema |
 | **Message contents** | No | Bodies are ciphertext (`ECIES-P256-AESGCM`); relay holds no device private key |
@@ -631,7 +633,7 @@ As a stated client security property (not an implementation description): **publ
 | **DeviceId** | First 12 hex chars of `SHA-256(publicKeyB64)`; used as the key in the per-recipient key map |
 | **TOFU** | Trust On First Use; pin a contact's keys on first contact, hold and re-verify on change |
 | **ECIES-P256-AESGCM** | Mesh's ephemeral-static ECIES: per-message AES-256-GCM content key, wrapped per recipient device via P-256 ECDH + SHA-256 KEK derivation |
-| **MeshEnvelope** | Routing unit with `To`, relay-stamped `From`, `Kind`, ciphertext `Body`, optional `FromDevice`/`ToDevice` |
+| **MeshEnvelope** | Routing unit with `To`, relay-stamped `From`, `Kind`, ciphertext `Body`, and optional `FromDevice`/`ToDevice`/`PushHint` metadata |
 | **MeshFanoutRequest** | Generic logical send containing one ciphertext and 1 to 128 transient recipient handles |
 | **MeshSendResult** | Explicit accepted/rejected result for a normal send or fan-out, including code and retry delay |
 | **Backplane** | Redis layer providing presence, shared live rate buckets, per-handle quota, and cross-replica routing |

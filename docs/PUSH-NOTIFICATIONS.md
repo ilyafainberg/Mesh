@@ -1,12 +1,12 @@
 # Push notifications (mobile wake)
 
 Mesh mobile clients (iOS and Android) can be woken by a push notification when a
-notifiable message reaches their handle while that device is offline (app
-backgrounded, screen off, or suspended by the OS). This holds even when the
-message was just delivered live to another of the owner's devices, such as an
-open desktop, so a phone is still notified rather than staying silent until the
-desktop is closed. This document explains the privacy model, how it works end to
-end, and the provisioning an operator and a client build need.
+notifiable message reaches their handle or when an agent finishes a topic
+response on another device while the receiving device is offline (app
+backgrounded, screen off, or suspended by the OS). A phone is also notified when
+a message was delivered live to another device, such as an open desktop. This
+document explains the privacy model, how it works end to end, and the
+provisioning an operator and a client build need.
 
 Push is optional. With nothing configured, the relay behaves exactly as before:
 messages still queue in the per-device inbox and are delivered when the client
@@ -14,20 +14,22 @@ next reconnects. Push only improves timeliness; it never carries message content
 
 ## Privacy model (Option 1)
 
-The relay only ever sees the cleartext envelope `Kind` and the `From` / `To`
-handles. It never sees message bodies (they are end-to-end encrypted) and it
-never sees a group's name (that lives inside the encrypted body). So the relay
-composes exactly two metadata-only alerts:
+The relay sees the cleartext envelope `Kind`, `From` / `To` handles, and an
+optional metadata-only `PushHint`. It never sees message bodies (they are
+end-to-end encrypted), a group's name, a topic title, a prompt, or an agent
+response. The relay composes exactly three metadata-only alerts:
 
 | Situation | Alert shown |
 |---|---|
 | A direct message is queued for an offline device | `Message from @sender` |
 | A group (fanout) message is queued for an offline device | `New group message` |
+| An agent successfully completes a remotely hosted topic turn | `Your agent replied in a topic` |
 
-Nothing else is included: no message text, no group name, no friendly contact
-name. This keeps the same privacy posture Mesh already has. The only new
-disclosure is that the recipient's push network (APNs or FCM) sees that a wake
-was sent to a device, plus the small alert text above.
+For the third case, the terminal update carries `PushHint = topic.response`.
+That discloses only that a successful topic response finished between two of the
+same owner's devices. The prompt, response, topic title, and all run progress
+remain encrypted. APNs or FCM sees that a wake was sent plus the small alert text
+above, but no Mesh content.
 
 ## How it works end to end
 
@@ -38,17 +40,18 @@ was sent to a device, plus the small alert text above.
 2. The relay stores `(deviceId -> platform, token)` alongside the handle record
    (durable when Cosmos is configured).
 3. When `MeshRouter` handles a notifiable envelope it fires a fire-and-forget
-   wake through the matching sender (APNs or FCM) to every one of the recipient's
-   registered devices that is not currently connected on any relay instance:
-     - If no device is connected, the envelope is also queued in the offline
-       inbox and every registered device is woken.
-     - If it was delivered live to one device (for example an open desktop), the
-       handle's other offline devices are still woken. Those siblings are not
-       queued a copy; they receive the content by device sync when they
-       reconnect.
+   wake through the matching sender (APNs or FCM):
+     - Handle-wide direct and group messages wake each registered device that is
+       not currently connected on any relay instance. If one device received the
+       message live, offline siblings are still woken and receive content by
+       device sync when they reconnect.
+     - A successful topic response is a device-targeted `topic.run.update` with
+       `PushHint = topic.response`. If the originating device is offline, the
+       encrypted terminal update is queued for that device and only its token is
+       woken.
    Device presence is read from the backplane, so the online/offline split is
-   correct across replicas. The category is derived purely from the cleartext
-   `Kind` (group vs direct); sync, receipt, and topic-internal kinds never push.
+   correct across replicas. Ordinary topic progress, failed or cancelled runs,
+   sync traffic, receipts, and control envelopes never push.
 4. On sign-out the client calls `DELETE /handles/{handle}/push` (also signed) so
    a signed-out device is no longer woken.
 

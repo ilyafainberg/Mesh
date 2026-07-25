@@ -11,8 +11,8 @@ namespace Mesh.App.Platforms.Android;
 /// Receives FCM callbacks: token refreshes (forwarded to <see cref="FirebasePushService"/> so the next relay
 /// registration uses the fresh token) and incoming messages. When the app is backgrounded or killed, the FCM
 /// SDK auto-displays the relay-composed notification payload; this service only needs to draw the banner for
-/// the foreground case, reusing the same metadata-only title/body the relay composed
-/// ("Message from @sender" / "New group message").
+/// the foreground case, reusing the same metadata-only title/body the relay composed for messages,
+/// groups, or completed topic responses.
 /// </summary>
 [Service(Exported = false)]
 [IntentFilter(new[] { "com.google.firebase.MESSAGING_EVENT" })]
@@ -51,7 +51,7 @@ public sealed class MeshFirebaseMessagingService : FirebaseMessagingService
         if (mgr is null || mgr.GetNotificationChannel(ChannelId) is not null) return;
         var channel = new NotificationChannel(ChannelId, ChannelName, NotificationImportance.High)
         {
-            Description = "Message and group notifications",
+            Description = "Message, group, and topic notifications",
         };
         mgr.CreateNotificationChannel(channel);
     }

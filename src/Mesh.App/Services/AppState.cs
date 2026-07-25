@@ -196,6 +196,32 @@ public sealed class AppState
         WriteIndex();
     }
 
+    /// <summary>Gets the local unsent text for a conversation.</summary>
+    public string GetConversationDraft(string handle)
+    {
+        var normalized = Norm(handle);
+        return normalized.Length == 0 ? "" : activeDb?.GetConversationDraft(normalized) ?? "";
+    }
+
+    /// <summary>Persists local unsent text for a conversation without syncing it to other devices.</summary>
+    public void SetConversationDraft(string handle, string text)
+    {
+        var normalized = Norm(handle);
+        if (normalized.Length == 0) return;
+        activeDb?.SetConversationDraft(normalized, text);
+    }
+
+    /// <summary>Gets the local unsent text for a topic.</summary>
+    public string GetTopicDraft(string threadId)
+        => string.IsNullOrWhiteSpace(threadId) ? "" : activeDb?.GetTopicDraft(threadId) ?? "";
+
+    /// <summary>Persists local unsent text for a topic without syncing it to other devices.</summary>
+    public void SetTopicDraft(string threadId, string text)
+    {
+        if (string.IsNullOrWhiteSpace(threadId)) return;
+        activeDb?.SetTopicDraft(threadId, text);
+    }
+
     private void PrepareProfileStorage()
     {
         // Adopt: onboarding/link just filled a fresh profile with no active id yet.

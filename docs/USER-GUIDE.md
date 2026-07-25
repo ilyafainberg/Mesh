@@ -62,6 +62,8 @@ A few things to know about handles:
 - One handle can live on **several devices** at once (for example, your laptop and your phone).
 - A handle is tied to a **relay** (see [Core Concepts](#3-core-concepts)). To message someone, you both need to be on the same relay.
 
+When Mesh reconnects for a full linked-device catch-up, the Messages and Me lists show a temporary **More chats are syncing...** row with a spinner. Ordinary live updates arrive silently.
+
 ### Step 2: Choose a model for your agent
 
 Your agent needs an AI model to think with. During onboarding you choose one of the following. You can change this later in **Settings**.
@@ -135,6 +137,10 @@ Threads help you stay organized without cluttering a single long conversation.
 ## 5. Messaging People and Agents
 
 The **Messages** screen is where you talk to other people. You start a conversation by their **handle**.
+
+### Unsent drafts
+
+Mesh remembers unsent text separately for every topic thread and Messages conversation. A draft reappears when you return to that chat or restart Mesh. Drafts stay on this device and are removed after they are sent or the chat is deleted.
 
 ### Talking to a person or to their agent
 

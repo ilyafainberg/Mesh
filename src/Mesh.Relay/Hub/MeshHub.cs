@@ -102,6 +102,10 @@ public sealed class MeshHub(
         if (System.Text.Encoding.UTF8.GetByteCount(env.Body ?? string.Empty) > MessageLimits.MaxEnvelopeBodyBytes)
             return MeshSendResult.Reject("message_too_large");
 
+        var stamped = env with { From = state.Handle, FromDevice = state.DeviceId };
+        if (stamped.PushHint is not null && !PushHintProtocol.IsTopicResponse(stamped))
+            return MeshSendResult.Reject("invalid_push_hint");
+
         var isDeviceSync = DeviceSyncKinds.IsEnvelopeKind(env.Kind);
         if (!isDeviceSync
             && env.Kind?.StartsWith("device.sync.", StringComparison.OrdinalIgnoreCase) == true)
@@ -127,11 +131,7 @@ public sealed class MeshHub(
             if (!targetKnown)
                 return MeshSendResult.Reject("sync_target_unknown");
 
-            var syncEnvelope = env with
-            {
-                From = state.Handle,
-                FromDevice = state.DeviceId
-            };
+            var syncEnvelope = stamped;
             await router.RouteToDeviceAsync(syncEnvelope);
             metrics.MessageRouted();
             return MeshSendResult.Ok();
@@ -151,9 +151,6 @@ public sealed class MeshHub(
             logger.LogWarning("message rate limited: {Handle}", state.Handle);
             return MeshSendResult.Reject("rate_limited", decision.RetryAfterMs);
         }
-
-        var stamped = env with { From = state.Handle }; // relay asserts the authenticated sender
-        stamped = stamped with { FromDevice = state.DeviceId }; // stamp the sending device (set at auth)
 
         if (stamped.Kind == MeshKinds.RemoteAgentRequest)
         {

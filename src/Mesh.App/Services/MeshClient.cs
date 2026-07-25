@@ -19,6 +19,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan GroupKeyCacheLifetime = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DeviceSyncTargetCacheLifetime = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DeviceSyncActivityQuietPeriod = TimeSpan.FromSeconds(1.5);
     private const int DeviceSyncSnapshotBatchSize = 100;
     private readonly AppState state;
     private readonly AgentService agent;
@@ -35,6 +36,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> keyCacheUpdated = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim deviceSyncSendGate = new(1, 1);
+    private readonly DeviceSyncActivityTracker deviceSyncActivity = new(DeviceSyncActivityQuietPeriod);
     private HubConnection? hub;
     private volatile bool authenticated;
     private volatile bool supportsSendResults;
@@ -62,6 +64,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         this.notifier = notifier;
         this.push = push;
         state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
+        deviceSyncActivity.Changed += () => DeviceSyncStateChanged?.Invoke();
     }
 
     private sealed record DeviceSyncIdentity(
@@ -85,7 +88,9 @@ public sealed class MeshClient : IDeviceTopicTransport
     }
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
+    public bool IsDeviceSnapshotSyncing => deviceSyncActivity.IsActive;
     public event Action? StateChanged;
+    public event Action? DeviceSyncStateChanged;
     public event Action<string>? Log;
 
     /// <summary>
@@ -1096,11 +1101,13 @@ public sealed class MeshClient : IDeviceTopicTransport
         try
         {
             if (Volatile.Read(ref active.TerminalSent) != 0) return;
+            var terminal = CorrelateUpdate(active, update);
             if (await SendTargetedTopicEnvelopeAsync(
                     active.SourceDeviceId,
                     MeshKinds.TopicRunUpdate,
-                    TopicRunProtocol.UpdateBody(CorrelateUpdate(active, update)),
-                    ct))
+                    TopicRunProtocol.UpdateBody(terminal),
+                    ct,
+                    PushHintProtocol.ForTopicRunPhase(terminal.Phase)))
                 Volatile.Write(ref active.TerminalSent, 1);
         }
         finally
@@ -1243,12 +1250,13 @@ public sealed class MeshClient : IDeviceTopicTransport
             {
                 var request = new DeviceSyncSnapshotRequest(
                     Guid.NewGuid().ToString("n"), identity.DeviceId);
-                await SendDeviceSyncEnvelopeCoreAsync(
+                var requested = await SendDeviceSyncEnvelopeCoreAsync(
                     identity,
                     target,
                     DeviceSyncKinds.EnvelopeSnapshotRequest,
                     JsonSerializer.Serialize(request, Json),
                     CancellationToken.None);
+                if (requested) deviceSyncActivity.ObserveSnapshotActivity();
                 await SendDeviceSyncSnapshotCoreAsync(identity, target, snapshot, CancellationToken.None);
             }
         }
@@ -1433,6 +1441,8 @@ public sealed class MeshClient : IDeviceTopicTransport
                 var batch = JsonSerializer.Deserialize<DeviceSyncBatch>(plaintext, Json)
                     ?? throw new JsonException("Device sync batch was null.");
                 ValidateDeviceSyncBatch(batch, env.FromDevice);
+                if (batch.IsSnapshot)
+                    deviceSyncActivity.ObserveSnapshotActivity();
                 _ = state.ApplyDeviceSyncBatch(batch);
                 return;
             }
@@ -1986,7 +1996,8 @@ public sealed class MeshClient : IDeviceTopicTransport
         string targetDeviceId,
         string kind,
         string plaintext,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? pushHint = null)
     {
         var identity = authenticatedDeviceSyncIdentity;
         if (identity is null
@@ -2027,7 +2038,8 @@ public sealed class MeshClient : IDeviceTopicTransport
             ciphertext,
             IdentityService.Sign(identity.PrivateKey, ciphertext),
             fromDevice: identity.DeviceId,
-            toDevice: targetDeviceId);
+            toDevice: targetDeviceId,
+            pushHint: pushHint);
         try
         {
             var result = await identity.Connection.InvokeAsync<MeshSendResult>(

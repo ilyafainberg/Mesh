@@ -2,34 +2,65 @@
 window.meshUI = {
   scrollToBottom: function (el) {
     if (!el) return;
+    el._stick = true;
+    var pin = function () {
+      el.scrollTop = el.scrollHeight;
+      if (el._meshUpdateScrollButton) el._meshUpdateScrollButton();
+    };
     // Defer across two frames so newly rendered (and re-flowed) content is measured before we
     // scroll: a single frame can fire before a long markdown reply has finished laying out.
     requestAnimationFrame(function () {
-      el.scrollTop = el.scrollHeight;
-      requestAnimationFrame(function () {
-        el.scrollTop = el.scrollHeight;
-      });
+      pin();
+      requestAnimationFrame(pin);
     });
+  },
+  scrollToBottomIfPinned: function (el) {
+    if (!el || el._stick === false) return;
+    window.meshUI.scrollToBottom(el);
   },
   // Keeps a scroll container pinned to the bottom as its content GROWS (streaming step trace, a long
   // reply that lays out or loads images/iframes after the initial render). This is more reliable than
   // a one-shot scroll: a ResizeObserver re-pins on every size change. It is "sticky" - if the user
   // scrolls up to read, it stops auto-pinning until they return near the bottom. Idempotent per element.
-  autoScroll: function (el) {
-    if (!el || el._meshAuto) return;
+  autoScroll: function (el, button) {
+    if (!el) return;
+    if (button) el._meshScrollButton = button;
+
+    var bottomDistance = function () {
+      return Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight);
+    };
+    var atBottom = function () { return bottomDistance() <= 24; };
+    var updateButton = function () {
+      var target = el._meshScrollButton;
+      if (!target) return;
+      var hidden = atBottom();
+      target.hidden = hidden;
+      target.setAttribute('aria-hidden', hidden ? 'true' : 'false');
+    };
+    el._meshUpdateScrollButton = updateButton;
+
+    if (el._meshAuto) {
+      updateButton();
+      return;
+    }
+
     el._meshAuto = true;
     el._stick = true;
-    var nearBottom = function () {
-      return el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+    el.addEventListener('scroll', function () {
+      el._stick = atBottom();
+      updateButton();
+    }, { passive: true });
+    var pin = function () {
+      if (el._stick) el.scrollTop = el.scrollHeight;
+      updateButton();
     };
-    el.addEventListener('scroll', function () { el._stick = nearBottom(); });
-    var pin = function () { if (el._stick) el.scrollTop = el.scrollHeight; };
     try {
       var ro = new ResizeObserver(pin);
       // Observe the inner content wrapper so its height changes fire; fall back to the container.
       ro.observe(el.firstElementChild || el);
       el._meshRo = ro;
     } catch (e) { /* ResizeObserver unavailable: the per-render scrollToBottom still runs */ }
+    requestAnimationFrame(pin);
   },
 
   // Thread screens live inside MobileShell's scrollable body. iOS treats that body as a native
@@ -339,6 +370,20 @@ window.meshUI = {
     grow();
   },
 
+  // Re-measure after Blazor swaps in a saved draft without raising a browser input event.
+  resizeComposer: function (el, maxRows) {
+    if (!el) return;
+    requestAnimationFrame(function () {
+      el.style.height = 'auto';
+      var cs = getComputedStyle(el);
+      var line = parseFloat(cs.lineHeight) || 20;
+      var pad = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) + 2;
+      var max = line * (maxRows || 5) + pad;
+      var h = Math.min(el.scrollHeight, max);
+      el.style.height = h + 'px';
+      el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden';
+    });
+  },
   // Reset a composer's height after its text is cleared programmatically (send clears the binding
   // without firing an input event).
   resetComposer: function (el) {
