@@ -17,6 +17,7 @@ public sealed class CopilotMcpBridge(ILogger<CopilotMcpBridge> logger) : IAsyncD
 
     private sealed record ToolScope(
         IReadOnlyDictionary<string, IAgentTool> Tools,
+        TokenOptimizationLevel TokenOptimization,
         CancellationToken CancellationToken);
 
     private readonly ConcurrentDictionary<string, ToolScope> scopes = new(StringComparer.Ordinal);
@@ -28,6 +29,7 @@ public sealed class CopilotMcpBridge(ILogger<CopilotMcpBridge> logger) : IAsyncD
 
     public async Task<Registration?> RegisterAsync(
         IReadOnlyList<IAgentTool> tools,
+        TokenOptimizationLevel tokenOptimization,
         CancellationToken ct)
     {
         if (tools.Count == 0) return null;
@@ -36,6 +38,7 @@ public sealed class CopilotMcpBridge(ILogger<CopilotMcpBridge> logger) : IAsyncD
         scopes[token] = new ToolScope(
             tools.GroupBy(tool => tool.Name, StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal),
+            TokenOptimizer.Normalize(tokenOptimization),
             ct);
         return new Registration("mesh", $"http://127.0.0.1:{port}/mcp/{token}/", token);
     }
@@ -223,10 +226,11 @@ public sealed class CopilotMcpBridge(ILogger<CopilotMcpBridge> logger) : IAsyncD
         try
         {
             var output = await tool.ExecuteAsync(arguments, linked.Token);
-            var isError = output.StartsWith("ERROR:", StringComparison.OrdinalIgnoreCase);
+            var optimized = TokenOptimizer.OptimizeToolResult(name, output, scope.TokenOptimization);
+            var isError = optimized.StartsWith("ERROR:", StringComparison.OrdinalIgnoreCase);
             return new
             {
-                content = new[] { new { type = "text", text = output } },
+                content = new[] { new { type = "text", text = optimized } },
                 isError
             };
         }

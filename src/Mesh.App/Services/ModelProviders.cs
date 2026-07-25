@@ -203,7 +203,9 @@ internal static class ReasoningControls
 public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state, TokenMeter meter, BrowserModelService browserModel, CopilotAcpHost copilot)
 {
     public IChatModel Create(ModelConfig cfg)
-        => new OffUiChatModel(CreateCore(cfg), meter);
+        => new OffUiChatModel(
+            new TokenOptimizingChatModel(CreateCore(cfg), cfg.TokenOptimization),
+            meter);
 
     private IChatModel CreateCore(ModelConfig cfg) => cfg.Provider switch
         {
@@ -221,6 +223,35 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
             ModelProvider.GitHubCopilot => new CopilotAcpModel(copilot, cfg),
             _ => new OpenAiCompatibleModel(httpFactory.CreateClient("model"), cfg, meter),
         };
+
+    private sealed class TokenOptimizingChatModel(
+        IChatModel inner,
+        TokenOptimizationLevel level) : IChatModel
+    {
+        public Task<string> CompleteAsync(
+            string systemPrompt,
+            IReadOnlyList<ChatLine> history,
+            CompletionOptions? options = null,
+            CancellationToken ct = default)
+        {
+            var request = TokenOptimizer.OptimizeRequest(systemPrompt, history, level);
+            return inner.CompleteAsync(request.SystemPrompt, request.History, options, ct);
+        }
+
+        public Task<string> CompleteWithToolsAsync(
+            string systemPrompt,
+            IReadOnlyList<ChatLine> history,
+            IReadOnlyList<IAgentTool> tools,
+            IProgress<AgentStep>? progress = null,
+            IProgress<AgentDelta>? delta = null,
+            CompletionOptions? options = null,
+            CancellationToken ct = default)
+        {
+            var request = TokenOptimizer.OptimizeRequest(systemPrompt, history, level);
+            return inner.CompleteWithToolsAsync(
+                request.SystemPrompt, request.History, tools, progress, delta, options, ct);
+        }
+    }
 
     private sealed class OffUiChatModel(IChatModel inner, TokenMeter tokenMeter) : IChatModel
     {
@@ -265,7 +296,15 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
     private static ModelConfig WithEndpoint(ModelConfig cfg, string defaultEndpoint)
     {
         if (!string.IsNullOrWhiteSpace(cfg.Endpoint)) return cfg;
-        return new ModelConfig { Provider = cfg.Provider, Model = cfg.Model, ApiKey = cfg.ApiKey, Endpoint = defaultEndpoint, ReasoningEffort = cfg.ReasoningEffort };
+        return new ModelConfig
+        {
+            Provider = cfg.Provider,
+            Model = cfg.Model,
+            ApiKey = cfg.ApiKey,
+            Endpoint = defaultEndpoint,
+            ReasoningEffort = cfg.ReasoningEffort,
+            TokenOptimization = cfg.TokenOptimization
+        };
     }
 
     /// <summary>GitHub Copilot CLI provider using its ACP stdio server. Mesh remains the history source.</summary>
@@ -296,7 +335,8 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
                 string.IsNullOrWhiteSpace(cfg.CopilotExecutable) ? "copilot" : cfg.CopilotExecutable.Trim(),
                 string.IsNullOrWhiteSpace(cfg.Model) ? "auto" : cfg.Model.Trim(),
                 cfg.CopilotEffort.ToString());
-            return host.CompleteAsync(config, system, promptLines, images, tools, progress, delta, ct);
+            return host.CompleteAsync(
+                config, system, promptLines, images, tools, cfg.TokenOptimization, progress, delta, ct);
         }
     }
 
@@ -305,7 +345,15 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
     /// the actual model/provider, so the client never pins a model. The endpoint is fixed.
     /// </summary>
     private static ModelConfig OpenRouterConfig(ModelConfig cfg)
-        => new ModelConfig { Provider = cfg.Provider, Model = "openrouter/auto", ApiKey = cfg.ApiKey, Endpoint = "https://openrouter.ai/api", ReasoningEffort = cfg.ReasoningEffort };
+        => new ModelConfig
+        {
+            Provider = cfg.Provider,
+            Model = "openrouter/auto",
+            ApiKey = cfg.ApiKey,
+            Endpoint = "https://openrouter.ai/api",
+            ReasoningEffort = cfg.ReasoningEffort,
+            TokenOptimization = cfg.TokenOptimization
+        };
 
     /// <summary>Foundry Local exposes an OpenAI-compatible endpoint on a dynamic port.</summary>
     private static ModelConfig WithFoundryDefault(ModelConfig cfg)
@@ -318,6 +366,7 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
             Model = cfg.Model,
             ApiKey = cfg.ApiKey,
             ReasoningEffort = cfg.ReasoningEffort,
+            TokenOptimization = cfg.TokenOptimization,
             Endpoint = "http://127.0.0.1:5273" // last-resort fallback for older Foundry builds
         };
     }
@@ -404,7 +453,8 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var result = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
+                var result = await AgentToolExecutor.ExecuteAsync(
+                    tools, name, argsJson, ct, progress, cfg.TokenOptimization);
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
@@ -508,7 +558,8 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             var results = new List<object>();
             foreach (var (id, name, argsJson) in toolUses)
             {
-                var result = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
+                var result = await AgentToolExecutor.ExecuteAsync(
+                    tools, name, argsJson, ct, progress, cfg.TokenOptimization);
                 results.Add(new { type = "tool_result", tool_use_id = id, content = result });
             }
             messages.Add(new { role = "user", content = results.ToArray() });
@@ -618,7 +669,7 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? me
                     ? args.GetRawText()
                     : "{}";
                 var result = await AgentToolExecutor.ExecuteAsync(
-                    tools, name, argsJson, ct, progress);
+                    tools, name, argsJson, ct, progress, cfg.TokenOptimization);
                 responses.Add(new
                 {
                     functionResponse = new
@@ -712,7 +763,8 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var toolResult = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
+                var toolResult = await AgentToolExecutor.ExecuteAsync(
+                    tools, name, argsJson, ct, progress, cfg.TokenOptimization);
                 messages.Add(new HostedModelMessage("tool", toolResult, ToolCallId: id));
             }
         }
@@ -855,7 +907,8 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var result = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
+                var result = await AgentToolExecutor.ExecuteAsync(
+                    tools, name, argsJson, ct, progress, cfg.TokenOptimization);
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }

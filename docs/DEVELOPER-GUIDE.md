@@ -17,6 +17,9 @@ This guide covers the two open-source components of Mesh: **Mesh.Relay** (the Si
 7. [Building and Running with Docker](#7-building-and-running-with-docker)
 8. [Testing and Contributing](#8-testing-and-contributing)
 9. [Extending the Relay](#9-extending-the-relay)
+10. [Mesh.App UI Mode (Developer Reference)](#10-meshapp-ui-mode-developer-reference)
+11. [GitHub Copilot CLI model provider](#11-github-copilot-cli-model-provider)
+12. [Client token optimization](#12-client-token-optimization)
 
 ---
 
@@ -895,3 +898,26 @@ remains the single source of truth.
 
 Changing the selected model or effort restarts the ACP child process on the next request. `Auto` omits
 the corresponding CLI option and leaves the choice to Copilot.
+
+---
+
+## 12. Client token optimization
+
+The reference client exposes a provider-neutral **Token Optimization** setting. This is a client-only inference feature, not a `Mesh.Shared` wire field or relay configuration. Interoperable clients may implement their own equivalent or ignore it without affecting message compatibility.
+
+| Level | Request behavior |
+|---|---|
+| `Disabled` | Bypasses the optimization layer. Existing caller history windows and provider limits still apply. |
+| `MaxAccuracy` | Keeps all older turn groups and uses generous text and tool-result limits. |
+| `Balanced` | Default. Keeps recent turns plus the most relevant older turns, knowledge, and skills, and compacts repetitive or oversized machine output. |
+| `MaxSavings` | Keeps the smallest relevant context set and uses the tightest text, JSON-array, and tool-result limits. |
+
+The reference-client pipeline has these invariants:
+
+1. Contact, circle, owner-only, and public-service visibility rules run before relevance selection. Optimization can only remove data from an authorized set.
+2. System and security instructions and the latest user turn remain verbatim.
+3. The optimizer creates new request objects where text changes. Durable `ChatLine`, memory, knowledge, skill, and tool-result records are never rewritten.
+4. Optimization runs before provider-specific serialization, so OpenAI-compatible providers, Anthropic, Gemini, Azure OpenAI, the Mesh hosted model, browser providers, Foundry Local, and GitHub Copilot ACP share the same setting.
+5. In the standard provider tool loops, user-visible progress receives the raw clipped tool result before the model receives its optimized copy. The Copilot loopback MCP scope carries the same level and returns the optimized copy to ACP.
+
+The Mesh hosted `/model/chat` endpoint therefore receives already-optimized plaintext. The relay does not perform this optimization and does not know which level the client selected. This reduces token usage and quota consumption, but it does not make a hosted or cloud model request confidential from that model path.

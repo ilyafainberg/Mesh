@@ -396,6 +396,36 @@
                 </div>
             }
 
+            <div class="field token-optimization-field">
+                <div class="token-optimization-heading">
+                    <label for="token-optimization">Token Optimization</label>
+                    <span class="token-optimization-value">@TokenOptimizationLabel</span>
+                </div>
+                <div class="token-optimization-control" style="--token-opt-progress: @TokenOptimizationProgress;">
+                    <input id="token-optimization" class="token-optimization-slider" type="range"
+                           min="0" max="3" step="1" value="@tokenOptimizationIndex"
+                           @oninput="OnTokenOptimizationInput"
+                           aria-valuetext="@TokenOptimizationLabel"
+                           aria-describedby="token-optimization-hint" />
+                    <div class="token-optimization-options">
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 0 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 0">Disabled</button>
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 1 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 1">Max Accuracy</button>
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 2 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 2">
+                            <span>Balanced</span>
+                            <small>Recommended</small>
+                        </button>
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 3 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 3">Max Savings</button>
+                    </div>
+                </div>
+                <div id="token-optimization-hint" class="field-hint">
+                    @TokenOptimizationDescription Mesh only shortens the temporary copy sent to the AI. Your encrypted chats and saved data are not changed.
+                </div>
+            </div>
+
             <div class="field" style="margin-top:8px;">
                 <button class="primary" @onclick="ChangeModel" disabled="@Setup.Running">
                     <i class="bi bi-check-lg"></i> @(Setup.Running ? "Working…" : "Change model")
@@ -686,6 +716,7 @@
     string apiKey = "";
     string apiVersion = "";
     string reasoningEffort = "Auto";
+    int tokenOptimizationIndex = (int)TokenOptimizationLevel.Balanced;
     string copilotExecutable = "copilot";
     string copilotEffort = "Auto";
     string browserEngine = "Firefox";
@@ -819,6 +850,7 @@
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
         reasoningEffort = p.Model.ReasoningEffort.ToString();
+        tokenOptimizationIndex = (int)TokenOptimizer.Normalize(p.Model.TokenOptimization);
         copilotExecutable = string.IsNullOrWhiteSpace(p.Model.CopilotExecutable) ? "copilot" : p.Model.CopilotExecutable;
         copilotEffort = p.Model.CopilotEffort.ToString();
         browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
@@ -835,6 +867,39 @@
         primaryAgentDeviceId = p.AgentPrimaryDeviceId ?? "";
         failoverAgentDeviceId = p.AgentFailoverDeviceId ?? "";
         SyncModelCustomFlag();
+    }
+
+    TokenOptimizationLevel SelectedTokenOptimization =>
+        TokenOptimizer.Normalize((TokenOptimizationLevel)Math.Clamp(tokenOptimizationIndex, 0, 3));
+
+    string TokenOptimizationLabel => SelectedTokenOptimization switch
+    {
+        TokenOptimizationLevel.Disabled => "Disabled",
+        TokenOptimizationLevel.MaxAccuracy => "Max Accuracy",
+        TokenOptimizationLevel.Balanced => "Balanced",
+        _ => "Max Savings"
+    };
+
+    string TokenOptimizationProgress => SelectedTokenOptimization switch
+    {
+        TokenOptimizationLevel.Disabled => "0%",
+        TokenOptimizationLevel.MaxAccuracy => "33.333%",
+        TokenOptimizationLevel.Balanced => "66.667%",
+        _ => "100%"
+    };
+
+    string TokenOptimizationDescription => SelectedTokenOptimization switch
+    {
+        TokenOptimizationLevel.Disabled => "Uses the normal context window without extra compaction.",
+        TokenOptimizationLevel.MaxAccuracy => "Keeps the most context and only removes obvious machine-generated repetition.",
+        TokenOptimizationLevel.Balanced => "Keeps recent and relevant context while trimming repetition and oversized results.",
+        _ => "Uses the smallest relevant context and the strongest result compaction."
+    };
+
+    void OnTokenOptimizationInput(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var value))
+            tokenOptimizationIndex = Math.Clamp(value, 0, 3);
     }
 
     string ModelPlaceholder=> provider switch
@@ -891,6 +956,7 @@
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
         reasoningEffort = p.Model.ReasoningEffort.ToString();
+        tokenOptimizationIndex = (int)TokenOptimizer.Normalize(p.Model.TokenOptimization);
         copilotExecutable = string.IsNullOrWhiteSpace(p.Model.CopilotExecutable) ? "copilot" : p.Model.CopilotExecutable;
         copilotEffort = p.Model.CopilotEffort.ToString();
         browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
@@ -1121,6 +1187,7 @@
     async Task ChangeModel()
     {
         var apiKeyToSet = apiKey;
+        var tokenOptimizationToSet = SelectedTokenOptimization;
         apiKey = "";
 
         // The save + model test runs in a background singleton, so it keeps going
@@ -1136,6 +1203,7 @@
             p.Model.Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim();
             p.Model.ApiVersion = string.IsNullOrWhiteSpace(apiVersion) ? null : apiVersion.Trim();
             p.Model.ReasoningEffort = Enum.TryParse<ReasoningEffort>(reasoningEffort, out var effort) ? effort : ReasoningEffort.Auto;
+            p.Model.TokenOptimization = tokenOptimizationToSet;
             p.Model.CopilotExecutable = string.IsNullOrWhiteSpace(copilotExecutable) ? "copilot" : copilotExecutable.Trim();
             p.Model.CopilotEffort = Enum.TryParse<CopilotEffort>(copilotEffort, out var cliEffort) ? cliEffort : CopilotEffort.Auto;
             p.Model.BrowserEngine = browserEngine;

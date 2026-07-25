@@ -11,6 +11,9 @@ public enum ReasoningEffort { Auto, Low, Medium, High }
 /// <summary>Reasoning effort levels accepted by GitHub Copilot CLI.</summary>
 public enum CopilotEffort { Auto, None, Minimal, Low, Medium, High, XHigh, Max }
 
+/// <summary>How aggressively Mesh reduces the ephemeral context sent to a model.</summary>
+public enum TokenOptimizationLevel { Disabled, MaxAccuracy, Balanced, MaxSavings }
+
 /// <summary>Where a knowledge item's content came from.</summary>
 public enum KnowledgeSource { Manual, File }
 
@@ -135,6 +138,8 @@ public sealed class ModelConfig
     public string Model { get; set; } = "claude-sonnet-4-6";
     /// <summary>Requested reasoning intensity. Auto leaves the choice to the provider.</summary>
     public ReasoningEffort ReasoningEffort { get; set; } = ReasoningEffort.Auto;
+    /// <summary>Controls local, provider-neutral optimization of the context copy sent for inference.</summary>
+    public TokenOptimizationLevel TokenOptimization { get; set; } = TokenOptimizationLevel.Balanced;
     /// <summary>GitHub Copilot CLI command or absolute path. Desktop only.</summary>
     public string CopilotExecutable { get; set; } = "copilot";
     /// <summary>GitHub Copilot CLI reasoning effort. Auto omits the launch option.</summary>

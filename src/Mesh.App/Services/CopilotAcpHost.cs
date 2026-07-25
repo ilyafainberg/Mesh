@@ -135,6 +135,7 @@ internal sealed class CopilotAcpLane(
                 new[] { ("user", "Reply with exactly OK") },
                 Array.Empty<(string MimeType, byte[] Data)>(),
                 Array.Empty<IAgentTool>(),
+                TokenOptimizationLevel.Disabled,
                 progress: null,
                 delta: null,
                 ct).ConfigureAwait(false);
@@ -154,11 +155,12 @@ internal sealed class CopilotAcpLane(
         IReadOnlyList<(string Role, string Text)> history,
         IReadOnlyList<(string MimeType, byte[] Data)> images,
         IReadOnlyList<IAgentTool> tools,
+        TokenOptimizationLevel tokenOptimization,
         IProgress<AgentStep>? progress = null,
         IProgress<AgentDelta>? delta = null,
         CancellationToken ct = default)
         => CompleteCoreAsync(
-            config, systemPrompt, history, images, tools, progress, delta, ct);
+            config, systemPrompt, history, images, tools, tokenOptimization, progress, delta, ct);
 
     private async Task<string> CompleteCoreAsync(
         CopilotAcpConfig config,
@@ -166,6 +168,7 @@ internal sealed class CopilotAcpLane(
         IReadOnlyList<(string Role, string Text)> history,
         IReadOnlyList<(string MimeType, byte[] Data)> images,
         IReadOnlyList<IAgentTool> tools,
+        TokenOptimizationLevel tokenOptimization,
         IProgress<AgentStep>? progress,
         IProgress<AgentDelta>? delta,
         CancellationToken ct)
@@ -179,7 +182,8 @@ internal sealed class CopilotAcpLane(
                 tools.Select(tool => $"mesh-{tool.Name}").OrderBy(name => name, StringComparer.Ordinal));
             var effectiveConfig = config with { ToolFilter = toolFilter };
             await EnsureProcessAsync(effectiveConfig, ct).ConfigureAwait(false);
-            mcpRegistration = await mcpBridge.RegisterAsync(tools, ct).ConfigureAwait(false);
+            mcpRegistration = await mcpBridge.RegisterAsync(
+                tools, tokenOptimization, ct).ConfigureAwait(false);
             var session = await NewSessionAsync(mcpRegistration, ct).ConfigureAwait(false);
             sessionId = SessionId(session);
             var content = new List<object>

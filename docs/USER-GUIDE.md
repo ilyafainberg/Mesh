@@ -462,6 +462,21 @@ Everything you can configure lives in **Settings**. Here are the settings that m
 
 Choose how your agent thinks: the free **Mesh-hosted model**, **bring your own API key** (Anthropic, OpenAI, Gemini, Grok, Groq, Azure OpenAI, OpenRouter), or **on-device with Foundry Local**. See [Installing and First Run](#2-installing-and-first-run) for details. You can change this at any time.
 
+#### Token Optimization
+
+**Token Optimization** controls how much of the temporary context copy Mesh sends to the selected AI model. It applies to every provider, including the Mesh free model and GitHub Copilot CLI.
+
+| Setting | What Mesh sends |
+|---|---|
+| **Disabled** | The normal Mesh context window, with no extra optimization. |
+| **Max Accuracy** | The most conversation and tool context, with only conservative cleanup. |
+| **Balanced** | Recent context plus the most relevant older context, with repeated and oversized machine output shortened. This is the default and recommended setting. |
+| **Max Savings** | The smallest relevant context and the strongest compaction. This saves the most tokens but can omit useful detail. |
+
+At every level, Mesh keeps the current user message and system and safety instructions verbatim. It only changes the in-flight copy used for that model request. It does not rewrite or delete encrypted chats, memories, knowledge, skills, or saved tool details.
+
+Token Optimization reduces token use and can lower provider cost, but it is not an additional privacy boundary. A cloud model provider still receives everything included in the optimized request. Choose an on-device model when the request content must stay on the device.
+
 ### Agent response devices
 
 On a compatible relay, use **Settings > Agent responses** to choose the **Primary agent response device** and, optionally, a **Failover response device**. Only compatible Windows and macOS desktops appear. Each entry shows whether it is ready, offline, or has no available agent model.

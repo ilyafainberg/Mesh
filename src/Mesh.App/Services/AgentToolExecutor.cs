@@ -11,7 +11,8 @@ internal static class AgentToolExecutor
         string name,
         string argsJson,
         CancellationToken ct,
-        IProgress<AgentStep>? progress = null)
+        IProgress<AgentStep>? progress = null,
+        TokenOptimizationLevel optimization = TokenOptimizationLevel.Disabled)
     {
         var label = ReasoningExtract.Label(name);
         var args = ToolTrace.Clip(argsJson);
@@ -38,7 +39,7 @@ internal static class AgentToolExecutor
                     AgentStepState.Done,
                     args,
                     ToolTrace.Clip(result)));
-            return result;
+            return TokenOptimizer.OptimizeToolResult(name, result, optimization);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

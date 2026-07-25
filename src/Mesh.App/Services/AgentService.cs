@@ -100,7 +100,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             .ToHashSet(StringComparer.Ordinal);
         agentTools.RemoveAll(tool => memoryToolNames.Contains(tool.Name));
         agentTools.AddRange(memoryTurn.Tools);
-        var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider))
+        var sys = BuildOwnerSystemPrompt(
+                      p, agentTools, IsSmall(p.Model.Provider), memoryTrigger?.Text ?? "")
                   + memoryTurn.BuildSystemPrompt();
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
@@ -376,7 +377,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var p = state.Profile;
         var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
         agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
-        var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider))
+        var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider), userText)
             + "\nYou are answering your owner remotely from another of their devices. Be concise.";
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
@@ -554,7 +555,10 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: false, circles: circles, ct));
         var widgets = p.Widgets.Where(w => Visible(w.Visibility, circles)).ToList();
 
-        var sys = BuildGuestSystemPrompt(p, fromHandle, circles, agentTools, widgets);
+        var currentRequest = agentHistory.LastOrDefault(line =>
+            string.Equals(line.Role, "user", StringComparison.Ordinal))?.Text ?? "";
+        var sys = BuildGuestSystemPrompt(
+            p, fromHandle, circles, agentTools, widgets, currentRequest);
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
         // Attribute the tokens this reply costs to the requesting contact (in addition to the
@@ -593,10 +597,6 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         // HARD SANDBOX: a public service never exposes tools of any kind.
         var agentTools = new List<IAgentTool>();
 
-        var sys = BuildServiceSystemPrompt(p, svc, knowledge, skills, widgets);
-        var cfg = await ResolveModelConfigAsync(p.Model, ct);
-        var model = factory.Create(cfg);
-
         // Only the inbound questions and prior service-channel turns steer the reply.
         var agentHistory = history.Where(l => l.Role == "user" || l.Via != "person").ToList();
         if (!agentHistory.Any(l => l.Role == "user"))
@@ -604,6 +604,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             var lastInbound = history.LastOrDefault(l => l.Role == "user");
             if (lastInbound is not null) agentHistory.Add(lastInbound);
         }
+        var currentRequest = agentHistory.LastOrDefault(line => line.Role == "user")?.Text ?? "";
+        var sys = BuildServiceSystemPrompt(
+            p, svc, knowledge, skills, widgets, currentRequest);
+        var cfg = await ResolveModelConfigAsync(p.Model, ct);
+        var model = factory.Create(cfg);
 
         // Meter this call's spend so the caller (MeshClient) can charge it against the service's token
         // budget, and additionally attribute it to the caller when they are already a known contact (a
@@ -676,7 +681,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             ApiKey = cfg.ApiKey,
             Model = model,
             Endpoint = endpoint,
-            ReasoningEffort = cfg.ReasoningEffort
+            ReasoningEffort = cfg.ReasoningEffort,
+            TokenOptimization = cfg.TokenOptimization
         };
     }
 
@@ -695,7 +701,15 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             {
                 var (ok, endpoint, model, error) = await foundry.EnsureReadyAsync(cfg.Model, progress, ct);
                 if (!ok) return (false, error ?? "Foundry Local setup failed.");
-                effective = new ModelConfig { Provider = cfg.Provider, ApiKey = cfg.ApiKey, Model = model ?? cfg.Model, Endpoint = endpoint, ReasoningEffort = cfg.ReasoningEffort };
+                effective = new ModelConfig
+                {
+                    Provider = cfg.Provider,
+                    ApiKey = cfg.ApiKey,
+                    Model = model ?? cfg.Model,
+                    Endpoint = endpoint,
+                    ReasoningEffort = cfg.ReasoningEffort,
+                    TokenOptimization = cfg.TokenOptimization
+                };
             }
             else if (!cfg.IsConfigured)
             {
@@ -718,7 +732,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     }
 
     // ---- prompt assembly --------------------------------------------------
-    private static string BuildOwnerSystemPrompt(MeshProfile p, IReadOnlyList<IAgentTool> agentTools, bool compact)
+    private static string BuildOwnerSystemPrompt(
+        MeshProfile p,
+        IReadOnlyList<IAgentTool> agentTools,
+        bool compact,
+        string query)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"You are the personal AI agent for {p.DisplayName} (@{p.Handle}), speaking privately with your owner.");
@@ -732,13 +750,17 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         AppendAppCapability(sb, compact);
         AppendTools(sb, agentTools, compact);
         AppendWidgets(sb, p.Widgets, "insert");
-        AppendKnowledge(sb, p.Knowledge, compact);
-        AppendSkills(sb, p.Skills.Where(s => s.Enabled).ToList());
+        AppendKnowledge(sb, p.Knowledge, compact, p.Model.TokenOptimization, query);
+        AppendSkills(
+            sb,
+            p.Skills.Where(s => s.Enabled).ToList(),
+            p.Model.TokenOptimization,
+            query);
         return sb.ToString();
     }
 
     private static string BuildGuestSystemPrompt(MeshProfile p, string fromHandle, List<string> circles,
-        IReadOnlyList<IAgentTool> agentTools, IReadOnlyList<Widget> widgets)
+        IReadOnlyList<IAgentTool> agentTools, IReadOnlyList<Widget> widgets, string query)
     {
         static bool Visible(string vis, List<string> circles) =>
             vis == "public" || (vis.StartsWith("shared:") && circles.Contains(vis["shared:".Length..]));
@@ -764,14 +786,18 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         if (knowledge.Count == 0)
             sb.AppendLine("(No specific knowledge exposed to this contact. Share only general, public-safe info.)");
         else
-            AppendKnowledge(sb, knowledge, compact);
-        AppendSkills(sb, skills);
+            AppendKnowledge(
+                sb, knowledge, compact, p.Model.TokenOptimization, query);
+        AppendSkills(sb, skills, p.Model.TokenOptimization, query);
         return sb.ToString();
     }
 
     /// <summary>System prompt for a hard-sandboxed public service agent (public-listed items only, no tools).</summary>
     private static string BuildServiceSystemPrompt(MeshProfile p, PublishedService svc,
-        IReadOnlyList<KnowledgeItem> knowledge, IReadOnlyList<Skill> skills, IReadOnlyList<Widget> widgets)
+        IReadOnlyList<KnowledgeItem> knowledge,
+        IReadOnlyList<Skill> skills,
+        IReadOnlyList<Widget> widgets,
+        string query)
     {
         var compact = IsSmall(p.Model.Provider);
         var sb = new StringBuilder();
@@ -791,8 +817,9 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         if (knowledge.Count == 0)
             sb.AppendLine("\n(No public knowledge attached. Answer only from the service description and skills.)");
         else
-            AppendKnowledge(sb, knowledge, compact);
-        AppendSkills(sb, skills);
+            AppendKnowledge(
+                sb, knowledge, compact, p.Model.TokenOptimization, query);
+        AppendSkills(sb, skills, p.Model.TokenOptimization, query);
         return sb.ToString();
     }
 
@@ -885,30 +912,53 @@ Widget runtime restrictions:
         sb.AppendLine("Keep prose as markdown outside the block. Most replies need no app.");
     }
 
-    private static void AppendKnowledge(StringBuilder sb, IReadOnlyList<KnowledgeItem> items, bool compact)
+    private static void AppendKnowledge(
+        StringBuilder sb,
+        IReadOnlyList<KnowledgeItem> items,
+        bool compact,
+        TokenOptimizationLevel optimization,
+        string query)
     {
         if (items.Count == 0) { sb.AppendLine(); sb.AppendLine("(No knowledge items yet.)"); return; }
+        var selection = TokenOptimizer.SelectKnowledge(items, query, optimization);
         sb.AppendLine();
         sb.AppendLine("=== Knowledge ===");
-        var perItem = compact ? 500 : 4000;
-        foreach (var k in items)
+        var perItem = TokenOptimizer.KnowledgeContentLimit(optimization, compact);
+        foreach (var k in selection.Included)
         {
             sb.AppendLine($"## {k.Title} [{k.Visibility}]");
-            sb.AppendLine(Truncate(k.Content, perItem));
+            sb.AppendLine(TokenOptimizer.Normalize(optimization) == TokenOptimizationLevel.Disabled
+                ? Truncate(k.Content, perItem)
+                : TokenOptimizer.FitContextText(k.Content, perItem));
         }
+        if (selection.Omitted.Count > 0)
+            sb.AppendLine("Other saved knowledge not included in this optimized request: "
+                + Truncate(string.Join(", ", selection.Omitted.Select(item => item.Title)), 600));
     }
 
-    private static void AppendSkills(StringBuilder sb, IReadOnlyList<Skill> skills)
+    private static void AppendSkills(
+        StringBuilder sb,
+        IReadOnlyList<Skill> skills,
+        TokenOptimizationLevel optimization,
+        string query)
     {
         if (skills.Count == 0) return;
+        var selection = TokenOptimizer.SelectSkills(skills, query, optimization);
+        var instructionLimit = TokenOptimizer.SkillInstructionLimit(optimization);
         sb.AppendLine();
         sb.AppendLine("=== Skills you can offer ===");
-        foreach (var s in skills)
+        foreach (var s in selection.Included)
         {
             sb.AppendLine($"## {s.Name} [{s.Visibility}]");
             if (!string.IsNullOrWhiteSpace(s.Description)) sb.AppendLine(s.Description);
-            if (!string.IsNullOrWhiteSpace(s.Instructions)) sb.AppendLine($"How: {s.Instructions}");
+            if (!string.IsNullOrWhiteSpace(s.Instructions))
+                sb.AppendLine("How: " + (instructionLimit == int.MaxValue
+                    ? s.Instructions
+                    : TokenOptimizer.FitContextText(s.Instructions, instructionLimit)));
         }
+        if (selection.Omitted.Count > 0)
+            sb.AppendLine("Other saved skills not included in this optimized request: "
+                + Truncate(string.Join(", ", selection.Omitted.Select(item => item.Name)), 400));
     }
 
     private static string Truncate(string s, int max)

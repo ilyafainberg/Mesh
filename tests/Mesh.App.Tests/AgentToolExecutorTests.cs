@@ -37,6 +37,27 @@ public sealed class AgentToolExecutorTests
     }
 
     [TestMethod]
+    public async Task VisibleTool_ReportsRawResultButReturnsOptimizedCopy()
+    {
+        var progress = new RecordingProgress();
+        var raw = JsonSerializer.Serialize(new
+        {
+            results = Enumerable.Range(1, 40).Select(index => new { id = index, value = $"value-{index}" })
+        });
+        var tool = new TestTool("web_search", isInternal: false, _ => raw);
+
+        var result = await AgentToolExecutor.ExecuteAsync(
+            [tool], tool.Name, "{}", CancellationToken.None, progress, TokenOptimizationLevel.Balanced);
+
+        Assert.HasCount(2, progress.Steps);
+        Assert.AreEqual(raw, progress.Steps[1].Result);
+        Assert.AreEqual(
+            TokenOptimizer.OptimizeToolResult(tool.Name, raw, TokenOptimizationLevel.Balanced),
+            result);
+        Assert.AreNotEqual(raw, result);
+    }
+
+    [TestMethod]
     public async Task InternalToolFailure_RemainsHiddenAndReturnsErrorToModel()
     {
         var progress = new RecordingProgress();

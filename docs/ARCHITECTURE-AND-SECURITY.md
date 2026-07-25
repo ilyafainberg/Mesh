@@ -532,6 +532,7 @@ The relay can offer optional convenience services. Each is authenticated by **de
 - **Budget**: a **per-handle daily token budget**.
 - **Secret handling**: the relay holds the **upstream provider key server-side**; clients **never see it**.
 - **Trust boundary**: content sent to the hosted model is, by nature, visible to the model proxy path for that request. This is an explicit, optional convenience; users who do not want it can configure their own provider in the client.
+- **Client-side request optimization**: before provider-specific serialization, the reference client can create a smaller, ephemeral projection of authorized conversation history, knowledge, skills, and tool results. The hosted proxy receives that projection rather than the durable source records. This reduces tokens but does not hide the projected plaintext from the proxy path.
 
 ### 7.2 Connector OAuth Broker
 
@@ -582,6 +583,8 @@ This section describes client storage as **externally observable security proper
 - Memory additions, updates, and deletion tombstones synchronize only inside end-to-end-encrypted linked-device traffic. The relay can observe the encrypted device-sync envelope metadata but cannot read the memory payload.
 - The client selects a small relevant subset for each Me turn. Those selected memories become part of that turn's model prompt; a configured cloud model provider can therefore read the selected text, just as it can read the rest of that model request.
 - Automatic capture requires direct support in the owner's latest message, rejects credential-like and payment data, and requires an explicit remember request for recognized sensitive personal information. These checks reduce accidental retention but are not a substitute for trusting the client device and configured model.
+- Token optimization creates only an in-flight model-request projection. It does not mutate the encrypted conversation, memories, knowledge, skills, or raw tool results from which the projection was built. System and security instructions and the latest user turn remain verbatim.
+- Relevance selection for knowledge and skills occurs only after the client has applied the owner, circle, contact, or public-service visibility rules. Optimization can reduce an already-authorized set, but cannot broaden it.
 - Client-only group records persist the group ID, name, owner handle, member list, and membership version. Group chat lines also persist the actual sender handle so the UI can attribute each message.
 
 ### 8.2 Relay
@@ -638,7 +641,7 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 | **Passive network observer** | Sees WebSocket traffic | Transport is over SignalR WebSockets; bodies are already E2E ciphertext independent of transport encryption. |
 | **Vote manipulation on the directory** | Tries to stuff votes | Voting requires an **attested usage event**; ranking uses a **Wilson score lower bound**. |
 | **Stolen client backup** | Has an encrypted backup file | Backup is **passphrase-encrypted** and excludes device signing keys; without the passphrase it is not usable. |
-| **Cloud model provider** | Receives a Me-topic model request containing selected relevant memories | Choose an on-device model when the selected memory and topic content must not leave the device. Memory is never routed into Messages or public-service execution. |
+| **Cloud model provider** | Receives the in-flight model-request projection, including any selected relevant memories, knowledge, skills, and tool results | Token optimization reduces what is sent but is not a confidentiality boundary. Choose an on-device model when request content must not leave the device. Memory is never routed into Messages or public-service execution. |
 
 ### 9.3 The Metadata Tradeoff (Explicit)
 
