@@ -41,7 +41,7 @@
 
         <!-- Versions -->
         <ApplicationDisplayVersion>1.11.1</ApplicationDisplayVersion>
-        <ApplicationVersion>53</ApplicationVersion>
+        <ApplicationVersion>54</ApplicationVersion>
         <!-- Drives AssemblyVersion/FileVersion/InformationalVersion, read by the self-updater. -->
         <Version>1.11.1</Version>
 
