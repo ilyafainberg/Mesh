@@ -133,6 +133,32 @@ public sealed class DeviceTopicDbTests
     }
 
     [TestMethod]
+    public void TopicReplyCorrelation_PersistsAndLoads()
+    {
+        var at = new DateTimeOffset(2026, 7, 25, 10, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("reply-order", "Reply order", at);
+            db.AppendOwnChat("reply-order", new ChatLine
+            {
+                Id = "answer-1",
+                Role = "assistant",
+                Text = "done",
+                ReplyToLineId = "prompt-1",
+                At = at
+            });
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var answer = reopened.LoadProfile()!.OwnThreads
+            .Single(thread => thread.Id == "reply-order")
+            .Lines.Single();
+        Assert.AreEqual("prompt-1", answer.ReplyToLineId);
+    }
+
+    [TestMethod]
     public void SetOwnThreadExecution_PersistsAndLoads()
     {
         var execAt = DateTimeOffset.UtcNow.AddMinutes(-5);
@@ -373,6 +399,52 @@ public sealed class DeviceTopicDbTests
         Assert.AreEqual("valid", applied.Lines[0].Text);
         Assert.AreEqual(parentAt.UtcTicks, applied.LastActivityAt?.UtcTicks);
         Assert.AreEqual(validVersion, db.GetSyncVersion(versionKey));
+    }
+
+    [TestMethod]
+    public void ComposerDrafts_PersistIndependentlyAndClear()
+    {
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.SetConversationDraft("alice", "message draft");
+            db.SetConversationDraft("bob", "other message draft");
+            db.SetTopicDraft("alice", "topic draft");
+        }
+        SqliteConnection.ClearAllPools();
+
+        using (var reopened = MeshDb.Open(databasePath, key))
+        {
+            Assert.AreEqual("message draft", reopened.GetConversationDraft("alice"));
+            Assert.AreEqual("other message draft", reopened.GetConversationDraft("bob"));
+            Assert.AreEqual("topic draft", reopened.GetTopicDraft("alice"));
+            Assert.AreEqual("", reopened.GetTopicDraft("missing"));
+            reopened.SetConversationDraft("alice", "");
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var cleared = MeshDb.Open(databasePath, key);
+        Assert.AreEqual("", cleared.GetConversationDraft("alice"));
+        Assert.AreEqual("other message draft", cleared.GetConversationDraft("bob"));
+        Assert.AreEqual("topic draft", cleared.GetTopicDraft("alice"));
+    }
+
+    [TestMethod]
+    public void DeletingConversationOrTopic_RemovesOnlyItsComposerDraft()
+    {
+        using var db = MeshDb.Open(databasePath, key);
+        db.EnsureConversation("shared");
+        db.EnsureOwnThread("shared", "Topic", DateTimeOffset.UtcNow);
+        db.SetConversationDraft("shared", "message draft");
+        db.SetTopicDraft("shared", "topic draft");
+
+        db.DeleteConversation("shared");
+
+        Assert.AreEqual("", db.GetConversationDraft("shared"));
+        Assert.AreEqual("topic draft", db.GetTopicDraft("shared"));
+
+        db.DeleteOwnThread("shared");
+
+        Assert.AreEqual("", db.GetTopicDraft("shared"));
     }
 
     [TestMethod]

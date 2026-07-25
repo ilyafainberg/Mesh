@@ -72,6 +72,11 @@ public sealed class DirectoryClient(AppState state, IHttpClientFactory httpFacto
     /// </summary>
     public async Task<bool> PublishAsync(PublishedService svc, CancellationToken ct = default)
     {
+        if (!PlatformCaps.CanHostServices)
+        {
+            Log?.Invoke("publish rejected: service hosting is desktop-only");
+            return false;
+        }
         if (svc is null || string.IsNullOrWhiteSpace(svc.Id)) return false;
         var p = state.Profile;
         if (string.IsNullOrWhiteSpace(p.PrivateKey) || string.IsNullOrWhiteSpace(p.PublicKey)) return false;

@@ -35,7 +35,7 @@
             </button>
         </div>
 
-        @if (State.Profile.OwnThreads.Count == 0)
+        @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsDeviceSnapshotSyncing)
         {
             <div class="list-empty">
                 <i class="bi bi-chat-heart"></i>
@@ -46,6 +46,10 @@
         else
         {
             <div class="thread-rows" @ref="threadRowsEl">
+                @if (Mesh.IsDeviceSnapshotSyncing)
+                {
+                    <DeviceSyncPlaceholder Text="More chats are syncing..." />
+                }
                 @foreach (var section in ThreadSections)
                 {
                     <h3 class="thread-section-title">@section.Label</h3>
@@ -72,7 +76,16 @@
                                             </span>
                                         }
                                     </span>
-                                    @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                                    @if (IsTopicBusy(t))
+                                    {
+                                        <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
+                                            <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
+                                        </span>
+                                    }
+                                    else if (State.IsThreadCompleted(t.Id))
+                                    {
+                                        <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
+                                    }
                                     @if (t.IsPinned) { <i class="bi bi-pin-angle-fill row-pin-status" title="Pinned" aria-label="Pinned"></i> }
                                     <i class="bi bi-chevron-right row-chevron"></i>
                                 </button>
@@ -170,8 +183,9 @@ else
             </div>
         }
 
-        <div class="messages" @ref="scrollEl">
-            <div class="messages-wrap">
+        <div class="messages-frame">
+            <div class="messages" @ref="scrollEl">
+                <div class="messages-wrap">
                 @if (Active.Lines.Count == 0)
                 {
                     <div class="empty">
@@ -179,7 +193,7 @@ else
                         and helps you manage what your public agent shares with others. Ask it anything.
                     </div>
                 }
-                @foreach (var line in Active.Lines.Where(l => !l.Internal))
+                @foreach (var line in OrderedVisibleLines.Where(line => !IsQueued(line)))
                 {
                     <div class="bubble @(line.Role)">
                         @if (!string.IsNullOrEmpty(line.Reasoning))
@@ -196,10 +210,6 @@ else
                         }
                         <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                         OnPin="html => PinWidget(html, line)" />
-                        @if (IsQueued(line))
-                        {
-                            <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
-                        }
                     </div>
                 }
                 @if (ActiveBusy)
@@ -277,7 +287,7 @@ else
                             }
                             <div class="planning-row">
                                 <i class="bi bi-arrow-repeat spin"></i>
-                                @(string.IsNullOrWhiteSpace(remote.Status) ? remote.Phase.ToString() : remote.Status)
+                                @RemoteRunPresentation.StatusLabel(remote)
                             </div>
                             @if (remote.Steps is { Count: > 0 })
                             {
@@ -303,7 +313,20 @@ else
                         }
                     </div>
                 }
+                @foreach (var line in OrderedVisibleLines.Where(IsQueued))
+                {
+                    <div class="bubble @(line.Role)">
+                        <MessageContent Text="@line.Text" Attachments="@line.Attachments"
+                                        OnPin="html => PinWidget(html, line)" />
+                        <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
+                    </div>
+                }
+                </div>
             </div>
+            <button type="button" class="scroll-to-latest" @ref="scrollToLatestEl" hidden aria-hidden="true"
+                    title="Jump to latest message" aria-label="Jump to latest message" @onclick="ScrollToLatest">
+                <i class="bi bi-arrow-down"></i>
+            </button>
         </div>
 
         <div class="composer-area">
@@ -396,15 +419,18 @@ else
                     </button>
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
                               placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
-                    @if (ActiveBusy)
+                    @if (ShowStopAction)
                     {
                         <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop current run" aria-label="Stop current run">
                             <i class="bi bi-stop-fill"></i>
                         </button>
                     }
-                    <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend)" title="@SendTitle" aria-label="@SendTitle">
-                        <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
-                    </button>
+                    else
+                    {
+                        <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend)" title="@SendTitle" aria-label="@SendTitle">
+                            <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
+                        </button>
+                    }
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 @if (Active is not null && !ActiveDeviceOnline)
@@ -468,7 +494,17 @@ else
 <ReportDialog @ref="reportDialog" />
 
 @code {
-    string input = "";
+    string inputValue = "";
+    string input
+    {
+        get => inputValue;
+        set
+        {
+            if (string.Equals(inputValue, value, StringComparison.Ordinal)) return;
+            inputValue = value;
+            if (activeThreadValue is not null) State.SetTopicDraft(activeThreadValue, value);
+        }
+    }
     ReportDialog? reportDialog;
     // Per-thread run state (busy/building/queue) lives in AppState (the singleton), NOT here, so a
     // running turn and its thinking indicator survive navigating away from and back to the Me section,
@@ -484,22 +520,36 @@ else
     bool confirmDelete;
     bool renaming;
     string renameText = "";
-    string? activeThread;
+    string? activeThreadValue;
+    string? activeThread
+    {
+        get => activeThreadValue;
+        set
+        {
+            if (string.Equals(activeThreadValue, value, StringComparison.Ordinal)) return;
+            activeThreadValue = value;
+            inputValue = value is null ? "" : State.GetTopicDraft(value);
+        }
+    }
     string? pinHtml;
     string pinName = "";
     string? pinPrompt;
     string? pinError;
     ElementReference scrollEl;
+    ElementReference scrollToLatestEl;
     ElementReference composerEl;
     ElementReference threadRowsEl;
     Microsoft.JSInterop.DotNetObjectReference<MobileMe>? selfRef;
     bool composerWired;
     int lastCount = -1;
+    string? lastScrolledThread;
     bool lastBusy;
     bool disposed;
 
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
-    RemoteRunProjection? RemoteRun => Active is null ? null : State.GetRemoteRunProjection(Active.Id);
+    RemoteRunProjection? RemoteRun => Active is null ? null : RemoteRunPresentation.VisibleProjection(
+        State.GetRemoteRunProjection(Active.Id),
+        State.IsThreadBusy(Active.Id));
     bool ActiveBusy => Active is not null &&
         (State.IsThreadBusy(Active.Id)
          || RemoteRun is { } activeRemoteRun && RemoteRunActivity.IsProjectionFresh(activeRemoteRun, DateTimeOffset.UtcNow)
@@ -516,9 +566,13 @@ else
     bool ActiveUsesCurrentDevice => Active is null
         || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
         || string.Equals(Active.ExecutionDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+    bool HasSendableDraft => !string.IsNullOrWhiteSpace(input)
+        || attachments.Count > 0
+        || selectedWidget is not null;
+    bool ShowStopAction => TopicComposerPresentation.ShowStop(ActiveBusy, HasSendableDraft);
     bool CanSend => ActiveDeviceOnline
         && (!ActiveUsesCurrentDevice || Agent.IsModelReady)
-        && (!string.IsNullOrWhiteSpace(input) || attachments.Count > 0 || selectedWidget is not null);
+        && HasSendableDraft;
     string SendTitle => !ActiveDeviceOnline
         ? $"{DeviceLabel(Active!)} is offline"
         : ActiveUsesCurrentDevice && !Agent.IsModelReady
@@ -528,11 +582,12 @@ else
     readonly List<StagedFile> attachments = new();
     string? attachError;
 
-    // Tier-1 steerable input: messages submitted while a thread's turn is running are queued for that
-    // thread (shown immediately as a subtle "queued" line) and answered together in ONE follow-up turn
-    // after the current one finishes, in order. A thread never runs two of its own turns concurrently,
-    // but different threads run independently.
+    // Messages submitted while a topic is busy stay visible below the live response. The runner answers
+    // them FIFO, one serialized turn per prompt, and reply correlation restores prompt/answer pairing.
     bool IsQueued(ChatLine line) => State.IsLineQueued(line);
+    IReadOnlyList<ChatLine> OrderedVisibleLines => Active is null
+        ? Array.Empty<ChatLine>()
+        : TopicTranscriptOrdering.OrderForDisplay(Active.Lines.Where(line => !line.Internal));
 
     // Assistant lines whose reasoning ("thinking") section is currently expanded.
     readonly HashSet<ChatLine> expandedReasoning = new();
@@ -618,6 +673,7 @@ else
     protected override void OnInitialized()
     {
         State.Changed += Refresh;
+        Mesh.DeviceSyncStateChanged += Refresh;
         // Deep-link: /m/me?thread=id opens that topic (used by Search). Otherwise land on the LIST
         // view - on mobile we do NOT auto-open the most recent thread; the user picks one.
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
@@ -663,6 +719,8 @@ else
         // mutually exclusive, so firstRender alone cannot initialize both.
         if (Active is null)
         {
+            composerWired = false;
+            lastScrolledThread = null;
             try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false); } catch { }
             try { await JS.InvokeVoidAsync("meshUI.swipeActions", threadRowsEl); } catch { }
             return;
@@ -684,20 +742,33 @@ else
             }
         }
 
+        try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
+
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
         // (busy true->false): the reply is added while the thread is still busy, so tracking that
         // transition guarantees the final answer scrolls into view even if its line count collides
         // with an earlier render.
         var count = Active?.Lines.Count ?? 0;
-        if (firstRender || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
+        var activeChanged = activeThread != lastScrolledThread;
+        if (activeChanged)
+        {
+            try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
+        }
+        if (firstRender || activeChanged || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
         {
             lastCount = count;
             lastBusy = ActiveBusy;
-            // autoScroll is idempotent: it attaches the sticky observer the first time scrollEl is real
-            // (mobile only mounts it when a thread overlay opens), then keeps the pane pinned to bottom.
-            try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl); } catch { }
-            try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
+            lastScrolledThread = activeThread;
+            var method = firstRender || activeChanged
+                ? "meshUI.scrollToBottom"
+                : "meshUI.scrollToBottomIfPinned";
+            try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
         }
+    }
+
+    async Task ScrollToLatest()
+    {
+        try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
     }
 
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
@@ -929,6 +1000,28 @@ else
         try { await JS.InvokeVoidAsync("meshUI.resetComposer", composerEl); } catch { }
     }
 
+    bool ClearSubmittedDraft(string threadId, string submittedText)
+    {
+        if (!string.Equals(activeThread, threadId, StringComparison.Ordinal))
+        {
+            State.SetTopicDraft(threadId, "");
+            return false;
+        }
+        if (!string.Equals(input, submittedText, StringComparison.Ordinal)) return false;
+        input = "";
+        return true;
+    }
+
+    void RestoreSubmittedDraft(string threadId, string submittedText)
+    {
+        if (string.Equals(activeThread, threadId, StringComparison.Ordinal))
+        {
+            if (input.Length == 0) input = submittedText;
+            return;
+        }
+        State.SetTopicDraft(threadId, submittedText);
+    }
+
     async Task PickFile()
     {
         attachError = null;
@@ -982,9 +1075,10 @@ else
     {
         if (!CanSend) return;
 
+        var text = input;
         var thread = Active ?? State.NewOwnThread("New chat", ToExecutionDevice(CurrentDevice));
         activeThread = thread.Id;
-        var text = input;
+        input = text;
         var chosenWidget = selectedWidget;
         var titleText = !string.IsNullOrWhiteSpace(text)
             ? text
@@ -1031,20 +1125,20 @@ else
             widgetContext,
             loadedAttachments);
 
-        input = "";
+        var clearedVisibleDraft = ClearSubmittedDraft(thread.Id, text);
         attachments.Clear();
         widgetMode = false;
         widgetPickerOpen = false;
         selectedWidget = null;
         attachError = null;
-        _ = ResetComposer();
+        if (clearedVisibleDraft) _ = ResetComposer();
 
         try
         {
             var result = await TopicRouter.SubmitAsync(draft, null, CancellationToken.None);
             if (!result.Accepted)
             {
-                input = text;
+                RestoreSubmittedDraft(thread.Id, text);
                 attachments.AddRange(files);
                 widgetMode = wasWidget;
                 selectedWidget = chosenWidget;
@@ -1053,7 +1147,7 @@ else
         }
         catch (Exception ex)
         {
-            input = text;
+            RestoreSubmittedDraft(thread.Id, text);
             attachments.AddRange(files);
             widgetMode = wasWidget;
             selectedWidget = chosenWidget;
@@ -1135,6 +1229,13 @@ else
         IsCurrentDevice(device)
             ? Agent.IsModelReady
             : device.Online && device.CanHostRemoteTurn;
+
+    bool IsTopicBusy(OwnThread thread) => RemoteRunActivity.IsBusy(
+        thread,
+        State.IsThreadBusy(thread.Id),
+        State.GetRemoteRunProjection(thread.Id),
+        IsAssignedElsewhere(thread),
+        DateTimeOffset.UtcNow);
 
     bool IsAssignedElsewhere(OwnThread thread) =>
         !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
@@ -1232,6 +1333,7 @@ else
         _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
         State.Changed -= Refresh;
         Mesh.StateChanged -= OnMeshStateChanged;
+        Mesh.DeviceSyncStateChanged -= Refresh;
         selfRef?.Dispose();
     }
 }

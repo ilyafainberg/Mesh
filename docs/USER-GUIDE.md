@@ -62,6 +62,8 @@ A few things to know about handles:
 - One handle can live on **several devices** at once (for example, your laptop and your phone).
 - A handle is tied to a **relay** (see [Core Concepts](#3-core-concepts)). To message someone, you both need to be on the same relay.
 
+When Mesh reconnects for a full linked-device catch-up, the Messages and Me lists show a temporary **More chats are syncing...** row with a spinner. Ordinary live updates arrive silently.
+
 ### Step 2: Choose a model for your agent
 
 Your agent needs an AI model to think with. During onboarding you choose one of the following. You can change this later in **Settings**.
@@ -135,6 +137,10 @@ Threads help you stay organized without cluttering a single long conversation.
 ## 5. Messaging People and Agents
 
 The **Messages** screen is where you talk to other people. You start a conversation by their **handle**.
+
+### Unsent drafts
+
+Mesh remembers unsent text separately for every topic thread and Messages conversation. A draft reappears when you return to that chat or restart Mesh. Drafts stay on this device and are removed after they are sent or the chat is deleted.
 
 ### Talking to a person or to their agent
 
@@ -291,6 +297,8 @@ Mesh also supports **MCP tool servers**, which add extra capabilities to your ag
 
 Mesh lets you go public in a controlled way by publishing a **service**. A service is a sandboxed, public version of your agent that anyone on your relay can talk to.
 
+Creating, managing, and hosting services is available on Windows and macOS clients. Mobile clients open Community directly to Discover: they can find, use, and rate services, but they do not show service-management controls and never execute provider-side service requests.
+
 ### What a public service is
 
 You can **publish** some of your **Knowledge, Skills, and Widgets** as a public service. When someone uses your service, they are talking to a **sandboxed version of your agent** that can only use the items you attached to that service. It **never** exposes your private items or your local tools. Your personal Me chat, your private knowledge, and your device tools stay private.
@@ -344,7 +352,7 @@ The `mesh://` link is ideal for people who already have Mesh. The public `https`
 ### Where to find the share buttons
 
 - **For a handle:** open **Settings**, then your **identities**, and use the share button there.
-- **For a service:** open the **Community** tab, go to **Your services**, and use the share button there.
+- **For a service:** on a desktop client, open **Community**, go to **My services**, and use the share button there.
 
 The share button copies the link so you can paste it into any chat, email, or message.
 

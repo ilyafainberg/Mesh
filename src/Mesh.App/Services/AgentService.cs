@@ -35,10 +35,9 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
 
     /// <summary>
     /// Runs an owner turn over the thread's EXISTING history WITHOUT appending a new user line.
-    /// Used to answer messages the user queued while a previous turn was still running: those
-    /// lines are already in the thread, so this only generates and stores the reply. Answering
-    /// them in one continuation turn (they are consecutive user turns in the history) batches
-    /// the queued guidance in order without ever running two turns concurrently.
+    /// Used to answer a message queued while a previous turn was still running: its line is already
+    /// in the thread, so this only generates and stores the correlated reply. The topic runner invokes
+    /// one serialized continuation per queued prompt so every prompt is followed by its own answer.
     /// </summary>
     public async Task<string> ContinueAsOwnerAsync(string threadId, CancellationToken ct = default)
         => await ContinueOwnerCoreAsync(
@@ -202,7 +201,13 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             var (reasoning, finalAnswer) = ReasoningExtract.FromText(answer);
             finalAnswer = ExpandWidgets(finalAnswer, p.Widgets);
             finalAnswer = AppendImages(finalAnswer, images);
-            state.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = finalAnswer, Reasoning = reasoning });
+            state.AddOwnChatLine(thread.Id, new ChatLine
+            {
+                Role = "assistant",
+                Text = finalAnswer,
+                Reasoning = reasoning,
+                ReplyToLineId = triggerLineId
+            });
             return finalAnswer;
         }
     }

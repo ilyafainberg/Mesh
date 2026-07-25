@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using Mesh.App.Domain;
 using Mesh.Shared;
 
@@ -81,4 +82,57 @@ public interface ITopicExecutionRouter
 
     Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Accepts progress synchronously, then processes every report in FIFO order. Completion drains all
+/// accepted reports before returning so a terminal update cannot overtake planning, tool, or stream updates.
+/// </summary>
+internal sealed class OrderedAsyncProgress<T> : IProgress<T>
+{
+    private readonly Channel<T> queue = Channel.CreateUnbounded<T>(new UnboundedChannelOptions
+    {
+        SingleReader = true,
+        SingleWriter = false,
+        AllowSynchronousContinuations = false
+    });
+    private readonly Func<T, Task> handler;
+    private readonly Action<Exception>? onError;
+    private readonly Task drainTask;
+    private int completed;
+
+    public OrderedAsyncProgress(Func<T, Task> handler, Action<Exception>? onError = null)
+    {
+        this.handler = handler ?? throw new ArgumentNullException(nameof(handler));
+        this.onError = onError;
+        drainTask = DrainAsync();
+    }
+
+    public void Report(T value)
+    {
+        if (Volatile.Read(ref completed) != 0 || !queue.Writer.TryWrite(value))
+            throw new InvalidOperationException("Progress has already completed.");
+    }
+
+    public async Task CompleteAsync()
+    {
+        if (Interlocked.Exchange(ref completed, 1) == 0)
+            queue.Writer.TryComplete();
+        await drainTask.ConfigureAwait(false);
+    }
+
+    private async Task DrainAsync()
+    {
+        await foreach (var value in queue.Reader.ReadAllAsync().ConfigureAwait(false))
+        {
+            try
+            {
+                await handler(value).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (onError is not null)
+            {
+                onError(ex);
+            }
+        }
+    }
 }

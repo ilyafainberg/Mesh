@@ -14,6 +14,7 @@ namespace Mesh.App.Services
         public int RegisteredRemoteRuns { get; private set; }
         public int ClearedRemoteRuns { get; private set; }
         public bool Busy { get; private set; }
+        public QueuedTopicRunState QueuedRuns { get; } = new();
 
         public static string Norm(string value) => value.Trim().TrimStart('@').ToLowerInvariant();
 
@@ -49,7 +50,27 @@ namespace Mesh.App.Services
             ClearedRemoteRuns++;
         }
 
-        public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update) { }
+        public void TrackQueuedTopicRun(string threadId, string runId, string lineId)
+            => QueuedRuns.MarkWaiting(threadId, runId, lineId);
+        public void StartQueuedTopicRun(string threadId, string runId)
+            => QueuedRuns.MarkStarted(threadId, runId);
+        public void CompleteQueuedTopicRun(string threadId, string runId)
+            => QueuedRuns.Complete(threadId, runId);
+        public int QueuedCountForThread(string threadId) => QueuedRuns.WaitingCount(threadId);
+        public bool IsLineQueued(string lineId) => QueuedRuns.IsLineWaiting(lineId);
+
+        public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
+        {
+            if (update.Phase == TopicRunPhase.Queued)
+            {
+                if (update.Queued > 0 && update.TriggerLineId is not null)
+                    TrackQueuedTopicRun(update.ThreadId, update.RunId, update.TriggerLineId);
+            }
+            else if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
+                CompleteQueuedTopicRun(update.ThreadId, update.RunId);
+            else
+                StartQueuedTopicRun(update.ThreadId, update.RunId);
+        }
         public void SetAgentRun(AgentRunState run)
             => Profile.OwnThreads.Single(item => item.Id == run.ThreadId).ExecutionRunId = run.RunId;
 
@@ -207,6 +228,61 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task EligibleDeviceRefreshes_AreSerializedSoThePickerGetsTheNewestResult()
+        {
+            var state = StateWithThread();
+            var transport = new SequencedDeviceTransport();
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+
+            var startupLoad = router.ListEligibleDevicesAsync(CancellationToken.None);
+            await transport.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            var pickerLoad = router.ListEligibleDevicesAsync(CancellationToken.None);
+
+            Assert.AreEqual(1, transport.Calls, "the picker refresh must wait behind the startup refresh");
+            transport.FirstResult.SetResult([]);
+            var startupDevices = await startupLoad;
+            await transport.SecondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            transport.SecondResult.SetResult(
+            [
+                new DeviceInfo("desktop", "Desktop", true, DevicePlatforms.Windows, true)
+            ]);
+            var pickerDevices = await pickerLoad;
+
+            Assert.AreEqual(1, startupDevices.Count);
+            Assert.AreEqual(2, pickerDevices.Count);
+            Assert.AreEqual("desktop", pickerDevices[1].DeviceId);
+        }
+
+        [TestMethod]
+        public async Task SubmissionBehindActiveRun_MarksTriggerLineQueued()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.ExecutionDeviceId = "target";
+            thread.ExecutionRunId = "active-run";
+            var transport = new RecordingTransport
+            {
+                Devices = [new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var progress = new RecordingProgress();
+            var draft = Draft() with
+            {
+                RunId = "queued-run",
+                TriggerLineId = "queued-line",
+                TargetDeviceId = "target"
+            };
+
+            var result = await router.SubmitAsync(draft, progress, CancellationToken.None);
+
+            Assert.IsTrue(result.Accepted);
+            Assert.IsTrue(state.IsLineQueued("queued-line"));
+            var queued = progress.Updates.Single(update => update.Phase == TopicRunPhase.Queued);
+            Assert.AreEqual(1, queued.Queued);
+            Assert.AreEqual("queued-line", queued.TriggerLineId);
+        }
+
+        [TestMethod]
         public async Task ValidationAndRunCorrelation_RejectBeforeMutation()
         {
             var state = StateWithThread();
@@ -276,6 +352,8 @@ namespace Mesh.App.Tests
             await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
             var secondTask = runner.ExecuteAsync(second, secondProgress, CancellationToken.None);
             await secondProgress.Queued.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.IsTrue(state.IsLineQueued("line-2"));
+            Assert.AreEqual("line-2", secondProgress.Updates[0].TriggerLineId);
 
             CollectionAssert.AreEqual(new[] { "run-1" }, order);
             releaseFirst.TrySetResult();
@@ -288,6 +366,9 @@ namespace Mesh.App.Tests
                 update.RunId == "run-1" && update.ThreadId == "thread-1"));
             Assert.IsTrue(secondProgress.Updates.All(update =>
                 update.RunId == "run-2" && update.ThreadId == "thread-1"));
+            Assert.IsFalse(state.IsLineQueued("line-2"));
+            Assert.IsTrue(secondProgress.Updates.Any(update =>
+                update.Phase == TopicRunPhase.Executing && update.Status == "Starting"));
         }
 
         [TestMethod]
@@ -409,6 +490,41 @@ namespace Mesh.App.Tests
             public Task<IReadOnlyList<DeviceInfo>> ListEligibleDevicesAsync(
                 CancellationToken cancellationToken)
                 => Task.FromResult(Devices);
+        }
+
+        private sealed class SequencedDeviceTransport : IDeviceTopicTransport
+        {
+            public int Calls { get; private set; }
+            public TaskCompletionSource FirstStarted { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public TaskCompletionSource SecondStarted { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public TaskCompletionSource<IReadOnlyList<DeviceInfo>> FirstResult { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public TaskCompletionSource<IReadOnlyList<DeviceInfo>> SecondResult { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public Task<TopicDispatchResult> DispatchAsync(
+                string targetDeviceId,
+                TopicRunRequestPayload request,
+                IReadOnlyList<ChatAttachment> attachments,
+                CancellationToken cancellationToken)
+                => Task.FromResult(TopicDispatchResult.Ok(request.RunId));
+
+            public Task<bool> CancelAsync(
+                string targetDeviceId,
+                TopicRunCancelPayload cancel,
+                CancellationToken cancellationToken)
+                => Task.FromResult(true);
+
+            public Task<IReadOnlyList<DeviceInfo>> ListEligibleDevicesAsync(
+                CancellationToken cancellationToken)
+            {
+                Calls++;
+                if (Calls == 1) { FirstStarted.TrySetResult(); return FirstResult.Task; }
+                SecondStarted.TrySetResult();
+                return SecondResult.Task;
+            }
         }
 
         private sealed class RecordingProgress : IProgress<TopicRunUpdatePayload>

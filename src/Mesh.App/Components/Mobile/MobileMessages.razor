@@ -58,6 +58,10 @@
             }
         </div>
         <div class="chat-rows" @ref="chatRowsEl">
+            @if (Mesh.IsDeviceSnapshotSyncing)
+            {
+                <DeviceSyncPlaceholder Text="More chats are syncing..." />
+            }
             @foreach (var section in ConversationSections)
             {
                 var sectionHeadingId = $"mobile-{section.Id}-conversations";
@@ -103,7 +107,7 @@
             }
         </div>
 
-        @if (!FilteredConversations.Any())
+        @if (!FilteredConversations.Any() && !Mesh.IsDeviceSnapshotSyncing)
         {
             <div class="empty conv-empty">@FilterEmptyText</div>
         }
@@ -200,8 +204,9 @@ else
             </div>
         }
 
-        <div class="messages" @ref="scrollEl">
-            <div class="messages-wrap">
+        <div class="messages-frame">
+            <div class="messages" @ref="scrollEl">
+                <div class="messages-wrap">
                 @foreach (var line in conv.Lines)
                 {
                     <div class="bubble @(line.Role == "user" ? "assistant" : "user")">
@@ -230,7 +235,12 @@ else
                 {
                     <div class="bubble assistant"><div class="text muted svc-thinking">@State.DisplayNameFor(active!) is thinking<span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>
                 }
+                </div>
             </div>
+            <button type="button" class="scroll-to-latest" @ref="scrollToLatestEl" hidden aria-hidden="true"
+                    title="Jump to latest message" aria-label="Jump to latest message" @onclick="ScrollToLatest">
+                <i class="bi bi-arrow-down"></i>
+            </button>
         </div>
 
         <div class="composer-area">
@@ -339,10 +349,30 @@ else
 <ReportDialog @ref="reportDialog" />
 
 @code {
-    string? active;
+    string? activeValue;
+    string? active
+    {
+        get => activeValue;
+        set
+        {
+            if (string.Equals(activeValue, value, StringComparison.OrdinalIgnoreCase)) return;
+            activeValue = value;
+            inputValue = value is null ? "" : State.GetConversationDraft(value);
+        }
+    }
     ReportDialog? reportDialog;
     string? confirmDelete;
-    string input = "";
+    string inputValue = "";
+    string input
+    {
+        get => inputValue;
+        set
+        {
+            if (string.Equals(inputValue, value, StringComparison.Ordinal)) return;
+            inputValue = value;
+            if (activeValue is not null) State.SetConversationDraft(activeValue, value);
+        }
+    }
     string newHandle = "";
     bool showGroupCreator;
     bool creatingGroup;
@@ -352,12 +382,13 @@ else
     bool busy;
     bool showWidgetPicker;
     Widget? selectedWidget;
-    bool directMode;
+    bool directMode = true;
     string? pinHtml;
     string pinName = "";
     string? pinPrompt;
     string? pinError;
     ElementReference scrollEl;
+    ElementReference scrollToLatestEl;
     ElementReference composerEl;
     ElementReference chatRowsEl;
     Microsoft.JSInterop.DotNetObjectReference<MobileMessages>? selfRef;
@@ -402,6 +433,7 @@ else
     {
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
+        Mesh.DeviceSyncStateChanged += Refresh;
 
         // Deep-link: /m/messages?to=handle opens that conversation (used by Search).
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
@@ -436,6 +468,7 @@ else
 
         if (active is null)
         {
+            lastActive = null;
             try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false); } catch { }
             try { await JS.InvokeVoidAsync("meshUI.swipeActions", chatRowsEl); } catch { }
             return;
@@ -450,14 +483,27 @@ else
             try { await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef); } catch { }
         }
 
+        try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
+
         var count = State.GetOrCreateConversation(active).Lines.Count;
         // Scroll on new messages or when switching into a conversation.
-        if (count != lastCount || active != lastActive)
+        var activeChanged = active != lastActive;
+        if (activeChanged)
+        {
+            try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
+        }
+        if (count != lastCount || activeChanged)
         {
             lastCount = count;
             lastActive = active;
-            try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
+            var method = activeChanged ? "meshUI.scrollToBottom" : "meshUI.scrollToBottomIfPinned";
+            try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
         }
+    }
+
+    async Task ScrollToLatest()
+    {
+        try { await JS.InvokeVoidAsync("meshUI.scrollToBottom", scrollEl); } catch { }
     }
 
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
@@ -959,6 +1005,7 @@ else
         _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
+        Mesh.DeviceSyncStateChanged -= Refresh;
         selfRef?.Dispose();
     }
 }

@@ -4,8 +4,8 @@ using Mesh.Shared;
 
 namespace Mesh.Relay.Push;
 
-/// <summary>The user-facing category a push alert falls into. Derived purely from the cleartext envelope Kind.</summary>
-public enum PushCategory { None, Message, Group }
+/// <summary>The user-facing category a push alert falls into.</summary>
+public enum PushCategory { None, Message, Group, TopicResponse }
 
 /// <summary>
 /// A ready-to-send, metadata-only push alert. Title/Body are composed by the relay from metadata it already
@@ -26,11 +26,12 @@ public interface IPushSender
 /// <summary>
 /// Composes and dispatches "Option 1" push alerts when a message is queued for an offline recipient.
 ///
-/// Privacy: the relay only ever sees the cleartext envelope Kind and the From/To handles, never message
-/// bodies (they are end-to-end encrypted). So the two alerts it can honestly compose are:
+/// Privacy: the relay only sees cleartext routing metadata (Kind, From/To, and an optional PushHint), never message
+/// bodies (they are end-to-end encrypted). The relay can compose three metadata-only alerts:
 ///   - direct message -> "Message from @sender"
-///   - group message  -> "New group message" (the relay never sees the group name; it is E2EE)
-/// Everything else (sync, receipts, topic-internal, control) produces no push.
+///   - group message -> "New group message" (the relay never sees the group name; it is E2EE)
+///   - completed topic turn -> "Your agent replied in a topic" (explicit metadata-only PushHint)
+/// Everything else (sync, receipts, topic progress, control) produces no push.
 ///
 /// The alert is dispatched fire-and-forget from the routing path via <see cref="NotifyOffline"/>, so it never
 /// adds latency to (or throws on) message delivery. When no push backend is configured, every call is a no-op.
@@ -46,6 +47,13 @@ public sealed class PushDispatcher(
 
     /// <summary>True when at least one push backend (APNs/FCM) is configured; otherwise every call is a no-op.</summary>
     public bool Enabled => byPlatform.Count > 0;
+
+    /// <summary>Maps cleartext routing metadata to a user-facing push category.</summary>
+    public static PushCategory Classify(MeshEnvelope env)
+    {
+        ArgumentNullException.ThrowIfNull(env);
+        return PushHintProtocol.IsTopicResponse(env) ? PushCategory.TopicResponse : Classify(env.Kind);
+    }
 
     /// <summary>Maps a cleartext envelope Kind to a user-facing push category (or None to suppress the push).</summary>
     public static PushCategory Classify(string kind) => kind switch
@@ -63,12 +71,13 @@ public sealed class PushDispatcher(
     /// </summary>
     /// <param name="toHandle">Recipient handle (normalized or not).</param>
     /// <param name="deviceId">When non-null, push only this device (device-targeted route, e.g. group fan-out).</param>
-    /// <param name="env">The envelope being queued; only its Kind and From are read.</param>
+    /// <param name="env">The envelope being queued; only routing metadata is read.</param>
     public void NotifyOffline(string toHandle, string? deviceId, MeshEnvelope env)
     {
         if (!Enabled) return;
-        if (Classify(env.Kind) == PushCategory.None) return;
-        _ = SafeSendAsync(toHandle, deviceId, env.Kind, env.From);
+        var category = Classify(env);
+        if (category == PushCategory.None) return;
+        _ = SafeSendAsync(toHandle, deviceId, category, env.From);
     }
 
     /// <summary>
@@ -81,15 +90,17 @@ public sealed class PushDispatcher(
     public void NotifyOfflineSiblings(string toHandle, MeshEnvelope env)
     {
         if (!Enabled) return;
-        if (Classify(env.Kind) == PushCategory.None) return;
-        _ = WakeOfflineSiblingsAsync(toHandle, env.Kind, env.From);
+        var category = Classify(env);
+        if (category == PushCategory.None) return;
+        _ = WakeOfflineSiblingsAsync(toHandle, category, env.From);
     }
 
-    private async Task SafeSendAsync(string toHandle, string? deviceId, string kind, string from)
+    private async Task SafeSendAsync(
+        string toHandle, string? deviceId, PushCategory category, string from)
     {
         try
         {
-            var alert = Compose(Classify(kind), from);
+            var alert = Compose(category, from);
             if (alert is null) return;
 
             var handle = Normalize(toHandle);
@@ -116,11 +127,15 @@ public sealed class PushDispatcher(
     /// Exposed (and self-guarded so it never throws) so the router can fire it, and so the offline-set
     /// computation is unit testable.
     /// </summary>
-    public async Task WakeOfflineSiblingsAsync(string toHandle, string kind, string from)
+    public Task WakeOfflineSiblingsAsync(string toHandle, string kind, string from)
+        => WakeOfflineSiblingsAsync(toHandle, Classify(kind), from);
+
+    private async Task WakeOfflineSiblingsAsync(
+        string toHandle, PushCategory category, string from)
     {
         try
         {
-            var alert = Compose(Classify(kind), from);
+            var alert = Compose(category, from);
             if (alert is null) return;
 
             var handle = Normalize(toHandle);
@@ -162,6 +177,8 @@ public sealed class PushDispatcher(
     {
         PushCategory.Message => new PushAlert("Mesh", $"Message from @{Normalize(fromHandle)}", "message"),
         PushCategory.Group => new PushAlert("Mesh", "New group message", "group"),
+        PushCategory.TopicResponse => new PushAlert(
+            "Mesh", "Your agent replied in a topic", "topic"),
         _ => null,
     };
 

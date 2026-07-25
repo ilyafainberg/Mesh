@@ -25,6 +25,8 @@ public sealed class MeshDb : IDisposable
         IReadOnlyList<DeviceSyncCircleRename> Renames);
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
+    private const string ConversationDraftKind = "conversation";
+    private const string TopicDraftKind = "topic";
     private static bool nativeInit;
 
     private readonly SqliteConnection conn;
@@ -81,6 +83,7 @@ public sealed class MeshDb : IDisposable
                 line_id TEXT,
                 role TEXT NOT NULL,
                 text TEXT NOT NULL,
+                reply_to_line_id TEXT,
                 via TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT '',
                 at TEXT NOT NULL);
@@ -88,6 +91,11 @@ public sealed class MeshDb : IDisposable
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS composer_drafts(
+                kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                PRIMARY KEY(kind, entity_id));
             CREATE TABLE IF NOT EXISTS sync_versions(
                 entity_key TEXT PRIMARY KEY,
                 version TEXT NOT NULL);
@@ -137,6 +145,7 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("own_chat", "internal", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("own_chat", "reasoning", "TEXT");
         AddColumnIfMissing("own_chat", "sender_handle", "TEXT");
+        AddColumnIfMissing("own_chat", "reply_to_line_id", "TEXT");
         // User-defined topic order. Existing rows retain their creation order through the fallback sort.
         AddColumnIfMissing("own_threads", "sort_order", "INTEGER");
         NormalizeOwnThreadOrder();
@@ -173,6 +182,59 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM profile;";
         return Convert.ToInt64(cmd.ExecuteScalar()) == 0;
+    }
+
+    // ---- composer drafts ---------------------------------------------------
+
+    public string GetConversationDraft(string handle)
+        => GetComposerDraft(ConversationDraftKind, handle);
+
+    public void SetConversationDraft(string handle, string text)
+        => SetComposerDraft(ConversationDraftKind, handle, text);
+
+    public string GetTopicDraft(string threadId)
+        => GetComposerDraft(TopicDraftKind, threadId);
+
+    public void SetTopicDraft(string threadId, string text)
+        => SetComposerDraft(TopicDraftKind, threadId, text);
+
+    private string GetComposerDraft(string kind, string entityId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT text FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        return cmd.ExecuteScalar() as string ?? "";
+    }
+
+    private void SetComposerDraft(string kind, string entityId, string text)
+    {
+        using var cmd = conn.CreateCommand();
+        if (text.Length == 0)
+        {
+            cmd.CommandText = "DELETE FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
+        }
+        else
+        {
+            cmd.CommandText = """
+                INSERT INTO composer_drafts(kind, entity_id, text) VALUES($kind, $id, $text)
+                ON CONFLICT(kind, entity_id) DO UPDATE SET text = excluded.text;
+                """;
+            cmd.Parameters.AddWithValue("$text", text);
+        }
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void DeleteComposerDraft(SqliteTransaction transaction, string kind, string entityId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = "DELETE FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", entityId);
+        cmd.ExecuteNonQuery();
     }
 
     // ---- profile + history --------------------------------------------------
@@ -339,7 +401,7 @@ public sealed class MeshDb : IDisposable
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = """
-                SELECT thread_id, role, text, via, at, line_id, status, internal, reasoning, sender_handle
+                SELECT thread_id, role, text, via, at, line_id, status, internal, reasoning, sender_handle, reply_to_line_id
                 FROM own_chat WHERE thread_id IS NOT NULL ORDER BY id;
                 """;
             using var r = cmd.ExecuteReader();
@@ -356,7 +418,8 @@ public sealed class MeshDb : IDisposable
                     Status = r.IsDBNull(6) ? "" : r.GetString(6),
                     Internal = !r.IsDBNull(7) && r.GetInt64(7) != 0,
                     Reasoning = r.IsDBNull(8) ? null : r.GetString(8),
-                    SenderHandle = r.IsDBNull(9) ? null : r.GetString(9)
+                    SenderHandle = r.IsDBNull(9) ? null : r.GetString(9),
+                    ReplyToLineId = r.IsDBNull(10) ? null : r.GetString(10)
                 });
             }
         }
@@ -651,6 +714,7 @@ public sealed class MeshDb : IDisposable
             topic.Parameters.AddWithValue("$id", id);
             topic.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, TopicDraftKind, id);
         UpsertSyncTombstone(tx, kind, id, version);
         tx.Commit();
     }
@@ -686,6 +750,7 @@ public sealed class MeshDb : IDisposable
             conversation.Parameters.AddWithValue("$handle", handle);
             conversation.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, ConversationDraftKind, handle);
         UpsertSyncTombstone(tx, kind, handle, version);
         tx.Commit();
     }
@@ -1067,8 +1132,8 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO own_chat(
-                line_id, thread_id, role, text, via, status, at, internal, reasoning, sender_handle)
-            VALUES($lid, $tid, $r, $x, $v, $s, $a, $i, $rz, $sender);
+                line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle)
+            VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $i, $rz, $sender);
             """;
         cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$tid", threadId);
@@ -1080,6 +1145,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$i", line.Internal ? 1 : 0);
         cmd.Parameters.AddWithValue("$rz", (object?)line.Reasoning ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$replyTo", (object?)line.ReplyToLineId ?? DBNull.Value);
         cmd.ExecuteNonQuery();
         AdvanceOwnThreadActivity(threadId, line.At);
     }
@@ -1094,7 +1160,8 @@ public sealed class MeshDb : IDisposable
             update.Transaction = tx;
             update.CommandText = """
                 UPDATE own_chat
-                SET role = $r, text = $x, via = $v, status = $s, at = $a,
+                SET role = $r, text = $x, reply_to_line_id = $replyTo,
+                    via = $v, status = $s, at = $a,
                     internal = $internal, reasoning = $reasoning, sender_handle = $sender
                 WHERE thread_id = $tid AND line_id = $lid;
                 """;
@@ -1107,8 +1174,8 @@ public sealed class MeshDb : IDisposable
             insert.Transaction = tx;
             insert.CommandText = """
                 INSERT INTO own_chat(
-                    line_id, thread_id, role, text, via, status, at, internal, reasoning, sender_handle)
-                VALUES($lid, $tid, $r, $x, $v, $s, $a, $internal, $reasoning, $sender);
+                    line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle)
+                VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $internal, $reasoning, $sender);
                 """;
             AddOwnChatParameters(insert, threadId, line);
             insert.ExecuteNonQuery();
@@ -1148,7 +1215,8 @@ public sealed class MeshDb : IDisposable
             update.Transaction = tx;
             update.CommandText = """
                 UPDATE own_chat
-                SET role = $r, text = $x, via = $v, status = $s, at = $a,
+                SET role = $r, text = $x, reply_to_line_id = $replyTo,
+                    via = $v, status = $s, at = $a,
                     internal = $internal, reasoning = $reasoning, sender_handle = $sender
                 WHERE thread_id = $tid AND line_id = $lid;
                 """;
@@ -1161,8 +1229,8 @@ public sealed class MeshDb : IDisposable
             insert.Transaction = tx;
             insert.CommandText = """
                 INSERT INTO own_chat(
-                    line_id, thread_id, role, text, via, status, at, internal, reasoning, sender_handle)
-                VALUES($lid, $tid, $r, $x, $v, $s, $a, $internal, $reasoning, $sender);
+                    line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle)
+                VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $internal, $reasoning, $sender);
                 """;
             AddOwnChatParameters(insert, threadId, line);
             insert.ExecuteNonQuery();
@@ -1242,6 +1310,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$internal", line.Internal ? 1 : 0);
         cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$replyTo", (object?)line.ReplyToLineId ?? DBNull.Value);
     }
 
     /// <summary>Records that a "Me" thread exists so an empty thread survives a reload.</summary>
@@ -1599,6 +1668,7 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$id", id);
             cmd.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, TopicDraftKind, id);
         tx.Commit();
     }
 
@@ -1649,6 +1719,7 @@ public sealed class MeshDb : IDisposable
             cmd.Parameters.AddWithValue("$h", handle);
             cmd.ExecuteNonQuery();
         }
+        DeleteComposerDraft(tx, ConversationDraftKind, handle);
         tx.Commit();
     }
 

@@ -154,6 +154,15 @@
     font-size: .84rem;
 }
 
+.topic-busy-indicator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--brand, #6d5dfc);
+    font-size: .85rem;
+    flex: none;
+}
+
 /* Completion indicator for a topic whose agent finished in the background. */
 .topic-unread {
     width: 10px;

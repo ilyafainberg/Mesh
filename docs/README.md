@@ -12,7 +12,7 @@ agent, and its open-source relay.
 | [Developer guide (open source)](DEVELOPER-GUIDE.md) | Contributors and client authors | The open-source components (`Mesh.Relay`, `Mesh.Shared`): building and running the relay, the `MeshCrypto` API and wire protocol, the relay REST + SignalR surface, and how to write an interoperable client. |
 | [Relay deployment guide](RELAY-DEPLOYMENT.md) | Operators self-hosting a relay | Deploying the relay with Docker or binaries, putting it behind TLS, the full configuration reference, storage and scaling (Cosmos + Redis), health and metrics, and operational best practices. |
 | [Self-hosting (short version)](SELF-HOSTING.md) | Operators who want the quick path | A condensed quick start for running your own relay. See the deployment guide for the comprehensive version. |
-| [Push notifications](PUSH-NOTIFICATIONS.md) | Operators and mobile client builders | The privacy model for mobile wake notifications (metadata-only "Message from @sender" / "New group message"), how token registration and offline wake work end to end, relay APNs/FCM configuration, and iOS/Android client provisioning. |
+| [Push notifications](PUSH-NOTIFICATIONS.md) | Operators and mobile client builders | The privacy model for mobile wake notifications (metadata-only message, group, and completed-topic alerts), how token registration and offline wake work end to end, relay APNs/FCM configuration, and iOS/Android client provisioning. |
 
 ## What is open source
 

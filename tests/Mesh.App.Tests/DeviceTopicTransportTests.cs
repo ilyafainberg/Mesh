@@ -32,6 +32,31 @@ public sealed class DeviceTopicTransportTests
     }
 
     [TestMethod]
+    public void TopicResponseEnvelope_PreservesMetadataOnlyPushHint()
+    {
+        var envelope = MeshEnvelope.Create(
+            "owner",
+            "owner",
+            MeshKinds.TopicRunUpdate,
+            "enc:v1:ciphertext",
+            "signature",
+            fromDevice: "host-device",
+            toDevice: "source-device",
+            pushHint: PushHintProtocol.ForTopicRunPhase(TopicRunPhase.Completed));
+
+        var json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        var parsed = JsonSerializer.Deserialize<MeshEnvelope>(
+            json, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.IsNotNull(parsed);
+        Assert.AreEqual(PushHintProtocol.TopicResponse, parsed.PushHint);
+        Assert.IsTrue(PushHintProtocol.IsTopicResponse(parsed));
+        Assert.IsNull(PushHintProtocol.ForTopicRunPhase(TopicRunPhase.Executing));
+        Assert.IsNull(PushHintProtocol.ForTopicRunPhase(TopicRunPhase.Failed));
+        Assert.IsNull(PushHintProtocol.ForTopicRunPhase(TopicRunPhase.Cancelled));
+    }
+
+    [TestMethod]
     public void AttachmentManifest_MapsIdsToTransientAttachmentsInOrder()
     {
         IReadOnlyList<ChatAttachment> attachments =

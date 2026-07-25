@@ -19,10 +19,13 @@ public sealed class PushDispatcherTests
     {
         public string Platform { get; } = platform;
         public List<string> Sent { get; } = new();
+        public TaskCompletionSource<(string Token, PushAlert Alert)> FirstDelivery { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task SendAsync(string token, PushAlert alert, CancellationToken ct = default)
         {
             Sent.Add(token);
+            FirstDelivery.TrySetResult((token, alert));
             return Task.CompletedTask;
         }
     }
@@ -36,6 +39,56 @@ public sealed class PushDispatcherTests
         await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
         await store.SetDevicePushTokenAsync("ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone");
         await store.SetDevicePushTokenAsync("ifain", "dev-ipad", DevicePlatforms.IOS, "tok-ipad");
+    }
+
+    [TestMethod]
+    public void Classify_TopicResponseRequiresSameHandleDeviceTargetAndExplicitHint()
+    {
+        var response = MeshEnvelope.Create(
+            "ifain",
+            "ifain",
+            MeshKinds.TopicRunUpdate,
+            "ciphertext",
+            fromDevice: "dev-desktop",
+            toDevice: "dev-iphone",
+            pushHint: PushHintProtocol.TopicResponse);
+
+        Assert.AreEqual(PushCategory.TopicResponse, PushDispatcher.Classify(response));
+        Assert.AreEqual(PushCategory.None, PushDispatcher.Classify(response with { PushHint = null }));
+        Assert.AreEqual(PushCategory.None, PushDispatcher.Classify(response with { To = "alice" }));
+        Assert.AreEqual(
+            PushCategory.None,
+            PushDispatcher.Classify(response with { ToDevice = response.FromDevice }));
+        Assert.AreEqual(
+            PushCategory.None,
+            PushDispatcher.Classify(response with { Kind = MeshKinds.TopicRunRequest }));
+    }
+
+    [TestMethod]
+    public async Task NotifyOffline_TopicResponsePushesOnlyTargetedDevice()
+    {
+        var store = new InMemoryRelayStore();
+        var backplane = new InMemoryBackplane();
+        await SeedHandleWithTwoPhonesAsync(store);
+        var apns = new CapturingSender(DevicePlatforms.IOS);
+        var dispatcher = NewDispatcher(store, backplane, apns);
+        var response = MeshEnvelope.Create(
+            "ifain",
+            "ifain",
+            MeshKinds.TopicRunUpdate,
+            "ciphertext",
+            fromDevice: "dev-desktop",
+            toDevice: "dev-iphone",
+            pushHint: PushHintProtocol.TopicResponse);
+
+        dispatcher.NotifyOffline("ifain", "dev-iphone", response);
+
+        var delivery = await apns.FirstDelivery.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.AreEqual("tok-iphone", delivery.Token);
+        Assert.AreEqual("Mesh", delivery.Alert.Title);
+        Assert.AreEqual("Your agent replied in a topic", delivery.Alert.Body);
+        Assert.AreEqual("topic", delivery.Alert.Category);
+        CollectionAssert.AreEqual(new[] { "tok-iphone" }, apns.Sent);
     }
 
     [TestMethod]

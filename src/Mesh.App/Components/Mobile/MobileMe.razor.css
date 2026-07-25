@@ -154,6 +154,15 @@
 
 .thread-open:active { background: var(--bg-3); }
 
+.topic-busy-indicator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--brand);
+    font-size: 16px;
+    flex: none;
+}
+
 .row-pin-status {
     flex: none;
     color: var(--brand);

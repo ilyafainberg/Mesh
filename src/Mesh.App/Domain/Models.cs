@@ -421,6 +421,8 @@ public sealed class ChatLine
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Role { get; set; } = "user"; // user | assistant | system
     public string Text { get; set; } = "";
+    /// <summary>The user line answered by this topic reply. Null for uncorrelated and non-topic lines.</summary>
+    public string? ReplyToLineId { get; set; }
     /// <summary>Original instructions for a generated widget in this line, used when saving it.</summary>
     public string? WidgetPrompt { get; set; }
     /// <summary>The actual group-message author. Direct messages may leave this null.</summary>
@@ -459,6 +461,45 @@ public sealed class ChatLine
     /// </summary>
     public bool Internal { get; set; }
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Builds a stable topic transcript where correlated replies follow their prompts.</summary>
+public static class TopicTranscriptOrdering
+{
+    public static IReadOnlyList<ChatLine> OrderForDisplay(IEnumerable<ChatLine> lines)
+    {
+        ArgumentNullException.ThrowIfNull(lines);
+        var source = lines.ToList();
+        if (source.Count < 2) return source;
+
+        var promptIds = source
+            .Where(line => string.Equals(line.Role, "user", StringComparison.Ordinal)
+                           && !string.IsNullOrWhiteSpace(line.Id))
+            .Select(line => line.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        var repliesByPrompt = source
+            .Where(line => string.Equals(line.Role, "assistant", StringComparison.Ordinal)
+                           && line.ReplyToLineId is not null
+                           && promptIds.Contains(line.ReplyToLineId))
+            .GroupBy(line => line.ReplyToLineId!, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.Ordinal);
+        if (repliesByPrompt.Count == 0) return source;
+
+        var correlatedReplyIds = repliesByPrompt.Values
+            .SelectMany(replies => replies)
+            .Select(reply => reply.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        var ordered = new List<ChatLine>(source.Count);
+        foreach (var line in source)
+        {
+            if (correlatedReplyIds.Contains(line.Id)) continue;
+            ordered.Add(line);
+            if (string.Equals(line.Role, "user", StringComparison.Ordinal)
+                && repliesByPrompt.TryGetValue(line.Id, out var replies))
+                ordered.AddRange(replies);
+        }
+        return ordered;
+    }
 }
 
 /// <summary>State of one agent step surfaced to the UI while a turn runs.</summary>
@@ -695,6 +736,128 @@ public static class RemoteRunActivity
     {
         ArgumentNullException.ThrowIfNull(projection);
         return projection.Timestamp != default && now - projection.Timestamp < StaleAfter;
+    }
+
+    /// <summary>True while a topic is actively running on this device or a remote execution device.</summary>
+    public static bool IsBusy(
+        OwnThread thread,
+        bool localTurnActive,
+        RemoteRunProjection? projection,
+        bool remoteBound,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(thread);
+        return localTurnActive
+            || projection is not null && IsProjectionFresh(projection, now)
+            || remoteBound && IsPersistedRunFresh(thread, now);
+    }
+}
+
+/// <summary>
+/// Resolves the run state shown in the UI when local execution progress is also echoed through the
+/// remote-run channel. The local state is richer and must win so the same tools are not rendered twice.
+/// </summary>
+public static class RemoteRunPresentation
+{
+    /// <summary>Returns the remote projection only when this device is not executing the turn locally.</summary>
+    public static RemoteRunProjection? VisibleProjection(
+        RemoteRunProjection? projection,
+        bool localTurnActive)
+        => localTurnActive ? null : projection;
+
+    /// <summary>
+    /// Returns a stable run status. Tool progress reports carry the current tool label as their status,
+    /// but that label is already present in the step list and should not be repeated as a heading.
+    /// </summary>
+    public static string StatusLabel(RemoteRunProjection projection)
+    {
+        ArgumentNullException.ThrowIfNull(projection);
+        var status = projection.Status?.Trim();
+        var repeatsStep = !string.IsNullOrEmpty(status)
+            && projection.Steps?.Any(step => string.Equals(
+                step.Label?.Trim(), status, StringComparison.OrdinalIgnoreCase)) == true;
+        return !string.IsNullOrEmpty(status) && !repeatsStep
+            ? status
+            : projection.Phase.ToString().ToLowerInvariant();
+    }
+}
+
+/// <summary>Chooses the single action shown in a topic composer while a turn is running.</summary>
+public static class TopicComposerPresentation
+{
+    public static bool ShowStop(bool topicBusy, bool hasSendableDraft)
+        => topicBusy && !hasSendableDraft;
+}
+
+/// <summary>
+/// Tracks queued topic runs by stable run and line identifiers. A run remains known after it starts so
+/// later progress is still accepted, while only runs that are still waiting drive the line subtitle.
+/// </summary>
+public sealed class QueuedTopicRunState
+{
+    private sealed record Entry(string LineId, bool Waiting);
+
+    private readonly Dictionary<string, Dictionary<string, Entry>> runsByThread =
+        new(StringComparer.Ordinal);
+
+    public bool MarkWaiting(string threadId, string runId, string lineId)
+    {
+        ValidateId(threadId, nameof(threadId));
+        ValidateId(runId, nameof(runId));
+        ValidateId(lineId, nameof(lineId));
+        if (!runsByThread.TryGetValue(threadId, out var runs))
+            runsByThread[threadId] = runs = new Dictionary<string, Entry>(StringComparer.Ordinal);
+        if (runs.TryGetValue(runId, out var current))
+        {
+            if (!string.Equals(current.LineId, lineId, StringComparison.Ordinal))
+                throw new InvalidOperationException("A queued run cannot change its trigger line.");
+            return false;
+        }
+        runs[runId] = new Entry(lineId, Waiting: true);
+        return true;
+    }
+
+    public bool MarkStarted(string threadId, string runId)
+    {
+        if (!runsByThread.TryGetValue(threadId, out var runs)
+            || !runs.TryGetValue(runId, out var current)
+            || !current.Waiting)
+            return false;
+        runs[runId] = current with { Waiting = false };
+        return true;
+    }
+
+    public bool Complete(string threadId, string runId)
+    {
+        if (!runsByThread.TryGetValue(threadId, out var runs) || !runs.Remove(runId))
+            return false;
+        if (runs.Count == 0) runsByThread.Remove(threadId);
+        return true;
+    }
+
+    public bool IsKnownRun(string threadId, string runId)
+        => runsByThread.TryGetValue(threadId, out var runs) && runs.ContainsKey(runId);
+
+    public bool IsLineWaiting(string lineId)
+    {
+        foreach (var runs in runsByThread.Values)
+            if (runs.Values.Any(entry => entry.Waiting
+                                         && string.Equals(entry.LineId, lineId, StringComparison.Ordinal)))
+                return true;
+        return false;
+    }
+
+    public int WaitingCount(string threadId)
+        => runsByThread.TryGetValue(threadId, out var runs)
+            ? runs.Values.Count(entry => entry.Waiting)
+            : 0;
+
+    public bool ClearThread(string threadId) => runsByThread.Remove(threadId);
+
+    private static void ValidateId(string value, string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("A stable identifier is required.", parameterName);
     }
 }
 

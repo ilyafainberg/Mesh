@@ -19,6 +19,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan GroupKeyCacheLifetime = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DeviceSyncTargetCacheLifetime = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DeviceSyncActivityQuietPeriod = TimeSpan.FromSeconds(1.5);
     private const int DeviceSyncSnapshotBatchSize = 100;
     private readonly AppState state;
     private readonly AgentService agent;
@@ -35,6 +36,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> keyCacheUpdated = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim deviceSyncSendGate = new(1, 1);
+    private readonly DeviceSyncActivityTracker deviceSyncActivity = new(DeviceSyncActivityQuietPeriod);
     private HubConnection? hub;
     private volatile bool authenticated;
     private volatile bool supportsSendResults;
@@ -62,6 +64,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         this.notifier = notifier;
         this.push = push;
         state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
+        deviceSyncActivity.Changed += () => DeviceSyncStateChanged?.Invoke();
     }
 
     private sealed record DeviceSyncIdentity(
@@ -85,7 +88,9 @@ public sealed class MeshClient : IDeviceTopicTransport
     }
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
+    public bool IsDeviceSnapshotSyncing => deviceSyncActivity.IsActive;
     public event Action? StateChanged;
+    public event Action? DeviceSyncStateChanged;
     public event Action<string>? Log;
 
     /// <summary>
@@ -604,6 +609,11 @@ public sealed class MeshClient : IDeviceTopicTransport
         // no tools of any kind).
         if (env.Kind == MeshKinds.ServiceRequest)
         {
+            if (!PlatformCaps.CanHostServices)
+            {
+                Log?.Invoke("service request ignored: service hosting is desktop-only");
+                return;
+            }
             var (serviceId, turns) = ServiceProtocol.ParseRequest(text);
             var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
             if (svc is null || !svc.Published) return;                 // not a live service here
@@ -910,8 +920,11 @@ public sealed class MeshClient : IDeviceTopicTransport
                 }
                 var updateThread = state.Profile.OwnThreads.FirstOrDefault(item =>
                     string.Equals(item.Id, update.ThreadId, StringComparison.Ordinal));
-                if (!RemoteRunCorrelation.IsExpected(updateThread, update.ThreadId, update.RunId)
-                    || !string.Equals(updateThread.ExecutionDeviceId, env.FromDevice, StringComparison.Ordinal))
+                var expectedCurrentRun = RemoteRunCorrelation.IsExpected(
+                    updateThread, update.ThreadId, update.RunId);
+                var expectedQueuedRun = state.IsExpectedQueuedRunUpdate(update);
+                if ((!expectedCurrentRun && !expectedQueuedRun)
+                    || !string.Equals(updateThread?.ExecutionDeviceId, env.FromDevice, StringComparison.Ordinal))
                 {
                     Log?.Invoke($"dropped uncorrelated topic update {update.RunId}");
                     return;
@@ -959,16 +972,19 @@ public sealed class MeshClient : IDeviceTopicTransport
                 request.WidgetId,
                 request.WidgetContext,
                 attachments);
-            var progress = new Progress<TopicRunUpdatePayload>(update =>
+            var progress = new OrderedAsyncProgress<TopicRunUpdatePayload>(
+                update => SendProgressUpdateAsync(active, CorrelateUpdate(active, update)),
+                ex => Log?.Invoke($"topic progress {active.RunId} failed: {ex.Message}"));
+            TopicRunCompletion completion;
+            try
             {
-                if (Volatile.Read(ref active.TerminalSent) == 0
-                    && Volatile.Read(ref active.TerminalSending) == 0)
-                    TrackBackground(
-                        SendProgressUpdateAsync(active, CorrelateUpdate(active, update)),
-                        $"topic progress {active.RunId}");
-            });
-            var completion = await topicTurnRunner.ExecuteAsync(
-                draft, progress, active.Cancellation.Token);
+                completion = await topicTurnRunner.ExecuteAsync(
+                    draft, progress, active.Cancellation.Token);
+            }
+            finally
+            {
+                await progress.CompleteAsync();
+            }
             await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
                 active.RunId,
                 active.ThreadId,
@@ -1085,11 +1101,13 @@ public sealed class MeshClient : IDeviceTopicTransport
         try
         {
             if (Volatile.Read(ref active.TerminalSent) != 0) return;
+            var terminal = CorrelateUpdate(active, update);
             if (await SendTargetedTopicEnvelopeAsync(
                     active.SourceDeviceId,
                     MeshKinds.TopicRunUpdate,
-                    TopicRunProtocol.UpdateBody(CorrelateUpdate(active, update)),
-                    ct))
+                    TopicRunProtocol.UpdateBody(terminal),
+                    ct,
+                    PushHintProtocol.ForTopicRunPhase(terminal.Phase)))
                 Volatile.Write(ref active.TerminalSent, 1);
         }
         finally
@@ -1232,12 +1250,13 @@ public sealed class MeshClient : IDeviceTopicTransport
             {
                 var request = new DeviceSyncSnapshotRequest(
                     Guid.NewGuid().ToString("n"), identity.DeviceId);
-                await SendDeviceSyncEnvelopeCoreAsync(
+                var requested = await SendDeviceSyncEnvelopeCoreAsync(
                     identity,
                     target,
                     DeviceSyncKinds.EnvelopeSnapshotRequest,
                     JsonSerializer.Serialize(request, Json),
                     CancellationToken.None);
+                if (requested) deviceSyncActivity.ObserveSnapshotActivity();
                 await SendDeviceSyncSnapshotCoreAsync(identity, target, snapshot, CancellationToken.None);
             }
         }
@@ -1422,6 +1441,8 @@ public sealed class MeshClient : IDeviceTopicTransport
                 var batch = JsonSerializer.Deserialize<DeviceSyncBatch>(plaintext, Json)
                     ?? throw new JsonException("Device sync batch was null.");
                 ValidateDeviceSyncBatch(batch, env.FromDevice);
+                if (batch.IsSnapshot)
+                    deviceSyncActivity.ObserveSnapshotActivity();
                 _ = state.ApplyDeviceSyncBatch(batch);
                 return;
             }
@@ -1975,7 +1996,8 @@ public sealed class MeshClient : IDeviceTopicTransport
         string targetDeviceId,
         string kind,
         string plaintext,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? pushHint = null)
     {
         var identity = authenticatedDeviceSyncIdentity;
         if (identity is null
@@ -2016,7 +2038,8 @@ public sealed class MeshClient : IDeviceTopicTransport
             ciphertext,
             IdentityService.Sign(identity.PrivateKey, ciphertext),
             fromDevice: identity.DeviceId,
-            toDevice: targetDeviceId);
+            toDevice: targetDeviceId,
+            pushHint: pushHint);
         try
         {
             var result = await identity.Connection.InvokeAsync<MeshSendResult>(
@@ -2123,11 +2146,11 @@ public sealed class MeshClient : IDeviceTopicTransport
             .Select(l => new ServiceTurn(l.Role == "assistant" ? "user" : "assistant", l.Text))
             .ToList();
 
-        // Self-owned service: the relay deliberately does NOT echo a message back to the sending
-        // device when it is addressed to your own handle (so home-calls reach your OTHER devices).
-        // That means a provider invoking their OWN service would never get a reply. Answer locally
-        // instead, running the same sandboxed service agent in-process.
-        if (AppState.Norm(conv.ProviderHandle!) == AppState.Norm(state.Profile.Handle))
+        // A desktop provider invoking their own service answers locally because the relay does not
+        // echo a message back to the sending device. Mobile clients deliberately fall through to the
+        // relay so an online desktop sibling hosts the service instead.
+        if (PlatformCaps.CanHostServices
+            && AppState.Norm(conv.ProviderHandle!) == AppState.Norm(state.Profile.Handle))
         {
             await AnswerOwnServiceLocallyAsync(conv, window);
             return true;
