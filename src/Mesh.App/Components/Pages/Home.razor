@@ -300,13 +300,13 @@
                                                 <div class="agent-step-detail">
                                                     @if (!string.IsNullOrEmpty(step.Arguments))
                                                     {
-                                                        <div class="step-detail-label">input</div>
-                                                        <pre class="step-detail-body">@step.Arguments</pre>
+                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                        Content="@step.Arguments" />
                                                     }
                                                     @if (!string.IsNullOrEmpty(step.Result))
                                                     {
-                                                        <div class="step-detail-label">output</div>
-                                                        <pre class="step-detail-body">@step.Result</pre>
+                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                        Content="@step.Result" IsOutput="true" />
                                                     }
                                                 </div>
                                             }
@@ -352,13 +352,13 @@
                                             <div class="agent-step-detail">
                                                 @if (!string.IsNullOrEmpty(s.Arguments))
                                                 {
-                                                    <div class="step-detail-label">input</div>
-                                                    <pre class="step-detail-body">@s.Arguments</pre>
+                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                    Content="@s.Arguments" />
                                                 }
                                                 @if (!string.IsNullOrEmpty(s.Result))
                                                 {
-                                                    <div class="step-detail-label">output</div>
-                                                    <pre class="step-detail-body">@s.Result</pre>
+                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                    Content="@s.Result" IsOutput="true" />
                                                 }
                                             </div>
                                         }

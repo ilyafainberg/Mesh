@@ -12,7 +12,7 @@
     gap: 3px;
 }
 
-/* Verbose per-step detail: raw tool arguments and output, shown when "Show details" is on. */
+/* Per-step tool arguments and output, shown when "Show details" is on. */
 .agent-step-detail {
     margin: 2px 0 4px 21px;
     border-left: 2px solid var(--border, #e2e5e9);
@@ -22,27 +22,6 @@
     gap: 2px;
 }
 
-.step-detail-label {
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-3, #8a929c);
-}
-
-.step-detail-body {
-    margin: 0 0 4px;
-    padding: 6px 8px;
-    background: var(--bg-2, #f6f7f9);
-    border-radius: 6px;
-    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-    font-size: 0.74rem;
-    line-height: 1.4;
-    color: var(--text-2, #5b6470);
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 220px;
-    overflow: auto;
-}
 
 .step-details-toggle {
     align-self: flex-start;

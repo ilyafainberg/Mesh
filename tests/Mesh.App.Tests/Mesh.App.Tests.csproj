@@ -24,6 +24,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\IAgentTool.cs" Link="IAgentTool.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AgentToolExecutor.cs" Link="AgentToolExecutor.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReasoningExtract.cs" Link="ReasoningExtract.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ToolDetailFormatter.cs" Link="ToolDetailFormatter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ToolApprovalService.cs" Link="ToolApprovalService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MemoryPolicy.cs" Link="MemoryPolicy.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MemoryService.cs" Link="MemoryService.cs" />

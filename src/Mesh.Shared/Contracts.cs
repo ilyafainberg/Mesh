@@ -1029,7 +1029,8 @@ public sealed record TopicRunStep(
     string Label,
     TopicRunItemState State,
     string? Arguments = null,
-    string? Result = null);
+    string? Result = null,
+    string? ToolName = null);
 
 public sealed record TopicRunUpdatePayload(
     string RunId,

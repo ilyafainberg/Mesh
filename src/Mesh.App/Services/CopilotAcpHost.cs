@@ -19,6 +19,7 @@ internal sealed class CopilotAcpLane(
         public sealed class ToolProgress
         {
             public string Label { get; set; } = "Copilot action";
+            public string? ToolName { get; set; }
             public string? Arguments { get; set; }
             public bool StartedReported { get; set; }
         }
@@ -546,7 +547,10 @@ internal sealed class CopilotAcpLane(
             turn.ToolCalls[toolCallId] = tracked;
         }
         if (!string.IsNullOrWhiteSpace(titleText))
+        {
+            tracked.ToolName = AcpToolName(titleText);
             tracked.Label = FriendlyToolLabel(titleText, turn.AllowedToolNames);
+        }
         if (update.TryGetProperty("rawInput", out var rawInput))
             tracked.Arguments = ToolTrace.Clip(rawInput.GetRawText());
 
@@ -564,7 +568,8 @@ internal sealed class CopilotAcpLane(
                 stepKey,
                 tracked.Label,
                 AgentStepState.Started,
-                tracked.Arguments));
+                tracked.Arguments,
+                ToolName: tracked.ToolName));
             tracked.StartedReported = true;
         }
         if (state != AgentStepState.Started)
@@ -574,18 +579,30 @@ internal sealed class CopilotAcpLane(
                 tracked.Label,
                 state,
                 tracked.Arguments,
-                ExtractToolResult(update)));
+                ExtractToolResult(update),
+                tracked.ToolName));
         }
     }
 
     private static string FriendlyToolLabel(string title, IReadOnlySet<string> allowedToolNames)
     {
-        var toolName = title.StartsWith("mesh-", StringComparison.Ordinal)
-            ? title["mesh-".Length..]
-            : title;
+        var toolName = AcpToolName(title);
         return allowedToolNames.Contains(title) || allowedToolNames.Contains(toolName)
             ? ReasoningExtract.Label(toolName)
             : title;
+    }
+
+    private static string AcpToolName(string title)
+    {
+        var name = title.Trim();
+        var dot = name.LastIndexOf('.');
+        if (dot >= 0 && dot < name.Length - 1)
+            name = name[(dot + 1)..];
+        if (name.StartsWith("mesh-", StringComparison.Ordinal))
+            name = name["mesh-".Length..];
+        else if (name.StartsWith("mesh_", StringComparison.Ordinal))
+            name = name["mesh_".Length..];
+        return name.Replace('-', '_');
     }
 
     private static string? ExtractToolResult(JsonElement update)

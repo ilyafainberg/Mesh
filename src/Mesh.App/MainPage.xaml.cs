@@ -13,7 +13,9 @@ public partial class MainPage : ContentPage
     {
         InitializeComponent();
 #if IOS
-        // Keep the entire Blazor surface below the status bar, Dynamic Island, and sensor housing.
+        // Match the exposed iOS safe areas to the white mobile navigation surface.
+        BackgroundColor = Colors.White;
+        blazorWebView.BackgroundColor = Colors.White;
         On<iOS>().SetUseSafeArea(true);
 #endif
     }

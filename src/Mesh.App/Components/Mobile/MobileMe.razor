@@ -244,13 +244,13 @@ else
                                             <div class="agent-step-detail">
                                                 @if (!string.IsNullOrEmpty(s.Arguments))
                                                 {
-                                                    <div class="step-detail-label">input</div>
-                                                    <pre class="step-detail-body">@s.Arguments</pre>
+                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                    Content="@s.Arguments" />
                                                 }
                                                 @if (!string.IsNullOrEmpty(s.Result))
                                                 {
-                                                    <div class="step-detail-label">output</div>
-                                                    <pre class="step-detail-body">@s.Result</pre>
+                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                    Content="@s.Result" IsOutput="true" />
                                                 }
                                             </div>
                                         }
@@ -294,12 +294,33 @@ else
                                 <div class="agent-steps">
                                     @foreach (var step in remote.Steps)
                                     {
-                                        <div class="agent-step @step.State.ToString().ToLowerInvariant()">
-                                            <i class="bi @RemoteStepIcon(step.State)"></i>
-                                            <span>@step.Label</span>
+                                        <div class="agent-step-item">
+                                            <div class="agent-step @step.State.ToString().ToLowerInvariant()">
+                                                <i class="bi @RemoteStepIcon(step.State)"></i>
+                                                <span>@step.Label</span>
+                                            </div>
+                                            @if (showStepDetails && (!string.IsNullOrEmpty(step.Arguments) || !string.IsNullOrEmpty(step.Result)))
+                                            {
+                                                <div class="agent-step-detail">
+                                                    @if (!string.IsNullOrEmpty(step.Arguments))
+                                                    {
+                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                        Content="@step.Arguments" />
+                                                    }
+                                                    @if (!string.IsNullOrEmpty(step.Result))
+                                                    {
+                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                        Content="@step.Result" IsOutput="true" />
+                                                    }
+                                                </div>
+                                            }
                                         </div>
                                     }
                                 </div>
+                                <button class="step-details-toggle" @onclick="() => showStepDetails = !showStepDetails">
+                                    <i class="bi @(showStepDetails ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                                    @(showStepDetails ? "Hide details" : "Show details")
+                                </button>
                             }
                             @if (remote.Queued > 0)
                             {

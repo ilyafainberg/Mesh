@@ -570,11 +570,12 @@ public sealed record AgentRunState(
 /// <summary>
 /// A single step the agent takes during a turn (a tool call), surfaced live so the user can see what
 /// the agent is doing. <see cref="Label"/> is a friendly description (e.g. "Ran Python").
-/// <see cref="Arguments"/> is the raw tool input and <see cref="Result"/> the tool output (both may be
-/// truncated for display); they drive the expandable "details" view and the model's hidden transcript.
+/// <see cref="Arguments"/> is the raw tool input and <see cref="Result"/> the tool output. Both may be
+/// truncated for display. <see cref="ToolName"/> preserves the real tool when <see cref="Tool"/> is an
+/// opaque call identifier, allowing the details view to choose the right formatter and language.
 /// </summary>
 public sealed record AgentStep(string Tool, string Label, AgentStepState State,
-    string? Arguments = null, string? Result = null);
+    string? Arguments = null, string? Result = null, string? ToolName = null);
 
 /// <summary>Which live stream a chunk belongs to: the model's reasoning, or its answer.</summary>
 public enum AgentDeltaKind { Reasoning, Answer }

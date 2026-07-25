@@ -390,5 +390,29 @@ window.meshUI = {
     if (!el) return;
     el.style.height = 'auto';
     el.style.overflowY = 'hidden';
+  },
+
+  // Highlight already-normalized tool details. Text is read from textContent on every pass so
+  // switching between formatted and raw views never re-highlights generated markup.
+  highlightCode: function (root) {
+    if (!root || !window.hljs) return;
+    var autoLanguages = [
+      'json', 'powershell', 'dos', 'bash', 'python', 'csharp', 'javascript',
+      'typescript', 'xml', 'css', 'sql', 'markdown', 'plaintext'
+    ];
+    root.querySelectorAll('code[data-mesh-highlight]').forEach(function (code) {
+      var source = code.textContent || '';
+      var language = code.dataset.language || '';
+      try {
+        var result = language && window.hljs.getLanguage(language)
+          ? window.hljs.highlight(source, { language: language, ignoreIllegals: true })
+          : window.hljs.highlightAuto(source, autoLanguages);
+        code.innerHTML = result.value;
+        code.classList.add('hljs');
+      } catch (error) {
+        code.textContent = source;
+        console.warn('Tool detail highlighting failed', error);
+      }
+    });
   }
 };
