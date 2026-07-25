@@ -4,7 +4,8 @@
   Runs the full chain that used to be done by hand:
     version bump -> em-dash lint -> Windows publish -> stage -> Inno installer ->
     Azure Trusted Signing -> signed Android AAB -> git commit+push ->
-    Azure Blob upload -> GitHub release -> (optional) Microsoft Store + Google Play push.
+    Azure Blob upload -> client + Relay GitHub releases -> Relay GHCR image ->
+    (optional) Microsoft Store + Google Play push.
 
   USAGE
     ./_deploy/release.ps1 -Version 1.4.1
@@ -53,6 +54,7 @@ $Artifacts  = Join-Path $Deploy "artifacts"
 $BrandIcon  = Join-Path $Deploy "brand\meshicon.ico"
 $LicenseSrc = Join-Path $Deploy "LICENSE-polyform.txt"
 $NoticesSrc = Join-Path $Deploy "THIRD-PARTY-NOTICES.txt"
+$RelayPublisher = Join-Path $Deploy "publish-relay-release.ps1"
 
 $WinTfm     = "net10.0-windows10.0.19041.0"
 $AndTfm     = "net10.0-android"
@@ -131,6 +133,7 @@ function Test-Preflight {
   if (-not $SkipGitHub) {
     & gh auth status *> $null
     if ($LASTEXITCODE -ne 0) { Die "gh not authenticated. Run 'gh auth login'." }
+    if (-not (Test-Path $RelayPublisher)) { Die "Relay publisher not found at $RelayPublisher" }
     Ok "gh authenticated"
   }
   Ok "tools present"
@@ -387,6 +390,7 @@ if ($script:WinExe -and -not $SkipGitHub) {
     Die "refusing GitHub upload: installer signature is not valid."
   }
   Publish-GitHubRelease $script:WinExe
+  & $RelayPublisher -Version $Version -RepoRoot $RepoRoot -DryRun:$DryRun
 }
 
 if ($PushStores) {

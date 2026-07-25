@@ -5,7 +5,8 @@
   part (AOT compile of every assembly takes the bulk of the wall-clock time). Use this
   for the common case where only client/relay code changed and you want a quick Windows
   drop: version bump -> em-dash lint -> Windows publish + sign + zipped installer ->
-  git commit+push -> Azure Blob upload -> GitHub release.
+  git commit+push -> Azure Blob upload -> client + Relay GitHub releases ->
+  versioned Relay image in GHCR.
 
   USAGE
     ./_deploy/release-win.ps1 -Version 1.5.8
@@ -14,7 +15,8 @@
 
   The shared release script builds and signs the installer. This Windows entry point
   then creates and validates the ZIP, uploads ZIP-only public artifacts, and creates
-  the GitHub release. Run release-android.ps1 separately for Android.
+  the client and Relay GitHub releases. It waits for the Relay GHCR image workflow to
+  publish latest and the release version. Run release-android.ps1 separately for Android.
 
   This script contains no em-dash (U+2014) characters, per project rule.
 #>
@@ -34,6 +36,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Artifacts = Join-Path $PSScriptRoot "artifacts"
 $ReleaseRepo = "MeshRelayAI/Mesh"
+$RelayPublisher = Join-Path $PSScriptRoot "publish-relay-release.ps1"
 $BlobAccount = "meshrelaydl"
 $BlobRg = "rg-mesh"
 $BlobCtr = "releases"
@@ -41,6 +44,7 @@ $BlobBase = "https://$BlobAccount.blob.core.windows.net/$BlobCtr"
 
 $release = Join-Path $PSScriptRoot "release.ps1"
 if (-not (Test-Path $release)) { Write-Host "  [fail] release.ps1 not found next to this wrapper" -ForegroundColor Red; exit 1 }
+if (-not (Test-Path $RelayPublisher)) { Write-Host "  [fail] publish-relay-release.ps1 not found next to this wrapper" -ForegroundColor Red; exit 1 }
 foreach ($tool in @("az", "gh")) {
   if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
     Write-Host "  [fail] required tool '$tool' is not on PATH." -ForegroundColor Red
@@ -152,6 +156,7 @@ if (-not $SkipGitHub) {
     if ($LASTEXITCODE -ne 0) { Write-Host "  [fail] could not remove legacy asset $asset." -ForegroundColor Red; exit 1 }
   }
   Write-Host "  [ok] released: https://github.com/$ReleaseRepo/releases/tag/v$Version" -ForegroundColor Green
+  & $RelayPublisher -Version $Version -RepoRoot $RepoRoot
 }
 
 Write-Host "`n=== Windows release complete ===" -ForegroundColor Cyan

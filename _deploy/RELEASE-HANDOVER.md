@@ -260,6 +260,8 @@ This builds:
 - ZIP containing exactly `Mesh-Setup-vX.Y.Z.exe`
 - Versioned and latest Blob ZIPs
 - GitHub release in `MeshRelayAI/Mesh`
+- Matching GitHub release in `MeshRelayAI/Relay`
+- GHCR images `ghcr.io/meshrelayai/relay:latest` and `:X.Y.Z`
 
 Do not run `_deploy\release.ps1` directly for the public Windows release. Its shared publication
 path uploads the raw EXE, which violates the ZIP-only policy.
@@ -283,6 +285,14 @@ Verify public release:
 gh release view vX.Y.Z --repo MeshRelayAI/Mesh `
   --json url,assets,isDraft,isPrerelease,publishedAt
 
+gh release view vX.Y.Z --repo MeshRelayAI/Relay `
+  --json url,targetCommitish,isDraft,isPrerelease,publishedAt
+
+gh run list --repo MeshRelayAI/Relay `
+  --workflow publish-image.yml --event release --limit 1
+
+docker pull ghcr.io/meshrelayai/relay:X.Y.Z
+
 Invoke-WebRequest `
   -Uri "https://meshrelaydl.blob.core.windows.net/releases/Mesh-Setup-vX.Y.Z.zip" `
   -Method Head -UseBasicParsing
@@ -293,7 +303,8 @@ Invoke-WebRequest `
 ```
 
 Both Blob URLs must return `200` and the same content length. GitHub must contain the ZIP and no
-raw `Mesh-Setup-v*.exe` asset.
+raw `Mesh-Setup-v*.exe` asset. The Relay release must exist, its image workflow must succeed, and
+the versioned GHCR image must pull successfully.
 
 ## 9. Microsoft Store
 
