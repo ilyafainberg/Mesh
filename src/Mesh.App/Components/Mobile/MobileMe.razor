@@ -72,7 +72,16 @@
                                             </span>
                                         }
                                     </span>
-                                    @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                                    @if (IsTopicBusy(t))
+                                    {
+                                        <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
+                                            <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
+                                        </span>
+                                    }
+                                    else if (State.IsThreadCompleted(t.Id))
+                                    {
+                                        <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
+                                    }
                                     @if (t.IsPinned) { <i class="bi bi-pin-angle-fill row-pin-status" title="Pinned" aria-label="Pinned"></i> }
                                     <i class="bi bi-chevron-right row-chevron"></i>
                                 </button>
@@ -179,7 +188,7 @@ else
                         and helps you manage what your public agent shares with others. Ask it anything.
                     </div>
                 }
-                @foreach (var line in Active.Lines.Where(l => !l.Internal))
+                @foreach (var line in OrderedVisibleLines.Where(line => !IsQueued(line)))
                 {
                     <div class="bubble @(line.Role)">
                         @if (!string.IsNullOrEmpty(line.Reasoning))
@@ -196,10 +205,6 @@ else
                         }
                         <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                         OnPin="html => PinWidget(html, line)" />
-                        @if (IsQueued(line))
-                        {
-                            <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
-                        }
                     </div>
                 }
                 @if (ActiveBusy)
@@ -277,7 +282,7 @@ else
                             }
                             <div class="planning-row">
                                 <i class="bi bi-arrow-repeat spin"></i>
-                                @(string.IsNullOrWhiteSpace(remote.Status) ? remote.Phase.ToString() : remote.Status)
+                                @RemoteRunPresentation.StatusLabel(remote)
                             </div>
                             @if (remote.Steps is { Count: > 0 })
                             {
@@ -301,6 +306,14 @@ else
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
+                    </div>
+                }
+                @foreach (var line in OrderedVisibleLines.Where(IsQueued))
+                {
+                    <div class="bubble @(line.Role)">
+                        <MessageContent Text="@line.Text" Attachments="@line.Attachments"
+                                        OnPin="html => PinWidget(html, line)" />
+                        <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
                     </div>
                 }
             </div>
@@ -499,7 +512,9 @@ else
     bool disposed;
 
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
-    RemoteRunProjection? RemoteRun => Active is null ? null : State.GetRemoteRunProjection(Active.Id);
+    RemoteRunProjection? RemoteRun => Active is null ? null : RemoteRunPresentation.VisibleProjection(
+        State.GetRemoteRunProjection(Active.Id),
+        State.IsThreadBusy(Active.Id));
     bool ActiveBusy => Active is not null &&
         (State.IsThreadBusy(Active.Id)
          || RemoteRun is { } activeRemoteRun && RemoteRunActivity.IsProjectionFresh(activeRemoteRun, DateTimeOffset.UtcNow)
@@ -528,11 +543,12 @@ else
     readonly List<StagedFile> attachments = new();
     string? attachError;
 
-    // Tier-1 steerable input: messages submitted while a thread's turn is running are queued for that
-    // thread (shown immediately as a subtle "queued" line) and answered together in ONE follow-up turn
-    // after the current one finishes, in order. A thread never runs two of its own turns concurrently,
-    // but different threads run independently.
+    // Messages submitted while a topic is busy stay visible below the live response. The runner answers
+    // them FIFO, one serialized turn per prompt, and reply correlation restores prompt/answer pairing.
     bool IsQueued(ChatLine line) => State.IsLineQueued(line);
+    IReadOnlyList<ChatLine> OrderedVisibleLines => Active is null
+        ? Array.Empty<ChatLine>()
+        : TopicTranscriptOrdering.OrderForDisplay(Active.Lines.Where(line => !line.Internal));
 
     // Assistant lines whose reasoning ("thinking") section is currently expanded.
     readonly HashSet<ChatLine> expandedReasoning = new();
@@ -1135,6 +1151,13 @@ else
         IsCurrentDevice(device)
             ? Agent.IsModelReady
             : device.Online && device.CanHostRemoteTurn;
+
+    bool IsTopicBusy(OwnThread thread) => RemoteRunActivity.IsBusy(
+        thread,
+        State.IsThreadBusy(thread.Id),
+        State.GetRemoteRunProjection(thread.Id),
+        IsAssignedElsewhere(thread),
+        DateTimeOffset.UtcNow);
 
     bool IsAssignedElsewhere(OwnThread thread) =>
         !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)

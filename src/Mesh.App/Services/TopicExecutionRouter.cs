@@ -27,6 +27,7 @@ public sealed class TopicExecutionRouter(
     private readonly Dictionary<string, string> triggerRuns = new(StringComparer.Ordinal);
     private readonly Queue<string> completedRuns = new();
     private readonly object submitGate = new();
+    private readonly SemaphoreSlim deviceListGate = new(1, 1);
     private const int MaxRememberedRuns = 1024;
 
     public async Task<TopicDispatchResult> SubmitAsync(
@@ -152,19 +153,27 @@ public sealed class TopicExecutionRouter(
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken)
     {
-        var devices = await deviceTransport.ListEligibleDevicesAsync(cancellationToken);
-        var eligible = devices
-            .Where(device => device.CanHostRemoteTurn)
-            .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
-            .Select(group => group.First())
-            .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        var current = CurrentDevice();
-        if (current is null) return eligible;
-        eligible.RemoveAll(device =>
-            string.Equals(device.DeviceId, current.DeviceId, StringComparison.Ordinal));
-        eligible.Insert(0, current);
-        return eligible;
+        await deviceListGate.WaitAsync(cancellationToken);
+        try
+        {
+            var devices = await deviceTransport.ListEligibleDevicesAsync(cancellationToken);
+            var eligible = devices
+                .Where(device => device.CanHostRemoteTurn)
+                .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
+                .Select(group => group.First())
+                .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var current = CurrentDevice();
+            if (current is null) return eligible;
+            eligible.RemoveAll(device =>
+                string.Equals(device.DeviceId, current.DeviceId, StringComparison.Ordinal));
+            eligible.Insert(0, current);
+            return eligible;
+        }
+        finally
+        {
+            deviceListGate.Release();
+        }
     }
 
     private async Task<TopicDispatchResult> DispatchNewAsync(
@@ -237,13 +246,19 @@ public sealed class TopicExecutionRouter(
             };
             state.AddOwnChatLine(thread.Id, trigger);
         }
+        var queuedBehindActiveRun = thread.ExecutionRunId is not null
+                                    || state.IsThreadBusy(thread.Id);
+        if (queuedBehindActiveRun)
+            state.TrackQueuedTopicRun(thread.Id, draft.RunId, draft.TriggerLineId);
 
         var queuedUpdate = new TopicRunUpdatePayload(
             draft.RunId,
             draft.ThreadId,
             TopicRunPhase.Queued,
             "Queued",
-            Timestamp: DateTimeOffset.UtcNow);
+            Queued: state.QueuedCountForThread(thread.Id),
+            Timestamp: DateTimeOffset.UtcNow,
+            TriggerLineId: draft.TriggerLineId);
         progress?.Report(queuedUpdate);
 
         if (current is not null
@@ -312,11 +327,15 @@ public sealed class TopicExecutionRouter(
             var result = await deviceTransport.DispatchAsync(
                 remoteTarget.DeviceId, request, attachments, cancellationToken);
             if (!result.Accepted)
+            {
+                state.CompleteQueuedTopicRun(thread.Id, draft.RunId);
                 state.ClearRemoteRunProjection(thread.Id, draft.RunId);
+            }
             return result;
         }
         catch
         {
+            state.CompleteQueuedTopicRun(thread.Id, draft.RunId);
             state.ClearRemoteRunProjection(thread.Id, draft.RunId);
             throw;
         }

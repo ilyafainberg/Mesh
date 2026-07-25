@@ -133,6 +133,32 @@ public sealed class DeviceTopicDbTests
     }
 
     [TestMethod]
+    public void TopicReplyCorrelation_PersistsAndLoads()
+    {
+        var at = new DateTimeOffset(2026, 7, 25, 10, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("reply-order", "Reply order", at);
+            db.AppendOwnChat("reply-order", new ChatLine
+            {
+                Id = "answer-1",
+                Role = "assistant",
+                Text = "done",
+                ReplyToLineId = "prompt-1",
+                At = at
+            });
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var answer = reopened.LoadProfile()!.OwnThreads
+            .Single(thread => thread.Id == "reply-order")
+            .Lines.Single();
+        Assert.AreEqual("prompt-1", answer.ReplyToLineId);
+    }
+
+    [TestMethod]
     public void SetOwnThreadExecution_PersistsAndLoads()
     {
         var execAt = DateTimeOffset.UtcNow.AddMinutes(-5);

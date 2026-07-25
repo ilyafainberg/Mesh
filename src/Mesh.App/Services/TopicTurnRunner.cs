@@ -23,6 +23,7 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         public TaskCompletionSource<TopicRunCompletion> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Started { get; set; }
+        public bool WasQueued { get; set; }
     }
 
     private sealed record WidgetTurn(
@@ -55,10 +56,11 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             CancellationToken = cancellationToken
         };
         var startDrain = false;
+        var queued = 0;
         lock (queue.Sync)
         {
-            var queued = queue.Items.Count + (queue.Draining ? 1 : 0);
-            Report(progress, draft, TopicRunPhase.Queued, "Queued", queued: queued);
+            queued = queue.Items.Count + (queue.Draining ? 1 : 0);
+            item.WasQueued = queued > 0;
             queue.Items.Enqueue(item);
             if (!queue.Draining)
             {
@@ -66,15 +68,22 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
                 startDrain = true;
             }
         }
+        if (item.WasQueued)
+            state.TrackQueuedTopicRun(draft.ThreadId, draft.RunId, draft.TriggerLineId);
+        Report(progress, draft, TopicRunPhase.Queued, "Queued", queued: queued);
         using var registration = cancellationToken.Register(() =>
         {
+            var clearQueued = false;
             lock (queue.Sync)
             {
                 if (item.Started || item.Completion.Task.IsCompleted) return;
                 ClearTriggerAttachments(draft);
                 item.Completion.TrySetResult(
                     Complete(progress, draft, TopicRunPhase.Cancelled, "Cancelled"));
+                clearQueued = item.WasQueued;
             }
+            if (clearQueued)
+                state.CompleteQueuedTopicRun(draft.ThreadId, draft.RunId);
         });
         if (startDrain) _ = DrainAsync(queue);
         return await item.Completion.Task;
@@ -99,6 +108,11 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
                 while (item.Completion.Task.IsCompleted);
                 item.Started = true;
             }
+            if (item.WasQueued)
+            {
+                state.StartQueuedTopicRun(item.Draft.ThreadId, item.Draft.RunId);
+                Report(item.Progress, item.Draft, TopicRunPhase.Executing, "Starting");
+            }
 
             TopicRunCompletion completion;
             try
@@ -117,6 +131,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
                     ex.Message,
                     "execution_failed");
             }
+            if (item.WasQueued)
+                state.CompleteQueuedTopicRun(item.Draft.ThreadId, item.Draft.RunId);
             item.Completion.TrySetResult(completion);
         }
     }
@@ -282,7 +298,7 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         if (action == "use")
         {
             AddWidgetLine(
-                draft.ThreadId,
+                draft.ThreadId, draft.TriggerLineId,
                 FirstNonBlank(turn.WidgetHtml),
                 FirstNonBlank(turn.WidgetPrompt));
             return;
@@ -294,7 +310,7 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             var reply = await agent.BuildWidgetAsync(prompt, cancellationToken);
             var html = ExtractWidgetHtml(reply);
             if (html is null) throw new InvalidOperationException(reply);
-            AddWidgetLine(draft.ThreadId, html, prompt);
+            AddWidgetLine(draft.ThreadId, draft.TriggerLineId, html, prompt);
             return;
         }
 
@@ -329,7 +345,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         if (!updated)
             throw new InvalidOperationException(
                 "The saved widget changed while it was being refined. Retry from the latest version.");
-        AddWidgetLine(draft.ThreadId, refinedHtml, $"{originalPrompt}\n\nChange request: {change}");
+        AddWidgetLine(
+            draft.ThreadId, draft.TriggerLineId, refinedHtml, $"{originalPrompt}\n\nChange request: {change}");
     }
 
     private Widget FindWidget(string? widgetId)
@@ -341,12 +358,13 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
                ?? throw new InvalidWidgetContextException("The saved widget was not found.");
     }
 
-    private void AddWidgetLine(string threadId, string html, string prompt)
+    private void AddWidgetLine(string threadId, string triggerLineId, string html, string prompt)
         => state.AddOwnChatLine(threadId, new ChatLine
         {
             Role = "assistant",
             Text = $"```html-app\n{html}\n```",
-            WidgetPrompt = prompt
+            WidgetPrompt = prompt,
+            ReplyToLineId = triggerLineId
         });
 
     private static WidgetTurn? ParseWidgetTurn(string? json)
@@ -512,7 +530,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             queued,
             error,
             failureCode,
-            DateTimeOffset.UtcNow));
+            DateTimeOffset.UtcNow,
+            TriggerLineId: draft.TriggerLineId));
 
     private static string? Bound(string? value, int maxLength)
         => value is null || value.Length <= maxLength ? value : value[..maxLength];
@@ -531,7 +550,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             DeltaKind: delta.Kind == AgentDeltaKind.Reasoning
                 ? TopicRunDeltaKind.Reasoning
                 : TopicRunDeltaKind.Answer,
-            Delta: Bound(delta.Text, TopicRunProtocol.MaxDeltaChars)));
+            Delta: Bound(delta.Text, TopicRunProtocol.MaxDeltaChars),
+            TriggerLineId: draft.TriggerLineId));
 
     private static TopicRunCompletion Complete(
         IProgress<TopicRunUpdatePayload> progress,
@@ -549,7 +569,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             Bound(status, 4096),
             Error: Bound(error, 32 * 1024),
             FailureCode: Bound(failureCode, TopicRunProtocol.MaxIdChars),
-            Timestamp: completedAt));
+            Timestamp: completedAt,
+            TriggerLineId: draft.TriggerLineId));
         return new TopicRunCompletion(
             draft.RunId, draft.ThreadId, phase, completedAt, error, failureCode);
     }

@@ -79,7 +79,16 @@
                                     <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
                                 </span>
                             }
-                            @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                            @if (IsTopicBusy(t))
+                            {
+                                <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
+                                    <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
+                                </span>
+                            }
+                            else if (State.IsThreadCompleted(t.Id))
+                            {
+                                <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
+                            }
                         </button>
                         <button class="thread-pin" title="Unpin topic" aria-label="Unpin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
                             <i class="bi bi-pin-angle-fill"></i>
@@ -103,7 +112,16 @@
                                     <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
                                 </span>
                             }
-                            @if (State.IsThreadCompleted(t.Id)) { <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span> }
+                            @if (IsTopicBusy(t))
+                            {
+                                <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
+                                    <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
+                                </span>
+                            }
+                            else if (State.IsThreadCompleted(t.Id))
+                            {
+                                <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
+                            }
                         </button>
                         <button class="thread-pin unpinned" title="Pin topic" aria-label="Pin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
                             <i class="bi bi-pin-angle"></i>
@@ -214,7 +232,7 @@
                 }
                 @if (Active is not null)
                 {
-                    @foreach (var line in Active.Lines.Where(l => !l.Internal))
+                    @foreach (var line in OrderedVisibleLines.Where(line => !IsQueued(line)))
                     {
                         <div class="bubble @(line.Role)">
                             @if (!string.IsNullOrEmpty(line.Reasoning))
@@ -231,17 +249,17 @@
                             }
                             <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                             OnPin="html => PinWidget(html, line)" />
-                            @if (IsQueued(line))
-                            {
-                                <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
-                            }
                         </div>
                     }
                 }
                 @if (ActiveBusy)
                 {
                     <div class="bubble assistant">
-                        @{ var remote = Active is null ? null : State.GetRemoteRunProjection(Active.Id); }
+                        @{
+                            var remote = Active is null ? null : RemoteRunPresentation.VisibleProjection(
+                                State.GetRemoteRunProjection(Active.Id),
+                                State.IsThreadBusy(Active.Id));
+                        }
                         @if (remote is not null)
                         {
                             @if (!string.IsNullOrWhiteSpace(remote.Plan))
@@ -259,6 +277,10 @@
                                     }
                                 </div>
                             }
+                            <div class="planning-row">
+                                <i class="bi bi-arrow-repeat spin"></i>
+                                @RemoteRunPresentation.StatusLabel(remote)
+                            </div>
                             @if (remote.Steps is { Count: > 0 })
                             {
                                 <div class="agent-steps">
@@ -291,7 +313,6 @@
                                     @(showStepDetails ? "Hide details" : "Show details")
                                 </button>
                             }
-                            <div class="msg-tag"><i class="bi bi-diagram-3"></i> @RemoteStatus(remote)</div>
                             @if (remote.Queued > 0)
                             {
                                 <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued @remote.Queued</div>
@@ -366,6 +387,14 @@
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
+                    </div>
+                }
+                @foreach (var line in OrderedVisibleLines.Where(IsQueued))
+                {
+                    <div class="bubble @(line.Role)">
+                        <MessageContent Text="@line.Text" Attachments="@line.Attachments"
+                                        OnPin="html => PinWidget(html, line)" />
+                        <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
                     </div>
                 }
             </div>
@@ -577,11 +606,12 @@
         _ => "bi-dot"
     };
 
-    // Tier-1 steerable input: messages submitted while a thread's turn is running are queued for that
-    // thread (shown immediately as a subtle "queued" line) and answered together in ONE follow-up turn
-    // after the current one finishes, in order. A thread never runs two of its own turns concurrently,
-    // but different threads run independently.
+    // Messages submitted while a topic is busy stay visible below the live response. The runner answers
+    // them FIFO, one serialized turn per prompt, and reply correlation restores prompt/answer pairing.
     bool IsQueued(ChatLine line) => State.IsLineQueued(line);
+    IReadOnlyList<ChatLine> OrderedVisibleLines => Active is null
+        ? Array.Empty<ChatLine>()
+        : TopicTranscriptOrdering.OrderForDisplay(Active.Lines.Where(line => !line.Internal));
 
     sealed record StagedFile(string Name, string Path, long Size)
     {
@@ -844,6 +874,13 @@
     void TogglePin(OwnThread thread) => State.SetOwnThreadPinned(thread.Id, !thread.IsPinned);
     static string ThreadRenderKey(OwnThread thread) => $"{(thread.IsPinned ? "pinned" : "recent")}:{thread.Id}";
 
+    bool IsTopicBusy(OwnThread thread) => RemoteRunActivity.IsBusy(
+        thread,
+        State.IsThreadBusy(thread.Id),
+        State.GetRemoteRunProjection(thread.Id),
+        IsRemoteBound(thread),
+        DateTimeOffset.UtcNow);
+
     bool IsRemoteBound(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
         && thread.ExecutionDeviceId != Mesh.MyDeviceId;
     bool IsDeviceOnline(string? deviceId) => deviceId == Mesh.MyDeviceId
@@ -885,8 +922,6 @@
         global::Mesh.Shared.TopicRunItemState.Cancelled => "bi-x",
         _ => "bi-circle"
     };
-    static string RemoteStatus(RemoteRunProjection remote) => !string.IsNullOrWhiteSpace(remote.Status)
-        ? remote.Status : remote.Phase.ToString().ToLowerInvariant();
 
     void BeginRename()
     {
@@ -1066,13 +1101,23 @@
             if (!result.Accepted)
             {
                 dispatchError = result.Error ?? DispatchFailure(result.Code);
-                State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = $"[{dispatchError}]" });
+                State.AddOwnChatLine(thread.Id, new ChatLine
+                {
+                    Role = "assistant",
+                    Text = $"[{dispatchError}]",
+                    ReplyToLineId = trigger.Id
+                });
             }
         }
         catch (Exception ex)
         {
             dispatchError = $"Could not submit this turn: {ex.Message}";
-            State.AddOwnChatLine(thread.Id, new ChatLine { Role = "assistant", Text = $"[{dispatchError}]" });
+            State.AddOwnChatLine(thread.Id, new ChatLine
+            {
+                Role = "assistant",
+                Text = $"[{dispatchError}]",
+                ReplyToLineId = trigger.Id
+            });
         }
     }
 

@@ -604,6 +604,11 @@ public sealed class MeshClient : IDeviceTopicTransport
         // no tools of any kind).
         if (env.Kind == MeshKinds.ServiceRequest)
         {
+            if (!PlatformCaps.CanHostServices)
+            {
+                Log?.Invoke("service request ignored: service hosting is desktop-only");
+                return;
+            }
             var (serviceId, turns) = ServiceProtocol.ParseRequest(text);
             var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
             if (svc is null || !svc.Published) return;                 // not a live service here
@@ -910,8 +915,11 @@ public sealed class MeshClient : IDeviceTopicTransport
                 }
                 var updateThread = state.Profile.OwnThreads.FirstOrDefault(item =>
                     string.Equals(item.Id, update.ThreadId, StringComparison.Ordinal));
-                if (!RemoteRunCorrelation.IsExpected(updateThread, update.ThreadId, update.RunId)
-                    || !string.Equals(updateThread.ExecutionDeviceId, env.FromDevice, StringComparison.Ordinal))
+                var expectedCurrentRun = RemoteRunCorrelation.IsExpected(
+                    updateThread, update.ThreadId, update.RunId);
+                var expectedQueuedRun = state.IsExpectedQueuedRunUpdate(update);
+                if ((!expectedCurrentRun && !expectedQueuedRun)
+                    || !string.Equals(updateThread?.ExecutionDeviceId, env.FromDevice, StringComparison.Ordinal))
                 {
                     Log?.Invoke($"dropped uncorrelated topic update {update.RunId}");
                     return;
@@ -959,16 +967,19 @@ public sealed class MeshClient : IDeviceTopicTransport
                 request.WidgetId,
                 request.WidgetContext,
                 attachments);
-            var progress = new Progress<TopicRunUpdatePayload>(update =>
+            var progress = new OrderedAsyncProgress<TopicRunUpdatePayload>(
+                update => SendProgressUpdateAsync(active, CorrelateUpdate(active, update)),
+                ex => Log?.Invoke($"topic progress {active.RunId} failed: {ex.Message}"));
+            TopicRunCompletion completion;
+            try
             {
-                if (Volatile.Read(ref active.TerminalSent) == 0
-                    && Volatile.Read(ref active.TerminalSending) == 0)
-                    TrackBackground(
-                        SendProgressUpdateAsync(active, CorrelateUpdate(active, update)),
-                        $"topic progress {active.RunId}");
-            });
-            var completion = await topicTurnRunner.ExecuteAsync(
-                draft, progress, active.Cancellation.Token);
+                completion = await topicTurnRunner.ExecuteAsync(
+                    draft, progress, active.Cancellation.Token);
+            }
+            finally
+            {
+                await progress.CompleteAsync();
+            }
             await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
                 active.RunId,
                 active.ThreadId,
@@ -2123,11 +2134,11 @@ public sealed class MeshClient : IDeviceTopicTransport
             .Select(l => new ServiceTurn(l.Role == "assistant" ? "user" : "assistant", l.Text))
             .ToList();
 
-        // Self-owned service: the relay deliberately does NOT echo a message back to the sending
-        // device when it is addressed to your own handle (so home-calls reach your OTHER devices).
-        // That means a provider invoking their OWN service would never get a reply. Answer locally
-        // instead, running the same sandboxed service agent in-process.
-        if (AppState.Norm(conv.ProviderHandle!) == AppState.Norm(state.Profile.Handle))
+        // A desktop provider invoking their own service answers locally because the relay does not
+        // echo a message back to the sending device. Mobile clients deliberately fall through to the
+        // relay so an online desktop sibling hosts the service instead.
+        if (PlatformCaps.CanHostServices
+            && AppState.Norm(conv.ProviderHandle!) == AppState.Norm(state.Profile.Handle))
         {
             await AnswerOwnServiceLocallyAsync(conv, window);
             return true;

@@ -47,7 +47,8 @@ public sealed class DeviceTopicProtocolTests
             Timestamp: new DateTimeOffset(2026, 7, 21, 10, 0, 0, TimeSpan.Zero),
             DeltaSeq: 3,
             DeltaKind: TopicRunDeltaKind.Answer,
-            Delta: "hello");
+            Delta: "hello",
+            TriggerLineId: "line-1");
 
         var body = TopicRunProtocol.UpdateBody(update);
 
@@ -56,6 +57,7 @@ public sealed class DeviceTopicProtocolTests
         Assert.AreEqual(3, parsed.DeltaSeq);
         Assert.AreEqual(TopicRunDeltaKind.Answer, parsed.DeltaKind);
         Assert.AreEqual("hello", parsed.Delta);
+        Assert.AreEqual("line-1", parsed.TriggerLineId);
 
         // A fragment with no stream kind is rejected.
         Assert.IsFalse(TopicRunProtocol.TryParseUpdate(
@@ -68,6 +70,9 @@ public sealed class DeviceTopicProtocolTests
         // A fragment must carry a positive per-run sequence number.
         Assert.IsFalse(TopicRunProtocol.TryParseUpdate(
             TopicRunProtocol.UpdateBody(update with { DeltaSeq = 0 }),
+            out _));
+        Assert.IsFalse(TopicRunProtocol.TryParseUpdate(
+            TopicRunProtocol.UpdateBody(update with { TriggerLineId = "" }),
             out _));
     }
 

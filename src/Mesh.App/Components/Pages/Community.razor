@@ -11,12 +11,15 @@
             <span class="muted">Discover services published by other people's agents.</span>
         </div>
 
-        <div class="tabs">
-            <button class="tab @(tab == "discover" ? "on" : "")" @onclick='() => tab = "discover"'>Discover</button>
-            <button class="tab @(tab == "mine" ? "on" : "")" @onclick='() => tab = "mine"'>My services</button>
-        </div>
+        @if (PlatformCaps.CanHostServices)
+        {
+            <div class="tabs">
+                <button class="tab @(tab == "discover" ? "on" : "")" @onclick='() => tab = "discover"'>Discover</button>
+                <button class="tab @(tab == "mine" ? "on" : "")" @onclick='() => tab = "mine"'>My services</button>
+            </div>
+        }
 
-        @if (tab == "discover")
+        @if (!PlatformCaps.CanHostServices || tab == "discover")
         {
             <div class="add-row">
                 <input class="full" @bind="query" @bind:event="oninput" @onkeydown="OnSearchKey"
@@ -40,7 +43,9 @@
             {
                 <div class="empty">
                     @(catFilter is null
-                        ? "No services yet. Publish one from the My services tab."
+                        ? (PlatformCaps.CanHostServices
+                            ? "No services yet. Publish one from the My services tab."
+                            : "No services yet.")
                         : $"No {catFilter} services yet.")
                 </div>
             }
@@ -421,7 +426,8 @@
     protected override async Task OnInitializedAsync()
     {
         await Search();
-        await RefreshStats();
+        if (PlatformCaps.CanHostServices)
+            await RefreshStats();
     }
 
     void Refresh() => InvokeAsync(StateHasChanged);
@@ -504,6 +510,7 @@
 
     void BeginEdit(PublishedService svc)
     {
+        if (!PlatformCaps.CanHostServices) return;
         editingId = svc.Id;
         editName = svc.Name;
         editDesc = svc.Description;
@@ -525,7 +532,7 @@
 
     void Create()
     {
-        if (string.IsNullOrWhiteSpace(newName)) return;
+        if (!PlatformCaps.CanHostServices || string.IsNullOrWhiteSpace(newName)) return;
         State.Mutate(p => p.PublishedServices.Add(new PublishedService
         {
             Name = newName.Trim(),
@@ -553,7 +560,7 @@
 
     async Task SaveEdit(PublishedService svc)
     {
-        if (string.IsNullOrWhiteSpace(editName)) return;
+        if (!PlatformCaps.CanHostServices || string.IsNullOrWhiteSpace(editName)) return;
         var name = editName.Trim();
         var desc = editDesc.Trim();
         var cat = ServiceCategories.Coerce(editCat);
@@ -587,6 +594,7 @@
 
     async Task TogglePublish(PublishedService svc, bool on)
     {
+        if (!PlatformCaps.CanHostServices) return;
         if (on)
         {
             var ok = await Dir.PublishAsync(svc);
@@ -602,6 +610,7 @@
 
     async Task Delete(PublishedService svc)
     {
+        if (!PlatformCaps.CanHostServices) return;
         if (editingId == svc.Id) editingId = null;
         await Dir.UnpublishAsync(svc.Id);
         State.Mutate(p => p.PublishedServices.Remove(svc));

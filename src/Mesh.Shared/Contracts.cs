@@ -667,7 +667,8 @@ public sealed record DeviceSyncLine(
     DateTimeOffset At,
     string? SenderHandle,
     bool Internal,
-    string? Reasoning);
+    string? Reasoning,
+    string? ReplyToLineId = null);
 
 public static class DeviceSyncVersion
 {
@@ -999,7 +1000,10 @@ public sealed record TopicRunUpdatePayload(
     // exactly-once application on a viewing device. Non-streaming updates leave these unset.
     int DeltaSeq = 0,
     TopicRunDeltaKind? DeltaKind = null,
-    string? Delta = null);
+    string? Delta = null,
+    // Identifies the user line represented by this run. Queue lifecycle updates use it to keep the
+    // transient "queued" subtitle attached to the right line on the submitting or executing device.
+    string? TriggerLineId = null);
 
 public sealed record AttachmentChunkPayload(
     string RunId,
@@ -1097,6 +1101,8 @@ public static class TopicRunProtocol
                 || !ValidOptionalText(p.FailureCode)
                 || !ValidSubtasks(p.Subtasks)
                 || !ValidSteps(p.Steps)
+                || p.TriggerLineId is not null
+                   && !ValidId(p.TriggerLineId)
                 || !ValidDelta(p.Delta, p.DeltaKind, p.DeltaSeq))
                 return false;
             result = p;

@@ -1953,7 +1953,8 @@ public sealed class AppState
             line.At,
             line.SenderHandle,
             line.Internal,
-            line.Reasoning);
+            line.Reasoning,
+            line.ReplyToLineId);
 
     private static ChatLine ToChatLine(DeviceSyncLine line)
         => new()
@@ -1966,7 +1967,8 @@ public sealed class AppState
             At = line.At,
             SenderHandle = line.SenderHandle,
             Internal = line.Internal,
-            Reasoning = line.Reasoning
+            Reasoning = line.Reasoning,
+            ReplyToLineId = line.ReplyToLineId
         };
 
     private static DeviceSyncConversation ToSyncConversation(Conversation conversation, int sortOrder)
@@ -2129,7 +2131,9 @@ public sealed class AppState
            && line.Role is not null
            && line.Text is not null
            && line.Via is not null
-           && line.Status is not null;
+           && line.Status is not null
+           && (line.ReplyToLineId is null
+               || TopicRunProtocol.IsValidIdentifier(line.ReplyToLineId));
 
     private static bool LineEquals(ChatLine line, DeviceSyncLine dto)
         => line.Role == dto.Role
@@ -2139,7 +2143,8 @@ public sealed class AppState
            && line.At == dto.At
            && line.SenderHandle == dto.SenderHandle
            && line.Internal == dto.Internal
-           && line.Reasoning == dto.Reasoning;
+           && line.Reasoning == dto.Reasoning
+           && line.ReplyToLineId == dto.ReplyToLineId;
 
     private static void MergeLine(ChatLine line, DeviceSyncLine dto)
     {
@@ -2151,6 +2156,7 @@ public sealed class AppState
         line.SenderHandle = dto.SenderHandle;
         line.Internal = dto.Internal;
         line.Reasoning = dto.Reasoning;
+        line.ReplyToLineId = dto.ReplyToLineId;
         line.Attachments.Clear();
     }
 
@@ -2402,7 +2408,7 @@ public sealed class AppState
     private readonly Dictionary<string, AgentRunState> agentRuns = new(StringComparer.Ordinal);
     private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
     private readonly HashSet<string> completedThreads = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, List<ChatLine>> queuedByThread = new(StringComparer.Ordinal);
+    private readonly QueuedTopicRunState queuedTopicRuns = new();
     private readonly Dictionary<string, RemoteRunProjection> remoteRuns = new(StringComparer.Ordinal);
     private readonly HashSet<string> terminalRemoteRuns = new(StringComparer.Ordinal);
     // Last applied streamed-delta sequence per remote run (key: threadId \0 runId), so a viewing device
@@ -2516,6 +2522,7 @@ public sealed class AppState
 
     public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
     {
+        ApplyQueuedTopicRunUpdate(update);
         // A streamed reply fragment rides the same channel as run-state updates but is applied to the
         // live draft, not the run projection, so it never disturbs the phase/steps the viewer is showing.
         if (update.Delta is { Length: > 0 })
@@ -2817,39 +2824,100 @@ public sealed class AppState
         if (a || b) NotifyChanged();
     }
 
-    /// <summary>
-    /// Queues a user line for a thread whose turn is already running (steerable input). The line is
-    /// also added to the thread history by the caller; this tracks that it is pending so the UI can
-    /// tag it and the running turn can drain it.
-    /// </summary>
-    public void EnqueueForThread(string threadId, ChatLine line)
+    /// <summary>Marks a submitted topic run as waiting behind the active turn.</summary>
+    public void TrackQueuedTopicRun(string threadId, string runId, string lineId)
     {
-        if (!queuedByThread.TryGetValue(threadId, out var l))
-            queuedByThread[threadId] = l = new List<ChatLine>();
-        l.Add(line);
-        NotifyChanged();
+        ValidateThreadId(threadId);
+        if (!TopicRunProtocol.IsValidIdentifier(runId))
+            throw new ArgumentException("A run ID is required.", nameof(runId));
+        if (!TopicRunProtocol.IsValidIdentifier(lineId))
+            throw new ArgumentException("A trigger line ID is required.", nameof(lineId));
+        bool changed;
+        lock (profileSyncGate)
+        {
+            if (!Profile.OwnThreads.Any(thread =>
+                    string.Equals(thread.Id, threadId, StringComparison.Ordinal)))
+                return;
+            changed = queuedTopicRuns.MarkWaiting(threadId, runId, lineId);
+        }
+        if (changed) NotifyChanged();
+    }
+
+    /// <summary>Hides the queued subtitle once a waiting run begins while retaining its correlation.</summary>
+    public void StartQueuedTopicRun(string threadId, string runId)
+    {
+        bool changed;
+        lock (profileSyncGate)
+            changed = queuedTopicRuns.MarkStarted(threadId, runId);
+        if (changed) NotifyChanged();
+    }
+
+    /// <summary>Forgets a queued run after completion, cancellation, or dispatch failure.</summary>
+    public void CompleteQueuedTopicRun(string threadId, string runId)
+    {
+        bool changed;
+        lock (profileSyncGate)
+            changed = queuedTopicRuns.Complete(threadId, runId);
+        if (changed) NotifyChanged();
+    }
+
+    /// <summary>
+    /// True when an update belongs to a queued run already tracked on this device, or is the first
+    /// queue update for a user line already present in the topic.
+    /// </summary>
+    public bool IsExpectedQueuedRunUpdate(TopicRunUpdatePayload update)
+    {
+        lock (profileSyncGate)
+        {
+            if (queuedTopicRuns.IsKnownRun(update.ThreadId, update.RunId)) return true;
+            if (update.Phase != TopicRunPhase.Queued
+                || update.Queued <= 0
+                || !TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
+                return false;
+            var thread = Profile.OwnThreads.FirstOrDefault(item =>
+                string.Equals(item.Id, update.ThreadId, StringComparison.Ordinal));
+            return thread?.Lines.Any(line =>
+                string.Equals(line.Id, update.TriggerLineId, StringComparison.Ordinal)
+                && string.Equals(line.Role, "user", StringComparison.Ordinal)) == true;
+        }
+    }
+
+    private void ApplyQueuedTopicRunUpdate(TopicRunUpdatePayload update)
+    {
+        if (update.Phase == TopicRunPhase.Queued)
+        {
+            if (update.Queued > 0 && TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
+                TrackQueuedTopicRun(update.ThreadId, update.RunId, update.TriggerLineId!);
+            return;
+        }
+        if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
+            CompleteQueuedTopicRun(update.ThreadId, update.RunId);
+        else
+            StartQueuedTopicRun(update.ThreadId, update.RunId);
     }
 
     /// <summary>True when a specific line is still waiting in some thread's queue (drives the "queued" tag).</summary>
     public bool IsLineQueued(ChatLine line)
     {
-        foreach (var l in queuedByThread.Values)
-            if (l.Contains(line)) return true;
-        return false;
+        ArgumentNullException.ThrowIfNull(line);
+        lock (profileSyncGate)
+            return queuedTopicRuns.IsLineWaiting(line.Id);
     }
 
     /// <summary>Number of lines currently queued for a thread.</summary>
     public int QueuedCountForThread(string threadId)
-        => queuedByThread.TryGetValue(threadId, out var l) ? l.Count : 0;
+    {
+        lock (profileSyncGate)
+            return queuedTopicRuns.WaitingCount(threadId);
+    }
 
-    /// <summary>Clears a thread's queue (called when the running turn starts answering the queued lines).</summary>
+    /// <summary>Clears transient queue presentation state for a topic.</summary>
     public void ClearThreadQueue(string threadId)
     {
-        if (queuedByThread.TryGetValue(threadId, out var l) && l.Count > 0)
-        {
-            l.Clear();
-            NotifyChanged();
-        }
+        bool changed;
+        lock (profileSyncGate)
+            changed = queuedTopicRuns.ClearThread(threadId);
+        if (changed) NotifyChanged();
     }
 
     /// <summary>Clears the unread flag for a conversation (called when the owner opens it).</summary>

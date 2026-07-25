@@ -179,6 +179,151 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void RemoteRunActivity_BusyCoversLocalLiveAndPersistedRemoteRuns()
+    {
+        var now = new DateTimeOffset(2026, 7, 24, 3, 0, 0, TimeSpan.Zero);
+        var thread = Thread("topic", now.AddHours(-1));
+        var freshProjection = Projection("run-1", "topic", now.AddMinutes(-1));
+        var staleProjection = Projection(
+            "run-1",
+            "topic",
+            now - RemoteRunActivity.StaleAfter - TimeSpan.FromMinutes(1));
+
+        Assert.IsFalse(RemoteRunActivity.IsBusy(thread, false, null, false, now));
+        Assert.IsTrue(RemoteRunActivity.IsBusy(thread, true, null, false, now));
+        Assert.IsTrue(RemoteRunActivity.IsBusy(thread, false, freshProjection, false, now));
+        Assert.IsFalse(RemoteRunActivity.IsBusy(thread, false, staleProjection, false, now));
+
+        thread.ExecutionRunId = "run-1";
+        thread.LastActivityAt = now.AddMinutes(-1);
+        Assert.IsFalse(RemoteRunActivity.IsBusy(thread, false, null, false, now),
+            "Persisted run state must not make a topic assigned to this device look busy after restart.");
+        Assert.IsTrue(RemoteRunActivity.IsBusy(thread, false, null, true, now));
+
+        thread.LastActivityAt = now - RemoteRunActivity.StaleAfter - TimeSpan.FromMinutes(1);
+        Assert.IsFalse(RemoteRunActivity.IsBusy(thread, false, null, true, now));
+    }
+
+    [TestMethod]
+    public void RemoteRunPresentation_PrefersLocalStateAndDoesNotRepeatToolLabel()
+    {
+        var projection = Projection("run-1", "topic", DateTimeOffset.UtcNow);
+        projection.Phase = Mesh.Shared.TopicRunPhase.Executing;
+        projection.Status = "Ran PowerShell";
+        projection.Steps = new[]
+        {
+            new Mesh.Shared.TopicRunStep(
+                "run_powershell",
+                "Ran PowerShell",
+                Mesh.Shared.TopicRunItemState.Completed)
+        };
+
+        Assert.AreSame(projection, RemoteRunPresentation.VisibleProjection(
+            projection, localTurnActive: false));
+        Assert.IsNull(RemoteRunPresentation.VisibleProjection(
+            projection, localTurnActive: true));
+        Assert.AreEqual("executing", RemoteRunPresentation.StatusLabel(projection));
+
+        projection.Status = "Waiting for approval";
+        Assert.AreEqual("Waiting for approval", RemoteRunPresentation.StatusLabel(projection));
+    }
+
+    [TestMethod]
+    public void QueuedTopicRunState_ShowsOnlyWaitingLinesAndRetainsStartedCorrelation()
+    {
+        var state = new QueuedTopicRunState();
+
+        Assert.IsTrue(state.MarkWaiting("topic", "run-1", "line-1"));
+        Assert.IsTrue(state.MarkWaiting("topic", "run-2", "line-2"));
+        Assert.IsFalse(state.MarkWaiting("topic", "run-2", "line-2"));
+        Assert.AreEqual(2, state.WaitingCount("topic"));
+        Assert.IsTrue(state.IsLineWaiting("line-1"));
+        Assert.IsTrue(state.IsKnownRun("topic", "run-1"));
+
+        Assert.IsTrue(state.MarkStarted("topic", "run-1"));
+        Assert.IsFalse(state.IsLineWaiting("line-1"));
+        Assert.IsTrue(state.IsKnownRun("topic", "run-1"));
+        Assert.AreEqual(1, state.WaitingCount("topic"));
+
+        Assert.IsTrue(state.Complete("topic", "run-1"));
+        Assert.IsFalse(state.IsKnownRun("topic", "run-1"));
+        Assert.IsTrue(state.ClearThread("topic"));
+        Assert.AreEqual(0, state.WaitingCount("topic"));
+        Assert.IsFalse(state.IsKnownRun("topic", "run-2"));
+    }
+
+    [TestMethod]
+    public void TopicTranscriptOrdering_PairsQueuedPromptsWithTheirReplies()
+    {
+        var lines = new[]
+        {
+            new ChatLine { Id = "prompt-1", Role = "user", Text = "one" },
+            new ChatLine { Id = "prompt-2", Role = "user", Text = "two" },
+            new ChatLine { Id = "prompt-3", Role = "user", Text = "three" },
+            new ChatLine { Id = "reply-1", Role = "assistant", Text = "ONE", ReplyToLineId = "prompt-1" },
+            new ChatLine { Id = "reply-2", Role = "assistant", Text = "TWO", ReplyToLineId = "prompt-2" },
+            new ChatLine { Id = "reply-3", Role = "assistant", Text = "THREE", ReplyToLineId = "prompt-3" }
+        };
+
+        var ordered = TopicTranscriptOrdering.OrderForDisplay(lines);
+
+        CollectionAssert.AreEqual(
+            new[] { "prompt-1", "reply-1", "prompt-2", "reply-2", "prompt-3", "reply-3" },
+            ordered.Select(line => line.Id).ToArray());
+    }
+
+    [TestMethod]
+    public void TopicTranscriptOrdering_KeepsWaitingPromptsBelowTheLiveResponse()
+    {
+        var queue = new QueuedTopicRunState();
+        queue.MarkWaiting("topic", "run-2", "prompt-2");
+        queue.MarkWaiting("topic", "run-3", "prompt-3");
+        var ordered = TopicTranscriptOrdering.OrderForDisplay(new[]
+        {
+            new ChatLine { Id = "prompt-1", Role = "user" },
+            new ChatLine { Id = "prompt-2", Role = "user" },
+            new ChatLine { Id = "prompt-3", Role = "user" },
+            new ChatLine { Id = "reply-1", Role = "assistant", ReplyToLineId = "prompt-1" }
+        });
+
+        var transcript = ordered
+            .Where(line => !queue.IsLineWaiting(line.Id))
+            .Select(line => line.Id)
+            .ToArray();
+        var waiting = ordered
+            .Where(line => queue.IsLineWaiting(line.Id))
+            .Select(line => line.Id)
+            .ToArray();
+
+        CollectionAssert.AreEqual(new[] { "prompt-1", "reply-1" }, transcript);
+        CollectionAssert.AreEqual(new[] { "prompt-2", "prompt-3" }, waiting);
+    }
+
+    [TestMethod]
+    public void TopicTranscriptOrdering_PreservesLegacyAndOrphanReplies()
+    {
+        var lines = new[]
+        {
+            new ChatLine { Id = "legacy-prompt", Role = "user" },
+            new ChatLine { Id = "legacy-reply", Role = "assistant" },
+            new ChatLine { Id = "new-prompt", Role = "user" },
+            new ChatLine { Id = "waiting-prompt", Role = "user" },
+            new ChatLine { Id = "new-reply", Role = "assistant", ReplyToLineId = "new-prompt" },
+            new ChatLine { Id = "orphan-reply", Role = "assistant", ReplyToLineId = "missing" }
+        };
+
+        var ordered = TopicTranscriptOrdering.OrderForDisplay(lines);
+
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                "legacy-prompt", "legacy-reply", "new-prompt", "new-reply",
+                "waiting-prompt", "orphan-reply"
+            },
+            ordered.Select(line => line.Id).ToArray());
+    }
+
+    [TestMethod]
     public void RemoteRunReconciliation_AnswerFinalizesOnlyWhenNotOlderThanProjection()
     {
         var at = new DateTimeOffset(2026, 7, 24, 3, 0, 0, TimeSpan.Zero);

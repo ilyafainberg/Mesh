@@ -20,6 +20,9 @@ public static class PlatformCaps
     /// </summary>
     public static bool CanRunAgent => !IsMobile;
 
+    /// <summary>True only on desktop platforms, which may publish and host public services.</summary>
+    public static bool CanHostServices => Mesh.Shared.DevicePlatforms.IsDesktop(DevicePlatform);
+
     public static string DevicePlatform =>
         OperatingSystem.IsWindows() ? Mesh.Shared.DevicePlatforms.Windows :
         OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS() ? Mesh.Shared.DevicePlatforms.MacOS :
