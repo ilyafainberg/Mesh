@@ -491,6 +491,8 @@ public static class DeviceSyncKinds
     public const string ContactDelete = "contact.delete";
     public const string CircleUpsert = "circle.upsert";
     public const string CircleDelete = "circle.delete";
+    public const string MemoryUpsert = "memory.upsert";
+    public const string MemoryDelete = "memory.delete";
 
      public static bool IsEnvelopeKind(string? kind)
         => kind is EnvelopeOperation or EnvelopeSnapshotRequest;
@@ -657,6 +659,22 @@ public sealed record DeviceSyncCircle(
 public sealed record DeviceSyncCircleRename(
     string PreviousName,
     string DeleteVersion);
+
+public sealed record DeviceSyncMemory(
+    string Id,
+    string Title,
+    string Content,
+    string Category,
+    string Origin,
+    double Importance,
+    double Confidence,
+    double Stability,
+    int ReinforcementCount,
+    string? SourceThreadId,
+    string? SourceLineId,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset LastReinforcedAt);
 
 public sealed record DeviceSyncLine(
     string Id,

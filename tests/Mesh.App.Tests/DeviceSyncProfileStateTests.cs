@@ -128,6 +128,30 @@ public sealed class DeviceSyncProfileStateTests
     }
 
     [TestMethod]
+    public void MemoryOperations_ApplyUpsertBeforeDelete()
+    {
+        var upsert = Operation(
+            DeviceSyncKinds.MemoryUpsert,
+            "memory-1",
+            Version(10, "upsert"));
+        var contact = Operation(
+            DeviceSyncKinds.ContactUpsert,
+            "alice",
+            Version(10, "contact"));
+        var delete = Operation(
+            DeviceSyncKinds.MemoryDelete,
+            "memory-1",
+            Version(20, "delete"),
+            "");
+
+        var ordered = ProfileSyncState.OrderForApplication([delete, contact, upsert]);
+
+        Assert.AreSame(upsert, ordered[0]);
+        Assert.AreSame(contact, ordered[1]);
+        Assert.AreSame(delete, ordered[2]);
+    }
+
+    [TestMethod]
     public void RenameUpsert_IsAppliedBeforeItsOlderDeleteToPreserveReferences()
     {
         var deleteVersion = Version(10, "delete-old");

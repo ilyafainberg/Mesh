@@ -122,26 +122,6 @@ public static class ModelReply
     }
 }
 
-/// <summary>
-/// Clips tool arguments/results for the step trace and the model's hidden transcript. Keeps the head
-/// and tail (where the useful signal usually is) and marks the elided middle, so a huge tool output
-/// (a long file, a big command dump) cannot blow up the UI or the context budget while still leaving
-/// the model enough to understand what happened.
-/// </summary>
-internal static class ToolTrace
-{
-    public const int MaxChars = 4000;
-
-    public static string? Clip(string? text)
-    {
-        if (string.IsNullOrEmpty(text)) return text;
-        if (text.Length <= MaxChars) return text;
-        var head = MaxChars * 2 / 3;
-        var tail = MaxChars - head;
-        var omitted = text.Length - head - tail;
-        return text[..head] + $"\n... [{omitted} characters omitted] ...\n" + text[^tail..];
-    }
-}
 
 /// <summary>Extracts token usage from the various provider response shapes and reports it to the meter.</summary>
 internal static class Usage
@@ -424,39 +404,12 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var result = await ExecuteToolAsync(tools, name, argsJson, ct, progress);
+                var result = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }
     }
 
-    internal static async Task<string> ExecuteToolAsync(IReadOnlyList<IAgentTool> tools, string name, string argsJson,
-        CancellationToken ct, IProgress<AgentStep>? progress = null)
-    {
-        var label = ReasoningExtract.Label(name);
-        var args = ToolTrace.Clip(argsJson);
-        progress?.Report(new AgentStep(name, label, AgentStepState.Started, Arguments: args));
-        var tool = tools.FirstOrDefault(t => t.Name == name);
-        if (tool is null)
-        {
-            var miss = $"ERROR: unknown tool '{name}'.";
-            progress?.Report(new AgentStep(name, label, AgentStepState.Failed, args, miss));
-            return miss;
-        }
-        try
-        {
-            using var argsDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
-            var result = await tool.ExecuteAsync(argsDoc.RootElement, ct);
-            progress?.Report(new AgentStep(name, label, AgentStepState.Done, args, ToolTrace.Clip(result)));
-            return result;
-        }
-        catch (Exception ex)
-        {
-            var err = "ERROR: " + ex.Message;
-            progress?.Report(new AgentStep(name, label, AgentStepState.Failed, args, ToolTrace.Clip(err)));
-            return err;
-        }
-    }
 
     private static object[] CloneArray(JsonElement arr)
         => arr.EnumerateArray().Select(e => (object)JsonSerializer.Deserialize<JsonElement>(e.GetRawText())).ToArray();
@@ -555,7 +508,7 @@ public sealed class AnthropicModel(HttpClient http, ModelConfig cfg, TokenMeter?
             var results = new List<object>();
             foreach (var (id, name, argsJson) in toolUses)
             {
-                var result = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct, progress);
+                var result = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
                 results.Add(new { type = "tool_result", tool_use_id = id, content = result });
             }
             messages.Add(new { role = "user", content = results.ToArray() });
@@ -594,6 +547,95 @@ public sealed class GeminiModel(HttpClient http, ModelConfig cfg, TokenMeter? me
         if (string.Equals(finishReason, "MAX_TOKENS", StringComparison.OrdinalIgnoreCase)) return TruncationDetection.Marker;
         return candidate.GetProperty("content").GetProperty("parts")[0].GetProperty("text").GetString() ?? "";
     }
+
+    public async Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
+        IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
+        IProgress<AgentDelta>? delta = null,
+        CompletionOptions? options = null, CancellationToken ct = default)
+    {
+        if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
+
+        var contents = history
+            .Where(line => line.Role is "user" or "assistant")
+            .Select(line => (object)new
+            {
+                role = line.Role == "assistant" ? "model" : "user",
+                parts = MultimodalContent.Gemini(line)
+            })
+            .ToList();
+        var declarations = tools.Select(tool => new
+        {
+            name = tool.Name,
+            description = tool.Description,
+            parameters = tool.ParametersSchema
+        }).ToArray();
+        var url = $"https://generativelanguage.googleapis.com/v1beta/models/{cfg.Model}:generateContent?key={cfg.ApiKey}";
+
+        for (;;)
+        {
+            ct.ThrowIfCancellationRequested();
+            var payload = new
+            {
+                system_instruction = new { parts = new[] { new { text = systemPrompt } } },
+                contents,
+                tools = new[] { new { functionDeclarations = declarations } },
+                generationConfig = ReasoningControls.GeminiGeneration(cfg, CompletionOptions.Resolve(options))
+            };
+
+            using var resp = await http.PostAsJsonAsync(url, payload, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
+            using var doc = JsonDocument.Parse(body);
+            Usage.ReportGemini(meter, doc.RootElement);
+            var candidate = doc.RootElement.GetProperty("candidates")[0];
+            var finishReason = candidate.TryGetProperty("finishReason", out var frEl) ? frEl.GetString() : null;
+            if (string.Equals(finishReason, "MAX_TOKENS", StringComparison.OrdinalIgnoreCase))
+                return TruncationDetection.Marker;
+
+            var content = candidate.GetProperty("content");
+            var parts = content.GetProperty("parts");
+            var calls = parts.EnumerateArray()
+                .Where(part => part.TryGetProperty("functionCall", out _))
+                .Select(part => part.GetProperty("functionCall").Clone())
+                .ToList();
+            if (calls.Count == 0)
+            {
+                var answer = new StringBuilder();
+                foreach (var part in parts.EnumerateArray())
+                    if (part.TryGetProperty("text", out var textPart) && textPart.ValueKind == JsonValueKind.String)
+                        answer.Append(textPart.GetString());
+                return answer.ToString();
+            }
+
+            contents.Add(new { role = "model", parts = CloneParts(parts) });
+            var responses = new List<object>();
+            foreach (var call in calls)
+            {
+                var name = call.TryGetProperty("name", out var nameElement)
+                    ? nameElement.GetString() ?? ""
+                    : "";
+                var argsJson = call.TryGetProperty("args", out var args)
+                    ? args.GetRawText()
+                    : "{}";
+                var result = await AgentToolExecutor.ExecuteAsync(
+                    tools, name, argsJson, ct, progress);
+                responses.Add(new
+                {
+                    functionResponse = new
+                    {
+                        name,
+                        response = new { result }
+                    }
+                });
+            }
+            contents.Add(new { role = "user", parts = responses.ToArray() });
+        }
+    }
+
+    private static object[] CloneParts(JsonElement parts)
+        => parts.EnumerateArray()
+            .Select(part => (object)JsonSerializer.Deserialize<JsonElement>(part.GetRawText()))
+            .ToArray();
 
     private static string Trim(string s) => s.Length > 300 ? s[..300] : s;
 }
@@ -670,7 +712,7 @@ public sealed class MeshHostedModel(HttpClient http, AppState state, ModelConfig
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var toolResult = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct, progress);
+                var toolResult = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
                 messages.Add(new HostedModelMessage("tool", toolResult, ToolCallId: id));
             }
         }
@@ -813,7 +855,7 @@ public sealed class AzureOpenAiModel(HttpClient http, ModelConfig cfg, TokenMete
                 var fn = call.GetProperty("function");
                 var name = fn.GetProperty("name").GetString() ?? "";
                 var argsJson = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
-                var result = await OpenAiCompatibleModel.ExecuteToolAsync(tools, name, argsJson, ct, progress);
+                var result = await AgentToolExecutor.ExecuteAsync(tools, name, argsJson, ct, progress);
                 messages.Add(new { role = "tool", tool_call_id = id, content = result });
             }
         }

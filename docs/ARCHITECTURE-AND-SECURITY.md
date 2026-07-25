@@ -72,7 +72,7 @@ Mesh has three logical components: **client peers**, the **relay**, and the **sh
 
 | Component | Role | Trust posture |
 | --- | --- | --- |
-| **Client peer** | Holds identity keys, encrypts/decrypts, pins contact keys (TOFU), stores data locally encrypted. Peers are symmetric: there is no "server account." | Trusted with the user's own keys and data. Proprietary but with publicly stated security properties. |
+| **Client peer** | Holds identity keys, encrypts/decrypts, pins contact keys (TOFU), stores data locally encrypted, and binds owner memory only to Me-topic execution. Peers are symmetric: there is no "server account." | Trusted with the user's own keys and data. Proprietary but with publicly stated security properties. |
 | **Relay** | Stateless-ish transport. Authenticates connections and senders by signature, routes sealed envelopes, queues offline messages, enforces rate limits, optionally offers helper services. Never sees plaintext. | Untrusted for confidentiality; trusted for availability and honest routing (and honest routing is verified via TOFU). Open source. |
 | **Shared library** | Defines `MeshEnvelope`, claim/registration contracts, and the crypto primitives (`MeshCrypto`). Used by both client and relay. | The definition of the security-critical wire format and crypto. Open source and auditable. |
 
@@ -82,7 +82,7 @@ Mesh has three logical components: **client peers**, the **relay**, and the **sh
 flowchart TB
     subgraph ClientA["Client Peer A (proprietary, PolyForm Noncommercial)"]
         A_Keys["Device signing + recovery keys<br/>(local, never leave device)"]
-        A_Store["Encrypted local store<br/>(SQLCipher + secure enclave)"]
+        A_Store["Encrypted local store<br/>(SQLCipher + secure enclave)<br/>including owner-only memories"]
         A_Crypto["Uses Mesh.Shared crypto"]
         A_TOFU["TOFU key pins for contacts"]
     end
@@ -180,6 +180,7 @@ A handle can authorize multiple devices. Because messages are multi-recipient en
 - An **already-authorized device** issues a **short-lived, single-use invite**. The invite has a maximum lifetime of **15 minutes** and its code is stored **hashed** by the relay (the raw code is not stored).
 - A **new device redeems** the invite by presenting the code and its own device public key. On success, the new device's public key is added to the handle's authorized key set.
 - Because linking requires action from an already-authorized device (or the recovery path), the relay alone cannot add a device to a handle.
+- Private profile state can then synchronize between authorized devices through ordinary end-to-end-encrypted envelopes. Owner memories use versioned `memory.upsert` and `memory.delete` operations. Last-writer-wins versions reject stale updates, and deletion tombstones prevent an older device from resurrecting a deleted memory. Local recall counters are deliberately omitted from the shared payload so a usage touch cannot overwrite newer content from another device.
 
 ```mermaid
 sequenceDiagram
@@ -475,7 +476,7 @@ sequenceDiagram
 | Party | Trusted for | Not trusted for |
 | --- | --- | --- |
 | **Relay operator** | Availability, honest routing, rate-limit fairness | Confidentiality of message contents; integrity of contact keys (checked via TOFU) |
-| **Client (own device)** | Holding your keys, encrypting/decrypting, pinning, local storage | n/a (it is your trusted computing base) |
+| **Client (own device)** | Holding your keys, encrypting/decrypting, pinning, local storage, and enforcing the Me-only memory binding | n/a (it is your trusted computing base) |
 | **Contact's client** | Being the endpoint you pinned | Anything beyond the pinned identity until re-verified |
 
 ---
@@ -537,6 +538,10 @@ This section describes client storage as **externally observable security proper
   - **Keychain** on iOS,
   - **Keystore** on Android.
 - **Backups** are **passphrase-encrypted** and carry the **handle recovery key** but **never the device signing keys**. This means a stolen backup plus its passphrase can support recovery of a handle, but does not directly yield device signing keys.
+- **Owner memories** are stored inside the identity's SQLCipher database and included in encrypted backups. They have no visibility or publishing field, so they cannot be attached to contacts, circles, Messages, guest agents, or Community services.
+- Memory additions, updates, and deletion tombstones synchronize only inside end-to-end-encrypted linked-device traffic. The relay can observe the encrypted device-sync envelope metadata but cannot read the memory payload.
+- The client selects a small relevant subset for each Me turn. Those selected memories become part of that turn's model prompt; a configured cloud model provider can therefore read the selected text, just as it can read the rest of that model request.
+- Automatic capture requires direct support in the owner's latest message, rejects credential-like and payment data, and requires an explicit remember request for recognized sensitive personal information. These checks reduce accidental retention but are not a substitute for trusting the client device and configured model.
 - Client-only group records persist the group ID, name, owner handle, member list, and membership version. Group chat lines also persist the actual sender handle so the UI can attribute each message.
 
 ### 8.2 Relay
@@ -554,7 +559,7 @@ This section describes client storage as **externally observable security proper
 
 | Location | Stored form | Keys held here? |
 | --- | --- | --- |
-| Client local store | SQLCipher-encrypted; master key in secure enclave | Device signing + recovery keys (private material) |
+| Client local store | SQLCipher-encrypted profile data, conversations, topics, and owner-only memories; master key in secure enclave | Device signing + recovery keys (private material) |
 | Client backup | Passphrase-encrypted; includes recovery key, excludes device signing keys | Recovery key only |
 | Relay durable store (Cosmos) | Per-recipient ciphertext inbox records, directory metadata, hashed invite codes, administrative rate policies | No private keys; only device public keys in the directory |
 | Relay Redis | Presence, live rate buckets, quota, and routing state | No private keys |
@@ -575,7 +580,8 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 | **Successful topic completion** | Yes, when push is requested | `PushHint = topic.response` reveals completion between the owner's devices, but not the topic, prompt, response, or progress |
 | **Inner fan-out type** | No | `GroupControl` / `GroupMessage` is inside encrypted `MeshFanoutContent`; the outer request is generic fan-out |
 | **Group ID, name, membership metadata, roles, or version** | No explicit protocol field | These values exist only inside E2E-encrypted content; the relay has no group-state schema |
-| **Message contents** | No | Bodies are ciphertext (`ECIES-P256-AESGCM`); relay holds no device private key |
+| **Message contents** | No | Bodies are ciphertext (ECIES-P256-AESGCM); relay holds no device private key |
+| **Memory contents and memory sync operations** | No | Memory payloads travel only inside E2E-encrypted linked-device envelopes; the relay sees routing metadata and ciphertext size |
 | **Device private keys** | No | Private keys never leave the device |
 | **Capability content** (what a published service actually does at invocation) | No | Capabilities run on the provider's client; relay stores only public metadata |
 
@@ -589,6 +595,7 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 | **Passive network observer** | Sees WebSocket traffic | Transport is over SignalR WebSockets; bodies are already E2E ciphertext independent of transport encryption. |
 | **Vote manipulation on the directory** | Tries to stuff votes | Voting requires an **attested usage event**; ranking uses a **Wilson score lower bound**. |
 | **Stolen client backup** | Has an encrypted backup file | Backup is **passphrase-encrypted** and excludes device signing keys; without the passphrase it is not usable. |
+| **Cloud model provider** | Receives a Me-topic model request containing selected relevant memories | Choose an on-device model when the selected memory and topic content must not leave the device. Memory is never routed into Messages or public-service execution. |
 
 ### 9.3 The Metadata Tradeoff (Explicit)
 
@@ -617,11 +624,12 @@ For fan-out, the relay necessarily observes the sender, transient recipient coho
 | **Group membership and history** | Groups are create-only in the MVP. There is no membership editing, invite-link, leave/removal, or history-backfill protocol. Local deletion does not revoke another member's existing history. |
 | **TOFU dependence** | TOFU pinning is only as strong as the user's **out-of-band verification** when keys change. A user who blindly accepts key changes loses the protection. |
 | **Hosted model proxy** | Content sent through the optional hosted model proxy is, by design, visible on that request path. It is opt-in convenience, not an E2EE channel. Users can configure their own provider in the client. |
+| **Memory policy classification** | Automatic capture uses conservative evidence, secret, and sensitive-data checks, but no classifier is perfect. Users can inspect, edit, delete, or undo memories, and should use an on-device model for the strongest model-path privacy. |
 | **Availability** | The relay is trusted for availability and honest routing. A relay can drop or delay messages (denial of service); it cannot read them. |
 
 ### 10.3 Sandboxed Public-Service Agent (Client Property)
 
-As a stated client security property (not an implementation description): **public services run through a hard-sandboxed, service-scoped agent** that can only reach the specific public-listed capabilities attached to that service - **never** private knowledge, connectors, or local tools. **AI-content reports require explicit user consent**, and the exact shared content is shown to the user before it is sent. This bounds the blast radius of interacting with third-party published services.
+As a stated client security property (not an implementation description): **public services run through a hard-sandboxed, service-scoped agent** that can only reach the specific public-listed capabilities attached to that service - **never** owner memories, private knowledge, connectors, or local tools. **AI-content reports require explicit user consent**, and the exact shared content is shown to the user before it is sent. This bounds the blast radius of interacting with third-party published services.
 
 ---
 
@@ -632,6 +640,7 @@ As a stated client security property (not an implementation description): **publ
 | **Handle** | Human-readable identity name bound to one or more device signing public keys |
 | **DeviceId** | First 12 hex chars of `SHA-256(publicKeyB64)`; used as the key in the per-recipient key map |
 | **TOFU** | Trust On First Use; pin a contact's keys on first contact, hold and re-verify on change |
+| **Owner memory** | A durable, editable detail available only to the owner's Me topics; it has no sharing or publishing surface |
 | **ECIES-P256-AESGCM** | Mesh's ephemeral-static ECIES: per-message AES-256-GCM content key, wrapped per recipient device via P-256 ECDH + SHA-256 KEK derivation |
 | **MeshEnvelope** | Routing unit with `To`, relay-stamped `From`, `Kind`, ciphertext `Body`, and optional `FromDevice`/`ToDevice`/`PushHint` metadata |
 | **MeshFanoutRequest** | Generic logical send containing one ciphertext and 1 to 128 transient recipient handles |

@@ -185,6 +185,57 @@ public sealed class KnowledgeItem
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+public static class MemoryCategories
+{
+    public const string Preference = "preference";
+    public const string PersonalFact = "personal_fact";
+    public const string Goal = "goal";
+    public const string Workflow = "workflow";
+    public const string Constraint = "constraint";
+
+    public static readonly IReadOnlyList<string> All =
+    [
+        Preference,
+        PersonalFact,
+        Goal,
+        Workflow,
+        Constraint
+    ];
+}
+
+public static class MemoryOrigins
+{
+    public const string Manual = "manual";
+    public const string Explicit = "explicit";
+    public const string Inferred = "inferred";
+}
+
+/// <summary>
+/// Owner-only durable memory used exclusively by Me topics. Memories never have visibility or
+/// publishing fields, so they cannot be exposed to Messages, contacts, circles, or Community services.
+/// </summary>
+public sealed class MemoryItem
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("n");
+    public string Title { get; set; } = "";
+    public string Content { get; set; } = "";
+    public string Category { get; set; } = MemoryCategories.Preference;
+    public string Origin { get; set; } = MemoryOrigins.Inferred;
+    public double Importance { get; set; } = 0.65;
+    public double Confidence { get; set; } = 0.8;
+    public double Stability { get; set; } = 0.75;
+    public int ReinforcementCount { get; set; } = 1;
+    public string? SourceThreadId { get; set; }
+    public string? SourceLineId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset LastReinforcedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    /// <summary>Local-only retrieval history. It is backed up but not synchronized between devices.</summary>
+    public int RecallCount { get; set; }
+    public DateTimeOffset? LastRecalledAt { get; set; }
+}
+
 /// <summary>A capability the agent can offer, exposed by visibility like knowledge.</summary>
 public sealed class Skill
 {
@@ -959,6 +1010,7 @@ public sealed class MeshProfile
     public string? ConnectorCatalogCache { get; set; }
 
     public List<KnowledgeItem> Knowledge { get; set; } = new();
+    public List<MemoryItem> Memories { get; set; } = new();
     public List<Skill> Skills { get; set; } = new();
     public List<SkillMarketplace> SkillMarketplaces { get; set; } = new();
     public List<Widget> Widgets { get; set; } = new();

@@ -339,7 +339,20 @@ The relay must remain group-agnostic. Do not add group IDs, membership, roles, g
 | `HostedModelRequest` | Request to the hosted free-model proxy. |
 | `HostedModelMessage` | A message in a hosted-model conversation. |
 
-#### 4.2.7 Capability directory (services)
+#### 4.2.7 Linked-device profile synchronization
+
+`DeviceSyncOperation` is the versioned unit used by interoperable clients to synchronize private profile state between authorized devices of the same handle. These operations are serialized inside end-to-end-encrypted device-targeted envelopes; the relay routes ciphertext and does not interpret the operation payload.
+
+`DeviceSyncKinds` defines both the envelope-level sync kinds and the operation kinds. Memory synchronization uses:
+
+| Operation kind | Payload |
+|------|------|
+| `memory.upsert` | `DeviceSyncMemory` with the owner-visible content, category, origin, salience metadata, source correlation, and timestamps. |
+| `memory.delete` | Empty payload plus the memory entity id and operation version. |
+
+`DeviceSyncMemory` deliberately omits local recall counters and last-recalled time. Those values describe use on one device and must not overwrite newer shared content. Clients should compare operation versions atomically, retain deletion tombstones, reject stale upserts, and allow recreation only with a version newer than both the prior upsert and delete.
+
+#### 4.2.8 Capability directory (services)
 
 | Type | Role |
 |------|------|
@@ -351,7 +364,7 @@ The relay must remain group-agnostic. Do not add group IDs, membership, roles, g
 | `ServiceDirectoryProtocol` | Directory helpers, including `WilsonScore` (ranking/scoring). |
 | `ServiceCategories` | The fixed list of service categories. |
 
-#### 4.2.8 System handles and links
+#### 4.2.9 System handles and links
 
 | Type | Role |
 |------|------|

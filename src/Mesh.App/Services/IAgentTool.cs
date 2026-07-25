@@ -10,6 +10,8 @@ public interface IAgentTool
     string Description { get; }
     /// <summary>JSON-schema object describing the tool's parameters.</summary>
     object ParametersSchema { get; }
+    /// <summary>Internal tools are omitted from user-facing tool lists and execution progress.</summary>
+    bool IsInternal => false;
     ToolOperationKind Classify(JsonElement args) => ToolRiskClassifier.Classify(Name, args);
     Task<string> ExecuteAsync(JsonElement args, CancellationToken ct = default);
 }
@@ -68,6 +70,7 @@ public sealed class ApprovalTool(
     public string Name => inner.Name;
     public string Description => inner.Description;
     public object ParametersSchema => inner.ParametersSchema;
+    public bool IsInternal => inner.IsInternal;
     public ToolOperationKind Classify(JsonElement args) => inner.Classify(args);
 
     public async Task<string> ExecuteAsync(JsonElement args, CancellationToken ct = default)

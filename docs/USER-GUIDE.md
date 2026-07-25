@@ -12,7 +12,7 @@ Welcome to Mesh. This guide explains what the Mesh app does and how to use it, s
 4. [Your Agent (Me and Threads)](#4-your-agent-me-and-threads)
 5. [Messaging People and Agents](#5-messaging-people-and-agents)
 6. [Contacts and Circles](#6-contacts-and-circles)
-7. [Knowledge, Skills, and Widgets](#7-knowledge-skills-and-widgets)
+7. [Memories, Knowledge, Skills, and Widgets](#7-memories-knowledge-skills-and-widgets)
 8. [Connecting Live Knowledge Sources](#8-connecting-live-knowledge-sources)
 9. [Local Tools and MCP](#9-local-tools-and-mcp)
 10. [Community and Public Services](#10-community-and-public-services)
@@ -31,7 +31,7 @@ Welcome to Mesh. This guide explains what the Mesh app does and how to use it, s
 Mesh is a private messenger with a personal AI agent built in. It combines three ideas that usually live in separate apps:
 
 - **A secure messenger.** You talk to other people using a simple handle (like a username). Your conversations are end-to-end encrypted, which means only the intended people can read them.
-- **A personal AI agent.** Every Mesh identity comes with its own agent: a private assistant that can chat with you, remember the knowledge you give it, run skills you define, build small apps for you, and (with your permission) talk to other people's agents on your behalf.
+- **A personal AI agent.** Every Mesh identity comes with its own agent: a private assistant that can chat with you, remember durable details across Me topics, use the knowledge you give it, run skills you define, build small apps for you, and (with your permission) talk to other people's agents on your behalf.
 - **An open relay.** Messages travel through a relay server whose only job is to route sealed, encrypted messages between devices. The relay cannot read your messages. It never sees the contents.
 
 The Mesh client is a desktop and mobile app. It runs on Windows and Android, with iOS builds as well. The look and behavior are consistent across platforms, though the layout adapts to each screen size.
@@ -110,11 +110,12 @@ Every message you send is encrypted on your device before it leaves, and it can 
 
 ## 4. Your Agent (Me and Threads)
 
-The **Me** screen is a private chat between you and your own agent. This is your personal space. Your agent here has **full access** to everything you have given it: your knowledge, your skills, your tools, and your connected sources.
+The **Me** screen is a private chat between you and your own agent. This is your personal space. Your agent here has **full access** to everything you have given it: your memories, your knowledge, your skills, your tools, and your connected sources.
 
 Use the Me chat to:
 
 - Ask questions and get help.
+- Have your agent recall durable preferences, facts, goals, workflows, and constraints across topics.
 - Have your agent search or summarize your knowledge.
 - Run your skills.
 - Ask your agent to build a widget (a small app) for you.
@@ -231,13 +232,30 @@ You can tune this per your comfort level. Approved contacts are still limited to
 
 ---
 
-## 7. Knowledge, Skills, and Widgets
+## 7. Memories, Knowledge, Skills, and Widgets
 
-These three building blocks give your agent its abilities. All three can be shared with circles (see above) and some can be published publicly (see [Community](#10-community-and-public-services)).
+These features help your agent work consistently across conversations. **Memories are always private to you.** Knowledge, skills, and widgets have separate sharing controls and can be shared with circles; some can also be published through [Community](#10-community-and-public-services).
+
+### Memories
+
+**Memories** are short, durable details that help your agent across separate Me topics, such as a stable preference, personal fact, ongoing goal, recurring workflow, or standing constraint. Mesh selects only the memories relevant to the current topic instead of inserting the entire collection into every request.
+
+After a successful Me turn, the agent can automatically remember an important detail directly supported by your latest message. It does not treat every message as a memory, and it does not save tool results, documents, email, web content, assistant guesses, temporary plans, credentials, payment data, private keys, recovery material, or similar secrets. Sensitive personal information is remembered automatically only when you explicitly ask Mesh to remember it.
+
+Memory is separated from messaging and sharing by design:
+
+- Memories are available only to your own agent in **Me topics**.
+- They are never attached to **Messages**, guest-agent requests, circles, or Community services.
+- They have no visibility, sharing, or publishing control.
+- They are stored in your identity's encrypted database, included in encrypted backups, and synchronized to your linked devices through end-to-end-encrypted device sync.
+
+Open **Memories** between **Settings** and **Backup** in the navigation menu to search, add, edit, or delete memories. Automatic changes show a **Remembered**, **Updated memory**, or **Forgot** banner. Use **Undo** to reverse that change when it is still current, or **View** to open the complete list. Deleting a memory creates a synchronized deletion so an older linked device cannot silently restore it.
+
+Relevant memory text becomes part of the model request for that Me turn. If you use a cloud model provider, that provider receives the selected memory along with the rest of the prompt. Use an on-device model when you do not want Me-topic content sent to a cloud model.
 
 ### Knowledge
 
-**Knowledge** is documents and notes your agent can use. Add the things you want your agent to know about: reference material, personal notes, project details, FAQs, and so on. Your agent can search and use this knowledge when it helps you or an approved contact.
+**Knowledge** is documents and notes your agent can use. Add the things you want your agent to know about: reference material, personal notes, project details, FAQs, and so on. Your agent can search and use this knowledge when it helps you or an approved contact. Unlike Memories, Knowledge has explicit visibility controls.
 
 ### Skills
 
@@ -301,7 +319,7 @@ Creating, managing, and hosting services is available on Windows and macOS clien
 
 ### What a public service is
 
-You can **publish** some of your **Knowledge, Skills, and Widgets** as a public service. When someone uses your service, they are talking to a **sandboxed version of your agent** that can only use the items you attached to that service. It **never** exposes your private items or your local tools. Your personal Me chat, your private knowledge, and your device tools stay private.
+You can **publish** some of your **Knowledge, Skills, and Widgets** as a public service. When someone uses your service, they are talking to a **sandboxed version of your agent** that can only use the items you attached to that service. It **never** exposes your private items or your local tools. Your owner memories, personal Me chat, private knowledge, and device tools stay private.
 
 ### How each service is defined
 
@@ -401,7 +419,7 @@ Because your keys and data live on your device, backups and device moves work a 
 
 Create a **passphrase-encrypted backup**. This backup carries:
 
-- **All your data** (your identities, knowledge, skills, widgets, settings, and so on).
+- **All your data** (your identities, memories, knowledge, skills, widgets, settings, and so on).
 - A **handle recovery key**, which lets you re-establish your handle on a new device.
 
 Important: the backup **never** includes your **device signing keys**. Those are unique to each device and are never exported. Choose a strong passphrase and keep it safe, because it is what protects the backup.
@@ -420,7 +438,7 @@ There are two ways the new device gets re-authorized:
 | **Device linking** | An already-authorized device issues a **QR code or link invite**. Scan or open it on the new device to link it under your handle. |
 | **Recovery** | Use the **handle recovery key** from your backup to re-establish the handle on the new device. |
 
-Device linking is the smooth path when you still have an authorized device handy. Recovery is there for when you do not (for example, if your old device is lost).
+Device linking is the smooth path when you still have an authorized device handy. Recovery is there for when you do not (for example, if your old device is lost). Linked devices synchronize memory additions, updates, and deletions through the same end-to-end-encrypted device-sync channel used for other private profile state.
 
 ### Why this design is good for you
 
@@ -506,7 +524,7 @@ No. Messages are **end-to-end encrypted**. The relay only routes sealed envelope
 
 ### Can others use my agent without my permission?
 
-Only in the ways you allow. Approved contacts see only what their **circle** can access. A **public service** exposes only the capabilities you attach to it, never your private items or local tools, and it is protected by budgets and daily request limits.
+Only in the ways you allow. Approved contacts see only what their **circle** can access. A **public service** exposes only the capabilities you attach to it, never your owner memories, private items, or local tools, and it is protected by budgets and daily request limits.
 
 ---
 
@@ -526,6 +544,7 @@ Only in the ways you allow. Approved contacts see only what their **circle** can
 | **Contact** | Someone you have added by handle. |
 | **Circle** | A named group of contacts that scopes what you share. |
 | **Privacy by binding** | What a contact can access is bound to their circle. |
+| **Memory** | An owner-only durable detail recalled across Me topics. It cannot be shared or published. |
 | **Knowledge** | Documents and notes your agent can use. |
 | **Skill** | Reusable instructions or capabilities for your agent. |
 | **Widget** | A mini HTML app your agent can build, pin, and share. |

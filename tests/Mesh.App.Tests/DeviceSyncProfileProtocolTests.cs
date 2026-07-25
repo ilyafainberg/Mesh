@@ -16,6 +16,8 @@ public sealed class DeviceSyncProfileProtocolTests
         Assert.AreEqual("contact.delete", DeviceSyncKinds.ContactDelete);
         Assert.AreEqual("circle.upsert", DeviceSyncKinds.CircleUpsert);
         Assert.AreEqual("circle.delete", DeviceSyncKinds.CircleDelete);
+        Assert.AreEqual("memory.upsert", DeviceSyncKinds.MemoryUpsert);
+        Assert.AreEqual("memory.delete", DeviceSyncKinds.MemoryDelete);
     }
 
     [TestMethod]
@@ -47,6 +49,37 @@ public sealed class DeviceSyncProfileProtocolTests
 
         using var document = JsonDocument.Parse(json);
         Assert.IsFalse(document.RootElement.TryGetProperty("tokensSpent", out _));
+    }
+
+    [TestMethod]
+    public void MemoryPayload_RoundTripsSharedFieldsOnly()
+    {
+        var created = new DateTimeOffset(2026, 3, 1, 10, 0, 0, TimeSpan.Zero);
+        var memory = new DeviceSyncMemory(
+            "memory-1",
+            "Concise answers",
+            "The owner prefers concise answers.",
+            "preference",
+            "explicit",
+            0.8,
+            0.95,
+            0.9,
+            3,
+            "topic-1",
+            "line-1",
+            created,
+            created.AddDays(1),
+            created.AddDays(1));
+
+        var json = JsonSerializer.Serialize(memory, JsonOptions);
+        var roundTrip = JsonSerializer.Deserialize<DeviceSyncMemory>(json, JsonOptions);
+
+        Assert.AreEqual(memory, roundTrip);
+        Assert.IsNull(typeof(DeviceSyncMemory).GetProperty("RecallCount"));
+        Assert.IsNull(typeof(DeviceSyncMemory).GetProperty("LastRecalledAt"));
+        using var document = JsonDocument.Parse(json);
+        Assert.IsFalse(document.RootElement.TryGetProperty("recallCount", out _));
+        Assert.IsFalse(document.RootElement.TryGetProperty("lastRecalledAt", out _));
     }
 
     [TestMethod]

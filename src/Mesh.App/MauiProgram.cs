@@ -74,6 +74,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<IPushService, NoopPushService>();
 #endif
 		builder.Services.AddSingleton<AppState>();
+		builder.Services.AddSingleton<IMemoryState>(services => services.GetRequiredService<AppState>());
 		builder.Services.AddSingleton<TokenMeter>();
 		builder.Services.AddSingleton<BrowserModelService>();
 		builder.Services.AddSingleton<CopilotMcpBridge>();
@@ -96,6 +97,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<SourceBrowser>();
 		builder.Services.AddSingleton<FileImporter>();
 		builder.Services.AddSingleton<AgentRunCoordinator>();
+		builder.Services.AddSingleton<MemoryService>();
 		builder.Services.AddSingleton<AgentService>();
 		builder.Services.AddSingleton<TopicTurnRunner>();
 		builder.Services.AddSingleton<ITopicTurnRunner>(services =>

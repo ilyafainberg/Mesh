@@ -6,6 +6,7 @@
 @inject IAppControl AppControl
 @inject ModelSetupService Setup
 @inject UpdateService Updater
+@inject MemoryService Memories
 @implements IDisposable
 
 <div class="m-shell @ModeClass">
@@ -40,6 +41,23 @@
                 <span class="gb-text">Mesh @Updater.Available.Version.ToString(3) is available.</span>
                 <a class="gb-link" href="settings">Update</a>
                 <button class="gb-close" @onclick="Updater.DismissBanner" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
+            </div>
+        }
+        @if (Memories.Notice is { } memoryNotice)
+        {
+            <div class="memory-notice" role="status" aria-live="polite">
+                <i class="bi @MemoryNoticeIcon(memoryNotice.Message)"></i>
+                <div class="memory-notice-copy">
+                    <strong>@memoryNotice.Message</strong>
+                </div>
+                @if (memoryNotice.CanUndo)
+                {
+                    <button type="button" @onclick="UndoMemoryNotice">Undo</button>
+                }
+                <button type="button" @onclick='() => Go("/memories")'>View</button>
+                <button type="button" class="memory-notice-dismiss" aria-label="Dismiss memory notice" @onclick='() => Memories.DismissNotice(memoryNotice.Id)'>
+                    <i class="bi bi-x-lg"></i>
+                </button>
             </div>
         }
         @ChildContent
@@ -99,6 +117,7 @@
                 <button class="m-sheet-link" @onclick='() => Go("/tools")'><i class="bi bi-tools"></i><span>Tools</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/community")'><i class="bi bi-globe"></i><span>Community</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/settings")'><i class="bi bi-gear"></i><span>Settings</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/memories")'><i class="bi bi-brain"></i><span>Memories</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/backup")'><i class="bi bi-shield-lock"></i><span>Backup</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/about")'><i class="bi bi-info-circle"></i><span>About</span></button>
             </div>
@@ -160,6 +179,7 @@
         Mesh.StateChanged += Refresh;
         Setup.Changed += Refresh;
         Updater.Changed += Refresh;
+        Memories.Changed += Refresh;
         Nav.LocationChanged += OnLocationChanged;
     }
 
@@ -167,12 +187,27 @@
 
     private void Refresh() => InvokeAsync(StateHasChanged);
 
+    private void UndoMemoryNotice()
+    {
+        if (Memories.Notice is { } current)
+            Memories.UndoNotice(current.Id);
+    }
+
+    private static string MemoryNoticeIcon(string message)
+    {
+        if (message.StartsWith("Could not", StringComparison.Ordinal)) return "bi-exclamation-triangle";
+        if (message.StartsWith("Forgot", StringComparison.Ordinal)) return "bi-trash3";
+        if (message.StartsWith("Updated", StringComparison.Ordinal)) return "bi-arrow-repeat";
+        return "bi-brain";
+    }
+
     public void Dispose()
     {
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
         Updater.Changed -= Refresh;
+        Memories.Changed -= Refresh;
         Nav.LocationChanged -= OnLocationChanged;
     }
 }

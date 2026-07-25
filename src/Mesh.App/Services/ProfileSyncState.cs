@@ -222,6 +222,7 @@ internal static class ProfileSyncState
             DeviceSyncKinds.CircleDelete => 1,
             DeviceSyncKinds.TopicUpsert => 1,
             DeviceSyncKinds.ConversationUpsert => 1,
+            DeviceSyncKinds.MemoryUpsert => 1,
             DeviceSyncKinds.ContactUpsert => 2,
             DeviceSyncKinds.ContactDelete => 2,
             DeviceSyncKinds.TopicLineUpsert => 2,
@@ -230,6 +231,7 @@ internal static class ProfileSyncState
             DeviceSyncKinds.ConversationClear => 3,
             DeviceSyncKinds.TopicDelete => 4,
             DeviceSyncKinds.ConversationDelete => 4,
+            DeviceSyncKinds.MemoryDelete => 4,
             _ => 2
         };
 

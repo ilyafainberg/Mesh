@@ -29,7 +29,9 @@ internal sealed class CopilotAcpLane(
         public IProgress<AgentDelta>? Delta { get; init; }
         public required TokenMeter.UsageContext UsageContext { get; init; }
         public HashSet<string> AllowedToolNames { get; init; } = new(StringComparer.Ordinal);
+        public HashSet<string> InternalToolNames { get; init; } = new(StringComparer.Ordinal);
         public HashSet<string> MeshToolCallIds { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> InternalToolCallIds { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, ToolProgress> ToolCalls { get; } = new(StringComparer.Ordinal);
         public CopilotAcpUsageAccumulator Usage { get; } = new();
         private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
@@ -201,6 +203,10 @@ internal sealed class CopilotAcpLane(
                 Delta = delta,
                 UsageContext = tokenMeter.CaptureContext(),
                 AllowedToolNames = tools
+                    .SelectMany(tool => new[] { tool.Name, $"mesh-{tool.Name}" })
+                    .ToHashSet(StringComparer.Ordinal),
+                InternalToolNames = tools
+                    .Where(tool => tool.IsInternal)
                     .SelectMany(tool => new[] { tool.Name, $"mesh-{tool.Name}" })
                     .ToHashSet(StringComparer.Ordinal)
             };
@@ -528,7 +534,11 @@ internal sealed class CopilotAcpLane(
             if (turn.AllowedToolNames.Any(name =>
                     string.Equals(titleText, name, StringComparison.Ordinal)))
                 turn.MeshToolCallIds.Add(toolCallId);
+            if (turn.InternalToolNames.Any(name =>
+                    string.Equals(titleText, name, StringComparison.Ordinal)))
+                turn.InternalToolCallIds.Add(toolCallId);
         }
+        if (turn.InternalToolCallIds.Contains(toolCallId)) return;
 
         if (!turn.ToolCalls.TryGetValue(toolCallId, out var tracked))
         {
