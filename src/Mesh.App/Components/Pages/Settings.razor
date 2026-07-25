@@ -451,6 +451,55 @@
                 </select>
                 <div class="field-hint">When on, your agent drafts a reply and waits for you on the Messages page before sending.</div>
             </div>
+            <div class="field">
+                <label>Primary agent response device</label>
+                @if (!Mesh.SupportsAtomicAgentDispatch)
+                {
+                    <div class="field-hint">This relay does not support single-device agent responses. Update the relay to configure this setting.</div>
+                }
+                else
+                {
+                    <div class="model-row">
+                        <select class="full" value="@primaryAgentDeviceId" @onchange="OnPrimaryAgentDeviceChanged"
+                                disabled="@(loadingAgentRouting || savingAgentRouting || AgentRoutingDevices.Count == 0)">
+                            @if (AgentRoutingDevices.Count == 0)
+                            {
+                                <option value="">No compatible desktop device</option>
+                            }
+                            @foreach (var device in AgentRoutingDevices)
+                            {
+                                <option value="@device.DeviceId">@AgentDeviceLabel(device)</option>
+                            }
+                        </select>
+                        <button class="ghost icon-btn" title="Refresh devices" aria-label="Refresh agent response devices"
+                                disabled="@(loadingAgentRouting || savingAgentRouting)" @onclick="LoadAgentRoutingAsync">
+                            <i class="bi @(loadingAgentRouting ? "bi-hourglass-split" : "bi-arrow-repeat")"></i>
+                        </button>
+                    </div>
+                    <div class="field-hint">
+                        The first compatible desktop is selected automatically. Only this device runs and answers each agent question.
+                    </div>
+                }
+            </div>
+            @if (Mesh.SupportsAtomicAgentDispatch)
+            {
+                <div class="field">
+                    <label>Failover response device</label>
+                    <select class="full" value="@failoverAgentDeviceId" @onchange="OnFailoverAgentDeviceChanged"
+                            disabled="@(loadingAgentRouting || savingAgentRouting || string.IsNullOrWhiteSpace(primaryAgentDeviceId))">
+                        <option value="">None</option>
+                        @foreach (var device in AgentRoutingDevices.Where(device => device.DeviceId != primaryAgentDeviceId))
+                        {
+                            <option value="@device.DeviceId">@AgentDeviceLabel(device)</option>
+                        }
+                    </select>
+                    <div class="field-hint">Used only when the primary is offline or cannot run its configured model. Choose None to keep questions queued for the primary.</div>
+                </div>
+                @if (!string.IsNullOrWhiteSpace(agentRoutingError))
+                {
+                    <div class="err-text" role="alert">@agentRoutingError</div>
+                }
+            }
             <div class="field-row">
                 <div>
                     <div class="field-label">Plan before acting</div>
@@ -651,6 +700,17 @@
     string approvalMode = "PerCircle";
     bool allowApps = true;
     int replyBudget = 100;
+    List<Mesh.Shared.DeviceInfo> agentDevices = new();
+    string primaryAgentDeviceId = "";
+    string failoverAgentDeviceId = "";
+    bool loadingAgentRouting;
+    bool savingAgentRouting;
+    bool agentRoutingAttempted;
+    string? agentRoutingError;
+
+    IReadOnlyList<Mesh.Shared.DeviceInfo> AgentRoutingDevices => agentDevices
+        .Where(device => device.IsDesktop && device.AtomicAgentDispatchEnabled)
+        .ToList();
 
     string BudgetUsageLabel => replyBudget <= 0
         ? "Unlimited"
@@ -702,6 +762,7 @@
                 SyncFields();
                 await Mesh.RegisterAsync();
                 await Mesh.ConnectAsync();
+                await LoadAgentRoutingAsync();
             }
         }
         finally { switching = false; }
@@ -771,6 +832,8 @@
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
+        primaryAgentDeviceId = p.AgentPrimaryDeviceId ?? "";
+        failoverAgentDeviceId = p.AgentFailoverDeviceId ?? "";
         SyncModelCustomFlag();
     }
 
@@ -840,6 +903,8 @@
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
+        primaryAgentDeviceId = p.AgentPrimaryDeviceId ?? "";
+        failoverAgentDeviceId = p.AgentFailoverDeviceId ?? "";
         // Use the list cached at app startup, do NOT reload here (that would reset the selection).
         foundryModels = Foundry.CachedModels.ToList();
         SyncModelCustomFlag();
@@ -862,6 +927,7 @@
     {
         if (provider == "GitHubCopilot")
             await LoadCopilotModelsAsync();
+        await LoadAgentRoutingAsync();
     }
 
     async Task OnDeviceNameChanged(ChangeEventArgs e)
@@ -877,6 +943,8 @@
         {
             if (!await Mesh.RegisterAsync())
                 registrationError = "Could not update this device on the relay. Check your connection and try again.";
+            else
+                await LoadAgentRoutingAsync();
         }
         catch { registrationError = "Could not update this device on the relay. Check your connection and try again."; }
     }
@@ -890,6 +958,8 @@
     }
     void Refresh()
     {
+        if (Mesh.SupportsAtomicAgentDispatch && !agentRoutingAttempted && !loadingAgentRouting)
+            _ = LoadAgentRoutingAsync();
         // Keep the dropdown in sync if the startup preload finishes while Settings is open.
         if (foundryModels.Count == 0 && Foundry.CachedModels.Count > 0)
             foundryModels = Foundry.CachedModels.ToList();
@@ -1086,7 +1156,94 @@
         State.ResetTokenCounter();
 
         await Mesh.RegisterAsync();
+        await LoadAgentRoutingAsync();
     }
+
+    async Task LoadAgentRoutingAsync()
+    {
+        if (!Mesh.SupportsAtomicAgentDispatch || loadingAgentRouting) return;
+        agentRoutingAttempted = true;
+        loadingAgentRouting = true;
+        agentRoutingError = null;
+        try
+        {
+            var devicesTask = Mesh.ListMyDevicesAsync();
+            var routingTask = Mesh.GetAgentRoutingAsync();
+            await Task.WhenAll(devicesTask, routingTask);
+            agentDevices = (await devicesTask).ToList();
+            var routing = await routingTask;
+            if (routing is null)
+            {
+                agentRoutingError = "Could not load agent response devices from the relay.";
+                return;
+            }
+            primaryAgentDeviceId = routing.PrimaryDeviceId ?? "";
+            failoverAgentDeviceId = routing.FailoverDeviceId ?? "";
+        }
+        finally
+        {
+            loadingAgentRouting = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    async Task OnPrimaryAgentDeviceChanged(ChangeEventArgs e)
+    {
+        var primary = e.Value?.ToString() ?? "";
+        if (string.IsNullOrWhiteSpace(primary)) return;
+        var failover = string.Equals(primary, failoverAgentDeviceId, StringComparison.Ordinal)
+            ? null
+            : NullIfBlank(failoverAgentDeviceId);
+        await SaveAgentRoutingAsync(primary, failover);
+    }
+
+    async Task OnFailoverAgentDeviceChanged(ChangeEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(primaryAgentDeviceId)) return;
+        await SaveAgentRoutingAsync(
+            primaryAgentDeviceId,
+            NullIfBlank(e.Value?.ToString()));
+    }
+
+    async Task SaveAgentRoutingAsync(string primary, string? failover)
+    {
+        if (savingAgentRouting) return;
+        savingAgentRouting = true;
+        agentRoutingError = null;
+        try
+        {
+            var result = await Mesh.SetAgentRoutingAsync(primary, failover);
+            if (!result.Success || result.Routing is null)
+            {
+                agentRoutingError = result.Error ?? "Could not save the agent response devices.";
+                primaryAgentDeviceId = State.Profile.AgentPrimaryDeviceId ?? primaryAgentDeviceId;
+                failoverAgentDeviceId = State.Profile.AgentFailoverDeviceId ?? "";
+                return;
+            }
+            primaryAgentDeviceId = result.Routing.PrimaryDeviceId ?? "";
+            failoverAgentDeviceId = result.Routing.FailoverDeviceId ?? "";
+        }
+        finally
+        {
+            savingAgentRouting = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    string AgentDeviceLabel(Mesh.Shared.DeviceInfo device)
+    {
+        var name = string.IsNullOrWhiteSpace(device.Name) ? "Desktop device" : device.Name;
+        var mine = string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal)
+            ? ", this device"
+            : "";
+        var status = !device.RemoteAgentEnabled
+            ? "agent unavailable"
+            : device.Online ? "ready" : "offline";
+        return $"{name} ({status}{mine})";
+    }
+
+    static string? NullIfBlank(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value;
 
     // ---- auto-save for non-model settings (persist immediately on change) ----
     void OnDisplayChanged(ChangeEventArgs e)
@@ -1120,7 +1277,7 @@
         if (string.IsNullOrWhiteSpace(url)) return;
         Toggle(p => p.RelayUrl = url);
         // A handle is registered per relay, so switching relays re-registers there and reconnects.
-        try { await Mesh.RegisterAsync(); await Mesh.ConnectAsync(); } catch { }
+        try { await Mesh.RegisterAsync(); await Mesh.ConnectAsync(); await LoadAgentRoutingAsync(); } catch { }
     }
 
     // Estimated spend for the current model's live token counter (null when the model has no price).

@@ -152,6 +152,14 @@ Each conversation has a per-conversation **Agent / Person toggle**. This decides
 
 This toggle is powerful: it lets you get a quick answer from someone's agent (for example, "what are your office hours?") without interrupting the person, or reach the person directly when you need them.
 
+### How Mesh chooses the device that answers
+
+On relays that support single-device agent responses, each message sent with **Agent** selected is assigned to one compatible desktop for that contact. The first compatible desktop becomes the primary automatically. The owner can select a different primary and an optional failover under **Settings > Agent responses**.
+
+The relay hands the encrypted question to exactly one connection on the primary. It uses the failover only when the primary is offline or cannot run its configured model. If neither configured device is ready, the sender sees **"[Name]'s agent is unavailable. Message queued."** The relay keeps the encrypted request queued and dispatches it when an eligible configured device reconnects.
+
+Only the assigned device can complete the request, so opening the same identity on several devices does not produce duplicate agent replies. Older relays continue to use legacy routing and do not show these device settings.
+
 ### Delivery receipts
 
 Messages show delivery status so you know what happened:
@@ -454,6 +462,12 @@ Everything you can configure lives in **Settings**. Here are the settings that m
 
 Choose how your agent thinks: the free **Mesh-hosted model**, **bring your own API key** (Anthropic, OpenAI, Gemini, Grok, Groq, Azure OpenAI, OpenRouter), or **on-device with Foundry Local**. See [Installing and First Run](#2-installing-and-first-run) for details. You can change this at any time.
 
+### Agent response devices
+
+On a compatible relay, use **Settings > Agent responses** to choose the **Primary agent response device** and, optionally, a **Failover response device**. Only compatible Windows and macOS desktops appear. Each entry shows whether it is ready, offline, or has no available agent model.
+
+The first compatible desktop is selected automatically. The failover is used only while the primary is offline or cannot run its model. Choose **None** to keep questions queued for the primary instead. This policy is stored on the relay for the whole identity, so linked devices see the same selection. If the relay is too old, Mesh explains that single-device responses are unavailable.
+
 ### Relay URL
 
 You can point Mesh at a **different relay**. Set the **Relay URL** (in onboarding or in Settings) and then **Reconnect**. Remember:
@@ -514,6 +528,12 @@ Live sources (Microsoft 365, Google, Dropbox, Notion, Slack) are **on-demand**. 
 
 Set your **home device** in **Settings** so that mobile requests go to the one device you intend, rather than all of your devices.
 
+### A contact's agent says "unavailable. Message queued."
+
+The contact's configured primary and failover devices are currently offline or cannot run a model. The encrypted question remains queued and is dispatched when an eligible configured device becomes ready. If this is your own agent, open **Settings > Agent responses**, connect the selected desktop and make sure its model is configured, or choose a ready failover device.
+
+The selected device must also have been one of the recipient keys when the question was encrypted. If a desktop was linked or selected later, the sender may need to verify the updated contact identity and send a new question, or you can choose an older eligible failover that already has a key slot.
+
 ### How do I move to a new phone or computer?
 
 Create a **passphrase-encrypted backup** on your current device, then **import** it on the new device. The new device mints its own key and re-authorizes under your handle via **device linking** (scan a QR/link from an authorized device) or **recovery** (using the handle recovery key in your backup). See [Backup, Moving Devices, and Recovery](#14-backup-moving-devices-and-recovery).
@@ -554,6 +574,8 @@ Only in the ways you allow. Approved contacts see only what their **circle** can
 | **Category** | The fixed label that describes a published service. |
 | **MTokens** | The app-wide token unit. 1 MTokens = 1,000,000 tokens, shown to one decimal. |
 | **Community** | The tab where you discover and manage public services. |
+| **Primary agent response device** | The desktop assigned to answer questions that contacts send to your agent. |
+| **Failover response device** | An optional second desktop used only while the primary cannot answer. |
 | **Home device** | The single device your mobile "ask my home agent" reaches. |
 | **Backup** | A passphrase-encrypted export of your data plus a handle recovery key. |
 | **Device linking** | Authorizing a new device via a QR/link invite from an existing device. |

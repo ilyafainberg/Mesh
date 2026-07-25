@@ -218,7 +218,7 @@ else
                             {
                                 <span class="msg-status" title="Queued - will send after the current turn"><i class="bi bi-hourglass-split"></i> queued</span>
                             }
-                            @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status))
+                            @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status) && line.Status != "agent_queued")
                             {
                                 var shownStatus = conv.IsGroup && line.Status == "delivered" ? "sent" : line.Status;
                                 <span class="msg-status @shownStatus" title="@shownStatus">
@@ -229,6 +229,12 @@ else
                                 </span>
                             }
                         </div>
+                    @if (line.Role == "assistant" && line.Status == "agent_queued")
+                    {
+                        <div class="agent-queued-note" role="status">
+                            <i class="bi bi-hourglass-split"></i> @AgentQueuedLabel(conv)
+                    </div>
+                }
                     </div>
                 }
                 @if (ActiveIsService && State.IsAwaiting(active!))
@@ -645,6 +651,9 @@ else
         return agent ? "their agent" : "them";
     }
 
+    string AgentQueuedLabel(Conversation conv)
+        => $"{State.DisplayNameFor(conv.Handle)}'s agent is unavailable. Message queued.";
+
     async Task PickFile()
     {
         attachError = null;
@@ -814,7 +823,7 @@ else
             State.Save();
             return;
         }
-        var kind = direct ? MeshKinds.DirectMessage : MeshKinds.Chat;
+        var kind = direct ? MeshKinds.DirectMessage : Mesh.AgentQuestionKind;
         await Mesh.SendAsync(handle, kind, toSend, line.Id);
     }
 

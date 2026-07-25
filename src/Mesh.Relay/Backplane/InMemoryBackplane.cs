@@ -50,5 +50,9 @@ public sealed class InMemoryBackplane : IBackplane
     public Task<bool> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)
         => Task.FromResult(false); // single instance: caller already tried the local socket
 
+    public Task<BackplaneDeliveryOutcome> PublishAtomicToOwnerAsync(
+        string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)
+        => Task.FromResult(BackplaneDeliveryOutcome.NotDelivered);
+
     private static string DeviceKey(string handle, string deviceId) => $"{handle}\u001f{deviceId}";
 }

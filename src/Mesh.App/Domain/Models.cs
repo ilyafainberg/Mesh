@@ -495,7 +495,7 @@ public sealed class ChatLine
     /// and reads "to them". Via still drives history scoping and the channel icon.
     /// </summary>
     public bool AddressedToAgent { get; set; }
-    /// <summary>Delivery status for an outgoing line: "" | "sent" | "delivered" | "failed".</summary>
+    /// <summary>Delivery status: "" | "sent" | "delivered" | "failed" | "agent_queued".</summary>
     public string Status { get; set; } = "";
     /// <summary>
     /// Optional model reasoning ("thinking") extracted from the reply, shown as a collapsible section
@@ -961,6 +961,8 @@ public sealed class PendingApproval
     public string From { get; set; } = "";
     public string RequestBody { get; set; } = "";
     public string DraftReply { get; set; } = "";
+    public string? AgentRequestId { get; set; }
+    public string? AgentDispatchToken { get; set; }
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -1037,6 +1039,13 @@ public sealed class MeshProfile
     /// peer draining the user's model credits. Zero means unlimited.
     /// </summary>
     public int AgentDailyReplyBudget { get; set; } = 100;
+
+    /// <summary>Cached relay-owned primary device for answering agent-addressed Messages.</summary>
+    public string? AgentPrimaryDeviceId { get; set; }
+    /// <summary>Cached optional failover device. Null means no failover.</summary>
+    public string? AgentFailoverDeviceId { get; set; }
+    public string AgentRoutingVersion { get; set; } = "";
+    public bool AgentPrimaryWasSelectedAutomatically { get; set; }
     /// <summary>Automatic agent replies used so far on <see cref="AgentBudgetDate"/>.</summary>
     public int AgentRepliesUsedToday { get; set; }
     /// <summary>The calendar day (yyyy-MM-dd, UTC) the used-counter applies to.</summary>

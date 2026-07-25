@@ -377,6 +377,8 @@ After the handshake, the relay knows the authenticated handle (and device) behin
 | `FromDevice` (optional) | Authenticated sending device, stamped by the relay |
 | `ToDevice` (optional) | Target a specific device for directed routing (for example home-device routing) |
 | `PushHint` (optional) | Metadata-only notification discriminator. Currently `topic.response` indicates successful topic completion without exposing content. |
+| `AgentRequestId` (optional) | Original atomic agent request id, stamped on an assigned request and echoed by its response |
+| `AgentDispatchToken` (optional) | Opaque relay-issued token that fences one assigned response; removed before the answer is routed to the sender |
 
 Because `From`/`FromDevice` are relay-stamped from the authenticated connection, a sender **cannot spoof identity**. A device sending to its **own** handle is **not echoed back** to the sending connection.
 
@@ -389,6 +391,7 @@ The relay chooses a delivery path based on where the recipient's sockets live an
 - **Local delivery**: deliver to all of the recipient's connections on the current instance.
 - **Directed cross-instance forward**: if the target socket is on another instance, forward via the **Redis backplane** to the instance holding that socket.
 - **Directed device routing**: if `ToDevice` is set (for example home-device routing) and that device is online, route to it; **fall back to broadcast** to all the handle's devices if the target device is offline.
+- **Atomic agent routing**: never broadcasts and never falls back to an unrelated device. It uses the configured primary, then the optional failover, through the durable dispatch fence described below.
 - **Offline**: if the recipient has no live connection anywhere, **queue** the message (see [Section 5.5](#55-offline-queue-and-ttl)).
 - **Fan-out**: clone the generic request into device-targeted ordinary envelopes, dispatch online devices concurrently, and enqueue a device-specific inbox record for each offline device. Acceptance is logical, not an atomic or simultaneous physical-delivery guarantee.
 
@@ -404,6 +407,42 @@ flowchart TD
     Dev -->|"No"| Broadcast["Broadcast to all handle devices"]
 ```
 
+#### 5.3.1 Atomic Single-Device Agent Dispatch
+
+Agent-addressed Messages use the atomic path only when the relay advertises protocol version 4 with `atomicAgentDispatch: true`. Older clients and relays continue to use the legacy agent kinds, which retain handle-wide routing and do not have an at-most-one-answer guarantee.
+
+Each handle has a relay-authoritative primary response device and an optional failover. A selectable device must be a registered desktop that advertised atomic protocol support. It is execution-ready only while it is online and advertises a configured model. The first selectable desktop becomes a sticky automatic primary until the owner saves another choice. The relay never elects an unrelated third device.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Sender client
+    participant R as Relay coordinator
+    participant Q as Atomic dispatch store
+    participant D as Selected response device
+
+    S->>R: Signed E2E-encrypted agent.atomic.request (stable id)
+    R->>Q: Create pending record, key-slot device ids, hash, random token
+    alt Primary ready, otherwise configured failover ready
+        R->>Q: Assign first decrypt-capable candidate; CAS -> delivered
+        R-->>D: Deliver to exactly one connection with request id + token
+        D->>R: Signed E2E-encrypted agent.atomic.response + same fence
+        R->>Q: CAS delivered -> completed, clear request ciphertext
+        R-->>S: Route answer with dispatch token removed
+    else Neither configured device ready
+        R-->>S: agent_dispatch_queued
+        Note over Q: Keep pending until an eligible configured device connects
+    end
+```
+
+The relay rejects caller-supplied assignment metadata on requests. It records which registered recipient devices have wrapped content-key slots and assigns each request to the first ready configured candidate that can decrypt it. `assigned` is pre-delivery and may be reclaimed after a restart or policy change; one record at a time is fenced as `delivered` immediately before handoff. The selected device receives `ToDevice`, `AgentRequestId`, and `AgentDispatchToken`; the reference client requires exact-device routing, deduplicates the envelope id, and serializes guest-agent turns per sender before model execution. A response can complete only from the assigned device with the matching original sender, request id, and token. The single `delivered -> completed` compare-and-swap makes every later completion fail.
+
+A confirmed failure to find the selected connection moves the record directly to an online, decrypt-capable configured failover when available, or back to `pending` otherwise. A Redis acknowledgement timeout or remote send exception stays fenced as `delivered`, because automatic reassignment after an uncertain handoff could execute the same question twice. This is an intentional availability tradeoff in favor of at-most-one execution. Exact retries are idempotent by sender, request id, and retained envelope hash; reuse of an id for different envelope bytes is rejected.
+
+Atomic request and response bodies are required to be E2E encrypted. The relay still sees that the traffic is an atomic agent exchange, the sender and recipient, encrypted key-slot device ids, selected device id, queue/assignment/completion timestamps, ciphertext size, and the opaque dispatch token. It clears the retained request ciphertext and key-slot ids on completion. The relay cannot read the question or answer. The single-device guarantee is a relay/storage integrity property, not a consequence of E2EE: a maliciously modified relay could violate assignment or availability, but still could not decrypt correctly encrypted bodies.
+
+For cross-replica delivery, protocol-4 relay instances advertise acknowledged single-connection atomic forwarding through Redis. A new coordinator does not send atomic work to an older replica without that capability, so a rolling upgrade may temporarily queue requests but does not fall back to legacy multi-connection delivery.
+
 ### 5.4 Backplane and Presence
 
 - **Redis backplane** provides: **presence** (short TTL), **per-handle quota** state, and **cross-replica directed routing** (knowing which instance holds a given socket).
@@ -413,6 +452,7 @@ flowchart TD
 
 - Messages for an offline recipient are **queued** in a durable **Cosmos DB inbox** and **drained on connect**, ordered by **queue time**.
 - Fan-out uses a device-specific inbox partition value and drains it only after that device authenticates. Legacy direct envelopes continue using the handle-wide inbox.
+- Atomic agent questions use a separate dispatch store rather than either inbox. Pending work is claimed in queue-time order only by the configured primary or failover; completed records clear request ciphertext but retain the hash and fence metadata until expiry.
 - Default retention is a **14-day TTL**.
 - **Reserved handles** (for example `meshreport`) get **no expiry** (per-item TTL of -1), so platform-critical messages are not dropped.
 
@@ -429,7 +469,7 @@ Default direct rate/burst, group rate/burst, and maximum fan-out recipients come
 | Backend | Purpose | Notes |
 | --- | --- | --- |
 | **In-memory** | Default, single node | Simplest deployment; no external dependencies |
-| **Cosmos DB** | Durable directory, invites, inbox, rate-policy overrides | Handle directory, device-linking invites, offline inbox, and administrative per-handle policies in `rate-policies` |
+| **Cosmos DB** | Durable directory, invites, inbox, rate-policy overrides, atomic dispatch | Handle and routing policy, device-linking invites, offline inbox, `agent-dispatches`, and administrative per-handle policies |
 | **Redis** | Presence, live rate buckets, per-handle quota, cross-replica routing | Shared atomic bucket balances and short-TTL operational state for multi-instance deployments |
 
 In all cases, **message bodies remain ciphertext**. Durable storage holds sealed payloads and metadata, never plaintext.
@@ -548,7 +588,8 @@ This section describes client storage as **externally observable security proper
 
 - The relay stores **only ciphertext and metadata**:
   - Sealed message bodies (ciphertext) in ordinary per-recipient offline inbox records until delivered or expired.
-  - The **handle directory** (handle to device public keys).
+  - The **handle directory** (handle to device public keys, device capability metadata, and primary/failover response policy).
+  - Atomic agent dispatch records: encrypted request envelope and recipient key-slot device ids until completion, envelope hash, sender/recipient handles, selected device id, opaque token, lifecycle state, and timestamps.
   - Device-linking invites (codes stored **hashed**).
   - Administrative per-handle overrides in the Cosmos `rate-policies` container.
   - Presence, live token buckets, quota, and routing state (Redis).
@@ -561,7 +602,7 @@ This section describes client storage as **externally observable security proper
 | --- | --- | --- |
 | Client local store | SQLCipher-encrypted profile data, conversations, topics, and owner-only memories; master key in secure enclave | Device signing + recovery keys (private material) |
 | Client backup | Passphrase-encrypted; includes recovery key, excludes device signing keys | Recovery key only |
-| Relay durable store (Cosmos) | Per-recipient ciphertext inbox records, directory metadata, hashed invite codes, administrative rate policies | No private keys; only device public keys in the directory |
+| Relay durable store (Cosmos) | Per-recipient ciphertext inbox records, atomic request ciphertext and fence metadata, directory/routing metadata, hashed invite codes, administrative rate policies | No private keys; only device public keys in the directory |
 | Relay Redis | Presence, live rate buckets, quota, and routing state | No private keys |
 
 ---
@@ -576,7 +617,9 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 | --- | --- | --- |
 | **Handle directory** (handle to device public keys) | Yes | Needed for routing and multi-recipient encryption target resolution |
 | **Presence** (who is online) | Yes | Short-TTL entries in Redis |
-| **Traffic metadata** (who talks to whom, and when) | Yes | Direct envelope metadata; for fan-out, sender, transient recipient cohort, timing, and ciphertext size |
+| **Traffic metadata** (who talks to whom, and when) | Yes | Direct envelope metadata; for fan-out, sender, transient recipient cohort, timing, and ciphertext size; for atomic agent traffic, request kind and lifecycle timing |
+| **Agent response routing policy** | Yes | Primary and optional failover device ids are stored with the handle registration |
+| **Atomic dispatch fence** | Yes | Request id/hash, assigned device id, state, opaque token, timestamps, and encrypted-envelope size are relay-visible |
 | **Successful topic completion** | Yes, when push is requested | `PushHint = topic.response` reveals completion between the owner's devices, but not the topic, prompt, response, or progress |
 | **Inner fan-out type** | No | `GroupControl` / `GroupMessage` is inside encrypted `MeshFanoutContent`; the outer request is generic fan-out |
 | **Group ID, name, membership metadata, roles, or version** | No explicit protocol field | These values exist only inside E2E-encrypted content; the relay has no group-state schema |
@@ -589,7 +632,7 @@ The central privacy tradeoff of Mesh is **metadata**. The relay is designed so i
 
 | Attacker | Capability | Mesh defense |
 | --- | --- | --- |
-| **Malicious relay operator** | Can read metadata; can attempt to swap contact keys | Cannot read message bodies (E2EE). Key swaps are detected by **TOFU pinning + client-side signature verification + out-of-band re-verify**. |
+| **Malicious relay operator** | Can read metadata, delay/drop traffic, attempt key swaps, or run modified dispatch logic | Cannot read correctly encrypted bodies. Key swaps are detected by **TOFU pinning + client-side signature verification + out-of-band re-verify**. Atomic single-device execution assumes the audited relay and store enforce the fence; a modified relay can violate atomicity or availability, not confidentiality. |
 | **Sender spoofing identity** | Tries to forge `From` | Relay stamps authenticated `From`/`FromDevice` from the challenge-authenticated connection; spoofing is rejected. |
 | **Unauthorized device joining a handle** | Tries to register a fresh key to a claimed handle | Rejected with conflict; joining requires device linking (short-lived, single-use, hashed invite) or recovery. |
 | **Passive network observer** | Sees WebSocket traffic | Transport is over SignalR WebSockets; bodies are already E2E ciphertext independent of transport encryption. |
@@ -612,6 +655,7 @@ For fan-out, the relay necessarily observes the sender, transient recipient coho
 - The user's device and its secure enclave (DPAPI / Keychain / Keystore) are trusted. Compromise of the device compromises that identity.
 - Out-of-band verification is available to the user for TOFU re-verification (a separate channel to compare fingerprints).
 - The shared crypto library and relay behave as their open source defines; their auditability is part of the trust model.
+- For atomic agent dispatch, the relay and its configured store correctly enforce compare-and-swap state transitions and exact-device presence.
 
 ### 10.2 Limitations and Non-Goals
 
@@ -625,6 +669,7 @@ For fan-out, the relay necessarily observes the sender, transient recipient coho
 | **TOFU dependence** | TOFU pinning is only as strong as the user's **out-of-band verification** when keys change. A user who blindly accepts key changes loses the protection. |
 | **Hosted model proxy** | Content sent through the optional hosted model proxy is, by design, visible on that request path. It is opt-in convenience, not an E2EE channel. Users can configure their own provider in the client. |
 | **Memory policy classification** | Automatic capture uses conservative evidence, secret, and sensitive-data checks, but no classifier is perfect. Users can inspect, edit, delete, or undo memories, and should use an on-device model for the strongest model-path privacy. |
+| **Atomic agent guarantee** | The at-most-one accepted response guarantee applies only to capability-negotiated atomic kinds on an honest protocol-4 relay. Legacy kinds may reach multiple devices. An ambiguous handoff stays fenced and may require operator recovery rather than automatic failover. |
 | **Availability** | The relay is trusted for availability and honest routing. A relay can drop or delay messages (denial of service); it cannot read them. |
 
 ### 10.3 Sandboxed Public-Service Agent (Client Property)
@@ -642,9 +687,11 @@ As a stated client security property (not an implementation description): **publ
 | **TOFU** | Trust On First Use; pin a contact's keys on first contact, hold and re-verify on change |
 | **Owner memory** | A durable, editable detail available only to the owner's Me topics; it has no sharing or publishing surface |
 | **ECIES-P256-AESGCM** | Mesh's ephemeral-static ECIES: per-message AES-256-GCM content key, wrapped per recipient device via P-256 ECDH + SHA-256 KEK derivation |
-| **MeshEnvelope** | Routing unit with `To`, relay-stamped `From`, `Kind`, ciphertext `Body`, and optional `FromDevice`/`ToDevice`/`PushHint` metadata |
+| **MeshEnvelope** | Routing unit with `To`, relay-stamped `From`, `Kind`, ciphertext `Body`, and optional device, push, and atomic-dispatch metadata |
 | **MeshFanoutRequest** | Generic logical send containing one ciphertext and 1 to 128 transient recipient handles |
 | **MeshSendResult** | Explicit accepted/rejected result for a normal send or fan-out, including code and retry delay |
+| **Atomic agent dispatch** | Relay assignment of one encrypted agent question to the configured primary or failover device with an at-most-one response fence |
+| **Dispatch fence** | Request id, assigned device, and opaque token checked by an atomic state transition before a response is routed |
 | **Backplane** | Redis layer providing presence, shared live rate buckets, per-handle quota, and cross-replica routing |
 | **Wilson score lower bound** | Conservative ranking metric for the capability directory that accounts for sample size |
 

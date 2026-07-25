@@ -1,5 +1,13 @@
 namespace Mesh.Relay.Backplane;
 
+/// <summary>The certainty of one directed cross-instance delivery attempt.</summary>
+public enum BackplaneDeliveryOutcome
+{
+    NotDelivered,
+    Delivered,
+    Uncertain
+}
+
 /// <summary>
 /// Cross-instance routing seam for the relay. When the relay runs as more than one
 /// replica, the WebSocket for a given handle lives on exactly one instance. The
@@ -44,4 +52,12 @@ public interface IBackplane
     /// live socket. Returns true only when the owning instance confirms local delivery.
     /// </summary>
     Task<bool> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default);
+
+    /// <summary>
+    /// Publishes an atomic agent request only to a replica that advertises single-connection
+    /// atomic delivery. Unlike the legacy boolean API, an acknowledgement timeout or remote
+    /// send exception is reported as uncertain so the caller never reassigns ambiguous work.
+    /// </summary>
+    Task<BackplaneDeliveryOutcome> PublishAtomicToOwnerAsync(
+        string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default);
 }

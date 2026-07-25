@@ -13,7 +13,7 @@ namespace Mesh.Relay.Storage;
 /// directory, and administrative rate-policy overrides so relay state survives restarts
 /// and can be shared across scaled-out instances.
 ///
-/// Five containers are provisioned idempotently on first use:
+/// Six containers are provisioned idempotently on first use:
 /// <list type="bullet">
 ///   <item>"handles" (partition key "/handle"): one document per registered handle.</item>
 ///   <item>"rate-policies" (partition key "/handle"): administrative per-handle rate-policy
@@ -22,6 +22,8 @@ namespace Mesh.Relay.Storage;
 ///   via native per-item TTL (container DefaultTimeToLive = -1).</item>
 ///   <item>"inbox" (partition key "/to"): queued envelopes for offline recipients, expired
 ///   after 14 days via a container DefaultTimeToLive of 1209600 seconds.</item>
+///   <item>"agent-dispatches" (partition key "/to"): opaque atomic agent requests and fencing state,
+///   expired after 14 days.</item>
 ///   <item>"services" (partition key "/serviceId"): published capabilities and reputation.</item>
 /// </list>
 /// </summary>
@@ -36,6 +38,7 @@ public sealed class CosmosRelayStore : IRelayStore
     private Container handlesContainer = null!;
     private Container invitesContainer = null!;
     private Container inboxContainer = null!;
+    private Container agentDispatchesContainer = null!;
     private Container servicesContainer = null!;
     private Container ratePoliciesContainer = null!;
     private volatile bool initialized;
@@ -94,6 +97,12 @@ public sealed class CosmosRelayStore : IRelayStore
             inboxContainer = await db
                 .CreateContainerIfNotExistsAsync(
                     new ContainerProperties("inbox", "/to") { DefaultTimeToLive = InboxTtlSeconds },
+                    cancellationToken: ct)
+                .ConfigureAwait(false);
+
+            agentDispatchesContainer = await db
+                .CreateContainerIfNotExistsAsync(
+                    new ContainerProperties("agent-dispatches", "/to") { DefaultTimeToLive = InboxTtlSeconds },
                     cancellationToken: ct)
                 .ConfigureAwait(false);
 
@@ -303,6 +312,7 @@ public sealed class CosmosRelayStore : IRelayStore
         string? name,
         string platform,
         bool remoteAgentEnabled,
+        bool atomicAgentDispatchEnabled,
         CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
@@ -328,10 +338,20 @@ public sealed class CosmosRelayStore : IRelayStore
             doc.DeviceNames ??= new Dictionary<string, string>();
             doc.DevicePlatforms ??= new Dictionary<string, string>();
             doc.DeviceRemoteAgentEnabled ??= new Dictionary<string, bool>();
+            doc.DeviceAtomicAgentDispatchEnabled ??= new Dictionary<string, bool>();
             if (!string.IsNullOrWhiteSpace(name))
                 doc.DeviceNames[deviceId] = name;
             doc.DevicePlatforms[deviceId] = platform;
             doc.DeviceRemoteAgentEnabled[deviceId] = remoteAgentEnabled;
+            doc.DeviceAtomicAgentDispatchEnabled[deviceId] = atomicAgentDispatchEnabled;
+            if (string.IsNullOrWhiteSpace(doc.AgentPrimaryDeviceId)
+                && Mesh.Shared.DevicePlatforms.IsDesktop(platform)
+                && atomicAgentDispatchEnabled)
+            {
+                doc.AgentPrimaryDeviceId = deviceId;
+                doc.AgentRoutingVersion = Guid.NewGuid().ToString("n");
+                doc.AgentPrimaryWasSelectedAutomatically = true;
+            }
 
             try
             {
@@ -339,6 +359,56 @@ public sealed class CosmosRelayStore : IRelayStore
                     .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
                     .ConfigureAwait(false);
                 return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> SetAgentRoutingAsync(
+        string handle,
+        string primaryDeviceId,
+        string? failoverDeviceId,
+        string expectedVersion,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            HandleDoc doc;
+            string etag;
+            try
+            {
+                var read = await handlesContainer
+                    .ReadItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return false;
+            }
+
+            if (!string.Equals(doc.AgentRoutingVersion ?? "", expectedVersion, StringComparison.Ordinal))
+                return false;
+
+            doc.AgentPrimaryDeviceId = primaryDeviceId;
+            doc.AgentFailoverDeviceId = failoverDeviceId;
+            doc.AgentRoutingVersion = Guid.NewGuid().ToString("n");
+            doc.AgentPrimaryWasSelectedAutomatically = false;
+
+            try
+            {
+                await handlesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return true;
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
             {
@@ -583,6 +653,252 @@ public sealed class CosmosRelayStore : IRelayStore
             }
         }
 
+        return result;
+    }
+
+    /// <inheritdoc />
+    public async Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
+        StoredAgentDispatch dispatch,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var doc = ToDoc(dispatch);
+        try
+        {
+            await agentDispatchesContainer
+                .CreateItemAsync(doc, new PartitionKey(dispatch.To), cancellationToken: ct)
+                .ConfigureAwait(false);
+            return new AgentDispatchCreateResult(
+                AgentDispatchCreateStatus.Created, dispatch.State, dispatch.AssignedDeviceId);
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
+        {
+            var existing = await GetAgentDispatchAsync(dispatch.To, dispatch.Id, ct).ConfigureAwait(false);
+            if (existing is null)
+                return new AgentDispatchCreateResult(AgentDispatchCreateStatus.Conflict, "", null);
+            var duplicate = string.Equals(existing.RequestId, dispatch.RequestId, StringComparison.Ordinal)
+                && string.Equals(existing.From, dispatch.From, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(existing.To, dispatch.To, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(existing.EnvelopeHash, dispatch.EnvelopeHash, StringComparison.Ordinal);
+            return new AgentDispatchCreateResult(
+                duplicate ? AgentDispatchCreateStatus.Duplicate : AgentDispatchCreateStatus.Conflict,
+                existing.State,
+                existing.AssignedDeviceId);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<StoredAgentDispatch?> GetAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var response = await agentDispatchesContainer
+                .ReadItemAsync<AgentDispatchDoc>(dispatchId, new PartitionKey(toHandle), cancellationToken: ct)
+                .ConfigureAwait(false);
+            return ToStored(response.Resource);
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task AssignPendingAgentDispatchesAsync(
+        string toHandle,
+        IReadOnlyList<string> candidateDeviceIds,
+        CancellationToken ct = default)
+    {
+        var readyDevices = candidateDeviceIds
+            .Where(deviceId => !string.IsNullOrWhiteSpace(deviceId))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (readyDevices.Length == 0) return;
+        var pending = await QueryAgentDispatchesAsync(toHandle, AgentDispatchStates.Pending, ct).ConfigureAwait(false);
+        var assigned = await QueryAgentDispatchesAsync(toHandle, AgentDispatchStates.Assigned, ct).ConfigureAwait(false);
+        var candidates = pending.Concat(assigned)
+            .DistinctBy(candidate => candidate.Id)
+            .OrderBy(candidate => candidate.QueuedAt)
+            .ThenBy(candidate => candidate.Id, StringComparer.Ordinal);
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                var read = await agentDispatchesContainer
+                    .ReadItemAsync<AgentDispatchDoc>(candidate.Id, new PartitionKey(toHandle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                var doc = read.Resource;
+                // Assigned is pre-delivery and may be reclaimed safely. Delivered is never reassigned.
+                if (doc.State is not (AgentDispatchStates.Pending or AgentDispatchStates.Assigned)) continue;
+                var deviceId = AgentDispatchRecipientPolicy.ChooseDevice(
+                    doc.RecipientDeviceIds, readyDevices);
+                if (deviceId is null)
+                {
+                    if (doc.State == AgentDispatchStates.Pending) continue;
+                    doc.State = AgentDispatchStates.Pending;
+                    doc.AssignedDeviceId = null;
+                    doc.AssignedAt = null;
+                }
+                else
+                {
+                    if (doc.State == AgentDispatchStates.Assigned
+                        && string.Equals(doc.AssignedDeviceId, deviceId, StringComparison.Ordinal))
+                        continue;
+                    doc.State = AgentDispatchStates.Assigned;
+                    doc.AssignedDeviceId = deviceId;
+                    doc.AssignedAt = DateTimeOffset.UtcNow;
+                }
+                doc.DeliveredAt = null;
+                await agentDispatchesContainer
+                    .ReplaceItemAsync(doc, doc.Id, new PartitionKey(toHandle),
+                        new ItemRequestOptions { IfMatchEtag = read.ETag }, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+            {
+                // Another relay instance assigned, delivered, reassigned, or expired this request first.
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<StoredAgentDispatch>> TakeAssignedAgentDispatchesAsync(
+        string toHandle,
+        string deviceId,
+        CancellationToken ct = default)
+    {
+        var result = new List<StoredAgentDispatch>();
+        foreach (var candidate in await QueryAgentDispatchesAsync(toHandle, AgentDispatchStates.Assigned, ct).ConfigureAwait(false))
+        {
+            try
+            {
+                var read = await agentDispatchesContainer
+                    .ReadItemAsync<AgentDispatchDoc>(candidate.Id, new PartitionKey(toHandle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                var doc = read.Resource;
+                if (!string.Equals(doc.State, AgentDispatchStates.Assigned, StringComparison.Ordinal)
+                    || !string.Equals(doc.AssignedDeviceId, deviceId, StringComparison.Ordinal))
+                    continue;
+                doc.State = AgentDispatchStates.Delivered;
+                doc.DeliveredAt = DateTimeOffset.UtcNow;
+                var replaced = await agentDispatchesContainer
+                    .ReplaceItemAsync(doc, doc.Id, new PartitionKey(toHandle),
+                        new ItemRequestOptions { IfMatchEtag = read.ETag }, ct)
+                    .ConfigureAwait(false);
+                result.Add(ToStored(replaced.Resource));
+                return result;
+            }
+            catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+            {
+                // Another relay instance delivered or expired this request first.
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> ReleaseAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        string deviceId,
+        string? nextDeviceId = null,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var read = await agentDispatchesContainer
+                .ReadItemAsync<AgentDispatchDoc>(dispatchId, new PartitionKey(toHandle), cancellationToken: ct)
+                .ConfigureAwait(false);
+            var doc = read.Resource;
+            if (!string.Equals(doc.State, AgentDispatchStates.Delivered, StringComparison.Ordinal)
+                || !string.Equals(doc.AssignedDeviceId, deviceId, StringComparison.Ordinal))
+                return false;
+            if (string.IsNullOrWhiteSpace(nextDeviceId))
+            {
+                doc.State = AgentDispatchStates.Pending;
+                doc.AssignedDeviceId = null;
+                doc.AssignedAt = null;
+            }
+            else
+            {
+                doc.State = AgentDispatchStates.Assigned;
+                doc.AssignedDeviceId = nextDeviceId;
+                doc.AssignedAt = DateTimeOffset.UtcNow;
+            }
+            doc.DeliveredAt = null;
+            await agentDispatchesContainer
+                .ReplaceItemAsync(doc, doc.Id, new PartitionKey(toHandle),
+                    new ItemRequestOptions { IfMatchEtag = read.ETag }, ct)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+        {
+            return false;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> CompleteAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        string fromHandle,
+        string dispatchToken,
+        string respondingDeviceId,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var read = await agentDispatchesContainer
+                .ReadItemAsync<AgentDispatchDoc>(dispatchId, new PartitionKey(toHandle), cancellationToken: ct)
+                .ConfigureAwait(false);
+            var doc = read.Resource;
+            if (!string.Equals(doc.State, AgentDispatchStates.Delivered, StringComparison.Ordinal)
+                || !string.Equals(doc.From, fromHandle, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(doc.DispatchToken, dispatchToken, StringComparison.Ordinal)
+                || !string.Equals(doc.AssignedDeviceId, respondingDeviceId, StringComparison.Ordinal))
+                return false;
+            doc.State = AgentDispatchStates.Completed;
+            doc.CompletedAt = DateTimeOffset.UtcNow;
+            doc.EnvelopeJson = "";
+            doc.RecipientDeviceIds = new List<string>();
+            await agentDispatchesContainer
+                .ReplaceItemAsync(doc, doc.Id, new PartitionKey(toHandle),
+                    new ItemRequestOptions { IfMatchEtag = read.ETag }, ct)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+        {
+            return false;
+        }
+    }
+
+    private async Task<IReadOnlyList<AgentDispatchDoc>> QueryAgentDispatchesAsync(
+        string toHandle,
+        string state,
+        CancellationToken ct)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var query = new QueryDefinition(
+                "SELECT * FROM c WHERE c.to = @to AND c.state = @state ORDER BY c.queuedAt ASC")
+            .WithParameter("@to", toHandle)
+            .WithParameter("@state", state);
+        var options = new QueryRequestOptions { PartitionKey = new PartitionKey(toHandle) };
+        var result = new List<AgentDispatchDoc>();
+        using var iterator = agentDispatchesContainer.GetItemQueryIterator<AgentDispatchDoc>(
+            query, requestOptions: options);
+        while (iterator.HasMoreResults)
+        {
+            var page = await iterator.ReadNextAsync(ct).ConfigureAwait(false);
+            result.AddRange(page);
+        }
         return result;
     }
 
@@ -938,6 +1254,13 @@ public sealed class CosmosRelayStore : IRelayStore
         DeviceRemoteAgentEnabled = doc.DeviceRemoteAgentEnabled is null
             ? new Dictionary<string, bool>()
             : new Dictionary<string, bool>(doc.DeviceRemoteAgentEnabled),
+        DeviceAtomicAgentDispatchEnabled = doc.DeviceAtomicAgentDispatchEnabled is null
+            ? new Dictionary<string, bool>()
+            : new Dictionary<string, bool>(doc.DeviceAtomicAgentDispatchEnabled),
+        AgentPrimaryDeviceId = doc.AgentPrimaryDeviceId,
+        AgentFailoverDeviceId = doc.AgentFailoverDeviceId,
+        AgentRoutingVersion = doc.AgentRoutingVersion ?? "",
+        AgentPrimaryWasSelectedAutomatically = doc.AgentPrimaryWasSelectedAutomatically,
         DevicePushTokens = doc.DevicePushTokens is null
             ? new Dictionary<string, DevicePushToken>()
             : new Dictionary<string, DevicePushToken>(doc.DevicePushTokens)
@@ -975,6 +1298,21 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("deviceRemoteAgentEnabled")]
         public Dictionary<string, bool>? DeviceRemoteAgentEnabled { get; set; }
+
+        [JsonPropertyName("deviceAtomicAgentDispatchEnabled")]
+        public Dictionary<string, bool>? DeviceAtomicAgentDispatchEnabled { get; set; }
+
+        [JsonPropertyName("agentPrimaryDeviceId")]
+        public string? AgentPrimaryDeviceId { get; set; }
+
+        [JsonPropertyName("agentFailoverDeviceId")]
+        public string? AgentFailoverDeviceId { get; set; }
+
+        [JsonPropertyName("agentRoutingVersion")]
+        public string? AgentRoutingVersion { get; set; }
+
+        [JsonPropertyName("agentPrimaryWasSelectedAutomatically")]
+        public bool AgentPrimaryWasSelectedAutomatically { get; set; }
 
         [JsonPropertyName("devicePushTokens")]
         public Dictionary<string, DevicePushToken>? DevicePushTokens { get; set; }
@@ -1054,6 +1392,87 @@ public sealed class CosmosRelayStore : IRelayStore
         [JsonPropertyName("ttl")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public int? Ttl { get; set; }
+    }
+
+    private static StoredAgentDispatch ToStored(AgentDispatchDoc doc) => new()
+    {
+        Id = doc.Id,
+        RequestId = doc.RequestId,
+        From = doc.From,
+        To = doc.To,
+        EnvelopeJson = doc.EnvelopeJson,
+        EnvelopeHash = doc.EnvelopeHash,
+        RecipientDeviceIds = doc.RecipientDeviceIds?.ToList() ?? new List<string>(),
+        DispatchToken = doc.DispatchToken,
+        State = doc.State,
+        AssignedDeviceId = doc.AssignedDeviceId,
+        QueuedAt = doc.QueuedAt,
+        AssignedAt = doc.AssignedAt,
+        DeliveredAt = doc.DeliveredAt,
+        CompletedAt = doc.CompletedAt
+    };
+
+    private static AgentDispatchDoc ToDoc(StoredAgentDispatch dispatch) => new()
+    {
+        Id = dispatch.Id,
+        RequestId = dispatch.RequestId,
+        From = dispatch.From,
+        To = dispatch.To,
+        EnvelopeJson = dispatch.EnvelopeJson,
+        EnvelopeHash = dispatch.EnvelopeHash,
+        RecipientDeviceIds = dispatch.RecipientDeviceIds.ToList(),
+        DispatchToken = dispatch.DispatchToken,
+        State = dispatch.State,
+        AssignedDeviceId = dispatch.AssignedDeviceId,
+        QueuedAt = dispatch.QueuedAt,
+        AssignedAt = dispatch.AssignedAt,
+        DeliveredAt = dispatch.DeliveredAt,
+        CompletedAt = dispatch.CompletedAt
+    };
+
+    private sealed class AgentDispatchDoc
+    {
+        [JsonPropertyName("id")]
+        public string Id { get; set; } = "";
+
+        [JsonPropertyName("requestId")]
+        public string RequestId { get; set; } = "";
+
+        [JsonPropertyName("from")]
+        public string From { get; set; } = "";
+
+        [JsonPropertyName("to")]
+        public string To { get; set; } = "";
+
+        [JsonPropertyName("envelopeJson")]
+        public string EnvelopeJson { get; set; } = "";
+
+        [JsonPropertyName("envelopeHash")]
+        public string EnvelopeHash { get; set; } = "";
+
+        [JsonPropertyName("recipientDeviceIds")]
+        public List<string>? RecipientDeviceIds { get; set; }
+
+        [JsonPropertyName("dispatchToken")]
+        public string DispatchToken { get; set; } = "";
+
+        [JsonPropertyName("state")]
+        public string State { get; set; } = AgentDispatchStates.Pending;
+
+        [JsonPropertyName("assignedDeviceId")]
+        public string? AssignedDeviceId { get; set; }
+
+        [JsonPropertyName("queuedAt")]
+        public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
+
+        [JsonPropertyName("assignedAt")]
+        public DateTimeOffset? AssignedAt { get; set; }
+
+        [JsonPropertyName("deliveredAt")]
+        public DateTimeOffset? DeliveredAt { get; set; }
+
+        [JsonPropertyName("completedAt")]
+        public DateTimeOffset? CompletedAt { get; set; }
     }
 
     /// <summary>

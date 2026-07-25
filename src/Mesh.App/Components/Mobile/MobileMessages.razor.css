@@ -588,6 +588,14 @@ button:disabled {
     color: var(--danger);
 }
 
+.agent-queued-note {
+    margin-top: 6px;
+    font-size: .72rem;
+    color: rgba(255,255,255,.9);
+}
+
+.agent-queued-note i.bi { margin-right: 3px; }
+
 /* ---------- Composer area ---------- */
 .composer-area {
     flex: none;

@@ -651,6 +651,8 @@ input[type=checkbox]:not(.switch input):checked::after {
 .msg-status.delivered i.bi { color: var(--brand); }
 .msg-status.sent i.bi { color: var(--fg-3); }
 .msg-status.failed i.bi { color: var(--danger, #d13438); }
+.agent-queued-note { margin-top: 6px; font-size: .72rem; color: rgba(255,255,255,.9); }
+.agent-queued-note i.bi { margin-right: 3px; }
 .conv-empty { text-align: left; margin: 6px 2px; max-width: none; font-size: .84rem; }
 
 .requests { margin-top: 16px; border-top: 1px solid var(--stroke-1); padding-top: 12px; }

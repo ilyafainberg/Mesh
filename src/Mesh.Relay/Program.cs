@@ -79,6 +79,7 @@ builder.Services.AddSingleton<IHandleRatePolicyProvider>(ratePolicyProvider);
 builder.Services.AddSingleton<IMessageRateLimiter>(messageRateLimiter);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
+builder.Services.AddSingleton<AgentDispatchCoordinator>();
 builder.Services.AddMeshPush(builder.Configuration);
 builder.Services.AddSingleton<Mesh.Relay.RelayConnectorCatalog>();
 builder.Services.AddHostedService<PresenceRenewer>();
@@ -129,31 +130,37 @@ app.UseRateLimiter();
 
 // When another instance forwards a message to this one, deliver it to the local hub connections.
 var router = app.Services.GetRequiredService<MeshRouter>();
+var agentDispatch = app.Services.GetRequiredService<AgentDispatchCoordinator>();
 var connectorCatalog = app.Services.GetRequiredService<Mesh.Relay.RelayConnectorCatalog>();
 await backplane.StartAsync(async (toHandle, envelopeJson) =>
 {
     // A cross-instance forward may target one specific device (MeshEnvelope.ToDevice). Parse it out of
     // the envelope JSON so the owning instance re-applies the same per-device filter on local delivery.
-    string? toDevice = null;
+    MeshEnvelope? envelope;
     try
     {
-        toDevice = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, json)?.ToDevice;
+        envelope = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, json);
     }
     catch (JsonException)
     {
         return false;
     }
+    if (envelope is null) return false;
+    if (AgentDispatchProtocol.IsAtomicRequest(envelope.Kind))
+        return !string.IsNullOrWhiteSpace(envelope.ToDevice)
+               && await router.DeliverSingleLocalDeviceAsync(toHandle, envelopeJson, envelope.ToDevice);
     return await router.DeliverLocalAsync(
-        toHandle, envelopeJson, excludeConnectionId: null, toDevice: toDevice);
+        toHandle, envelopeJson, excludeConnectionId: null, toDevice: envelope.ToDevice);
 });
 
 // ---- Health ---------------------------------------------------------------
 var transportCapabilities = new
 {
-    protocolVersion = 3,
+    protocolVersion = 4,
     sendResults = true,
     fanout = true,
     deviceSync = true,
+    atomicAgentDispatch = true,
     maxFanoutRecipients = FanoutProtocol.MaxRecipients
 };
 app.MapGet("/", () => Results.Ok(new
@@ -329,8 +336,10 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
                 req.DevicePlatform.Trim().ToLowerInvariant(),
                 // Directory honesty: never let a device (an old client, or one on the wrong platform) advertise
                 // mobile remote hosting. The stored flag is clamped to desktop-only regardless of what was sent.
-                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()));
+                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()),
+                req.AtomicAgentDispatchEnabled);
         }
+        await agentDispatch.DispatchAvailableAsync(handle);
         metrics.HandleRegistered();
         app.Logger.LogInformation("handle registered: {Handle}", handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), created.RegisteredAt));
@@ -358,8 +367,10 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
                 req.DevicePlatform.Trim().ToLowerInvariant(),
                 // Directory honesty: never let a device (an old client, or one on the wrong platform) advertise
                 // mobile remote hosting. The stored flag is clamped to desktop-only regardless of what was sent.
-                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()));
+                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()),
+                req.AtomicAgentDispatchEnabled);
         }
+        await agentDispatch.DispatchAvailableAsync(handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), existing.RegisteredAt));
     }
 
@@ -635,10 +646,68 @@ app.MapGet("/handles/{handle}/devices", async (string handle) =>
             rec.DeviceNames.GetValueOrDefault(deviceId),
             owners[index] is not null,
             rec.DevicePlatforms.GetValueOrDefault(deviceId, DevicePlatforms.Unknown),
-            rec.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId)))
+            rec.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId),
+            rec.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId)))
         .ToArray();
 
     return Results.Ok(devices);
+});
+
+app.MapPost("/handles/{handle}/agent-routing/query", async (string handle, AgentRoutingQueryRequest req) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+    if (!MeshCrypto.Verify(
+            req.DevicePublicKey,
+            AgentRoutingProtocol.QueryMessage(key),
+            req.Signature ?? ""))
+        return Results.BadRequest(new { error = "invalid signature" });
+    return Results.Ok(AgentRoutingPolicy.ToInfo(rec));
+});
+
+app.MapPut("/handles/{handle}/agent-routing", async (string handle, AgentRoutingUpdateRequest req) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null
+        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+    if (string.IsNullOrWhiteSpace(req.PrimaryDeviceId)
+        || !AgentRoutingPolicy.IsSelectableDevice(rec, req.PrimaryDeviceId))
+        return Results.BadRequest(new { error = "primary device must be a compatible desktop device" });
+    if (!string.IsNullOrWhiteSpace(req.FailoverDeviceId)
+        && (!AgentRoutingPolicy.IsSelectableDevice(rec, req.FailoverDeviceId)
+            || string.Equals(req.PrimaryDeviceId, req.FailoverDeviceId, StringComparison.Ordinal)))
+        return Results.BadRequest(new { error = "failover device must be a different compatible desktop device" });
+    var message = AgentRoutingProtocol.UpdateMessage(
+        key,
+        req.PrimaryDeviceId,
+        req.FailoverDeviceId,
+        req.ExpectedVersion ?? "");
+    if (!MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature ?? ""))
+        return Results.BadRequest(new { error = "invalid signature" });
+
+    var updated = await store.SetAgentRoutingAsync(
+        key,
+        req.PrimaryDeviceId,
+        string.IsNullOrWhiteSpace(req.FailoverDeviceId) ? null : req.FailoverDeviceId,
+        req.ExpectedVersion ?? "");
+    if (!updated)
+    {
+        var current = await store.GetHandleAsync(key);
+        return Results.Json(
+            current is null ? new { error = "handle not found" } : AgentRoutingPolicy.ToInfo(current),
+            statusCode: StatusCodes.Status409Conflict);
+    }
+
+    await agentDispatch.DispatchPendingAsync(key);
+    var saved = await store.GetHandleAsync(key);
+    return Results.Ok(AgentRoutingPolicy.ToInfo(saved!));
 });
 
 // Register or refresh this device's push token (APNs/FCM) so the relay can wake it when a message arrives

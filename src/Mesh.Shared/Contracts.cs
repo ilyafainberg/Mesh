@@ -21,7 +21,8 @@ public record RegisterHandleRequest(
     string? Signature = null,
     string? DeviceName = null,
     string? DevicePlatform = null,
-    bool RemoteAgentEnabled = false)
+    bool RemoteAgentEnabled = false,
+    bool AtomicAgentDispatchEnabled = false)
 {
     [System.Text.Json.Serialization.JsonIgnore]
     public bool AgentReady => RemoteAgentEnabled;
@@ -360,7 +361,8 @@ public record DeviceInfo(
     string? Name,
     bool Online,
     string Platform = DevicePlatforms.Unknown,
-    bool RemoteAgentEnabled = false)
+    bool RemoteAgentEnabled = false,
+    bool AtomicAgentDispatchEnabled = false)
 {
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsDesktop => DevicePlatforms.IsDesktop(Platform);
@@ -379,6 +381,10 @@ public record DeviceInfo(
 
     [System.Text.Json.Serialization.JsonIgnore]
     public bool AgentReady => RemoteAgentEnabled;
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool CanAnswerAtomicAgentRequests =>
+        IsDesktop && RemoteAgentEnabled && AtomicAgentDispatchEnabled;
 
 }
 
@@ -416,6 +422,49 @@ public static class DeviceProtocol
     public static string DeviceId(string devicePublicKey)
         => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
             System.Text.Encoding.UTF8.GetBytes(devicePublicKey)))[..12].ToLowerInvariant();
+}
+
+public sealed record AgentRoutingQueryRequest(string DevicePublicKey, string Signature);
+
+public sealed record AgentRoutingUpdateRequest(
+    string DevicePublicKey,
+    string PrimaryDeviceId,
+    string? FailoverDeviceId,
+    string ExpectedVersion,
+    string Signature);
+
+public sealed record AgentRoutingInfo(
+    string? PrimaryDeviceId,
+    string? FailoverDeviceId,
+    string Version,
+    bool PrimaryWasSelectedAutomatically);
+
+public static class AgentRoutingProtocol
+{
+    public static string QueryMessage(string handle)
+        => $"agent-routing|get|{LinkProtocol.Normalize(handle)}";
+
+    public static string UpdateMessage(
+        string handle,
+        string primaryDeviceId,
+        string? failoverDeviceId,
+        string expectedVersion)
+        => $"agent-routing|set|{LinkProtocol.Normalize(handle)}|{primaryDeviceId.Trim()}|{failoverDeviceId?.Trim() ?? ""}|{expectedVersion}";
+}
+
+public static class AgentDispatchCodes
+{
+    public const string Accepted = "agent_dispatch_accepted";
+    public const string Queued = "agent_dispatch_queued";
+}
+
+public static class AgentDispatchProtocol
+{
+    public static bool IsAtomicRequest(string? kind)
+        => string.Equals(kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal);
+
+    public static bool IsAtomicResponse(string? kind)
+        => string.Equals(kind, MeshKinds.AtomicAgentResponse, StringComparison.Ordinal);
 }
 
 public sealed record RemoteAgentRequestPayload(string RequestId, string ThreadId, string Prompt);
@@ -796,12 +845,15 @@ public record MeshEnvelope(
     DateTimeOffset SentAt,
     string? FromDevice = null,
     string? ToDevice = null,
-    string? PushHint = null)
+    string? PushHint = null,
+    string? AgentRequestId = null,
+    string? AgentDispatchToken = null)
 {
     public static MeshEnvelope Create(string from, string to, string kind, string body, string? signature = null,
-        string? fromDevice = null, string? toDevice = null, string? pushHint = null)
-        => new(Guid.NewGuid().ToString("n"), from, to, kind, body, signature, DateTimeOffset.UtcNow,
-            fromDevice, toDevice, pushHint);
+        string? fromDevice = null, string? toDevice = null, string? pushHint = null,
+        string? agentRequestId = null, string? agentDispatchToken = null, string? id = null)
+        => new(id ?? Guid.NewGuid().ToString("n"), from, to, kind, body, signature, DateTimeOffset.UtcNow,
+            fromDevice, toDevice, pushHint, agentRequestId, agentDispatchToken);
 }
 
 /// <summary>
@@ -896,6 +948,8 @@ public static class MeshKinds
     public const string Chat = "chat";
     public const string AgentRequest = "agent.request";
     public const string AgentResponse = "agent.response";
+    public const string AtomicAgentRequest = "agent.atomic.request";
+    public const string AtomicAgentResponse = "agent.atomic.response";
     public const string System = "system";
     public const string Fanout = "fanout";
     public const string GroupControl = "group.control";
