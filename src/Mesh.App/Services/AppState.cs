@@ -2598,6 +2598,7 @@ public sealed class AppState : IMemoryState
     // ChatLine is committed. It lets the UI show the model's reasoning and answer building up live
     // instead of appearing all at once when the turn finishes.
     private readonly Dictionary<string, AssistantDraft> assistantDrafts = new(StringComparer.Ordinal);
+    private readonly AssistantDraftRefreshGate assistantDraftRefreshGate = new();
 
     /// <summary>A thread's live streamed reply: reasoning and answer accumulated as chunks arrive.</summary>
     public sealed class AssistantDraft
@@ -2625,6 +2626,7 @@ public sealed class AppState : IMemoryState
     /// <summary>Starts a fresh streamed draft for a thread at the start of a turn.</summary>
     public void BeginAssistantDraft(string key)
     {
+        assistantDraftRefreshGate.Reset(key);
         assistantDrafts[key] = new AssistantDraft();
         NotifyChanged();
     }
@@ -2634,13 +2636,17 @@ public sealed class AppState : IMemoryState
     {
         if (!assistantDrafts.TryGetValue(key, out var draft))
             assistantDrafts[key] = draft = new AssistantDraft();
-        if (draft.Append(delta)) NotifyChanged();
+        if (draft.Append(delta)
+            && assistantDraftRefreshGate.ShouldPublish(key, delta.Kind, Environment.TickCount64))
+            NotifyChanged();
     }
 
     /// <summary>Clears a thread's streamed draft once its turn ends and the final line is committed.</summary>
     public void EndAssistantDraft(string key)
     {
-        if (assistantDrafts.Remove(key)) NotifyChanged();
+        var removed = assistantDrafts.Remove(key);
+        assistantDraftRefreshGate.Reset(key);
+        if (removed) NotifyChanged();
     }
 
     // Per-thread owner-turn run state, held here (in the singleton app state) rather than in the Me
@@ -2823,7 +2829,11 @@ public sealed class AppState : IMemoryState
                 assistantDrafts[threadId] = draft = new AssistantDraft();
             appended = draft.Append(new AgentDelta(kind, update.Delta));
         }
-        if (appended) NotifyChanged();
+        if (appended
+            && assistantDraftRefreshGate.ShouldPublish(
+                threadId,
+                update.DeltaKind == TopicRunDeltaKind.Reasoning ? AgentDeltaKind.Reasoning : AgentDeltaKind.Answer,
+                Environment.TickCount64)) NotifyChanged();
     }
 
     /// <summary>Applies a remote run update projection for a thread and refreshes the UI.</summary>
@@ -2873,6 +2883,7 @@ public sealed class AppState : IMemoryState
                 terminalRemoteRuns.Add(correlationKey);
                 remoteDeltaSeq.Remove(correlationKey);
                 assistantDrafts.Remove(threadId);
+                assistantDraftRefreshGate.Reset(threadId);
             }
             else
             {
@@ -2917,6 +2928,8 @@ public sealed class AppState : IMemoryState
             terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
             thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
+            assistantDrafts.Remove(threadId);
+            assistantDraftRefreshGate.Reset(threadId);
         }
         EmitTopicUpsert(thread!);
         NotifyChanged();
@@ -2960,6 +2973,7 @@ public sealed class AppState : IMemoryState
             terminalRemoteRuns.Add(thread.Id + "\0" + projection.RunId);
             remoteDeltaSeq.Remove(thread.Id + "\0" + projection.RunId);
             assistantDrafts.Remove(thread.Id);
+            assistantDraftRefreshGate.Reset(thread.Id);
             return true;
         }
     }

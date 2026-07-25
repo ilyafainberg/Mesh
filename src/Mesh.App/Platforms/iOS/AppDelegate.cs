@@ -1,7 +1,10 @@
 using Foundation;
+using MetricKit;
 using Mesh.App.Platforms.iOS;
 using Mesh.App.Services;
 using Microsoft.Identity.Client;
+using ObjCRuntime;
+using System.Text;
 using UIKit;
 using UserNotifications;
 
@@ -10,13 +13,147 @@ namespace Mesh.App;
 [Register("AppDelegate")]
 public class AppDelegate : MauiUIApplicationDelegate
 {
+    private readonly MeshNotificationCenterDelegate notificationCenterDelegate = new();
+    private MeshMetricManagerSubscriber? metricSubscriber;
+    private NSObject? memoryWarningObserver;
+    private bool nativeExceptionHooksInstalled;
+
     protected override MauiApp CreateMauiApp() => MauiProgram.CreateMauiApp();
 
-    public override bool FinishedLaunching(UIApplication application, NSDictionary launchOptions)
+    public override bool FinishedLaunching(UIApplication application, NSDictionary? launchOptions)
     {
         // Present relay-composed alerts even while the app is foregrounded (iOS suppresses them by default).
-        UNUserNotificationCenter.Current.Delegate = new MeshNotificationCenterDelegate();
-        return base.FinishedLaunching(application, launchOptions);
+        // UNUserNotificationCenter holds a weak delegate, so AppDelegate keeps the managed instance alive.
+        UNUserNotificationCenter.Current.Delegate = notificationCenterDelegate;
+        var launched = base.FinishedLaunching(application, launchOptions);
+
+        var diagnostics = RuntimeDiagnostics.Current;
+        diagnostics?.MarkLifecycle("launched");
+        if (diagnostics is not null)
+        {
+            InstallNativeExceptionHooks();
+            InstallMetricKit(diagnostics);
+            memoryWarningObserver = UIApplication.Notifications.ObserveDidReceiveMemoryWarning(
+                (_, _) => RecordMemoryWarning(diagnostics));
+        }
+        return launched;
+    }
+
+    public override void OnActivated(UIApplication application)
+    {
+        RuntimeDiagnostics.Current?.MarkLifecycle("active");
+        base.OnActivated(application);
+    }
+
+    public override void OnResignActivation(UIApplication application)
+    {
+        RuntimeDiagnostics.Current?.MarkLifecycle("inactive");
+        base.OnResignActivation(application);
+    }
+
+    public override void DidEnterBackground(UIApplication application)
+    {
+        RuntimeDiagnostics.Current?.MarkLifecycle("background");
+        base.DidEnterBackground(application);
+    }
+
+    public override void WillEnterForeground(UIApplication application)
+    {
+        RuntimeDiagnostics.Current?.MarkLifecycle("foreground");
+        base.WillEnterForeground(application);
+    }
+
+    private static void RecordMemoryWarning(RuntimeDiagnostics diagnostics)
+    {
+        try
+        {
+            var memory = GC.GetGCMemoryInfo();
+            diagnostics.RecordEvent(
+                "ios-memory-warning",
+                $"managedBytes={GC.GetTotalMemory(forceFullCollection: false)}; heapBytes={memory.HeapSizeBytes}; "
+                + $"memoryLoadBytes={memory.MemoryLoadBytes}; highThresholdBytes={memory.HighMemoryLoadThresholdBytes}");
+        }
+        catch (Exception ex)
+        {
+            diagnostics.RecordException("ios-memory-warning-callback", ex);
+        }
+    }
+
+    public override void WillTerminate(UIApplication application)
+    {
+        var diagnostics = RuntimeDiagnostics.Current;
+        diagnostics?.MarkLifecycle("terminated");
+        if (metricSubscriber is not null)
+        {
+            try
+            {
+                MXMetricManager.SharedManager.Remove(metricSubscriber);
+            }
+            catch (Exception ex)
+            {
+                diagnostics?.RecordException("metrickit-remove", ex);
+            }
+            finally
+            {
+                metricSubscriber.Dispose();
+                metricSubscriber = null;
+            }
+        }
+        memoryWarningObserver?.Dispose();
+        memoryWarningObserver = null;
+        RemoveNativeExceptionHooks();
+        base.WillTerminate(application);
+    }
+
+    private void InstallNativeExceptionHooks()
+    {
+        if (nativeExceptionHooksInstalled) return;
+        nativeExceptionHooksInstalled = true;
+        ObjCRuntime.Runtime.MarshalManagedException += OnMarshalManagedException;
+        ObjCRuntime.Runtime.MarshalObjectiveCException += OnMarshalObjectiveCException;
+    }
+
+    private void RemoveNativeExceptionHooks()
+    {
+        if (!nativeExceptionHooksInstalled) return;
+        nativeExceptionHooksInstalled = false;
+        ObjCRuntime.Runtime.MarshalManagedException -= OnMarshalManagedException;
+        ObjCRuntime.Runtime.MarshalObjectiveCException -= OnMarshalObjectiveCException;
+    }
+
+    private void OnMarshalManagedException(object? sender, MarshalManagedExceptionEventArgs args)
+        => RuntimeDiagnostics.Current?.RecordException("ios-managed-native-boundary", args.Exception);
+
+    private void OnMarshalObjectiveCException(object? sender, MarshalObjectiveCExceptionEventArgs args)
+        => RuntimeDiagnostics.Current?.RecordEvent("ios-objective-c-exception", args.Exception.ToString());
+
+    private void InstallMetricKit(RuntimeDiagnostics diagnostics)
+    {
+        var added = false;
+        try
+        {
+            metricSubscriber = new MeshMetricManagerSubscriber(diagnostics);
+            MXMetricManager.SharedManager.Add(metricSubscriber);
+            added = true;
+            metricSubscriber.DidReceiveDiagnosticPayloads(MXMetricManager.SharedManager.PastDiagnosticPayloads);
+        }
+        catch (Exception ex)
+        {
+            diagnostics.RecordException("metrickit-startup", ex);
+            if (added && metricSubscriber is not null)
+            {
+                try
+                {
+                    MXMetricManager.SharedManager.Remove(metricSubscriber);
+                }
+                catch (Exception removeException)
+                {
+                    diagnostics.RecordException("metrickit-remove", removeException);
+                }
+            }
+            metricSubscriber?.Dispose();
+            metricSubscriber = null;
+        }
     }
 
     // APNs issued this device a token: forward it to ApplePushService so the pending RegisterAsync completes.
@@ -24,10 +161,18 @@ public class AppDelegate : MauiUIApplicationDelegate
     [Export("application:didRegisterForRemoteNotificationsWithDeviceToken:")]
     public void RegisteredForRemoteNotifications(UIApplication application, NSData deviceToken)
     {
-        var bytes = deviceToken.ToArray();
-        var hex = new global::System.Text.StringBuilder(bytes.Length * 2);
-        foreach (var b in bytes) hex.Append(b.ToString("x2"));
-        ApplePushService.CompleteRegistration(hex.ToString());
+        try
+        {
+            var bytes = deviceToken.ToArray();
+            var hex = new StringBuilder(bytes.Length * 2);
+            foreach (var value in bytes) hex.Append(value.ToString("x2"));
+            ApplePushService.CompleteRegistration(hex.ToString());
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("apns-token-callback", ex);
+            ApplePushService.FailRegistration("APNs token callback failed.");
+        }
     }
 
     // APNs registration failed (missing entitlement, no network, restricted state): unblock any pending
@@ -35,7 +180,17 @@ public class AppDelegate : MauiUIApplicationDelegate
     [Export("application:didFailToRegisterForRemoteNotificationsWithError:")]
     public void FailedToRegisterForRemoteNotifications(UIApplication application, NSError error)
     {
-        ApplePushService.FailRegistration();
+        try
+        {
+            var reason = error.LocalizedDescription;
+            RuntimeDiagnostics.Current?.RecordEvent("apns-registration-failed", reason);
+            ApplePushService.FailRegistration(reason);
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("apns-failure-callback", ex);
+            ApplePushService.FailRegistration("APNs failure callback failed.");
+        }
     }
 
     public override bool OpenUrl(UIApplication application, NSUrl url, NSDictionary options)
@@ -67,6 +222,31 @@ public class AppDelegate : MauiUIApplicationDelegate
             return true;
         }
         return base.ContinueUserActivity(application, userActivity, completionHandler);
+    }
+}
+
+public sealed class MeshMetricManagerSubscriber(RuntimeDiagnostics diagnostics)
+    : NSObject, IMXMetricManagerSubscriber
+{
+    public void DidReceiveMetricPayloads(MXMetricPayload[] payloads)
+    {
+        // Runtime metrics are intentionally not retained. Diagnostic payloads contain the actionable data.
+    }
+
+    public void DidReceiveDiagnosticPayloads(MXDiagnosticPayload[] payloads)
+    {
+        foreach (var payload in payloads ?? [])
+        {
+            try
+            {
+                var json = Encoding.UTF8.GetString(payload.JsonRepresentation.ToArray());
+                diagnostics.RecordDiagnosticPayload("metrickit", json);
+            }
+            catch (Exception ex)
+            {
+                diagnostics.RecordException("metrickit-payload", ex);
+            }
+        }
     }
 }
 

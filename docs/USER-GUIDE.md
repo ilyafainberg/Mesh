@@ -553,6 +553,14 @@ The selected device must also have been one of the recipient keys when the quest
 
 Create a **passphrase-encrypted backup** on your current device, then **import** it on the new device. The new device mints its own key and re-authorizes under your handle via **device linking** (scan a QR/link from an authorized device) or **recovery** (using the handle recovery key in your backup). See [Backup, Moving Devices, and Recovery](#14-backup-moving-devices-and-recovery).
 
+### Mesh closed unexpectedly or showed a reload error. How do I report it?
+
+Reopen or reload Mesh, go to **Settings > Diagnostics**, and choose **Copy diagnostics**. Paste the result into your bug report together with what you were doing immediately before the app closed or showed the error. Mesh keeps this log only on your device and does not intentionally add message text, prompts, keys, or tool arguments.
+
+On every platform, the report includes managed exceptions and Blazor UI renderer failures. On iOS it also includes Objective-C exception boundaries, lifecycle state, memory warnings, and Apple MetricKit crash or hang payloads when iOS makes them available. MetricKit data can arrive after a later launch, so copy the diagnostics again if the first report does not identify the cause.
+
+You can clear the retained diagnostics from the same Settings card.
+
 ### Can people read my messages on the relay?
 
 No. Messages are **end-to-end encrypted**. The relay only routes sealed envelopes and cannot read the contents. Your keys and data stay on your device in encrypted storage.

@@ -65,6 +65,7 @@
 
     private ElementReference container;
     private ToolDetailDocument document = new("", "plaintext", Array.Empty<ToolDetailSection>(), false);
+    private readonly CancellationTokenSource lifetime = new();
     private string? lastTool;
     private string? lastContent;
     private bool lastIsOutput;
@@ -109,11 +110,15 @@
         highlightPending = false;
         try
         {
-            await JS.InvokeVoidAsync("meshUI.highlightCode", container);
+            await JS.InvokeVoidAsync("meshUI.highlightCode", lifetime.Token, container);
         }
-        catch (JSException ex)
+        catch (OperationCanceledException) when (disposed)
         {
-            Logger.LogWarning(ex, "Could not syntax-highlight tool details.");
+            // Navigation disposed the component while WebView highlighting was in flight.
+        }
+        catch (Exception ex) when (ex is JSException or ObjectDisposedException or InvalidOperationException)
+        {
+            if (!disposed) Logger.LogWarning(ex, "Could not syntax-highlight tool details.");
         }
     }
 
@@ -132,16 +137,19 @@
         try
         {
             await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(VisibleText());
+            if (disposed) return;
             copied = true;
             copyFailed = false;
         }
         catch (Exception ex)
         {
+            if (disposed) return;
             copied = false;
             copyFailed = true;
             Logger.LogWarning(ex, "Could not copy tool details to the clipboard.");
         }
 
+        if (disposed) return;
         var version = ++copyVersion;
         _ = ResetCopyStateAsync(version);
     }
@@ -158,11 +166,22 @@
 
     private async Task ResetCopyStateAsync(int version)
     {
-        await Task.Delay(1600);
-        if (disposed || version != copyVersion) return;
-        copied = false;
-        copyFailed = false;
-        await InvokeAsync(StateHasChanged);
+        try
+        {
+            await Task.Delay(1600, lifetime.Token);
+            if (disposed || version != copyVersion) return;
+            copied = false;
+            copyFailed = false;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (OperationCanceledException) when (disposed)
+        {
+            // Expected when the details view is removed before the copy indicator resets.
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+        {
+            if (!disposed) Logger.LogWarning(ex, "Could not reset the tool-detail copy indicator.");
+        }
     }
 
     private static bool IsExitStatus(ToolDetailSection section)
@@ -181,7 +200,10 @@
 
     public void Dispose()
     {
+        if (disposed) return;
         disposed = true;
         copyVersion++;
+        lifetime.Cancel();
+        lifetime.Dispose();
     }
 }

@@ -8,6 +8,7 @@
 @inject IHttpClientFactory HttpFactory
 @inject UpdateService Updater
 @inject IAppControl AppControl
+@inject RuntimeDiagnostics Diagnostics
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -703,6 +704,37 @@
             </div>
         </div>
         }
+        <div class="card-panel">
+            <h3>Diagnostics</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Mesh keeps a small technical UI, lifecycle, and crash log on this device. It does not intentionally add
+                message text, prompts, keys, or tool arguments.
+                @if (OperatingSystem.IsIOS())
+                {
+                    <span> Apple crash and hang diagnostics can arrive after the next launch.</span>
+                }
+            </div>
+            @if (Diagnostics.PreviousSessionEndedUnexpectedly)
+            {
+                <div class="field-hint err-text" style="margin-bottom:12px;">
+                    The previous session ended unexpectedly while the app was @Diagnostics.PreviousSessionPhase.
+                    Copy diagnostics and include them with the crash report.
+                </div>
+            }
+            <div class="model-row">
+                <button class="ghost" @onclick="CopyDiagnostics">
+                    <i class="bi bi-clipboard"></i> Copy diagnostics
+                </button>
+                <button class="ghost" @onclick="ClearDiagnostics" disabled="@(!Diagnostics.HasEntries)">
+                    Clear
+                </button>
+            </div>
+            @if (!string.IsNullOrWhiteSpace(diagnosticsStatus))
+            {
+                <div class="field-hint">@diagnosticsStatus</div>
+            }
+        </div>
+
 
     </div>
 </div>
@@ -738,6 +770,7 @@
     bool savingAgentRouting;
     bool agentRoutingAttempted;
     string? agentRoutingError;
+    string? diagnosticsStatus;
 
     IReadOnlyList<Mesh.Shared.DeviceInfo> AgentRoutingDevices => agentDevices
         .Where(device => device.IsDesktop && device.AtomicAgentDispatchEnabled)
@@ -813,6 +846,35 @@
             if (copiedHandle == a.Handle) { copiedHandle = null; StateHasChanged(); }
         }
         catch { /* clipboard is best-effort */ }
+    }
+
+    async Task CopyDiagnostics()
+    {
+        try
+        {
+            await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(
+                Diagnostics.CreateReport());
+            diagnosticsStatus = "Diagnostics copied. Paste them into the crash report.";
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.RecordException("diagnostics-copy", ex);
+            diagnosticsStatus = "Could not copy diagnostics: " + ex.Message;
+        }
+    }
+
+    void ClearDiagnostics()
+    {
+        try
+        {
+            Diagnostics.Clear();
+            diagnosticsStatus = "Diagnostics cleared.";
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.RecordException("diagnostics-clear", ex);
+            diagnosticsStatus = "Could not clear diagnostics: " + ex.Message;
+        }
     }
 
     async Task DeleteAccount(AccountRef a)

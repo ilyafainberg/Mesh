@@ -186,6 +186,19 @@ else
         <div class="messages-frame">
             <div class="messages" @ref="scrollEl">
                 <div class="messages-wrap">
+                @{
+                    var allVisibleLines = OrderedVisibleLines;
+                    var renderedLines = MessageRenderWindow.Latest(allVisibleLines, messageRenderCount);
+                    var hiddenMessageCount = MessageRenderWindow.HiddenCount(allVisibleLines.Count, messageRenderCount);
+                }
+                @if (hiddenMessageCount > 0)
+                {
+                    <div class="message-history-more">
+                        <button type="button" class="ghost" @onclick="ShowEarlierMessages">
+                            <i class="bi bi-clock-history"></i> Show @MessageRenderWindow.NextPageSize(allVisibleLines.Count, messageRenderCount) earlier messages
+                        </button>
+                    </div>
+                }
                 @if (Active.Lines.Count == 0)
                 {
                     <div class="empty">
@@ -193,9 +206,9 @@ else
                         and helps you manage what your public agent shares with others. Ask it anything.
                     </div>
                 }
-                @foreach (var line in OrderedVisibleLines.Where(line => !IsQueued(line)))
+                @foreach (var line in renderedLines.Where(line => !IsQueued(line)))
                 {
-                    <div class="bubble @(line.Role)">
+                    <div class="bubble @(line.Role)" @key="line.Id">
                         @if (!string.IsNullOrEmpty(line.Reasoning))
                         {
                             <button class="reasoning-toggle" @onclick="() => ToggleReasoning(line)" aria-label="Show reasoning">
@@ -334,9 +347,9 @@ else
                         }
                     </div>
                 }
-                @foreach (var line in OrderedVisibleLines.Where(IsQueued))
+                @foreach (var line in renderedLines.Where(IsQueued))
                 {
-                    <div class="bubble @(line.Role)">
+                    <div class="bubble @(line.Role)" @key="line.Id">
                         <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                         OnPin="html => PinWidget(html, line)" />
                         <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
@@ -542,6 +555,8 @@ else
     bool renaming;
     string renameText = "";
     string? activeThreadValue;
+    int messageRenderCount = MessageRenderWindow.InitialCount;
+    bool preserveHistoryScroll;
     string? activeThread
     {
         get => activeThreadValue;
@@ -549,6 +564,7 @@ else
         {
             if (string.Equals(activeThreadValue, value, StringComparison.Ordinal)) return;
             activeThreadValue = value;
+            messageRenderCount = MessageRenderWindow.InitialCount;
             inputValue = value is null ? "" : State.GetTopicDraft(value);
         }
     }
@@ -765,6 +781,12 @@ else
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
 
+        if (preserveHistoryScroll)
+        {
+            preserveHistoryScroll = false;
+            return;
+        }
+
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
         // (busy true->false): the reply is added while the thread is still busy, so tracking that
         // transition guarantees the final answer scrolls into view even if its line count collides
@@ -828,6 +850,12 @@ else
             eligibleDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
         }
         if (!disposed) await InvokeAsync(StateHasChanged);
+    }
+
+    void ShowEarlierMessages()
+    {
+        messageRenderCount = MessageRenderWindow.NextCount(OrderedVisibleLines.Count, messageRenderCount);
+        preserveHistoryScroll = true;
     }
 
     void Select(string id)
@@ -973,6 +1001,7 @@ else
     void ClearActive()
     {
         if (Active is not null) State.ClearOwnThread(Active.Id);
+        messageRenderCount = MessageRenderWindow.InitialCount;
         confirmDelete = false;
     }
 

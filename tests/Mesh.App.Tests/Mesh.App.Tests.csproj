@@ -27,6 +27,9 @@
     <Compile Include="..\..\src\Mesh.App\Services\ToolDetailFormatter.cs" Link="ToolDetailFormatter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ToolApprovalService.cs" Link="ToolApprovalService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TokenOptimizer.cs" Link="TokenOptimizer.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\RuntimeDiagnostics.cs" Link="RuntimeDiagnostics.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MessageRenderWindow.cs" Link="MessageRenderWindow.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\AssistantDraftRefreshGate.cs" Link="AssistantDraftRefreshGate.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MemoryPolicy.cs" Link="MemoryPolicy.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MemoryService.cs" Link="MemoryService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProfileSyncState.cs" Link="ProfileSyncState.cs" />

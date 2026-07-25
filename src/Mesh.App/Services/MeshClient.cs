@@ -2607,11 +2607,25 @@ public sealed class MeshClient : IDeviceTopicTransport
     // on. No-op on platforms without push (Windows/Mac) or until native token acquisition is provisioned
     // (IPushService returns null), so behavior is unchanged there.
     private volatile string? registeredPushToken;
+    private int pushRegistrationInProgress;
 
     private void TryRegisterPushToken()
     {
         if (!push.IsSupported) return;
-        TrackBackground(RegisterPushTokenAsync(), "push token registration");
+        if (Interlocked.CompareExchange(ref pushRegistrationInProgress, 1, 0) != 0) return;
+        TrackBackground(RegisterPushTokenGuardedAsync(), "push token registration");
+    }
+
+    private async Task RegisterPushTokenGuardedAsync()
+    {
+        try
+        {
+            await RegisterPushTokenAsync();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref pushRegistrationInProgress, 0);
+        }
     }
 
     private async Task RegisterPushTokenAsync()
@@ -2619,7 +2633,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         string? token;
         try { token = await push.RegisterAsync(); }
         catch (Exception ex) { Log?.Invoke($"push token request failed: {ex.Message}"); return; }
-        if (string.IsNullOrWhiteSpace(token)) return;                       // unsupported, denied, or unprovisioned
+        if (string.IsNullOrWhiteSpace(token)) return; // unsupported, denied, timed out, or unprovisioned
         var pushToken = token!;
 
         var p = state.Profile;

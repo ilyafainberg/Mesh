@@ -2,13 +2,14 @@
 @inject IJSRuntime JS
 @implements IAsyncDisposable
 
-@if (Attachments is { Count: > 0 })
+@if (renderedAttachments.Count > 0)
 {
     <div class="message-attachments">
-        @foreach (var attachment in Attachments.Where(a => a.IsImage))
+        @foreach (var rendered in renderedAttachments)
         {
+            var attachment = rendered.Attachment;
             <img class="msg-img attached-preview"
-                 src="@DataUri(attachment)"
+                 src="@rendered.DataUri"
                  alt="@attachment.Name"
                  title="@attachment.Name"
                  @onclick="() => Download(attachment)" />
@@ -16,13 +17,14 @@
     </div>
 }
 
-@foreach (var seg in Markdown.Parse(Text))
+@foreach (var rendered in renderedSegments)
 {
+    var seg = rendered.Segment;
     if (seg.IsFile)
     {
         @if (seg.FileMime is not null && seg.FileMime.StartsWith("image/"))
         {
-            <img class="msg-img" src="data:@seg.FileMime;base64,@seg.Content"
+            <img class="msg-img" src="@rendered.DataUri"
                  alt="@seg.FileName" title="@seg.FileName (click to save)"
                  @onclick="() => Download(seg)" />
         }
@@ -41,7 +43,7 @@
     {
         @if (!string.IsNullOrWhiteSpace(seg.Content))
         {
-            <div class="text md">@((MarkupString)Markdown.ToHtml(seg.Content))</div>
+            <div class="text md">@((MarkupString)rendered.Html)</div>
         }
     }
     else if (!State.Profile.AllowInteractiveApps)
@@ -53,7 +55,7 @@
     }
     else
     {
-        var id = seg.Content.GetHashCode();
+        var id = rendered.Id;
         appHtml[id] = seg.Content;
         @if (running.Contains(id))
         {
@@ -78,7 +80,7 @@
         }
         else
         {
-            <button class="app-card" @onclick="() => running.Add(id)">
+            <button class="app-card" @onclick="() => Start(id)">
                 <i class="bi bi-play-circle"></i>
                 <div class="app-card-text">
                     <b>Interactive app@(string.IsNullOrEmpty(From) ? "" : $" from {From}")</b>
@@ -95,6 +97,12 @@
     [Parameter] public string? From { get; set; }
     [Parameter] public EventCallback<string> OnPin { get; set; }
 
+    private sealed record RenderedSegment(int Id, MessageSegment Segment, string Html, string? DataUri);
+    private sealed record RenderedAttachment(ChatAttachment Attachment, string DataUri);
+
+    private IReadOnlyList<RenderedSegment> renderedSegments = Array.Empty<RenderedSegment>();
+    private IReadOnlyList<RenderedAttachment> renderedAttachments = Array.Empty<RenderedAttachment>();
+    private string? renderedText;
     private readonly HashSet<int> running = new();
     private readonly HashSet<int> expanded = new();
 
@@ -103,11 +111,66 @@
     private readonly Dictionary<int, ElementReference> frameRefs = new();
     private readonly Dictionary<int, string> appHtml = new();
     private readonly HashSet<int> mounted = new();
+    private int renderedAttachmentSignature;
+    private bool segmentsInitialized;
+    private bool attachmentsInitialized;
+
+    protected override void OnParametersSet()
+    {
+        if (!segmentsInitialized || !string.Equals(renderedText, Text, StringComparison.Ordinal))
+        {
+            renderedText = Text;
+            renderedSegments = Markdown.Parse(Text)
+                .Select((segment, index) => new RenderedSegment(
+                    index,
+                    segment,
+                    segment.IsApp || segment.IsFile ? "" : Markdown.ToHtml(segment.Content),
+                    segment.IsFile && segment.FileMime?.StartsWith("image/") == true
+                        ? $"data:{segment.FileMime};base64,{segment.Content}"
+                        : null))
+                .ToArray();
+            segmentsInitialized = true;
+            running.Clear();
+            expanded.Clear();
+            frameRefs.Clear();
+            appHtml.Clear();
+            mounted.Clear();
+        }
+
+        var signature = AttachmentSignature(Attachments);
+        if (!attachmentsInitialized || signature != renderedAttachmentSignature)
+        {
+            renderedAttachmentSignature = signature;
+            renderedAttachments = Attachments?
+                .Where(attachment => attachment.IsImage)
+                .Select(attachment => new RenderedAttachment(attachment, DataUri(attachment)))
+                .ToArray()
+                ?? Array.Empty<RenderedAttachment>();
+            attachmentsInitialized = true;
+        }
+    }
+
+    private static int AttachmentSignature(IReadOnlyList<ChatAttachment>? attachments)
+    {
+        var hash = new HashCode();
+        if (attachments is null) return hash.ToHashCode();
+        hash.Add(attachments.Count);
+        foreach (var attachment in attachments)
+        {
+            hash.Add(attachment.Name, StringComparer.Ordinal);
+            hash.Add(attachment.MimeType, StringComparer.Ordinal);
+            hash.Add(attachment.Data.Length);
+            hash.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(attachment.Data));
+        }
+        return hash.ToHashCode();
+    }
 
     private void Toggle(HashSet<int> set, int id)
     {
         if (!set.Remove(id)) set.Add(id);
     }
+
+    private void Start(int id) => running.Add(id);
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {

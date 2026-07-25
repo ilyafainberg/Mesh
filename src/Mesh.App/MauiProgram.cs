@@ -12,6 +12,12 @@ public static class MauiProgram
 	public static MauiApp CreateMauiApp()
 	{
 		var builder = MauiApp.CreateBuilder();
+		var diagnostics = new RuntimeDiagnostics(Path.Combine(StoragePaths.Root, "Diagnostics"));
+		builder.Services.AddSingleton(diagnostics);
+		diagnostics.StartSession(PlatformCaps.DevicePlatform, detectUnexpectedTermination: OperatingSystem.IsIOS());
+		diagnostics.InstallManagedHandlers();
+		builder.Logging.AddProvider(new RuntimeDiagnosticsLoggerProvider(diagnostics));
+
 		builder
 			.UseMauiApp<App>()
 			.UseBarcodeReader()
@@ -127,8 +133,11 @@ public static class MauiProgram
 		// Auto-update marketplace-imported skills in the background at startup (never blocks launch).
 		_ = Task.Run(async () =>
 		{
-			try { await app.Services.GetRequiredService<SkillMarketplaceService>().SyncAllAsync(); }
-			catch { /* startup sync is best-effort */ }
+			try
+			{
+				await app.Services.GetRequiredService<SkillMarketplaceService>().SyncAllAsync();
+			}
+			catch (Exception ex) { RuntimeDiagnostics.Current?.RecordException("marketplace-startup-sync", ex); }
 		});
 		return app;
 	}
