@@ -419,15 +419,18 @@ else
                     </button>
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
                               placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
-                    @if (ActiveBusy)
+                    @if (ShowStopAction)
                     {
                         <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop current run" aria-label="Stop current run">
                             <i class="bi bi-stop-fill"></i>
                         </button>
                     }
-                    <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend)" title="@SendTitle" aria-label="@SendTitle">
-                        <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
-                    </button>
+                    else
+                    {
+                        <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend)" title="@SendTitle" aria-label="@SendTitle">
+                            <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
+                        </button>
+                    }
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 @if (Active is not null && !ActiveDeviceOnline)
@@ -563,9 +566,13 @@ else
     bool ActiveUsesCurrentDevice => Active is null
         || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
         || string.Equals(Active.ExecutionDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+    bool HasSendableDraft => !string.IsNullOrWhiteSpace(input)
+        || attachments.Count > 0
+        || selectedWidget is not null;
+    bool ShowStopAction => TopicComposerPresentation.ShowStop(ActiveBusy, HasSendableDraft);
     bool CanSend => ActiveDeviceOnline
         && (!ActiveUsesCurrentDevice || Agent.IsModelReady)
-        && (!string.IsNullOrWhiteSpace(input) || attachments.Count > 0 || selectedWidget is not null);
+        && HasSendableDraft;
     string SendTitle => !ActiveDeviceOnline
         ? $"{DeviceLabel(Active!)} is offline"
         : ActiveUsesCurrentDevice && !Agent.IsModelReady

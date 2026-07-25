@@ -782,6 +782,13 @@ public static class RemoteRunPresentation
     }
 }
 
+/// <summary>Chooses the single action shown in a topic composer while a turn is running.</summary>
+public static class TopicComposerPresentation
+{
+    public static bool ShowStop(bool topicBusy, bool hasSendableDraft)
+        => topicBusy && !hasSendableDraft;
+}
+
 /// <summary>
 /// Tracks queued topic runs by stable run and line identifiers. A run remains known after it starts so
 /// later progress is still accepted, while only runs that are still waiting drive the line subtitle.

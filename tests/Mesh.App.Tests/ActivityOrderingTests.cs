@@ -229,6 +229,15 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void TopicComposerPresentation_SwitchesBetweenStopAndSendDuringExecution()
+    {
+        Assert.IsFalse(TopicComposerPresentation.ShowStop(topicBusy: false, hasSendableDraft: false));
+        Assert.IsTrue(TopicComposerPresentation.ShowStop(topicBusy: true, hasSendableDraft: false));
+        Assert.IsFalse(TopicComposerPresentation.ShowStop(topicBusy: true, hasSendableDraft: true));
+        Assert.IsTrue(TopicComposerPresentation.ShowStop(topicBusy: true, hasSendableDraft: false));
+    }
+
+    [TestMethod]
     public void QueuedTopicRunState_ShowsOnlyWaitingLinesAndRetainsStartedCorrelation()
     {
         var state = new QueuedTopicRunState();
