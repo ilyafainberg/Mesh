@@ -27,6 +27,8 @@ public sealed class MeshDb : IDisposable
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private const string ConversationDraftKind = "conversation";
     private const string TopicDraftKind = "topic";
+    private const string LastDesktopTopicMetaKey = "ui.desktop.last_topic";
+    private const string LastDesktopConversationMetaKey = "ui.desktop.last_conversation";
     private static bool nativeInit;
 
     private readonly SqliteConnection conn;
@@ -252,6 +254,44 @@ public sealed class MeshDb : IDisposable
         cmd.CommandText = "DELETE FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
         cmd.Parameters.AddWithValue("$kind", kind);
         cmd.Parameters.AddWithValue("$id", entityId);
+        cmd.ExecuteNonQuery();
+    }
+
+    // ---- local UI state ----------------------------------------------------
+
+    public string? GetLastDesktopTopicId()
+        => GetMetaValue(LastDesktopTopicMetaKey);
+
+    public void SetLastDesktopTopicId(string? threadId)
+        => SetMetaValue(LastDesktopTopicMetaKey, threadId);
+
+    public string? GetLastDesktopConversationKey()
+        => GetMetaValue(LastDesktopConversationMetaKey);
+
+    public void SetLastDesktopConversationKey(string? conversationKey)
+        => SetMetaValue(LastDesktopConversationMetaKey, conversationKey);
+
+    private string? GetMetaValue(string key)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT v FROM meta WHERE k = $key;";
+        cmd.Parameters.AddWithValue("$key", key);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    private void SetMetaValue(string key, string? value)
+    {
+        using var cmd = conn.CreateCommand();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            cmd.CommandText = "DELETE FROM meta WHERE k = $key;";
+        }
+        else
+        {
+            cmd.CommandText = "INSERT INTO meta(k, v) VALUES($key, $value) ON CONFLICT(k) DO UPDATE SET v = excluded.v;";
+            cmd.Parameters.AddWithValue("$value", value);
+        }
+        cmd.Parameters.AddWithValue("$key", key);
         cmd.ExecuteNonQuery();
     }
 

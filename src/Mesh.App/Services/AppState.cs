@@ -222,6 +222,22 @@ public sealed class AppState : IMemoryState
         activeDb?.SetTopicDraft(threadId, text);
     }
 
+    /// <summary>Gets the last Me topic opened in the desktop UI on this device.</summary>
+    public string? GetLastDesktopTopicId()
+        => activeDb?.GetLastDesktopTopicId();
+
+    /// <summary>Stores the last Me topic opened in the desktop UI without syncing it.</summary>
+    public void SetLastDesktopTopicId(string? threadId)
+        => activeDb?.SetLastDesktopTopicId(threadId);
+
+    /// <summary>Gets the last Messages conversation opened in the desktop UI on this device.</summary>
+    public string? GetLastDesktopConversationKey()
+        => activeDb?.GetLastDesktopConversationKey();
+
+    /// <summary>Stores the last Messages conversation opened in the desktop UI without syncing it.</summary>
+    public void SetLastDesktopConversationKey(string? conversationKey)
+        => activeDb?.SetLastDesktopConversationKey(conversationKey);
+
     public MemorySnapshot SnapshotMemories()
     {
         lock (profileSyncGate)

@@ -154,6 +154,18 @@
 }
 
 
+.conv-list {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.topic-list-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
 .thread-groups { display: flex; flex-direction: column; gap: 2px; }
 .thread-group-label {
     display: flex;
@@ -273,7 +285,7 @@
     line-height: 1.45;
 }
 .split-create {
-    position: static;
+    position: relative;
     display: inline-flex;
     align-items: stretch;
     gap: 0;
@@ -323,6 +335,12 @@
     border-radius: 12px;
     background: var(--bg-1, #fff);
     box-shadow: var(--shadow-3, 0 10px 30px rgba(0,0,0,.16));
+}
+.split-create > .device-menu {
+    left: auto;
+    right: 0;
+    width: min(260px, calc(100vw - 32px));
+    min-width: min(240px, calc(100vw - 32px));
 }
 .device-menu-title {
     padding: 6px 9px;

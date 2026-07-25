@@ -7,6 +7,7 @@
 
 <div class="split">
     <div class="conv-list">
+        <div class="conversation-list-head">
         <h2>Messages</h2>
         <div class="new-conv">
             <input @bind="newHandle" @bind:event="oninput" @onkeydown="OnNewKey" list="msg-handles" placeholder="Add by handle…" aria-label="Add a conversation by handle" />
@@ -15,6 +16,8 @@
             </datalist>
             <button class="primary icon-primary" @onclick="StartConversation" title="Start conversation" aria-label="Start conversation"><i class="bi bi-plus-lg"></i></button>
         </div>
+        </div>
+        <div class="conversation-list-scroll">
         <button class="ghost new-group-btn" @onclick="ShowGroupCreator" aria-expanded="@showGroupCreator">
             <i class="bi bi-people"></i> New group
         </button>
@@ -120,6 +123,7 @@
                 }
             </div>
         }
+        </div>
     </div>
 
     <div class="thread">
@@ -363,6 +367,7 @@
             activeValue = value;
             messageRenderCount = MessageRenderWindow.InitialCount;
             inputValue = value is null ? "" : State.GetConversationDraft(value);
+            State.SetLastDesktopConversationKey(value);
         }
     }
     string? confirmDelete;
@@ -451,6 +456,14 @@
         }
 
         OpenPendingDeepLink();
+        if (active is null)
+        {
+            var remembered = State.GetLastDesktopConversationKey();
+            if (!string.IsNullOrWhiteSpace(remembered) && State.FindConversation(remembered) is not null)
+                Select(remembered);
+            else if (!string.IsNullOrWhiteSpace(remembered))
+                State.SetLastDesktopConversationKey(null);
+        }
     }
 
     // Opens a conversation a mesh:// deep link asked for (the router pre-created it and set the key).

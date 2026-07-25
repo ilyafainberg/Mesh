@@ -34,6 +34,45 @@ public sealed class DeviceTopicDbTests
     }
 
     [TestMethod]
+    public void DesktopSelectionState_PersistsAndCanBeCleared()
+    {
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.SetLastDesktopTopicId("topic-42");
+            db.SetLastDesktopConversationKey("group:project");
+        }
+        SqliteConnection.ClearAllPools();
+
+        using (var reopened = MeshDb.Open(databasePath, key))
+        {
+            Assert.AreEqual("topic-42", reopened.GetLastDesktopTopicId());
+            Assert.AreEqual("group:project", reopened.GetLastDesktopConversationKey());
+            reopened.SetLastDesktopTopicId(null);
+            reopened.SetLastDesktopConversationKey(null);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var cleared = MeshDb.Open(databasePath, key);
+        Assert.IsNull(cleared.GetLastDesktopTopicId());
+        Assert.IsNull(cleared.GetLastDesktopConversationKey());
+    }
+
+    [TestMethod]
+    public void DesktopSelectionState_IsIndependentForEachIdentityDatabase()
+    {
+        var otherPath = Path.Combine(directory, "other.meshdb");
+        using (var db = MeshDb.Open(databasePath, key))
+            db.SetLastDesktopTopicId("first-topic");
+        using (var other = MeshDb.Open(otherPath, key))
+            other.SetLastDesktopTopicId("second-topic");
+
+        using var first = MeshDb.Open(databasePath, key);
+        using var second = MeshDb.Open(otherPath, key);
+        Assert.AreEqual("first-topic", first.GetLastDesktopTopicId());
+        Assert.AreEqual("second-topic", second.GetLastDesktopTopicId());
+    }
+
+    [TestMethod]
     public void Migration_SetsLastActivityAt_FromNewestChatLine()
     {
         var older = DateTimeOffset.UtcNow.AddHours(-2);
