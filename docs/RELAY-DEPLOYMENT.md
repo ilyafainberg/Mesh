@@ -344,6 +344,7 @@ with no hosted model. Only the settings you actually provide change behaviour.
 | --- | --- | --- | --- |
 | `COSMOS_CONNECTION` | `Cosmos:Connection` | Azure Cosmos DB connection string. When set, the handle registry, invites, and offline inbox become durable. | in-memory |
 | `COSMOS_DB` | `Cosmos:Database` | Cosmos database name. | `mesh` |
+| `MESH_REQUIRE_DURABLE_STORAGE` | `Mesh:RequireDurableStorage` | When `true`, fail startup unless `COSMOS_CONNECTION` is configured. Recommended for every hosted relay. | `false` |
 | `REDIS_CONNECTION` | `Redis:Connection` | Redis connection string. When set, presence, live Direct/Group token buckets, per-handle quota, and cross-node routing are shared across replicas. | in-memory |
 | `BLOB_CONNECTION` | `Blob:Connection` | Azure Storage connection string (must include an account key). When set, the relay issues short-lived SAS URLs so clients upload and download end-to-end-encrypted attachment ciphertext directly to blob storage; the envelope carries only a pointer. Unset disables attachments. | disabled |
 | `BLOB_ATTACHMENTS_CONTAINER` | `Blob:AttachmentsContainer` | Private container holding attachment ciphertext. Created on demand. | `attachments` |
@@ -540,11 +541,12 @@ The relay exposes plain HTTP endpoints for status and observability.
 - hosted-model calls
 - rate-limit rejections
 - connected count
+- envelopes enqueued
+- deliveries acknowledged
+- deliveries redelivered
+- queued envelopes cancelled
 
-Normal and fan-out hub sends return explicit accepted or rejected results. An accepted
-fan-out means the relay admitted the logical request and began routing or queueing its
-per-recipient envelopes. Online work is concurrent and offline users receive later;
-there is no atomic simultaneous physical-delivery guarantee.
+Normal and fan-out hub sends return explicit accepted or rejected results. Ordinary envelopes are enqueued before live delivery. Protocol-5 clients acknowledge after processing; until then, the inbox item remains leased and can be redelivered after a disconnect or dropped acknowledgement. An accepted fan-out still has no atomic simultaneous physical-delivery guarantee.
 
 Atomic agent sends are different: `agent_dispatch_accepted` means the request reached
 its assigned device fence, while `agent_dispatch_queued` means the relay accepted
@@ -607,6 +609,7 @@ version floor:
 
 | Relay capability | Client behavior | Result |
 | --- | --- | --- |
+| Protocol 5+, `durableDelivery: true` | Current client with `deliveryAck=1` | Enqueue-before-deliver, lease/ack redelivery, strict device inboxes, and queued-envelope cancellation |
 | Protocol 4+, `atomicAgentDispatch: true` | Atomic-capable client | Primary/failover assignment, queueing (durable with Cosmos), relay-enforced at-most-one accepted response |
 | Capability absent | Current client | Falls back to legacy agent kinds; no single-device guarantee |
 | Capability present | Legacy client | Legacy kinds continue to route; no single-device guarantee |

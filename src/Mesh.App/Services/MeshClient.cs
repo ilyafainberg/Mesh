@@ -14,7 +14,7 @@ namespace Mesh.App.Services;
 /// keepalive and automatic reconnection; this client adds the device-key auth handshake,
 /// end-to-end encryption, and dispatch of inbound messages to the agent and UI.
 /// </summary>
-public sealed class MeshClient : IDeviceTopicTransport
+public sealed partial class MeshClient : IDeviceTopicTransport
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan GroupKeyCacheLifetime = TimeSpan.FromMinutes(5);
@@ -29,9 +29,10 @@ public sealed class MeshClient : IDeviceTopicTransport
     private readonly IPushService push;
     private readonly DeviceTopicAttachmentInbox attachmentInbox = new();
     private readonly ConcurrentDictionary<string, ActiveTopicRun> activeTopicRuns = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, DateTimeOffset> topicRunReplay = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> topicEnvelopeReplay = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> guestAgentGates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Lazy<Task>> serviceRequestExecutions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> serviceRequestReplay = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<long, Task> backgroundTasks = new();
     private long nextBackgroundTaskId;
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
@@ -44,9 +45,13 @@ public sealed class MeshClient : IDeviceTopicTransport
     private volatile bool supportsFanout;
     private volatile bool supportsDeviceSync;
     private volatile bool supportsAtomicAgentDispatch;
+    private volatile bool supportsDurableDelivery;
+    private readonly SemaphoreSlim durableFlushGate = new(1, 1);
+    private readonly SemaphoreSlim connectionGate = new(1, 1);
     private volatile DeviceSyncIdentity? authenticatedDeviceSyncIdentity;
     private volatile bool wantConnected;   // the user intends to be connected; drives auto-recovery
     private int reconnectScheduled;         // 0/1 guard so only one recovery loop runs at a time
+    private int durableRetryScheduled;
     private IReadOnlyList<string> deviceSyncTargetCache = Array.Empty<string>();
     private DateTimeOffset deviceSyncTargetCacheUpdated;
     private string deviceSyncTargetCacheIdentity = "";
@@ -67,6 +72,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         this.push = push;
         state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
         deviceSyncActivity.Changed += () => DeviceSyncStateChanged?.Invoke();
+        Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged += OnConnectivityChanged;
     }
 
     private sealed record DeviceSyncIdentity(
@@ -333,82 +339,114 @@ public sealed class MeshClient : IDeviceTopicTransport
 
     public async Task ConnectAsync()
     {
-        await DisconnectAsync();
-        wantConnected = true;
-        var p = state.Profile;
-        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
-        await DetectRelayCapabilitiesAsync(p.RelayUrl);
-
-        var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}";
-        var connection = new HubConnectionBuilder()
-            .WithUrl(url)
-            .WithAutomaticReconnect(new ForeverRetry())
-            .Build();
-
-        // The relay opens with a nonce challenge; sign it with the device key to authenticate.
-        connection.On<string>(MeshHubProtocol.Challenge, async nonce =>
-        {
-            try
-            {
-                var sig = IdentityService.Sign(state.Profile.PrivateKey, nonce);
-                await connection.InvokeAsync(MeshHubProtocol.Authenticate, state.Profile.PublicKey, sig);
-            }
-            catch (Exception ex) { Log?.Invoke($"auth failed: {ex.Message}"); }
-        });
-
-        connection.On(MeshHubProtocol.Ready, () =>
-        {
-            authenticated = true;
-            var identity = CaptureDeviceSyncIdentity(connection);
-            authenticatedDeviceSyncIdentity = identity;
-            Log?.Invoke("hub connected + authenticated");
-            StateChanged?.Invoke();
-            if (identity is not null)
-                TrackBackground(RunDeviceSyncHandshakeAsync(identity), "device sync handshake");
-            TryRegisterPushToken();
-        });
-
-        connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
-        {
-            MeshEnvelope? env;
-            try { env = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, Json); }
-            catch { return; }
-            if (env is not null) await HandleInboundAsync(env, CancellationToken.None);
-        });
-
-        // A reconnect re-runs the server's challenge automatically (the handler stays registered),
-        // so we just reflect the transient unauthenticated state in the UI.
-        connection.Reconnecting += _ =>
-        {
-            authenticated = false;
-            authenticatedDeviceSyncIdentity = null;
-            StateChanged?.Invoke();
-            return Task.CompletedTask;
-        };
-        connection.Reconnected += _ => { StateChanged?.Invoke(); return Task.CompletedTask; };
-        connection.Closed += _ =>
-        {
-            authenticated = false;
-            authenticatedDeviceSyncIdentity = null;
-            StateChanged?.Invoke();
-            // SignalR's own auto-reconnect has given up by the time Closed fires. If the user still
-            // wants to be connected, keep trying ourselves so a long drop does not strand us offline.
-            ScheduleRecovery();
-            return Task.CompletedTask;
-        };
-
-        hub = connection;
+        await connectionGate.WaitAsync();
         try
         {
-            await connection.StartAsync();
-            StateChanged?.Invoke();
-            StartAuthWatchdog(connection);
+            await DisconnectCoreAsync();
+            var p = state.Profile;
+            if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
+            wantConnected = true;
+            await DetectRelayCapabilitiesAsync(p.RelayUrl);
+
+            var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}&deliveryAck=1";
+            var connection = new HubConnectionBuilder()
+                .WithUrl(url)
+                .WithAutomaticReconnect(new ForeverRetry())
+                .Build();
+
+            // The relay opens with a nonce challenge; sign it with the device key to authenticate.
+            connection.On<string>(MeshHubProtocol.Challenge, async nonce =>
+            {
+                try
+                {
+                    var sig = IdentityService.Sign(state.Profile.PrivateKey, nonce);
+                    await connection.InvokeAsync(MeshHubProtocol.Authenticate, state.Profile.PublicKey, sig);
+                }
+                catch (Exception ex) { Log?.Invoke($"auth failed: {ex.Message}"); }
+            });
+
+            connection.On(MeshHubProtocol.Ready, () =>
+            {
+                authenticated = true;
+                var identity = CaptureDeviceSyncIdentity(connection);
+                authenticatedDeviceSyncIdentity = identity;
+                Log?.Invoke("hub connected + authenticated");
+                StateChanged?.Invoke();
+                if (identity is not null)
+                    TrackBackground(RunDeviceSyncHandshakeAsync(identity), "device sync handshake");
+                TryRegisterPushToken();
+                if (identity is not null)
+                {
+                    TrackBackground(RecoverDurableDeliveryAsync(identity), "durable delivery recovery");
+                    TrackBackground(MaintainDurableDeliveryAsync(identity), "durable delivery maintenance");
+                }
+            });
+
+            connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
+            {
+                MeshEnvelope? env;
+                try { env = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, Json); }
+                catch { return; }
+                if (env is null) return;
+                try
+                {
+                    await HandleInboundAsync(env, CancellationToken.None);
+                    if (!string.IsNullOrWhiteSpace(env.RelayDeliveryId))
+                    {
+                        // The delivery marker is authoritative even when the health probe was unavailable.
+                        supportsDurableDelivery = true;
+                        await AcknowledgeDeliveryAsync(connection, env);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    TraceTransport("receive-failed", ex.Message);
+                }
+            });
+
+            // A reconnect re-runs the server's challenge automatically (the handler stays registered),
+            // so we just reflect the transient unauthenticated state in the UI.
+            connection.Reconnecting += _ =>
+            {
+                authenticated = false;
+                authenticatedDeviceSyncIdentity = null;
+                StateChanged?.Invoke();
+                return Task.CompletedTask;
+            };
+            connection.Reconnected += _ =>
+            {
+                StartAuthWatchdog(connection);
+                StateChanged?.Invoke();
+                return Task.CompletedTask;
+            };
+            connection.Closed += _ =>
+            {
+                authenticated = false;
+                authenticatedDeviceSyncIdentity = null;
+                StateChanged?.Invoke();
+                // SignalR's own auto-reconnect has given up by the time Closed fires. If the user still
+                // wants to be connected, keep trying ourselves so a long drop does not strand us offline.
+                ScheduleRecovery();
+                return Task.CompletedTask;
+            };
+
+            hub = connection;
+            try
+            {
+                await connection.StartAsync();
+                StateChanged?.Invoke();
+                StartAuthWatchdog(connection);
+            }
+            catch (Exception ex)
+            {
+                Log?.Invoke($"hub connect failed: {ex.Message}");
+                StateChanged?.Invoke();
+                ScheduleRecovery();
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            Log?.Invoke($"hub connect failed: {ex.Message}");
-            StateChanged?.Invoke();
-            ScheduleRecovery();
+            connectionGate.Release();
         }
     }
 
@@ -418,6 +456,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         supportsFanout = false;
         supportsDeviceSync = false;
         supportsAtomicAgentDispatch = false;
+        supportsDurableDelivery = false;
         try
         {
             var http = httpFactory.CreateClient("relay");
@@ -433,6 +472,8 @@ public sealed class MeshClient : IDeviceTopicTransport
                 && deviceSync.ValueKind == JsonValueKind.True;
             supportsAtomicAgentDispatch = capabilities.TryGetProperty("atomicAgentDispatch", out var atomicDispatch)
                 && atomicDispatch.ValueKind == JsonValueKind.True;
+            supportsDurableDelivery = capabilities.TryGetProperty("durableDelivery", out var durableDelivery)
+                && durableDelivery.ValueKind == JsonValueKind.True;
         }
         catch (Exception ex)
         {
@@ -468,31 +509,56 @@ public sealed class MeshClient : IDeviceTopicTransport
     private void ScheduleRecovery()
     {
         if (!wantConnected) return;
-        if (Interlocked.Exchange(ref reconnectScheduled, 1) == 1) return; // already running
+        if (Interlocked.Exchange(ref reconnectScheduled, 1) == 1) return;
         TrackBackground(Task.Run(async () =>
         {
             try
             {
-                var delay = TimeSpan.FromSeconds(3);
-                while (wantConnected && (hub is null || hub.State == HubConnectionState.Disconnected))
+                var delay = TimeSpan.FromSeconds(2);
+                while (wantConnected)
                 {
                     await Task.Delay(delay);
                     if (!wantConnected) break;
-                    if (hub is not null && hub.State != HubConnectionState.Disconnected) break;
+                    if (Connected)
+                    {
+                        var identity = authenticatedDeviceSyncIdentity;
+                        if (identity is not null)
+                            await RecoverDurableDeliveryAsync(identity);
+                        break;
+                    }
+                    if (hub?.State is HubConnectionState.Connecting
+                        or HubConnectionState.Reconnecting)
+                    {
+                        delay = TimeSpan.FromSeconds(Math.Min(30, delay.TotalSeconds * 2));
+                        continue;
+                    }
+                    if (hub?.State == HubConnectionState.Connected)
+                    {
+                        delay = TimeSpan.FromSeconds(Math.Min(30, delay.TotalSeconds * 2));
+                        continue;
+                    }
+
                     try
                     {
                         Log?.Invoke("recovery: reconnecting to relay");
                         await ConnectAsync();
-                        break; // ConnectAsync rebuilds the hub + its own recovery hooks
                     }
-                    catch (Exception ex) { Log?.Invoke($"recovery attempt failed: {ex.Message}"); }
+                    catch (Exception ex)
+                    {
+                        Log?.Invoke($"recovery attempt failed: {ex.Message}");
+                    }
+                    if (Connected) break;
                     delay = TimeSpan.FromSeconds(Math.Min(30, delay.TotalSeconds * 2));
                 }
             }
-            finally { Interlocked.Exchange(ref reconnectScheduled, 0); }
+            finally
+            {
+                Interlocked.Exchange(ref reconnectScheduled, 0);
+                if (wantConnected && !Connected && hub?.State == HubConnectionState.Disconnected)
+                    ScheduleRecovery();
+            }
         }), "relay recovery");
     }
-
     private async Task HandleInboundAsync(MeshEnvelope env, CancellationToken ct)
     {
         var from = AppState.Norm(env.From);
@@ -641,64 +707,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         // no tools of any kind).
         if (env.Kind == MeshKinds.ServiceRequest)
         {
-            if (!PlatformCaps.CanHostServices)
-            {
-                Log?.Invoke("service request ignored: service hosting is desktop-only");
-                return;
-            }
-            var (serviceId, turns) = ServiceProtocol.ParseRequest(text);
-            var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
-            if (svc is null || !svc.Published) return;                 // not a live service here
-            if (!agent.IsModelReady) return;                           // no model to answer with
-
-            // Token-budget gate (provider-side cost control; the relay never sees the E2E-encrypted
-            // token spend, so the owner enforces their own budget here). Refuse politely when the
-            // service's lifetime total budget is exhausted or this caller has hit their daily cap.
-            if (svc.IsBudgetExhausted(from))
-            {
-                await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId,
-                    "This service has reached its usage budget and is not accepting requests right now."));
-                Log?.Invoke($"service '{serviceId}' refused for @{from}: budget exhausted");
-                return;
-            }
-
-            // Rate-limit gate: cap the number of requests one caller can make per day, independent of
-            // token cost, so nobody can flood the service with cheap requests (anti-abuse).
-            if (svc.IsRateLimited(from))
-            {
-                await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId,
-                    "You have reached this service's daily request limit. Please try again tomorrow."));
-                Log?.Invoke($"service '{serviceId}' refused for @{from}: daily rate limit");
-                return;
-            }
-
-            if (!state.TryConsumeAgentReply()) return;                 // daily budget spent; don't burn the model
-
-            // Count this accepted request against the caller's daily rate limit.
-            state.Mutate(_ => svc.RecordRequest(from));
-
-            // The consumer supplies the (windowed) transcript so a follow-up has context; the provider
-            // stays stateless per caller. Map turns to chat lines the sandboxed agent understands.
-            var svcHistory = turns
-                .Select(t => new ChatLine { Role = t.Role == "user" ? "user" : "assistant", Text = t.Text, Via = "agent" })
-                .ToList();
-            if (svcHistory.Count == 0) svcHistory.Add(new ChatLine { Role = "user", Text = "" });
-
-            var reply = await agent.RespondAsServiceAsync(serviceId, from, svcHistory, ct);
-
-            // Do not send model-failure text to the caller as if it were a real answer; refund budget.
-            if (ModelReply.IsFailure(reply.Text))
-            {
-                state.RefundAgentReply();
-                Log?.Invoke($"service '{serviceId}' reply to @{from} skipped: model unavailable");
-                return;
-            }
-
-            // Charge the tokens this reply cost against the service's budget (lifetime total + daily per-handle).
-            if (reply.Tokens > 0)
-                state.Mutate(_ => svc.RecordSpend(from, reply.Tokens));
-
-            await SendAsync(from, MeshKinds.ServiceResponse, ServiceProtocol.Body(serviceId, reply.Text));
+            await HandleServiceRequestOnceAsync(env, from, text, ct);
             return;
         }
         if (env.Kind == MeshKinds.ServiceResponse)
@@ -708,8 +717,16 @@ public sealed class MeshClient : IDeviceTopicTransport
             // consumer can keep a real multi-turn conversation with the service.
             var conv = state.FindConversation(AppState.ServiceKey(from, svcId))
                        ?? state.GetOrCreateServiceConversation(from, svcId, null);
+            if (conv.Lines.Any(line => string.Equals(line.Id, env.Id, StringComparison.Ordinal))) return;
             state.ClearAwaiting(conv.Handle);
-            state.AddChatLine(conv.Handle, new ChatLine { Role = "user", Text = answer, Via = "agent", AddressedToAgent = true });
+            state.AddChatLine(conv.Handle, new ChatLine
+            {
+                Id = env.Id,
+                Role = "user",
+                Text = answer,
+                Via = "agent",
+                AddressedToAgent = true
+            });
             state.MarkUnread(conv.Handle);
             notifier.Notify($"{conv.ServiceName} replied", Preview(answer), NotifyKind.Message, "messages");
             return;
@@ -721,7 +738,16 @@ public sealed class MeshClient : IDeviceTopicTransport
             // Render it as a readable message from the reporter so the operator can review it.
             var payload = ReportProtocol.Parse(text);
             var rendered = payload is null ? text : FormatReport(payload);
-            state.AddChatLine(from, new ChatLine { Role = "user", Text = rendered, Via = "person" });
+            if (state.FindConversation(from)?.Lines.Any(line =>
+                    string.Equals(line.Id, env.Id, StringComparison.Ordinal)) == true)
+                return;
+            state.AddChatLine(from, new ChatLine
+            {
+                Id = env.Id,
+                Role = "user",
+                Text = rendered,
+                Via = "person"
+            });
             state.MarkUnread(from);
             notifier.Notify("New report", Preview(rendered), NotifyKind.Message, "messages");
             return;
@@ -799,6 +825,103 @@ public sealed class MeshClient : IDeviceTopicTransport
             && agent.IsModelReady)
             await HandleAgentQuestionAsync(env, from, text, display, ct);
         StateChanged?.Invoke();
+    }
+
+    private async Task HandleServiceRequestOnceAsync(
+        MeshEnvelope envelope,
+        string from,
+        string text,
+        CancellationToken ct)
+    {
+        if (serviceRequestReplay.ContainsKey(envelope.Id)) return;
+        var execution = serviceRequestExecutions.GetOrAdd(
+            envelope.Id,
+            _ => new Lazy<Task>(
+                () => HandleServiceRequestAsync(envelope, from, text, ct),
+                LazyThreadSafetyMode.ExecutionAndPublication));
+        var completed = false;
+        try
+        {
+            await execution.Value;
+            completed = true;
+        }
+        finally
+        {
+            if (completed) RememberReplay(serviceRequestReplay, envelope.Id);
+            if (serviceRequestExecutions.TryGetValue(envelope.Id, out var current)
+                && ReferenceEquals(current, execution))
+                serviceRequestExecutions.TryRemove(envelope.Id, out _);
+        }
+    }
+
+    private async Task HandleServiceRequestAsync(
+        MeshEnvelope envelope,
+        string from,
+        string text,
+        CancellationToken ct)
+    {
+        if (!PlatformCaps.CanHostServices)
+        {
+            Log?.Invoke("service request ignored: service hosting is desktop-only");
+            return;
+        }
+        var (serviceId, turns) = ServiceProtocol.ParseRequest(text);
+        var svc = state.Profile.PublishedServices.FirstOrDefault(s => s.Id == serviceId);
+        if (svc is null || !svc.Published) return;
+        if (!agent.IsModelReady) return;
+
+        if (svc.IsBudgetExhausted(from))
+        {
+            await SendAsync(
+                from,
+                MeshKinds.ServiceResponse,
+                ServiceProtocol.Body(serviceId,
+                    "This service has reached its usage budget and is not accepting requests right now."),
+                StableEnvelopeId("service.response", envelope.Id));
+            Log?.Invoke($"service '{serviceId}' refused for @{from}: budget exhausted");
+            return;
+        }
+
+        if (svc.IsRateLimited(from))
+        {
+            await SendAsync(
+                from,
+                MeshKinds.ServiceResponse,
+                ServiceProtocol.Body(serviceId,
+                    "You have reached this service's daily request limit. Please try again tomorrow."),
+                StableEnvelopeId("service.response", envelope.Id));
+            Log?.Invoke($"service '{serviceId}' refused for @{from}: daily rate limit");
+            return;
+        }
+
+        if (!state.TryConsumeAgentReply()) return;
+        state.Mutate(_ => svc.RecordRequest(from));
+        var svcHistory = turns
+            .Select(t => new ChatLine
+            {
+                Role = t.Role == "user" ? "user" : "assistant",
+                Text = t.Text,
+                Via = "agent"
+            })
+            .ToList();
+        if (svcHistory.Count == 0)
+            svcHistory.Add(new ChatLine { Role = "user", Text = "" });
+
+        var reply = await agent.RespondAsServiceAsync(serviceId, from, svcHistory, ct);
+        if (ModelReply.IsFailure(reply.Text))
+        {
+            state.RefundAgentReply();
+            Log?.Invoke($"service '{serviceId}' reply to @{from} skipped: model unavailable");
+            return;
+        }
+
+        if (reply.Tokens > 0)
+            state.Mutate(_ => svc.RecordSpend(from, reply.Tokens));
+        await SendAsync(
+            from,
+            MeshKinds.ServiceResponse,
+            ServiceProtocol.Body(serviceId, reply.Text),
+            StableEnvelopeId("service.response", envelope.Id));
     }
 
     private async Task HandleAgentQuestionAsync(
@@ -884,11 +1007,6 @@ public sealed class MeshClient : IDeviceTopicTransport
             Log?.Invoke($"dropped {env.Kind} from {env.FromDevice}: decryption failed");
             return;
         }
-        if (!RememberReplay(topicEnvelopeReplay, env.Id))
-        {
-            Log?.Invoke($"dropped replayed topic envelope {env.Id}");
-            return;
-        }
 
         switch (env.Kind)
         {
@@ -897,6 +1015,11 @@ public sealed class MeshClient : IDeviceTopicTransport
                 if (!TopicRunProtocol.TryParseChunk(plaintext, out var chunk))
                 {
                     Log?.Invoke($"dropped attachment chunk from {env.FromDevice}: invalid payload");
+                    return;
+                }
+                if (!RememberReplay(topicEnvelopeReplay, env.Id))
+                {
+                    Log?.Invoke($"dropped replayed topic envelope {env.Id}");
                     return;
                 }
                 if (!attachmentInbox.TryAdd(env.FromDevice, chunk, out var chunkError))
@@ -916,70 +1039,77 @@ public sealed class MeshClient : IDeviceTopicTransport
                     attachmentInbox.RejectRun(env.FromDevice, request.RunId);
                     return;
                 }
-                OwnThread thread;
-                try
+                if (!EnsureInboundTopicContext(request))
                 {
-                    thread = state.EnsureOwnThreadForDeviceRun(
-                        request.ThreadId,
-                        new ExecutionDevice(
-                            MyDeviceId,
-                            string.IsNullOrWhiteSpace(state.Profile.DeviceName)
-                                ? null
-                                : state.Profile.DeviceName,
-                            PlatformCaps.DevicePlatform),
-                        request.TriggerAt);
-                }
-                catch (Exception ex) when (ex is ArgumentException
-                                           or InvalidOperationException
-                                           or KeyNotFoundException)
-                {
-                    Log?.Invoke($"dropped topic request {request.RunId}: {ex.Message}");
+                    Log?.Invoke($"dropped topic request {request.RunId}: topic context conflicted");
                     attachmentInbox.RejectRun(env.FromDevice, request.RunId);
                     return;
                 }
-                if (!RememberReplay(topicRunReplay, request.RunId))
-                {
-                    Log?.Invoke($"ignored replayed topic run {request.RunId}");
-                    return;
-                }
-                var existingTrigger = thread.Lines.FirstOrDefault(line =>
-                    string.Equals(line.Id, request.TriggerLineId, StringComparison.Ordinal));
-                if (existingTrigger is not null
-                    && (!string.Equals(existingTrigger.Role, "user", StringComparison.Ordinal)
-                        || !string.Equals(existingTrigger.Text, request.TriggerText, StringComparison.Ordinal)
-                        || existingTrigger.At != request.TriggerAt))
-                {
-                    Log?.Invoke($"dropped topic request {request.RunId}: trigger line conflicted");
-                    attachmentInbox.RejectRun(env.FromDevice, request.RunId);
-                    return;
-                }
-                if (existingTrigger is null)
-                    state.AddOwnChatLine(request.ThreadId, new ChatLine
-                    {
-                        Id = request.TriggerLineId,
-                        Role = "user",
-                        Text = request.TriggerText,
-                        Via = "agent",
-                        AddressedToAgent = true,
-                        At = request.TriggerAt
-                    });
 
-                var active = new ActiveTopicRun(
-                    request.RunId, request.ThreadId, env.FromDevice, new CancellationTokenSource());
-                if (!activeTopicRuns.TryAdd(request.RunId, active))
+                var record = state.GetInboundTopicRun(request.RunId);
+                if (record is null)
                 {
-                    Log?.Invoke($"ignored duplicate active topic run {request.RunId}");
+                    var now = DateTimeOffset.UtcNow;
+                    var candidate = new MeshDb.InboundTopicRunItem(
+                        request.RunId,
+                        env.FromDevice,
+                        request,
+                        InboundTopicRunStates.Accepted,
+                        now,
+                        now);
+                    if (state.TryAcceptInboundTopicRun(candidate))
+                    {
+                        record = candidate;
+                    }
+                    else
+                    {
+                        record = state.GetInboundTopicRun(request.RunId)
+                                 ?? throw new InvalidOperationException(
+                                     "The inbound topic request could not be persisted.");
+                    }
+                }
+                if (!string.Equals(record.SourceDeviceId, env.FromDevice, StringComparison.Ordinal)
+                    || !string.Equals(
+                        TopicRunProtocol.RequestBody(record.Request),
+                        TopicRunProtocol.RequestBody(request),
+                        StringComparison.Ordinal))
+                {
+                    Log?.Invoke($"dropped topic request {request.RunId}: durable run identity conflicted");
                     return;
                 }
-                TrackBackground(
-                    ExecuteInboundTopicRunAsync(request, active),
-                    $"topic run {request.RunId}");
+                if (record.State is InboundTopicRunStates.Completed
+                    or InboundTopicRunStates.Failed
+                    or InboundTopicRunStates.Cancelled
+                    or InboundTopicRunStates.Interrupted)
+                {
+                    if (TopicRunProtocol.TryParseUpdate(record.TerminalUpdateJson, out var terminal))
+                        await SendTargetedTopicEnvelopeAsync(
+                            record.SourceDeviceId,
+                            MeshKinds.TopicRunUpdate,
+                            TopicRunProtocol.UpdateBody(terminal),
+                            ct,
+                            PushHintProtocol.ForTopicRunPhase(terminal.Phase));
+                    return;
+                }
+                if (string.Equals(record.State, InboundTopicRunStates.Running, StringComparison.Ordinal)
+                    && !activeTopicRuns.ContainsKey(record.RunId))
+                {
+                    QueueInterruptedInboundRun(record, "remote_execution_interrupted");
+                    return;
+                }
+                if (!TryStartInboundTopicRun(record.Request, record.SourceDeviceId))
+                    throw new InvalidOperationException("The inbound topic run could not be scheduled.");
                 break;
 
             case MeshKinds.TopicRunUpdate:
                 if (!TopicRunProtocol.TryParseUpdate(plaintext, out var update))
                 {
                     Log?.Invoke($"dropped topic update from {env.FromDevice}: invalid payload");
+                    return;
+                }
+                if (topicEnvelopeReplay.ContainsKey(env.Id))
+                {
+                    Log?.Invoke($"dropped replayed topic envelope {env.Id}");
                     return;
                 }
                 var updateThread = state.Profile.OwnThreads.FirstOrDefault(item =>
@@ -994,25 +1124,61 @@ public sealed class MeshClient : IDeviceTopicTransport
                     return;
                 }
                 state.ApplyRemoteRunUpdate(update);
+                RememberReplay(topicEnvelopeReplay, env.Id);
                 StateChanged?.Invoke();
                 break;
 
             case MeshKinds.TopicRunCancel:
-                if (!TopicRunProtocol.TryParseCancel(plaintext, out var cancel)
-                    || !activeTopicRuns.TryGetValue(cancel.RunId, out var activeRun)
-                    || !string.Equals(activeRun.ThreadId, cancel.ThreadId, StringComparison.Ordinal)
-                    || !string.Equals(activeRun.SourceDeviceId, env.FromDevice, StringComparison.Ordinal))
+                if (!TopicRunProtocol.TryParseCancel(plaintext, out var cancel))
+                {
+                    Log?.Invoke("dropped invalid topic cancellation");
+                    return;
+                }
+                if (topicEnvelopeReplay.ContainsKey(env.Id))
+                {
+                    Log?.Invoke($"dropped replayed topic envelope {env.Id}");
+                    return;
+                }
+                if (activeTopicRuns.TryGetValue(cancel.RunId, out var activeRun)
+                    && string.Equals(activeRun.ThreadId, cancel.ThreadId, StringComparison.Ordinal)
+                    && string.Equals(activeRun.SourceDeviceId, env.FromDevice, StringComparison.Ordinal))
+                {
+                    activeRun.Cancellation.Cancel();
+                    var cancelledUpdate = new TopicRunUpdatePayload(
+                        cancel.RunId,
+                        cancel.ThreadId,
+                        TopicRunPhase.Cancelled,
+                        Status: "Cancelled",
+                        Timestamp: DateTimeOffset.UtcNow);
+                    await SendTerminalOnceAsync(activeRun, cancelledUpdate, ct);
+                    RememberReplay(topicEnvelopeReplay, env.Id);
+                    return;
+                }
+
+                var pending = state.GetInboundTopicRun(cancel.RunId);
+                if (pending is null
+                    || !string.Equals(pending.SourceDeviceId, env.FromDevice, StringComparison.Ordinal)
+                    || !string.Equals(pending.Request.ThreadId, cancel.ThreadId, StringComparison.Ordinal)
+                    || !string.Equals(pending.State, InboundTopicRunStates.Accepted, StringComparison.Ordinal))
                 {
                     Log?.Invoke("dropped uncorrelated topic cancellation");
                     return;
                 }
-                activeRun.Cancellation.Cancel();
-                await SendTerminalOnceAsync(activeRun, new TopicRunUpdatePayload(
+                var cancelled = new TopicRunUpdatePayload(
                     cancel.RunId,
                     cancel.ThreadId,
                     TopicRunPhase.Cancelled,
                     Status: "Cancelled",
-                    Timestamp: DateTimeOffset.UtcNow), ct);
+                    Timestamp: DateTimeOffset.UtcNow);
+                var terminalCancellation = PersistInboundTopicTerminal(
+                    cancel.RunId, InboundTopicRunStates.Cancelled, cancelled);
+                await SendTargetedTopicEnvelopeAsync(
+                    env.FromDevice,
+                    MeshKinds.TopicRunUpdate,
+                    TopicRunProtocol.UpdateBody(terminalCancellation),
+                    ct,
+                    PushHintProtocol.ForTopicRunPhase(terminalCancellation.Phase));
+                RememberReplay(topicEnvelopeReplay, env.Id);
                 break;
         }
     }
@@ -1023,6 +1189,8 @@ public sealed class MeshClient : IDeviceTopicTransport
     {
         try
         {
+            if (!state.SetInboundTopicRunState(active.RunId, InboundTopicRunStates.Running))
+                throw new InvalidOperationException("The inbound topic run state could not be persisted.");
             var attachments = await FetchInboundAttachmentsAsync(request, active);
             var draft = new TopicTurnDraft(
                 request.RunId,
@@ -1049,7 +1217,7 @@ public sealed class MeshClient : IDeviceTopicTransport
             {
                 await progress.CompleteAsync();
             }
-            await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
+            var terminalUpdate = new TopicRunUpdatePayload(
                 active.RunId,
                 active.ThreadId,
                 completion.Phase,
@@ -1057,27 +1225,30 @@ public sealed class MeshClient : IDeviceTopicTransport
                 FailureCode: completion.FailureCode,
                 Timestamp: completion.CompletedAt == default
                     ? DateTimeOffset.UtcNow
-                    : completion.CompletedAt), CancellationToken.None);
+                    : completion.CompletedAt);
+            await SendTerminalOnceAsync(active, terminalUpdate, CancellationToken.None);
         }
         catch (OperationCanceledException)
         {
-            await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
+            var cancelledUpdate = new TopicRunUpdatePayload(
                 active.RunId,
                 active.ThreadId,
                 TopicRunPhase.Cancelled,
                 Status: "Cancelled",
-                Timestamp: DateTimeOffset.UtcNow), CancellationToken.None);
+                Timestamp: DateTimeOffset.UtcNow);
+            await SendTerminalOnceAsync(active, cancelledUpdate, CancellationToken.None);
         }
         catch (Exception ex)
         {
             Log?.Invoke($"topic run {active.RunId} failed: {ex.Message}");
-            await SendTerminalOnceAsync(active, new TopicRunUpdatePayload(
+            var failedUpdate = new TopicRunUpdatePayload(
                 active.RunId,
                 active.ThreadId,
                 TopicRunPhase.Failed,
                 Error: "The remote device could not complete this run.",
                 FailureCode: "remote_execution_failed",
-                Timestamp: DateTimeOffset.UtcNow), CancellationToken.None);
+                Timestamp: DateTimeOffset.UtcNow);
+            await SendTerminalOnceAsync(active, failedUpdate, CancellationToken.None);
         }
         finally
         {
@@ -1086,7 +1257,6 @@ public sealed class MeshClient : IDeviceTopicTransport
             active.Cancellation.Dispose();
         }
     }
-
     // Retrieves a topic run's attachments. Senders upload each attachment to blob storage and carry an
     // encrypted pointer in the request, which we download and decrypt here. The legacy chunk-staging
     // path remains only for a request that somehow arrives without pointers.
@@ -1134,6 +1304,13 @@ public sealed class MeshClient : IDeviceTopicTransport
         ActiveTopicRun active,
         TopicRunUpdatePayload update)
     {
+        if (update.Phase is TopicRunPhase.Completed
+            or TopicRunPhase.Failed
+            or TopicRunPhase.Cancelled)
+        {
+            await SendTerminalOnceAsync(active, update, CancellationToken.None);
+            return;
+        }
         if (Volatile.Read(ref active.TerminalSent) != 0
             || Volatile.Read(ref active.TerminalSending) != 0)
             return;
@@ -1155,6 +1332,28 @@ public sealed class MeshClient : IDeviceTopicTransport
         }
     }
 
+    private TopicRunUpdatePayload PersistInboundTopicTerminal(
+        string runId,
+        string runState,
+        TopicRunUpdatePayload terminalUpdate)
+    {
+        if (!state.SetInboundTopicRunTerminal(runId, runState, terminalUpdate))
+            throw new InvalidOperationException("The terminal topic run state could not be persisted.");
+        var persisted = state.GetInboundTopicRun(runId);
+        if (persisted is null
+            || !TopicRunProtocol.TryParseUpdate(persisted.TerminalUpdateJson, out var winner))
+            throw new InvalidOperationException("The persisted terminal topic update could not be read.");
+        return winner;
+    }
+
+    private static string InboundTopicTerminalState(TopicRunPhase phase) => phase switch
+    {
+        TopicRunPhase.Completed => InboundTopicRunStates.Completed,
+        TopicRunPhase.Cancelled => InboundTopicRunStates.Cancelled,
+        TopicRunPhase.Failed => InboundTopicRunStates.Failed,
+        _ => throw new ArgumentOutOfRangeException(nameof(phase), phase, "A terminal phase is required.")
+    };
+
     private async Task SendTerminalOnceAsync(
         ActiveTopicRun active,
         TopicRunUpdatePayload update,
@@ -1165,7 +1364,9 @@ public sealed class MeshClient : IDeviceTopicTransport
         try
         {
             if (Volatile.Read(ref active.TerminalSent) != 0) return;
-            var terminal = CorrelateUpdate(active, update);
+            var proposed = CorrelateUpdate(active, update);
+            var terminal = PersistInboundTopicTerminal(
+                active.RunId, InboundTopicTerminalState(proposed.Phase), proposed);
             if (await SendTargetedTopicEnvelopeAsync(
                     active.SourceDeviceId,
                     MeshKinds.TopicRunUpdate,
@@ -1245,7 +1446,8 @@ public sealed class MeshClient : IDeviceTopicTransport
             && string.Equals(p.PublicKey, identity.PublicKey, StringComparison.Ordinal)
             && string.Equals(p.PrivateKey, identity.PrivateKey, StringComparison.Ordinal)
             && string.Equals(p.RelayUrl.TrimEnd('/'), identity.RelayUrl, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(MyDeviceId, identity.DeviceId, StringComparison.Ordinal);
+            && string.Equals(MyDeviceId, identity.DeviceId, StringComparison.Ordinal)
+            && ReferenceEquals(authenticatedDeviceSyncIdentity, identity);
     }
 
     private void OnDeviceSyncOperationCreated(DeviceSyncOperation operation)
@@ -1940,10 +2142,6 @@ public sealed class MeshClient : IDeviceTopicTransport
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(attachments);
-        if (!Connected)
-            return TopicDispatchResult.Reject("not_connected", request.RunId);
-        if (!supportsSendResults)
-            return TopicDispatchResult.Reject("transport_ack_required", request.RunId);
         if (attachments.Any(item => item.Data.LongLength > MessageLimits.MaxAttachmentBytes))
             return TopicDispatchResult.Reject(
                 "attachment_too_large",
@@ -1969,23 +2167,6 @@ public sealed class MeshClient : IDeviceTopicTransport
             || !string.Equals(thread.ExecutionDeviceId, targetDeviceId, StringComparison.Ordinal))
             return TopicDispatchResult.Reject("invalid_thread_target", request.RunId);
 
-        IReadOnlyList<Mesh.Shared.DeviceInfo> devices;
-        try
-        {
-            devices = await ListMyDevicesCoreAsync(cancellationToken);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            Log?.Invoke($"topic directory lookup failed: {ex.Message}");
-            return TopicDispatchResult.Reject("directory_unavailable", request.RunId);
-        }
-        var target = devices.FirstOrDefault(device =>
-            string.Equals(device.DeviceId, targetDeviceId, StringComparison.Ordinal));
-        if (target is null || !target.IsAgentReady)
-            return TopicDispatchResult.Reject("target_not_ready", request.RunId);
-        if (!target.Online)
-            return TopicDispatchResult.Reject("target_offline", request.RunId);
-
         var manifest = request.Attachments ?? Array.Empty<TopicRunAttachment>();
         var ids = request.AttachmentIds ?? manifest.Select(item => item.Id).ToArray();
         if (manifest.Count != attachments.Count
@@ -1998,43 +2179,8 @@ public sealed class MeshClient : IDeviceTopicTransport
                 .Any())
             return TopicDispatchResult.Reject("attachment_manifest_mismatch", request.RunId);
 
-        // Upload each attachment to blob storage and carry only an encrypted pointer in the (E2EE)
-        // request. Attachments no longer travel inline or as SignalR chunks, so a large attachment can
-        // never inflate an envelope past the relay's 2 MB Cosmos item limit.
-        var pointers = new List<TopicRunAttachment>(attachments.Count);
-        for (var attachmentIndex = 0; attachmentIndex < attachments.Count; attachmentIndex++)
-        {
-            AttachmentPointer? pointer;
-            try
-            {
-                pointer = await UploadAttachmentAsync(attachments[attachmentIndex], cancellationToken);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                Log?.Invoke($"topic attachment upload failed: {ex.Message}");
-                return TopicDispatchResult.Reject("attachment_transfer_failed", request.RunId);
-            }
-            if (pointer is null)
-                return TopicDispatchResult.Reject("attachment_transfer_failed", request.RunId);
-            pointers.Add(manifest[attachmentIndex] with
-            {
-                BlobId = pointer.BlobId,
-                Key = pointer.Key,
-                Sha256 = pointer.Sha256,
-            });
-        }
-
-        var outbound = attachments.Count == 0
-            ? request
-            : request with { Attachments = pointers, AttachmentIds = pointers.Select(item => item.Id).ToList() };
-
-        return await SendTargetedTopicEnvelopeAsync(
-            targetDeviceId,
-            MeshKinds.TopicRunRequest,
-            TopicRunProtocol.RequestBody(outbound),
-            cancellationToken)
-            ? TopicDispatchResult.Ok(request.RunId)
-            : TopicDispatchResult.Reject("transport_error", request.RunId);
+        return await QueueTopicRequestAsync(
+            targetDeviceId, request, attachments, cancellationToken);
     }
 
     public async Task<bool> CancelAsync(
@@ -2049,13 +2195,10 @@ public sealed class MeshClient : IDeviceTopicTransport
             string.Equals(item.Id, cancel.ThreadId, StringComparison.Ordinal));
         if (thread is null
             || !string.Equals(thread.ExecutionDeviceId, targetDeviceId, StringComparison.Ordinal)
-            || !string.Equals(thread.ExecutionRunId, cancel.RunId, StringComparison.Ordinal))
+            || !string.Equals(thread.ExecutionRunId, cancel.RunId, StringComparison.Ordinal)
+               && !state.IsKnownQueuedTopicRun(cancel.ThreadId, cancel.RunId))
             return false;
-        return await SendTargetedTopicEnvelopeAsync(
-            targetDeviceId,
-            MeshKinds.TopicRunCancel,
-            TopicRunProtocol.CancelBody(cancel),
-            cancellationToken);
+        return await QueueTopicCancellationAsync(targetDeviceId, cancel, cancellationToken);
     }
 
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
@@ -2064,78 +2207,14 @@ public sealed class MeshClient : IDeviceTopicTransport
             .Where(device => device.CanHostRemoteTurn)
             .ToArray();
 
-    private async Task<bool> SendTargetedTopicEnvelopeAsync(
+    private Task<bool> SendTargetedTopicEnvelopeAsync(
         string targetDeviceId,
         string kind,
         string plaintext,
         CancellationToken ct,
         string? pushHint = null)
-    {
-        var identity = authenticatedDeviceSyncIdentity;
-        if (identity is null
-            || !supportsSendResults
-            || !IsCurrentDeviceSyncIdentity(identity)
-            || string.IsNullOrWhiteSpace(targetDeviceId)
-            || string.Equals(targetDeviceId, identity.DeviceId, StringComparison.Ordinal))
-            return false;
+        => QueueDeviceEnvelopeAsync(targetDeviceId, kind, plaintext, ct, pushHint);
 
-        var keys = await ResolveOwnDeviceKeysAsync(identity);
-        var targetKeys = keys.Where(key =>
-                string.Equals(DeviceProtocol.DeviceId(key), targetDeviceId, StringComparison.Ordinal))
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-        if (targetKeys.Length == 0)
-        {
-            keys = await ResolveOwnDeviceKeysAsync(identity, refresh: true);
-            targetKeys = keys.Where(key =>
-                    string.Equals(DeviceProtocol.DeviceId(key), targetDeviceId, StringComparison.Ordinal))
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
-        }
-        if (!IsCurrentDeviceSyncIdentity(identity) || targetKeys.Length != 1)
-        {
-            Log?.Invoke($"topic {kind} to {targetDeviceId} failed: exact encryption key unavailable");
-            return false;
-        }
-        var ciphertext = MessageCrypto.Encrypt(plaintext, targetKeys);
-        if (ciphertext is null)
-        {
-            Log?.Invoke($"topic {kind} to {targetDeviceId} failed: encryption failed");
-            return false;
-        }
-        var envelope = MeshEnvelope.Create(
-            identity.Handle,
-            identity.NormalizedHandle,
-            kind,
-            ciphertext,
-            IdentityService.Sign(identity.PrivateKey, ciphertext),
-            fromDevice: identity.DeviceId,
-            toDevice: targetDeviceId,
-            pushHint: pushHint);
-        try
-        {
-            var result = await identity.Connection.InvokeAsync<MeshSendResult>(
-                MeshHubProtocol.SendEnvelope, envelope, ct);
-            if (result.Accepted) return true;
-            Log?.Invoke($"topic {kind} to {targetDeviceId} rejected: {DescribeResult(result)}");
-            return false;
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Log?.Invoke($"topic {kind} to {targetDeviceId} failed: {ex.Message}");
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Lists the devices currently registered under this handle (from the relay directory) so the
-    /// Settings UI can offer a "home device" picker. Best-effort: returns an empty list on any error
-    /// (unreachable relay, bad response) rather than throwing.
-    /// </summary>
     public async Task<AgentRoutingInfo?> GetAgentRoutingAsync(CancellationToken ct = default)
     {
         if (!supportsAtomicAgentDispatch) return null;
@@ -2581,7 +2660,13 @@ public sealed class MeshClient : IDeviceTopicTransport
             var p = state.Profile;
             var body = ReceiptProtocol.Body(messageId);
             var sig = IdentityService.Sign(p.PrivateKey, body);
-            var env = MeshEnvelope.Create(p.Handle, AppState.Norm(toHandle), MeshKinds.Receipt, body, sig);
+            var env = MeshEnvelope.Create(
+                p.Handle,
+                AppState.Norm(toHandle),
+                MeshKinds.Receipt,
+                body,
+                sig,
+                id: StableEnvelopeId("receipt", messageId));
             if (supportsSendResults)
                 _ = await hub.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, env);
             else
@@ -2777,6 +2862,19 @@ public sealed class MeshClient : IDeviceTopicTransport
         catch (Exception ex) { Log?.Invoke($"push token clear failed: {ex.Message}"); }
     }
     public async Task DisconnectAsync()
+    {
+        await connectionGate.WaitAsync();
+        try
+        {
+            await DisconnectCoreAsync();
+        }
+        finally
+        {
+            connectionGate.Release();
+        }
+    }
+
+    private async Task DisconnectCoreAsync()
     {
         // Clear intent first so the Closed handler from StopAsync does not trigger auto-recovery.
         // ConnectAsync calls this then re-sets wantConnected, so a reconnect is unaffected.

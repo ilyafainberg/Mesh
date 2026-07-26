@@ -113,10 +113,26 @@ public sealed class TopicExecutionRouter(
         CancellationToken cancellationToken)
     {
         if (!TopicRunProtocol.IsValidIdentifier(threadId)
-            || !TopicRunProtocol.IsValidIdentifier(runId)
-            || !runs.TryGetValue(runId, out var entry)
-            || !string.Equals(entry.Draft.ThreadId, threadId, StringComparison.Ordinal))
+            || !TopicRunProtocol.IsValidIdentifier(runId))
             return false;
+
+        if (!runs.TryGetValue(runId, out var entry)
+            || !string.Equals(entry.Draft.ThreadId, threadId, StringComparison.Ordinal))
+        {
+            var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
+                string.Equals(item.Id, threadId, StringComparison.Ordinal));
+            if (thread?.ExecutionDeviceId is null
+                || !state.IsKnownQueuedTopicRun(threadId, runId))
+                return false;
+            state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
+            var queuedCancelled = await deviceTransport.CancelAsync(
+                thread.ExecutionDeviceId,
+                new TopicRunCancelPayload(runId, threadId),
+                cancellationToken);
+            if (queuedCancelled)
+                state.ClearRemoteRunProjection(threadId, runId);
+            return queuedCancelled;
+        }
 
         var localCancellation = entry.LocalCancellation;
         if (localCancellation is not null)
@@ -149,7 +165,6 @@ public sealed class TopicExecutionRouter(
             state.ClearRemoteRunProjection(threadId, runId);
         return cancelled;
     }
-
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken)
     {
@@ -204,13 +219,30 @@ public sealed class TopicExecutionRouter(
         Mesh.Shared.DeviceInfo? target = null;
         if (targetId is not null)
         {
-            var devices = await ListEligibleDevicesAsync(cancellationToken);
-            target = devices.FirstOrDefault(device =>
-                string.Equals(device.DeviceId, targetId, StringComparison.Ordinal));
-            if (target is null || !target.Online)
+            try
+            {
+                var devices = await ListEligibleDevicesAsync(cancellationToken);
+                target = devices.FirstOrDefault(device =>
+                    string.Equals(device.DeviceId, targetId, StringComparison.Ordinal));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                target = null;
+            }
+            if (target is null
+                && string.Equals(thread.ExecutionDeviceId, targetId, StringComparison.Ordinal)
+                && DevicePlatforms.CanHostRemoteAgent(
+                    true, thread.ExecutionDevicePlatform ?? DevicePlatforms.Unknown))
+                target = new Mesh.Shared.DeviceInfo(
+                    targetId,
+                    thread.ExecutionDeviceName,
+                    false,
+                    thread.ExecutionDevicePlatform ?? DevicePlatforms.Unknown,
+                    true);
+            if (target is null)
                 return TopicDispatchResult.Reject(
                     "device_not_eligible", draft.RunId,
-                    "The selected device is offline or not agent-ready.");
+                    "The selected device is not agent-ready.");
             if (thread.ExecutionDeviceId is null)
             {
                 try
@@ -232,7 +264,6 @@ public sealed class TopicExecutionRouter(
                     "Move the topic before sending it to a different device.");
             }
         }
-
         if (trigger is null)
         {
             trigger = new ChatLine
@@ -290,6 +321,8 @@ public sealed class TopicExecutionRouter(
 
         var remoteTarget = target!;
         entry.RemoteDeviceId = remoteTarget.DeviceId;
+        state.TrackQueuedTopicRun(
+            thread.Id, draft.RunId, draft.TriggerLineId, TopicQueueStage.Sending);
         if (thread.ExecutionRunId is null)
         {
             state.RegisterExpectedRemoteRun(
@@ -330,6 +363,16 @@ public sealed class TopicExecutionRouter(
             {
                 state.CompleteQueuedTopicRun(thread.Id, draft.RunId);
                 state.ClearRemoteRunProjection(thread.Id, draft.RunId);
+            }
+            else
+            {
+                state.SetQueuedTopicRunStage(
+                    thread.Id,
+                    draft.RunId,
+                    result.Code is DurableDeliveryCodes.RelayQueued
+                        or DurableDeliveryCodes.Delivered
+                        ? TopicQueueStage.Relay
+                        : TopicQueueStage.Sending);
             }
             return result;
         }

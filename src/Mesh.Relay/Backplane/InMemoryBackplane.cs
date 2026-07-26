@@ -14,7 +14,7 @@ public sealed class InMemoryBackplane : IBackplane
 
     public string InstanceId { get; } = Guid.NewGuid().ToString("n")[..8];
 
-    public Task StartAsync(Func<string, string, Task<bool>> deliverLocal, CancellationToken ct = default)
+    public Task StartAsync(Func<string, string, Task<BackplaneDeliveryReceipt>> deliverLocal, CancellationToken ct = default)
         => Task.CompletedTask; // nothing to subscribe to on a single instance
 
     public Task SetPresenceAsync(string handle, CancellationToken ct = default)
@@ -47,8 +47,8 @@ public sealed class InMemoryBackplane : IBackplane
     public Task<string?> GetInstanceForDeviceAsync(string handle, string deviceId, CancellationToken ct = default)
         => Task.FromResult<string?>(presentDevices.ContainsKey(DeviceKey(handle, deviceId)) ? InstanceId : null);
 
-    public Task<bool> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)
-        => Task.FromResult(false); // single instance: caller already tried the local socket
+    public Task<BackplaneDeliveryReceipt> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)
+        => Task.FromResult(BackplaneDeliveryReceipt.NotDelivered); // caller already tried the local socket
 
     public Task<BackplaneDeliveryOutcome> PublishAtomicToOwnerAsync(
         string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)

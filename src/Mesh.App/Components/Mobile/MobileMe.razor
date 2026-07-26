@@ -353,7 +353,15 @@ else
                     <div class="bubble @(line.Role)" @key="line.Id">
                         <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                         OnPin="html => PinWidget(html, line)" />
-                        <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
+                        <div class="msg-tag queue-tag">
+                            <i class="bi @QueueIcon(line)"></i>
+                            <span>@QueueLabel(line)</span>
+                            <button type="button" class="queue-cancel" title="Cancel queued turn"
+                                    aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
+                                    @onclick:stopPropagation="true">
+                                <i class="bi bi-x-lg"></i>
+                            </button>
+                        </div>
                     </div>
                 }
                 </div>
@@ -470,7 +478,7 @@ else
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 @if (Active is not null && !ActiveDeviceOnline)
                 {
-                    <div class="warn-banner" role="status"><i class="bi bi-wifi-off"></i> @DeviceLabel(Active) is offline. Sending is unavailable until it reconnects.</div>
+                    <div class="warn-banner" role="status"><i class="bi bi-cloud-arrow-up"></i> @DeviceLabel(Active) is offline. New turns will wait securely until it reconnects.</div>
                 }
                 @if (ActiveUsesCurrentDevice && !Agent.IsModelReady)
                 {
@@ -608,13 +616,12 @@ else
         || attachments.Count > 0
         || selectedWidget is not null;
     bool ShowStopAction => TopicComposerPresentation.ShowStop(ActiveBusy, HasSendableDraft);
-    bool CanSend => ActiveDeviceOnline
-        && (!ActiveUsesCurrentDevice || Agent.IsModelReady)
+    bool CanSend => (!ActiveUsesCurrentDevice || Agent.IsModelReady)
         && HasSendableDraft;
-    string SendTitle => !ActiveDeviceOnline
-        ? $"{DeviceLabel(Active!)} is offline"
-        : ActiveUsesCurrentDevice && !Agent.IsModelReady
-            ? "Configure a model to use this device"
+    string SendTitle => ActiveUsesCurrentDevice && !Agent.IsModelReady
+        ? "Configure a model to use this device"
+        : !ActiveDeviceOnline && Active is not null
+            ? $"Send when {DeviceLabel(Active)} is available"
             : "Send";
 
     readonly List<StagedFile> attachments = new();
@@ -623,6 +630,36 @@ else
     // Messages submitted while a topic is busy stay visible below the live response. The runner answers
     // them FIFO, one serialized turn per prompt, and reply correlation restores prompt/answer pairing.
     bool IsQueued(ChatLine line) => State.IsLineQueued(line);
+    QueuedTopicRunInfo? QueueInfo(ChatLine line) => State.QueuedTopicRunForLine(line);
+    string QueueLabel(ChatLine line)
+    {
+        var device = Active is null ? "linked device" : DeviceLabel(Active);
+        return QueueInfo(line)?.Stage switch
+        {
+            TopicQueueStage.Relay => $"waiting for {device}",
+            TopicQueueStage.Device => $"queued on {device}",
+            TopicQueueStage.Cancelling => "cancelling",
+            TopicQueueStage.Expired => "expired",
+            TopicQueueStage.Failed => "failed",
+            _ => ActiveUsesCurrentDevice ? "queued on this device" : "sending"
+        };
+    }
+    string QueueIcon(ChatLine line) => QueueInfo(line)?.Stage switch
+    {
+        TopicQueueStage.Cancelling => "bi-x-circle",
+        TopicQueueStage.Expired or TopicQueueStage.Failed => "bi-exclamation-circle",
+        TopicQueueStage.Sending => "bi-arrow-repeat",
+        _ => "bi-hourglass-split"
+    };
+
+    async Task CancelQueued(ChatLine line)
+    {
+        var queued = QueueInfo(line);
+        if (queued is null) return;
+        State.SetQueuedTopicRunStage(queued.ThreadId, queued.RunId, TopicQueueStage.Cancelling);
+        if (!await TopicRouter.StopAsync(queued.ThreadId, queued.RunId, CancellationToken.None))
+            attachError = "The queued turn could not be cancelled yet.";
+    }
     IReadOnlyList<ChatLine> OrderedVisibleLines => Active is null
         ? Array.Empty<ChatLine>()
         : TopicTranscriptOrdering.OrderForDisplay(Active.Lines.Where(line => !line.Internal));
@@ -1140,11 +1177,7 @@ else
         var files = attachments.ToList();
         var wasWidget = widgetMode;
         var target = ResolveTarget(thread);
-        if (!IsDeviceOnline(target.DeviceId))
-        {
-            attachError = $"{FriendlyName(target)} is offline.";
-            return;
-        }
+
         if (string.IsNullOrWhiteSpace(thread.ExecutionDeviceId))
             State.BindOwnThreadForSend(thread.Id, target);
 

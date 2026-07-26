@@ -50,12 +50,20 @@ namespace Mesh.App.Services
             ClearedRemoteRuns++;
         }
 
-        public void TrackQueuedTopicRun(string threadId, string runId, string lineId)
-            => QueuedRuns.MarkWaiting(threadId, runId, lineId);
+        public void TrackQueuedTopicRun(
+            string threadId,
+            string runId,
+            string lineId,
+            TopicQueueStage stage = TopicQueueStage.Sending)
+            => QueuedRuns.MarkWaiting(threadId, runId, lineId, stage);
+        public void SetQueuedTopicRunStage(string threadId, string runId, TopicQueueStage stage)
+            => QueuedRuns.SetStage(threadId, runId, stage);
         public void StartQueuedTopicRun(string threadId, string runId)
             => QueuedRuns.MarkStarted(threadId, runId);
         public void CompleteQueuedTopicRun(string threadId, string runId)
             => QueuedRuns.Complete(threadId, runId);
+        public bool IsKnownQueuedTopicRun(string threadId, string runId)
+            => QueuedRuns.IsKnownRun(threadId, runId);
         public int QueuedCountForThread(string threadId) => QueuedRuns.WaitingCount(threadId);
         public bool IsLineQueued(string lineId) => QueuedRuns.IsLineWaiting(lineId);
 
@@ -191,15 +199,7 @@ namespace Mesh.App.Tests
             };
             var router = new TopicExecutionRouter(state, runner, transport);
             var attachment = new ChatAttachment("notes.txt", "text/plain", [1, 2, 3]);
-            var offlineResult = await router.SubmitAsync(
-                Draft() with
-                {
-                    RunId = "run-offline",
-                    TriggerLineId = "line-offline",
-                    TargetDeviceId = "offline"
-                },
-                null,
-                CancellationToken.None);
+
             var draft = Draft() with
             {
                 TargetDeviceId = "target",
@@ -219,14 +219,36 @@ namespace Mesh.App.Tests
                 transport.Request.Attachments[0].Id,
                 transport.Request.AttachmentIds![0]);
             Assert.AreEqual(3L, transport.Request.Attachments[0].Length);
-            Assert.IsFalse(offlineResult.Accepted);
-            Assert.AreEqual("device_not_eligible", offlineResult.Code);
             Assert.AreEqual(3, listed.Count);
             Assert.AreEqual("offline", listed[1].DeviceId);
             Assert.AreEqual("target", listed[2].DeviceId);
             Assert.AreEqual(0, state.Profile.OwnThreads[0].Lines[0].Attachments.Count);
         }
 
+        [TestMethod]
+        public async Task RemoteSubmission_ToOfflineBoundDeviceIsQueued()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.ExecutionDeviceId = "offline";
+            thread.ExecutionDeviceName = "Laptop";
+            thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
+            var transport = new RecordingTransport
+            {
+                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                ResultCode = DurableDeliveryCodes.LocalQueued
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "offline" };
+
+            var result = await router.SubmitAsync(draft, null, CancellationToken.None);
+
+            Assert.IsTrue(result.Accepted);
+            Assert.AreEqual(DurableDeliveryCodes.LocalQueued, result.Code);
+            Assert.AreEqual(1, transport.Dispatches);
+            Assert.IsTrue(state.IsLineQueued(draft.TriggerLineId));
+            Assert.AreEqual(TopicQueueStage.Sending, state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
+        }
         [TestMethod]
         public async Task EligibleDeviceRefreshes_AreSerializedSoThePickerGetsTheNewestResult()
         {
@@ -469,6 +491,7 @@ namespace Mesh.App.Tests
             public IReadOnlyList<DeviceInfo> Devices { get; set; } = [];
             public int Dispatches { get; private set; }
             public TopicRunRequestPayload? Request { get; private set; }
+            public string ResultCode { get; set; } = "accepted";
 
             public Task<TopicDispatchResult> DispatchAsync(
                 string targetDeviceId,
@@ -478,7 +501,7 @@ namespace Mesh.App.Tests
             {
                 Dispatches++;
                 Request = request;
-                return Task.FromResult(TopicDispatchResult.Ok(request.RunId));
+                return Task.FromResult(TopicDispatchResult.Ok(request.RunId, ResultCode));
             }
 
             public Task<bool> CancelAsync(

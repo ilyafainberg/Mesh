@@ -206,7 +206,10 @@ public sealed class DeviceTopicDbTests
             db.EnsureOwnThread("model-topic", "Model", at);
             var topicLine = new ChatLine
             {
-                Id = "topic-model-line", Role = "assistant", Text = "answer", At = at,
+                Id = "topic-model-line",
+                Role = "assistant",
+                Text = "answer",
+                At = at,
                 ModelId = "deepseek/deepseek-chat"
             };
             db.AppendOwnChat("model-topic", topicLine);
@@ -216,7 +219,10 @@ public sealed class DeviceTopicDbTests
             db.EnsureConversation("model-conversation");
             var conversationLine = new ChatLine
             {
-                Id = "conversation-model-line", Role = "assistant", Text = "answer", At = at,
+                Id = "conversation-model-line",
+                Role = "assistant",
+                Text = "answer",
+                At = at,
                 ModelId = "deepseek/deepseek-r1"
             };
             db.AppendChatLine("model-conversation", conversationLine);
@@ -452,8 +458,12 @@ public sealed class DeviceTopicDbTests
         SaveProfile(db);
         var invalid = new ChatLine
         {
-            Id = "line", Role = "user", Text = "invalid", Via = "device",
-            Status = "sent", At = default
+            Id = "line",
+            Role = "user",
+            Text = "invalid",
+            Via = "device",
+            Status = "sent",
+            At = default
         };
 
         Assert.IsFalse(db.TryApplyOwnSyncLine(
@@ -467,8 +477,12 @@ public sealed class DeviceTopicDbTests
 
         var valid = new ChatLine
         {
-            Id = "line", Role = "user", Text = "valid", Via = "device",
-            Status = "sent", At = parentAt.AddDays(-1),
+            Id = "line",
+            Role = "user",
+            Text = "valid",
+            Via = "device",
+            Status = "sent",
+            At = parentAt.AddDays(-1),
             ModelId = "deepseek/deepseek-chat"
         };
         Assert.IsTrue(db.TryApplyOwnSyncLine(
@@ -535,6 +549,99 @@ public sealed class DeviceTopicDbTests
         db.DeleteOwnThread("shared");
 
         Assert.AreEqual("", db.GetTopicDraft("shared"));
+    }
+
+    [TestMethod]
+    public void DurableTopicState_PersistsAcrossRestartAndDeduplicatesInboundRuns()
+    {
+        var created = new DateTimeOffset(2026, 7, 26, 9, 0, 0, TimeSpan.Zero);
+        var request = new TopicRunRequestPayload(
+            "run-durable",
+            "thread-durable",
+            "line-durable",
+            "owner",
+            "Do durable work",
+            created,
+            "laptop-device",
+            TopicTurnMode.Single);
+        var attachment = new ChatAttachment("note.txt", "text/plain", [1, 2, 3]);
+        var topic = new MeshDb.TopicOutboxItem(
+            request.RunId,
+            request.ThreadId,
+            request.TriggerLineId,
+            request.TargetDeviceId,
+            request,
+            [attachment],
+            TopicOutboxStates.Pending,
+            created,
+            created);
+        var inbound = new MeshDb.InboundTopicRunItem(
+            request.RunId,
+            "phone-device",
+            request,
+            InboundTopicRunStates.Accepted,
+            created,
+            created);
+        var terminalUpdate = new TopicRunUpdatePayload(
+            request.RunId,
+            request.ThreadId,
+            TopicRunPhase.Completed,
+            Timestamp: created.AddMinutes(1));
+        var envelope = new MeshDb.DeviceEnvelopeOutboxItem(
+            "terminal-envelope",
+            "phone-device",
+            MeshKinds.TopicRunUpdate,
+            TopicRunProtocol.UpdateBody(terminalUpdate),
+            PushHintProtocol.TopicResponse,
+            created.AddMinutes(1));
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertTopicOutbox(topic);
+            Assert.IsTrue(db.TryAddInboundTopicRun(inbound));
+            Assert.IsFalse(db.TryAddInboundTopicRun(inbound));
+            db.UpsertDeviceEnvelopeOutbox(envelope);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using (var reopened = MeshDb.Open(databasePath, key))
+        {
+            var restoredTopic = reopened.GetTopicOutbox(request.RunId);
+            Assert.IsNotNull(restoredTopic);
+            Assert.AreEqual(3, restoredTopic.Attachments.Single().Data.Length);
+            Assert.AreEqual(TopicOutboxStates.Pending, restoredTopic.State);
+
+            var restoredInbound = reopened.GetInboundTopicRun(request.RunId);
+            Assert.IsNotNull(restoredInbound);
+            Assert.AreEqual("phone-device", restoredInbound.SourceDeviceId);
+            Assert.IsFalse(reopened.TryAddInboundTopicRun(inbound));
+
+            var restoredEnvelope = reopened.ListDeviceEnvelopeOutbox().Single();
+            Assert.AreEqual("terminal-envelope", restoredEnvelope.EnvelopeId);
+            Assert.AreEqual(PushHintProtocol.TopicResponse, restoredEnvelope.PushHint);
+
+            reopened.SetTopicOutboxState(request.RunId, TopicOutboxStates.RelayQueued);
+            Assert.IsTrue(reopened.SetInboundTopicRunState(request.RunId, InboundTopicRunStates.Running));
+            Assert.IsTrue(reopened.SetInboundTopicRunTerminal(
+                request.RunId, InboundTopicRunStates.Completed, terminalUpdate));
+            Assert.IsTrue(reopened.SetInboundTopicRunTerminal(
+                request.RunId,
+                InboundTopicRunStates.Failed,
+                terminalUpdate with { Phase = TopicRunPhase.Failed, Error = "conflict" }));
+            Assert.IsFalse(reopened.SetInboundTopicRunState(
+                request.RunId, InboundTopicRunStates.Running));
+            reopened.DeleteDeviceEnvelopeOutbox(envelope.EnvelopeId);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var final = MeshDb.Open(databasePath, key);
+        Assert.AreEqual(TopicOutboxStates.RelayQueued, final.GetTopicOutbox(request.RunId)!.State);
+        var finalInbound = final.GetInboundTopicRun(request.RunId)!;
+        Assert.AreEqual(InboundTopicRunStates.Completed, finalInbound.State);
+        Assert.IsTrue(TopicRunProtocol.TryParseUpdate(
+            finalInbound.TerminalUpdateJson, out var persistedTerminal));
+        Assert.AreEqual(TopicRunPhase.Completed, persistedTerminal.Phase);
+        Assert.HasCount(0, final.ListDeviceEnvelopeOutbox());
     }
 
     [TestMethod]

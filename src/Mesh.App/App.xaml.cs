@@ -5,16 +5,19 @@ namespace Mesh.App;
 public partial class App : Application
 {
 	private readonly IUiModeService _uiModeService;
+	private readonly MeshClient _meshClient;
 
-	public App(IUiModeService uiModeService)
+	public App(IUiModeService uiModeService, MeshClient meshClient)
 	{
 		_uiModeService = uiModeService;
+		_meshClient = meshClient;
 		InitializeComponent();
 	}
 
 	protected override Window CreateWindow(IActivationState? activationState)
 	{
 		var window = new Window(new MainPage()) { Title = "Mesh" };
+		window.Activated += (_, _) => _meshClient.ResumeTransport();
 
 		var hasDesktopWindowGeometry = OperatingSystem.IsWindows() || OperatingSystem.IsMacCatalyst();
 		if (hasDesktopWindowGeometry)

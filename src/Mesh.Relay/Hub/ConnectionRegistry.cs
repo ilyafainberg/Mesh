@@ -28,6 +28,8 @@ public sealed class ConnectionRegistry
         public string? DeviceId { get; set; }
         public string Nonce { get; set; } = "";
         public bool Authenticated { get; set; }
+        public bool SupportsDurableDelivery { get; init; }
+        public SemaphoreSlim DeliveryGate { get; } = new(1, 1);
     }
 
     private readonly ConcurrentDictionary<string, ConnState> byConnection = new();
@@ -35,8 +37,13 @@ public sealed class ConnectionRegistry
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Registers a freshly connected (not yet authenticated) connection with its nonce.</summary>
-    public void Add(string connectionId, string handle, string nonce)
-        => byConnection[connectionId] = new ConnState { Handle = handle, Nonce = nonce };
+    public void Add(string connectionId, string handle, string nonce, bool supportsDurableDelivery = false)
+        => byConnection[connectionId] = new ConnState
+        {
+            Handle = handle,
+            Nonce = nonce,
+            SupportsDurableDelivery = supportsDurableDelivery
+        };
 
     public ConnState? Get(string connectionId)
         => byConnection.TryGetValue(connectionId, out var s) ? s : null;
@@ -81,6 +88,11 @@ public sealed class ConnectionRegistry
             .Where(c => byConnection.TryGetValue(c, out var s) && s.DeviceId == deviceId)
             .ToArray();
     }
+
+    public bool SupportsDurableDelivery(string connectionId)
+        => byConnection.TryGetValue(connectionId, out var state)
+           && state.Authenticated
+           && state.SupportsDurableDelivery;
 
     /// <summary>The distinct device ids of a handle's authenticated connections on this instance.</summary>
     public IReadOnlyCollection<string> OnlineDeviceIds(string handle)

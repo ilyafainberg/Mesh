@@ -917,12 +917,12 @@ public static class RemoteRunCorrelation
 /// <summary>
 /// Decides whether a topic bound to another device, carrying a persisted <see cref="OwnThread.ExecutionRunId"/>
 /// but with no live run projection on this device, should still count as an active (busy) remote run.
-/// A persisted run id is only cleared by a terminal topic.run.update from the executing device; if that
-/// signal is missed (this device was offline at completion, the executor closed before emitting it, or it
-/// was dropped) the id lingers indefinitely and the topic would otherwise show a permanent "thinking"
-/// bubble and a dead Stop button. We therefore honor the persisted-only binding only while the run is
-/// still "fresh": a genuinely live remote run keeps emitting updates that advance the timestamp, while a
-/// dead or finished-but-missed run goes stale and the topic falls back to idle.
+/// A persisted run id is normally cleared by a terminal topic.run.update from the executing device. If
+/// that signal is delayed, unavailable on a legacy relay, or expires before delivery, the id can linger
+/// indefinitely and the topic would otherwise show a permanent "thinking" bubble and a dead Stop button.
+/// We therefore honor the persisted-only binding only while the run is still "fresh": a genuinely live
+/// remote run keeps emitting updates that advance the timestamp, while a dead or finished run goes stale
+/// and the topic falls back to idle.
 /// </summary>
 public static class RemoteRunActivity
 {
@@ -949,9 +949,8 @@ public static class RemoteRunActivity
     /// True when a LIVE remote-run projection's last update is within <see cref="StaleAfter"/> of
     /// <paramref name="now"/>. Mirrors <see cref="IsPersistedRunFresh"/> for the in-memory projection:
     /// a genuinely live run keeps advancing <see cref="RemoteRunProjection.Timestamp"/>, so a projection
-    /// whose terminal update was missed (that update is delivered live-only and is dropped when the
-    /// viewing device is briefly disconnected) self-heals to idle once it goes stale instead of pinning
-    /// the "thinking" bubble forever.
+    /// whose terminal update is delayed or unavailable self-heals to idle once it goes stale instead of
+    /// pinning the "thinking" bubble forever.
     /// </summary>
     public static bool IsProjectionFresh(RemoteRunProjection projection, DateTimeOffset now)
     {
@@ -1014,14 +1013,27 @@ public static class TopicComposerPresentation
 /// Tracks queued topic runs by stable run and line identifiers. A run remains known after it starts so
 /// later progress is still accepted, while only runs that are still waiting drive the line subtitle.
 /// </summary>
+public enum TopicQueueStage { Sending, Relay, Device, Cancelling, Expired, Failed }
+
+public sealed record QueuedTopicRunInfo(
+    string ThreadId,
+    string RunId,
+    string LineId,
+    TopicQueueStage Stage,
+    bool Waiting);
+
 public sealed class QueuedTopicRunState
 {
-    private sealed record Entry(string LineId, bool Waiting);
+    private sealed record Entry(string LineId, bool Waiting, TopicQueueStage Stage);
 
     private readonly Dictionary<string, Dictionary<string, Entry>> runsByThread =
         new(StringComparer.Ordinal);
 
-    public bool MarkWaiting(string threadId, string runId, string lineId)
+    public bool MarkWaiting(
+        string threadId,
+        string runId,
+        string lineId,
+        TopicQueueStage stage = TopicQueueStage.Sending)
     {
         ValidateId(threadId, nameof(threadId));
         ValidateId(runId, nameof(runId));
@@ -1032,9 +1044,21 @@ public sealed class QueuedTopicRunState
         {
             if (!string.Equals(current.LineId, lineId, StringComparison.Ordinal))
                 throw new InvalidOperationException("A queued run cannot change its trigger line.");
-            return false;
+            if (current.Waiting && current.Stage == stage) return false;
+            runs[runId] = current with { Waiting = true, Stage = stage };
+            return true;
         }
-        runs[runId] = new Entry(lineId, Waiting: true);
+        runs[runId] = new Entry(lineId, Waiting: true, stage);
+        return true;
+    }
+
+    public bool SetStage(string threadId, string runId, TopicQueueStage stage)
+    {
+        if (!runsByThread.TryGetValue(threadId, out var runs)
+            || !runs.TryGetValue(runId, out var current)
+            || current.Stage == stage)
+            return false;
+        runs[runId] = current with { Stage = stage };
         return true;
     }
 
@@ -1059,14 +1083,17 @@ public sealed class QueuedTopicRunState
     public bool IsKnownRun(string threadId, string runId)
         => runsByThread.TryGetValue(threadId, out var runs) && runs.ContainsKey(runId);
 
-    public bool IsLineWaiting(string lineId)
+    public QueuedTopicRunInfo? FindByLine(string lineId)
     {
-        foreach (var runs in runsByThread.Values)
-            if (runs.Values.Any(entry => entry.Waiting
-                                         && string.Equals(entry.LineId, lineId, StringComparison.Ordinal)))
-                return true;
-        return false;
+        foreach (var (threadId, runs) in runsByThread)
+            foreach (var (runId, entry) in runs)
+                if (string.Equals(entry.LineId, lineId, StringComparison.Ordinal))
+                    return new QueuedTopicRunInfo(
+                        threadId, runId, entry.LineId, entry.Stage, entry.Waiting);
+        return null;
     }
+
+    public bool IsLineWaiting(string lineId) => FindByLine(lineId)?.Waiting == true;
 
     public int WaitingCount(string threadId)
         => runsByThread.TryGetValue(threadId, out var runs)
@@ -1074,6 +1101,8 @@ public sealed class QueuedTopicRunState
             : 0;
 
     public bool ClearThread(string threadId) => runsByThread.Remove(threadId);
+
+    public void Clear() => runsByThread.Clear();
 
     private static void ValidateId(string value, string parameterName)
     {
@@ -1084,10 +1113,9 @@ public sealed class QueuedTopicRunState
 
 /// <summary>
 /// Decides whether a committed assistant answer that just synced in from the executing device should
-/// finalize a lingering LIVE remote-run projection on a viewing device. The terminal topic.run.update
-/// is delivered live-only (no relay enqueue or retry), so a viewer briefly disconnected at completion
-/// keeps a non-terminal projection and shows a phantom "thinking" bubble though the answer has already
-/// synced in durably. The durable answer is the terminal truth.
+/// finalize a lingering LIVE remote-run projection on a viewing device. Terminal updates and committed
+/// lines travel independently, so the durable answer can arrive first. The durable answer is the
+/// terminal truth.
 /// </summary>
 public static class RemoteRunReconciliation
 {

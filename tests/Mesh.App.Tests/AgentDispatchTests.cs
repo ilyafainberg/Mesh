@@ -15,7 +15,7 @@ public sealed class AgentDispatchTests
     {
         public string InstanceId => "local";
 
-        public Task StartAsync(Func<string, string, Task<bool>> deliverLocal, CancellationToken ct = default)
+        public Task StartAsync(Func<string, string, Task<BackplaneDeliveryReceipt>> deliverLocal, CancellationToken ct = default)
             => Task.CompletedTask;
         public Task SetPresenceAsync(string handle, CancellationToken ct = default) => Task.CompletedTask;
         public Task SetDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default)
@@ -30,12 +30,12 @@ public sealed class AgentDispatchTests
             string deviceId,
             CancellationToken ct = default)
             => Task.FromResult<string?>("remote");
-        public Task<bool> PublishToOwnerAsync(
+        public Task<BackplaneDeliveryReceipt> PublishToOwnerAsync(
             string instanceId,
             string toHandle,
             string envelopeJson,
             CancellationToken ct = default)
-            => Task.FromResult(false);
+            => Task.FromResult(BackplaneDeliveryReceipt.NotDelivered);
         public Task<BackplaneDeliveryOutcome> PublishAtomicToOwnerAsync(
             string instanceId,
             string toHandle,

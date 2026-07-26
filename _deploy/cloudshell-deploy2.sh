@@ -54,7 +54,7 @@ echo "== wiring secrets + env =="
 if [ -n "$COSMOS_CONN" ]; then az containerapp secret set -n "$APP" -g "$RG" --secrets cosmos="$COSMOS_CONN" -o none; fi
 if [ -n "$REDIS_CONN" ]; then az containerapp secret set -n "$APP" -g "$RG" --secrets redis="$REDIS_CONN" -o none; fi
 
-ENVSET="ASPNETCORE_URLS=http://+:8080 MODEL_DAILY_TOKEN_LIMIT=100000"
+ENVSET="ASPNETCORE_URLS=http://+:8080 MODEL_DAILY_TOKEN_LIMIT=100000 MESH_REQUIRE_DURABLE_STORAGE=true"
 [ -n "$COSMOS_CONN" ] && ENVSET="$ENVSET COSMOS_CONNECTION=secretref:cosmos"
 [ -n "$REDIS_CONN" ] && ENVSET="$ENVSET REDIS_CONNECTION=secretref:redis"
 az containerapp update -n "$APP" -g "$RG" --set-env-vars $ENVSET --min-replicas 1 --max-replicas 5 -o none

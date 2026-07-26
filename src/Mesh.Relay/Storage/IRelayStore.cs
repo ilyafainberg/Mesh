@@ -71,12 +71,47 @@ public sealed class StoredInvite
     public DateTimeOffset ExpiresAt { get; set; }
 }
 
-/// <summary>A queued message for an offline recipient, awaiting delivery on next connect.</summary>
+/// <summary>An enqueue-first envelope awaiting acknowledgement or legacy delivery.</summary>
 public sealed class StoredEnvelope
 {
+    public string Id { get; set; } = "";
+    public string EnvelopeId { get; set; } = "";
+    public string From { get; set; } = "";
     public string To { get; set; } = "";
     public string Json { get; set; } = "";
     public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? ExpiresAt { get; set; }
+    public string? LeaseOwner { get; set; }
+    public DateTimeOffset? LeaseUntil { get; set; }
+    public int DeliveryAttempts { get; set; }
+}
+
+public static class RelayInboxPolicy
+{
+    public static readonly TimeSpan Retention = TimeSpan.FromDays(14);
+    public static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(30);
+    public const int DeliveryWindow = 100;
+
+    public static bool NeverExpires(string inboxKey)
+    {
+        var separator = inboxKey.IndexOf('\u001f');
+        var handle = separator < 0 ? inboxKey : inboxKey[..separator];
+        return Mesh.Shared.ReservedHandles.IsReserved(handle);
+    }
+}
+
+public sealed record InboxEnqueueResult(string DeliveryId, bool Created);
+
+public sealed record RelayInboxStats(long QueuedItems, DateTimeOffset? OldestQueuedAt);
+
+public static class InboxDeliveryId
+{
+    public static string Create(string fromHandle, string envelopeId)
+    {
+        var material = $"{LinkProtocol.Normalize(fromHandle)}\u001f{envelopeId}";
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(material))).ToLowerInvariant();
+    }
 }
 
 public static class AgentDispatchStates
@@ -228,11 +263,54 @@ public interface IRelayStore
     /// </summary>
     Task<bool> ConsumeInviteAsync(string handle, string codeHash, CancellationToken ct = default);
 
-    /// <summary>Enqueues a message for an offline recipient.</summary>
-    Task EnqueueAsync(string toHandle, string envelopeJson, CancellationToken ct = default);
+    /// <summary>Durably enqueues an idempotent envelope and returns its relay delivery id.</summary>
+    Task<InboxEnqueueResult> EnqueueAsync(
+        string toHandle,
+        string envelopeId,
+        string fromHandle,
+        string envelopeJson,
+        CancellationToken ct = default);
 
-    /// <summary>Drains and returns all queued messages for a handle (FIFO), removing them.</summary>
+    /// <summary>Leases queued envelopes without removing them. The receiver must acknowledge each item.</summary>
+    Task<IReadOnlyList<StoredEnvelope>> LeaseInboxAsync(
+        string toHandle,
+        string leaseOwner,
+        int maxItems = RelayInboxPolicy.DeliveryWindow,
+        TimeSpan? leaseDuration = null,
+        CancellationToken ct = default);
+
+    Task<StoredEnvelope?> AcknowledgeInboxAsync(
+        string toHandle,
+        string deliveryId,
+        CancellationToken ct = default);
+
+    Task<bool> TryLeaseInboxItemAsync(
+        string toHandle,
+        string deliveryId,
+        string leaseOwner,
+        TimeSpan? leaseDuration = null,
+        CancellationToken ct = default);
+
+    Task ReleaseInboxLeaseAsync(
+        string toHandle,
+        string deliveryId,
+        string leaseOwner,
+        CancellationToken ct = default);
+
+    Task<bool> CancelInboxAsync(
+        string toHandle,
+        string deliveryId,
+        string fromHandle,
+        CancellationToken ct = default);
+
+    Task ReleaseInboxLeasesAsync(
+        string toHandle,
+        string leaseOwner,
+        CancellationToken ct = default);
+
+    /// <summary>Legacy destructive drain used only by clients that do not support acknowledgements.</summary>
     Task<IReadOnlyList<string>> DrainInboxAsync(string toHandle, CancellationToken ct = default);
+    Task<RelayInboxStats> GetInboxStatsAsync(CancellationToken ct = default);
 
     Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
         StoredAgentDispatch dispatch,

@@ -8,6 +8,14 @@ public enum BackplaneDeliveryOutcome
     Uncertain
 }
 
+public readonly record struct BackplaneDeliveryReceipt(
+    BackplaneDeliveryOutcome Outcome,
+    bool DurableAckExpected)
+{
+    public static BackplaneDeliveryReceipt NotDelivered =>
+        new(BackplaneDeliveryOutcome.NotDelivered, false);
+}
+
 /// <summary>
 /// Cross-instance routing seam for the relay. When the relay runs as more than one
 /// replica, the WebSocket for a given handle lives on exactly one instance. The
@@ -27,7 +35,7 @@ public interface IBackplane
     /// Starts listening for messages addressed to sockets on THIS instance. The handler
     /// is invoked with (toHandle, envelopeJson) and should deliver to the local socket.
     /// </summary>
-    Task StartAsync(Func<string, string, Task<bool>> deliverLocal, CancellationToken ct = default);
+    Task StartAsync(Func<string, string, Task<BackplaneDeliveryReceipt>> deliverLocal, CancellationToken ct = default);
 
     /// <summary>Records that <paramref name="handle"/> is connected on this instance (renew before TTL).</summary>
     Task SetPresenceAsync(string handle, CancellationToken ct = default);
@@ -49,9 +57,10 @@ public interface IBackplane
 
     /// <summary>
     /// Publishes a message to the instance that owns the handle so it can deliver it to the
-    /// live socket. Returns true only when the owning instance confirms local delivery.
+    /// live socket. Returns the confirmed outcome and whether the client will acknowledge durable delivery.
     /// </summary>
-    Task<bool> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default);
+    Task<BackplaneDeliveryReceipt> PublishToOwnerAsync(
+        string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default);
 
     /// <summary>
     /// Publishes an atomic agent request only to a replica that advertises single-connection

@@ -134,6 +134,8 @@ For each thread you can:
 
 Threads help you stay organized without cluttering a single long conversation.
 
+Threads can run on a linked device such as a laptop. You can send a new turn even when that device is offline: Mesh saves the encrypted request locally, hands it to the relay when connected, and keeps it queued for the selected device for up to 14 days. The status below the turn changes from **sending** to **waiting for Device**, then **queued on Device** after that device accepts it. **Cancelling** means a cancellation is still being delivered, **expired** means the 14-day delivery window ended, and **failed** means the relay rejected the saved request. Use the **X** beside any queued turn to cancel it.
+
 ---
 
 ## 5. Messaging People and Agents

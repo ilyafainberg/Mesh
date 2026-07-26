@@ -25,7 +25,7 @@ public sealed class AccountRef
 /// databases are kept so the user can switch back. No data leaves the device except through an
 /// explicit passphrase-encrypted export (see <see cref="MeshExport"/>).
 /// </summary>
-public sealed class AppState : IMemoryState
+public sealed partial class AppState : IMemoryState
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
@@ -136,6 +136,7 @@ public sealed class AppState : IMemoryState
                     Profile = loaded;
                     ReconcileDeletedCircles();
                     RehydrateUnread();
+                    RehydrateDurableTopicState();
                     return;
                 }
                 db.Dispose();
@@ -1274,8 +1275,8 @@ public sealed class AppState : IMemoryState
         MergeLine(line, dto);
         thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, dto.At);
         // A committed assistant answer syncing in from the executing device is the terminal truth for a
-        // remote run: the terminal topic.run.update is live-only and may have been missed, so reconcile
-        // any lingering projection here to clear the phantom "thinking" bubble on this viewing device.
+        // remote run. The terminal update travels independently and can arrive later, so reconcile any
+        // lingering projection here to clear the phantom "thinking" bubble on this viewing device.
         var reconciled = string.Equals(dto.Role, "assistant", StringComparison.Ordinal)
                          && !dto.Internal
                          && ReconcileRemoteRunWithAnswer(thread, dto.At);
@@ -2820,9 +2821,9 @@ public sealed class AppState : IMemoryState
     // reasoning and answer build up incrementally on a viewer instead of arriving as one block when the
     // committed line finally syncs. The executing device shows its own locally streamed draft, so this
     // no-ops there (guarded by busyThreads) to avoid double counting the fragments echoed back through the
-    // local projected-progress sink. Fragments ride a live-only stream: a viewer disconnected mid-turn
-    // simply misses some and still gets the whole answer via device sync of the committed line, while the
-    // per-run sequence keeps what does arrive ordered and applied exactly once.
+    // local projected-progress sink. Fragments are presentation updates that may be delayed or deduplicated;
+    // the committed line remains authoritative, while the per-run sequence keeps arriving fragments ordered
+    // and applied exactly once.
     private void ApplyRemoteAssistantDelta(TopicRunUpdatePayload update)
     {
         if (update.Delta is not { Length: > 0 } || update.DeltaKind is null)
@@ -2957,10 +2958,9 @@ public sealed class AppState : IMemoryState
 
     /// <summary>
     /// Finalizes a lingering LIVE remote-run projection when the executing device's committed assistant
-    /// answer arrives via device sync. The terminal topic.run.update is delivered live-only
-    /// (RouteToOnlineDeviceAsync: no enqueue, no retry), so a viewer briefly disconnected at completion
-    /// never receives it and keeps showing a phantom "thinking" bubble though the answer already synced
-    /// in. The durable answer is the terminal truth: drop the projection, null the persisted run id, and
+    /// answer arrives via device sync. The terminal update and committed line travel independently, so the
+    /// line can arrive first or the update can be unavailable on a legacy relay. The durable answer is the
+    /// terminal truth: drop the projection, null the persisted run id, and
     /// mark the run terminal so a late replay of a non-terminal update for the same run cannot resurrect
     /// it. Runs while applying a device-sync batch (under profileSyncGate, which is reentrant) so it must
     /// not re-broadcast: it mutates local state only and returns true so the caller refreshes the UI.
@@ -3103,7 +3103,11 @@ public sealed class AppState : IMemoryState
     }
 
     /// <summary>Marks a submitted topic run as waiting behind the active turn.</summary>
-    public void TrackQueuedTopicRun(string threadId, string runId, string lineId)
+    public void TrackQueuedTopicRun(
+        string threadId,
+        string runId,
+        string lineId,
+        TopicQueueStage stage = TopicQueueStage.Sending)
     {
         ValidateThreadId(threadId);
         if (!TopicRunProtocol.IsValidIdentifier(runId))
@@ -3116,8 +3120,16 @@ public sealed class AppState : IMemoryState
             if (!Profile.OwnThreads.Any(thread =>
                     string.Equals(thread.Id, threadId, StringComparison.Ordinal)))
                 return;
-            changed = queuedTopicRuns.MarkWaiting(threadId, runId, lineId);
+            changed = queuedTopicRuns.MarkWaiting(threadId, runId, lineId, stage);
         }
+        if (changed) NotifyChanged();
+    }
+
+    public void SetQueuedTopicRunStage(string threadId, string runId, TopicQueueStage stage)
+    {
+        bool changed;
+        lock (profileSyncGate)
+            changed = queuedTopicRuns.SetStage(threadId, runId, stage);
         if (changed) NotifyChanged();
     }
 
@@ -3149,7 +3161,6 @@ public sealed class AppState : IMemoryState
         {
             if (queuedTopicRuns.IsKnownRun(update.ThreadId, update.RunId)) return true;
             if (update.Phase != TopicRunPhase.Queued
-                || update.Queued <= 0
                 || !TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
                 return false;
             var thread = Profile.OwnThreads.FirstOrDefault(item =>
@@ -3164,14 +3175,22 @@ public sealed class AppState : IMemoryState
     {
         if (update.Phase == TopicRunPhase.Queued)
         {
-            if (update.Queued > 0 && TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
-                TrackQueuedTopicRun(update.ThreadId, update.RunId, update.TriggerLineId!);
+            if (TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
+                TrackQueuedTopicRun(
+                    update.ThreadId, update.RunId, update.TriggerLineId!, TopicQueueStage.Device);
+            SetTopicOutboxState(update.RunId, TopicOutboxStates.DeviceQueued);
             return;
         }
         if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
+        {
             CompleteQueuedTopicRun(update.ThreadId, update.RunId);
+            DeleteTopicOutbox(update.RunId);
+        }
         else
+        {
             StartQueuedTopicRun(update.ThreadId, update.RunId);
+            SetTopicOutboxState(update.RunId, TopicOutboxStates.Running);
+        }
     }
 
     /// <summary>True when a specific line is still waiting in some thread's queue (drives the "queued" tag).</summary>
@@ -3180,6 +3199,19 @@ public sealed class AppState : IMemoryState
         ArgumentNullException.ThrowIfNull(line);
         lock (profileSyncGate)
             return queuedTopicRuns.IsLineWaiting(line.Id);
+    }
+
+    public QueuedTopicRunInfo? QueuedTopicRunForLine(ChatLine line)
+    {
+        ArgumentNullException.ThrowIfNull(line);
+        lock (profileSyncGate)
+            return queuedTopicRuns.FindByLine(line.Id);
+    }
+
+    public bool IsKnownQueuedTopicRun(string threadId, string runId)
+    {
+        lock (profileSyncGate)
+            return queuedTopicRuns.IsKnownRun(threadId, runId);
     }
 
     /// <summary>Number of lines currently queued for a thread.</summary>
@@ -3373,6 +3405,8 @@ public sealed class AppState : IMemoryState
         activeDb = db;
         activeId = id;
         Profile = imported;
+        RehydrateUnread();
+        RehydrateDurableTopicState();
         accounts.Add(new AccountRef { Id = id, Handle = imported.Handle, DisplayName = imported.DisplayName });
         WriteIndex();
         NotifyChanged();
@@ -3392,6 +3426,7 @@ public sealed class AppState : IMemoryState
         activeDb = null;
         activeId = null;
         Profile = new MeshProfile();
+        queuedTopicRuns.Clear();
         WriteIndex();
         NotifyChanged();
     }
@@ -3412,6 +3447,8 @@ public sealed class AppState : IMemoryState
             activeDb = db;
             activeId = id;
             Profile = loaded;
+            RehydrateUnread();
+            RehydrateDurableTopicState();
             WriteIndex();
             NotifyChanged();
             return true;
