@@ -83,7 +83,7 @@
         @if (Filtered.Count == 0)
         {
             <div class="memory-empty">
-                <i class="bi bi-brain"></i>
+                <i class="bi bi-memory"></i>
                 @if (State.Profile.Memories.Count == 0)
                 {
                     <b>No memories yet</b>
@@ -111,7 +111,7 @@
                             {
                                 <div class="memory-actions">
                                     <button class="icon-btn" @onclick="() => StartEdit(item)" title="Edit" aria-label="@($"Edit {item.Title}")"><i class="bi bi-pencil"></i></button>
-                                    <button class="icon-btn danger" @onclick="() => StartDelete(item)" title="Delete" aria-label="@($"Delete {item.Title}")"><i class="bi bi-trash"></i></button>
+                                    <button class="icon-btn memory-delete" @onclick="() => StartDelete(item)" title="Delete" aria-label="@($"Delete {item.Title}")"><i class="bi bi-trash"></i></button>
                                 </div>
                             }
                         </div>

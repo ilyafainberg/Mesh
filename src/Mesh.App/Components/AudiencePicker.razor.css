@@ -83,6 +83,8 @@
     right: 0;
     width: min(340px, calc(100vw - 32px));
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
     color: var(--fg-1);
     background: var(--bg-1);
     border: 1px solid var(--stroke-2);
@@ -115,6 +117,7 @@
 }
 
 .audience-close {
+    display: none;
     flex: 0 0 auto;
     width: 32px;
     height: 32px;
@@ -130,10 +133,13 @@
 }
 
 .audience-body {
+    flex: 1 1 auto;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: 4px;
     padding: 10px;
+    overscroll-behavior: contain;
 }
 
 .audience-mode {
@@ -200,6 +206,7 @@
     margin: 0 4px 4px 40px;
     padding: 6px;
     overflow-y: auto;
+    overflow-x: hidden;
     border-left: 2px solid var(--brand-tint-2);
 }
 
@@ -211,6 +218,8 @@
     padding: 7px 9px;
     border-radius: var(--radius-s);
     color: var(--fg-2);
+    min-width: 0;
+    overflow: hidden;
     cursor: pointer;
 }
 
@@ -220,7 +229,18 @@
 }
 
 .audience-circle input {
+    flex: 0 0 18px;
+    width: 18px;
+    min-width: 18px;
+    max-width: 18px;
+    height: 18px;
     margin: 0;
+    padding: 0;
+}
+
+.audience-circle input:focus {
+    padding: 0;
+    border: 1px solid var(--brand);
 }
 
 .audience-circle span {
@@ -242,6 +262,12 @@
     margin: 0 14px 4px;
     color: var(--danger);
     font-size: .76rem;
+}
+
+.audience-head,
+.audience-warning,
+.audience-actions {
+    flex: 0 0 auto;
 }
 
 .audience-actions {
@@ -273,12 +299,17 @@
         left: 0;
         width: 100%;
         max-height: min(82vh, 680px);
-        overflow-y: auto;
+        max-height: min(82dvh, 680px);
+        overflow: hidden;
         border-right: 0;
         border-bottom: 0;
         border-left: 0;
         border-radius: 18px 18px 0 0;
         padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    .audience-close {
+        display: inline-flex;
     }
 
     .audience-head {
@@ -287,6 +318,8 @@
 
     .audience-body {
         padding: 10px 12px;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
     }
 
     .audience-mode,
@@ -300,8 +333,7 @@
     }
 
     .audience-actions {
-        position: sticky;
-        bottom: 0;
+        position: static;
         padding: 12px 18px calc(12px + env(safe-area-inset-bottom));
     }
 

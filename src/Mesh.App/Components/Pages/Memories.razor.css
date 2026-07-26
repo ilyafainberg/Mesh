@@ -124,7 +124,7 @@
 }
 
 .memory-actions { display: flex; gap: 3px; flex: 0 0 auto; }
-.memory-actions .danger { color: #a61b1b; }
+.memory-actions .memory-delete { color: var(--danger); }
 
 .memory-content {
     margin: 12px 0;

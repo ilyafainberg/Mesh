@@ -117,7 +117,7 @@
                 <button class="m-sheet-link" @onclick='() => Go("/tools")'><i class="bi bi-tools"></i><span>Tools</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/community")'><i class="bi bi-globe"></i><span>Community</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/settings")'><i class="bi bi-gear"></i><span>Settings</span></button>
-                <button class="m-sheet-link" @onclick='() => Go("/memories")'><i class="bi bi-brain"></i><span>Memories</span></button>
+                <button class="m-sheet-link" @onclick='() => Go("/memories")'><i class="bi bi-memory"></i><span>Memories</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/backup")'><i class="bi bi-shield-lock"></i><span>Backup</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/about")'><i class="bi bi-info-circle"></i><span>About</span></button>
             </div>
@@ -198,7 +198,7 @@
         if (message.StartsWith("Could not", StringComparison.Ordinal)) return "bi-exclamation-triangle";
         if (message.StartsWith("Forgot", StringComparison.Ordinal)) return "bi-trash3";
         if (message.StartsWith("Updated", StringComparison.Ordinal)) return "bi-arrow-repeat";
-        return "bi-brain";
+        return "bi-memory";
     }
 
     public void Dispose()
