@@ -1,9 +1,9 @@
 using Microsoft.AspNetCore.Components.WebView;
-using Mesh.App.Services;
 #if IOS
-using UIKit;
-using WebKit;
+using Microsoft.Maui.Controls.PlatformConfiguration;
+using Microsoft.Maui.Controls.PlatformConfiguration.iOSSpecific;
 #endif
+using Mesh.App.Services;
 
 namespace Mesh.App;
 
@@ -16,22 +16,7 @@ public partial class MainPage : ContentPage
         // Match the exposed iOS safe areas to the white mobile navigation surface.
         BackgroundColor = Colors.White;
         blazorWebView.BackgroundColor = Colors.White;
-        SafeAreaEdges = Microsoft.Maui.SafeAreaEdges.All;
-#endif
-    }
-
-    private void BlazorWebView_Initialized(object? sender, BlazorWebViewInitializedEventArgs e)
-    {
-#if IOS
-        if (e.WebView is not WKWebView webView) return;
-
-        // The ContentPage owns safe-area and keyboard resizing. Prevent WKWebView from applying a
-        // second native inset while its HTML root fills the already-adjusted host bounds.
-        var scrollView = webView.ScrollView;
-        scrollView.ContentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentBehavior.Never;
-        scrollView.AutomaticallyAdjustsScrollIndicatorInsets = false;
-        scrollView.ContentInset = UIEdgeInsets.Zero;
-        scrollView.ScrollIndicatorInsets = UIEdgeInsets.Zero;
+        On<iOS>().SetUseSafeArea(true);
 #endif
     }
 
