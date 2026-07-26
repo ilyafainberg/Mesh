@@ -76,7 +76,8 @@ Your agent needs an AI model to think with. During onboarding you choose one of 
 
 Notes on model picking:
 
-- For **OpenRouter** and the **Mesh-hosted model**, routing is **automatic**: you do not pick a specific model, the app selects one for you.
+- For **OpenRouter**, routing is **automatic** and follows your OpenRouter Auto Router settings. Each new Topic reply shows the model id reported by OpenRouter. Trust that label rather than asking the model to identify itself, because models can answer that question incorrectly.
+- For the **Mesh-hosted model**, routing is **automatic** and the server selects the model.
 - For other providers, you may be able to choose a specific model.
 
 Once your identity and model are set, you land in the main app.

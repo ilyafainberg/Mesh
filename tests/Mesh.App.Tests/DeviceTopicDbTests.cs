@@ -198,6 +198,45 @@ public sealed class DeviceTopicDbTests
     }
 
     [TestMethod]
+    public void ModelAttribution_PersistsAcrossChatStorageAndUpserts()
+    {
+        var at = new DateTimeOffset(2026, 7, 25, 11, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("model-topic", "Model", at);
+            var topicLine = new ChatLine
+            {
+                Id = "topic-model-line", Role = "assistant", Text = "answer", At = at,
+                ModelId = "deepseek/deepseek-chat"
+            };
+            db.AppendOwnChat("model-topic", topicLine);
+            topicLine.ModelId = "moonshotai/kimi-k2";
+            db.UpsertOwnChat("model-topic", topicLine);
+
+            db.EnsureConversation("model-conversation");
+            var conversationLine = new ChatLine
+            {
+                Id = "conversation-model-line", Role = "assistant", Text = "answer", At = at,
+                ModelId = "deepseek/deepseek-r1"
+            };
+            db.AppendChatLine("model-conversation", conversationLine);
+            conversationLine.ModelId = "moonshotai/kimi-k2";
+            db.UpsertChatLine("model-conversation", conversationLine);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var profile = reopened.LoadProfile()!;
+        Assert.AreEqual(
+            "moonshotai/kimi-k2",
+            profile.OwnThreads.Single(thread => thread.Id == "model-topic").Lines.Single().ModelId);
+        Assert.AreEqual(
+            "moonshotai/kimi-k2",
+            profile.Conversations.Single(conversation => conversation.Handle == "model-conversation").Lines.Single().ModelId);
+    }
+
+    [TestMethod]
     public void SetOwnThreadExecution_PersistsAndLoads()
     {
         var execAt = DateTimeOffset.UtcNow.AddMinutes(-5);
@@ -429,15 +468,27 @@ public sealed class DeviceTopicDbTests
         var valid = new ChatLine
         {
             Id = "line", Role = "user", Text = "valid", Via = "device",
-            Status = "sent", At = parentAt.AddDays(-1)
+            Status = "sent", At = parentAt.AddDays(-1),
+            ModelId = "deepseek/deepseek-chat"
         };
         Assert.IsTrue(db.TryApplyOwnSyncLine(
             threadId, valid, versionKey, validVersion));
         var applied = db.LoadProfile()!.OwnThreads.Single(t => t.Id == threadId);
         Assert.HasCount(1, applied.Lines);
         Assert.AreEqual("valid", applied.Lines[0].Text);
+        Assert.AreEqual("deepseek/deepseek-chat", applied.Lines[0].ModelId);
         Assert.AreEqual(parentAt.UtcTicks, applied.LastActivityAt?.UtcTicks);
         Assert.AreEqual(validVersion, db.GetSyncVersion(versionKey));
+
+        var newerVersion = DeviceSyncVersion.Create(
+            DateTimeOffset.UtcNow.AddMinutes(3), "remote", "newer");
+        valid.Text = "updated by older client";
+        valid.ModelId = null;
+        Assert.IsTrue(db.TryApplyOwnSyncLine(
+            threadId, valid, versionKey, newerVersion));
+        var updated = db.LoadProfile()!.OwnThreads.Single(t => t.Id == threadId).Lines.Single();
+        Assert.AreEqual("updated by older client", updated.Text);
+        Assert.AreEqual("deepseek/deepseek-chat", updated.ModelId);
     }
 
     [TestMethod]

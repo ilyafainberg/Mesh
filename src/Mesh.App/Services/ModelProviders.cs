@@ -47,6 +47,9 @@ internal static class MultimodalContent
 
 public interface IChatModel
 {
+    /// <summary>The model id reported by the provider for the most recent completion.</summary>
+    string? ResponseModelId => null;
+
     Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         CompletionOptions? options = null, CancellationToken ct = default);
 
@@ -228,6 +231,8 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
         IChatModel inner,
         TokenOptimizationLevel level) : IChatModel
     {
+        public string? ResponseModelId => inner.ResponseModelId;
+
         public Task<string> CompleteAsync(
             string systemPrompt,
             IReadOnlyList<ChatLine> history,
@@ -255,6 +260,8 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
 
     private sealed class OffUiChatModel(IChatModel inner, TokenMeter tokenMeter) : IChatModel
     {
+        public string? ResponseModelId => inner.ResponseModelId;
+
         public Task<string> CompleteAsync(
             string systemPrompt,
             IReadOnlyList<ChatLine> history,
@@ -375,9 +382,12 @@ public sealed class ModelFactory(IHttpClientFactory httpFactory, AppState state,
 /// <summary>Works for OpenAI, Groq, Mistral, Foundry Local, Ollama (OpenAI-compatible).</summary>
 public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, TokenMeter? meter = null) : IChatModel
 {
+    public string? ResponseModelId { get; private set; }
+
     public async Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         CompletionOptions? options = null, CancellationToken ct = default)
     {
+        ResponseModelId = null;
         var baseUrl = string.IsNullOrWhiteSpace(cfg.Endpoint) ? "https://api.openai.com" : cfg.Endpoint!.TrimEnd('/');
         var messages = new List<object> { new { role = "system", content = systemPrompt } };
         messages.AddRange(history.Select(l => (object)new { role = MapRole(l.Role), content = MultimodalContent.OpenAi(l) }));
@@ -391,6 +401,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
         var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode) return $"[model error {(int)resp.StatusCode}: {Trim(body)}]";
         using var doc = JsonDocument.Parse(body);
+        ResponseModelId = ProviderModelMetadata.ReadOpenAi(doc.RootElement);
         Usage.ReportOpenAi(meter, doc.RootElement);
         var choice = doc.RootElement.GetProperty("choices")[0];
         if (TruncationDetection.IsLengthCappedOpenAi(choice)) return TruncationDetection.Marker;
@@ -405,6 +416,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
         IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
     {
+        ResponseModelId = null;
         if (tools.Count == 0) return await CompleteAsync(systemPrompt, history, options, ct);
 
         var baseUrl = string.IsNullOrWhiteSpace(cfg.Endpoint) ? "https://api.openai.com" : cfg.Endpoint!.TrimEnd('/');
@@ -436,6 +448,7 @@ public sealed class OpenAiCompatibleModel(HttpClient http, ModelConfig cfg, Toke
             }
 
             using var doc = JsonDocument.Parse(body);
+            ResponseModelId = ProviderModelMetadata.ReadOpenAi(doc.RootElement);
             Usage.ReportOpenAi(meter, doc.RootElement);
             var choice = doc.RootElement.GetProperty("choices")[0];
             var msg = choice.GetProperty("message");

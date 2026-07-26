@@ -2214,7 +2214,8 @@ public sealed class AppState : IMemoryState
             line.SenderHandle,
             line.Internal,
             line.Reasoning,
-            line.ReplyToLineId);
+            line.ReplyToLineId,
+            line.ModelId);
 
     private static ChatLine ToChatLine(DeviceSyncLine line)
         => new()
@@ -2228,7 +2229,8 @@ public sealed class AppState : IMemoryState
             SenderHandle = line.SenderHandle,
             Internal = line.Internal,
             Reasoning = line.Reasoning,
-            ReplyToLineId = line.ReplyToLineId
+            ReplyToLineId = line.ReplyToLineId,
+            ModelId = line.ModelId
         };
 
     private static DeviceSyncConversation ToSyncConversation(Conversation conversation, int sortOrder)
@@ -2404,7 +2406,8 @@ public sealed class AppState : IMemoryState
            && line.SenderHandle == dto.SenderHandle
            && line.Internal == dto.Internal
            && line.Reasoning == dto.Reasoning
-           && line.ReplyToLineId == dto.ReplyToLineId;
+           && line.ReplyToLineId == dto.ReplyToLineId
+           && (dto.ModelId is null || line.ModelId == dto.ModelId);
 
     private static void MergeLine(ChatLine line, DeviceSyncLine dto)
     {
@@ -2417,6 +2420,7 @@ public sealed class AppState : IMemoryState
         line.Internal = dto.Internal;
         line.Reasoning = dto.Reasoning;
         line.ReplyToLineId = dto.ReplyToLineId;
+        if (dto.ModelId is not null) line.ModelId = dto.ModelId;
         line.Attachments.Clear();
     }
 

@@ -83,6 +83,27 @@ public sealed class DeviceSyncProfileProtocolTests
     }
 
     [TestMethod]
+    public void LinePayload_RoundTripsProviderModelAndReadsOlderPayload()
+    {
+        var line = new DeviceSyncLine(
+            "line-1", "assistant", "answer", "agent", "sent",
+            DateTimeOffset.UtcNow, null, false, null, "prompt-1",
+            "deepseek/deepseek-chat");
+
+        var json = JsonSerializer.Serialize(line, JsonOptions);
+        var roundTrip = JsonSerializer.Deserialize<DeviceSyncLine>(json, JsonOptions);
+
+        Assert.IsNotNull(roundTrip);
+        Assert.AreEqual("deepseek/deepseek-chat", roundTrip.ModelId);
+
+        var olderJson = "{\"id\":\"line-1\",\"role\":\"assistant\",\"text\":\"answer\",\"via\":\"agent\",\"status\":\"sent\",\"at\":\"2026-07-25T10:00:00+00:00\",\"senderHandle\":null,\"internal\":false,\"reasoning\":null,\"replyToLineId\":null}";
+        var older = JsonSerializer.Deserialize<DeviceSyncLine>(olderJson, JsonOptions);
+
+        Assert.IsNotNull(older);
+        Assert.IsNull(older.ModelId);
+    }
+
+    [TestMethod]
     public void CirclePayload_RoundTripsApprovalRequirement()
     {
         var circle = new DeviceSyncCircle(
