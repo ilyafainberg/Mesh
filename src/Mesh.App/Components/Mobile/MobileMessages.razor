@@ -689,18 +689,25 @@ else
         attachError = null;
         try
         {
+            await JS.InvokeVoidAsync("meshUI.prepareForNativePicker", composerEl);
             var file = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
             if (file is null) return;
             using var stream = await file.OpenReadAsync();
             using var ms = new MemoryStream();
-            await stream.CopyToAsync(ms);
+            var buffer = new byte[81920];
+            while (true)
+            {
+                var read = await stream.ReadAsync(buffer);
+                if (read == 0) break;
+                if (ms.Length + read > MaxAttachmentBytes)
+                {
+                    attachError = $"\"{file.FileName}\" is over the {Human(MaxAttachmentBytes)} limit.";
+                    return;
+                }
+                await ms.WriteAsync(buffer.AsMemory(0, read));
+            }
             var bytes = ms.ToArray();
             if (bytes.LongLength == 0) { attachError = "That file is empty."; return; }
-            if (bytes.LongLength > MaxAttachmentBytes)
-            {
-                attachError = $"\"{file.FileName}\" is {Human(bytes.LongLength)}, over the {Human(MaxAttachmentBytes)} limit.";
-                return;
-            }
             var mime = string.IsNullOrWhiteSpace(file.ContentType) ? GuessMime(file.FileName) : file.ContentType;
             attachments.Add(new StagedFile(file.FileName, mime, Convert.ToBase64String(bytes), bytes.LongLength));
         }
