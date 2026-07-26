@@ -76,14 +76,17 @@
                         <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
                             <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
                                     @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
-                                <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                                @if (IsRemoteBound(t))
-                                {
-                                    <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
-                                          title="@DeviceStatusText(t)">
-                                        <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
-                                    </span>
-                                }
+                                <span class="topic-title-line">
+                                    <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                                    @if (IsRemoteBound(t))
+                                    {
+                                        <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                              title="@DeviceStatusText(t)">
+                                            <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
+                                            <span class="topic-device-name">@ThreadDeviceName(t)</span>
+                                        </span>
+                                    }
+                                </span>
                                 @if (IsTopicBusy(t))
                                 {
                                     <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
@@ -109,14 +112,17 @@
                         <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
                             <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
                                     @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
-                                <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                                @if (IsRemoteBound(t))
-                                {
-                                    <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
-                                          title="@DeviceStatusText(t)">
-                                        <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
-                                    </span>
-                                }
+                                <span class="topic-title-line">
+                                    <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                                    @if (IsRemoteBound(t))
+                                    {
+                                        <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                              title="@DeviceStatusText(t)">
+                                            <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
+                                            <span class="topic-device-name">@ThreadDeviceName(t)</span>
+                                        </span>
+                                    }
+                                </span>
                                 @if (IsTopicBusy(t))
                                 {
                                     <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">

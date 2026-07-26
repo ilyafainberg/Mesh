@@ -221,8 +221,15 @@
 .topic-open:active {
     background: transparent;
 }
-.topic-open .conv-name {
+.topic-title-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     flex: 1 1 auto;
+    min-width: 0;
+}
+.topic-open .conv-name {
+    flex: 0 1 auto;
     min-width: 0;
     text-align: left;
     overflow: hidden;
@@ -251,15 +258,23 @@
     display: inline-flex;
     align-items: center;
     gap: 3px;
-    max-width: 90px;
-    padding: 2px 6px;
+    flex: none;
+    max-width: calc(1em + 3px + 6ch + 12px);
+    padding-block: 2px;
+    padding-inline: 6px;
     border-radius: 999px;
     background: var(--bg-3, #eef0f3);
     color: var(--fg-2, #5b6470);
     font-size: .66rem;
     white-space: nowrap;
+}
+.topic-device-pill i { flex: none; }
+.topic-device-name {
+    min-width: 0;
+    max-width: 6ch;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .topic-device-pill.offline { opacity: .55; }
 
