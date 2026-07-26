@@ -16,13 +16,26 @@ namespace Mesh.App.Services;
 /// The profile blob deliberately excludes conversations and own-chat, those live in the
 /// <c>chat_lines</c> / <c>own_chat</c> tables and are hydrated back onto the profile on load.
 /// </summary>
-public sealed class MeshDb : IDisposable
+public sealed partial class MeshDb : IDisposable
 {
     internal sealed record SyncVersionWrite(string EntityKey, string Version);
     internal sealed record SyncTombstoneWrite(string Kind, string EntityId, string Version);
     internal sealed record SyncCircleRenameWrite(
         string EntityId,
         IReadOnlyList<DeviceSyncCircleRename> Renames);
+    public sealed record TopicOutboxItem(
+        string RunId, string ThreadId, string TriggerLineId, string TargetDeviceId,
+        TopicRunRequestPayload Request, IReadOnlyList<ChatAttachment> Attachments,
+        string State, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string? LastError = null);
+
+    public sealed record InboundTopicRunItem(
+        string RunId, string SourceDeviceId, TopicRunRequestPayload Request,
+        string State, DateTimeOffset AcceptedAt, DateTimeOffset UpdatedAt,
+        string? TerminalUpdateJson = null);
+
+    public sealed record DeviceEnvelopeOutboxItem(
+        string EnvelopeId, string TargetDeviceId, string Kind, string Plaintext,
+        string? PushHint, DateTimeOffset CreatedAt);
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private const string ConversationDraftKind = "conversation";
@@ -92,6 +105,34 @@ public sealed class MeshDb : IDisposable
             CREATE TABLE IF NOT EXISTS own_threads(
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS topic_outbox(
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                trigger_line_id TEXT NOT NULL,
+                target_device_id TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                attachments_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_error TEXT);
+            CREATE INDEX IF NOT EXISTS ix_topic_outbox_state ON topic_outbox(state, created_at);
+            CREATE TABLE IF NOT EXISTS inbound_topic_runs(
+                run_id TEXT PRIMARY KEY,
+                source_device_id TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                terminal_update_json TEXT);
+            CREATE INDEX IF NOT EXISTS ix_inbound_topic_runs_state ON inbound_topic_runs(state, accepted_at);
+            CREATE TABLE IF NOT EXISTS device_envelope_outbox(
+                envelope_id TEXT PRIMARY KEY,
+                target_device_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                plaintext TEXT NOT NULL,
+                push_hint TEXT,
                 created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS composer_drafts(
                 kind TEXT NOT NULL,
@@ -179,6 +220,7 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("own_threads", "execution_device_platform", "TEXT");
         AddColumnIfMissing("own_threads", "execution_at", "TEXT");
         AddColumnIfMissing("own_threads", "execution_run_id", "TEXT");
+        AddColumnIfMissing("inbound_topic_runs", "terminal_update_json", "TEXT");
         MigrateOwnThreadActivity();
         AddColumnIfMissing("conversations", "last_activity_at", "TEXT");
         AddColumnIfMissing("conversations", "is_pinned", "INTEGER NOT NULL DEFAULT 0");

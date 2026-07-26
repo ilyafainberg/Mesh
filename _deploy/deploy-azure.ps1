@@ -73,6 +73,7 @@ az containerapp create -n $appName -g $ResourceGroup --environment $env `
   --env-vars `
     "ASPNETCORE_URLS=http://+:8080" `
     "COSMOS_CONNECTION=secretref:cosmos" `
+    "MESH_REQUIRE_DURABLE_STORAGE=true" `
     "REDIS_CONNECTION=secretref:redis" `
     "MODEL_KIND=azure" `
     "MODEL_ENDPOINT=$aoaiEndpoint" `

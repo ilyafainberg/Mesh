@@ -36,8 +36,8 @@ public sealed class RedisBackplane : IBackplane
     private readonly SemaphoreSlim connectGate = new(1, 1);
 
     private ConnectionMultiplexer? multiplexer;
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<BackplaneDeliveryOutcome>> pendingAcks = new();
-    private Func<string, string, Task<bool>>? deliverLocal;
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<BackplaneDeliveryReceipt>> pendingAcks = new();
+    private Func<string, string, Task<BackplaneDeliveryReceipt>>? deliverLocal;
 
     /// <summary>Creates a Redis backplane bound to the given StackExchange.Redis connection string.</summary>
     /// <param name="connectionString">A StackExchange.Redis connection string (host:port, options, etc.).</param>
@@ -54,7 +54,7 @@ public sealed class RedisBackplane : IBackplane
     /// message carries a small JSON payload of { "to": ..., "json": ... }; on receipt we invoke
     /// the local delivery handler so the message reaches the live socket on this instance.
     /// </summary>
-    public async Task StartAsync(Func<string, string, Task<bool>> deliverLocal, CancellationToken ct = default)
+    public async Task StartAsync(Func<string, string, Task<BackplaneDeliveryReceipt>> deliverLocal, CancellationToken ct = default)
     {
         this.deliverLocal = deliverLocal ?? throw new ArgumentNullException(nameof(deliverLocal));
 
@@ -133,7 +133,7 @@ public sealed class RedisBackplane : IBackplane
     /// Publishes an envelope to the instance that owns the handle so it can deliver it to the
     /// live socket. Returns true when at least one subscriber received the publish.
     /// </summary>
-    public async Task<bool> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)
+    public async Task<BackplaneDeliveryReceipt> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)
     {
         var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
         var channel = RedisChannel.Literal(InstanceChannelPrefix + instanceId);
@@ -150,12 +150,14 @@ public sealed class RedisBackplane : IBackplane
             var legacyReceivers = await mux.GetSubscriber()
                 .PublishAsync(channel, legacyPayload)
                 .ConfigureAwait(false);
-            return legacyReceivers > 0;
+            return legacyReceivers > 0
+                ? new BackplaneDeliveryReceipt(BackplaneDeliveryOutcome.Delivered, false)
+                : BackplaneDeliveryReceipt.NotDelivered;
         }
 
         return await PublishWithAcknowledgementAsync(
                 mux, instanceId, toHandle, envelopeJson, ct)
-            .ConfigureAwait(false) == BackplaneDeliveryOutcome.Delivered;
+            .ConfigureAwait(false);
     }
 
     public async Task<BackplaneDeliveryOutcome> PublishAtomicToOwnerAsync(
@@ -173,12 +175,12 @@ public sealed class RedisBackplane : IBackplane
                 .Contains(AtomicAgentDeliveryCapability, StringComparer.Ordinal))
             return BackplaneDeliveryOutcome.NotDelivered;
 
-        return await PublishWithAcknowledgementAsync(
+        return (await PublishWithAcknowledgementAsync(
                 mux, instanceId, toHandle, envelopeJson, ct)
-            .ConfigureAwait(false);
+            .ConfigureAwait(false)).Outcome;
     }
 
-    private async Task<BackplaneDeliveryOutcome> PublishWithAcknowledgementAsync(
+    private async Task<BackplaneDeliveryReceipt> PublishWithAcknowledgementAsync(
         ConnectionMultiplexer mux,
         string instanceId,
         string toHandle,
@@ -188,7 +190,7 @@ public sealed class RedisBackplane : IBackplane
         var channel = RedisChannel.Literal(InstanceChannelPrefix + instanceId);
 
         var correlationId = Guid.NewGuid().ToString("n");
-        var completion = new TaskCompletionSource<BackplaneDeliveryOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = new TaskCompletionSource<BackplaneDeliveryReceipt>(TaskCreationOptions.RunContinuationsAsynchronously);
         pendingAcks[correlationId] = completion;
         var payload = JsonSerializer.Serialize(
             new RoutedMessage(toHandle, envelopeJson, InstanceId, correlationId));
@@ -199,14 +201,14 @@ public sealed class RedisBackplane : IBackplane
                 .PublishAsync(channel, payload)
                 .ConfigureAwait(false);
             if (receivers == 0)
-                return BackplaneDeliveryOutcome.NotDelivered;
+                return BackplaneDeliveryReceipt.NotDelivered;
             return await completion.Task
                 .WaitAsync(DeliveryAckTimeout, ct)
                 .ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
-            return BackplaneDeliveryOutcome.Uncertain;
+            return new BackplaneDeliveryReceipt(BackplaneDeliveryOutcome.Uncertain, false);
         }
         finally
         {
@@ -242,14 +244,14 @@ public sealed class RedisBackplane : IBackplane
     }
 
     private async Task DeliverAndAcknowledgeAsync(
-        Func<string, string, Task<bool>> handler,
+        Func<string, string, Task<BackplaneDeliveryReceipt>> handler,
         RoutedMessage routed)
     {
-        var delivered = false;
+        var receipt = BackplaneDeliveryReceipt.NotDelivered;
         var uncertain = false;
         try
         {
-            delivered = await handler(routed.To, routed.Json).ConfigureAwait(false);
+            receipt = await handler(routed.To, routed.Json).ConfigureAwait(false);
         }
         catch
         {
@@ -265,7 +267,11 @@ public sealed class RedisBackplane : IBackplane
             var channel = RedisChannel.Literal(AckChannelPrefix + routed.ReplyInstance);
             await mux.GetSubscriber()
                 .PublishAsync(channel, JsonSerializer.Serialize(
-                    new DeliveryAck(routed.CorrelationId, delivered, uncertain)))
+                    new DeliveryAck(
+                        routed.CorrelationId,
+                        receipt.Outcome == BackplaneDeliveryOutcome.Delivered,
+                        uncertain,
+                        receipt.DurableAckExpected)))
                 .ConfigureAwait(false);
         }
         catch
@@ -282,12 +288,13 @@ public sealed class RedisBackplane : IBackplane
             var ack = JsonSerializer.Deserialize<DeliveryAck>((string)message!);
             if (ack is not null
                 && pendingAcks.TryGetValue(ack.CorrelationId, out var completion))
-                completion.TrySetResult(
+                completion.TrySetResult(new BackplaneDeliveryReceipt(
                     ack.Delivered
                         ? BackplaneDeliveryOutcome.Delivered
                         : ack.Uncertain
                             ? BackplaneDeliveryOutcome.Uncertain
-                            : BackplaneDeliveryOutcome.NotDelivered);
+                            : BackplaneDeliveryOutcome.NotDelivered,
+                    ack.DurableAckExpected));
         }
         catch (JsonException)
         {
@@ -331,5 +338,6 @@ public sealed class RedisBackplane : IBackplane
     private sealed record DeliveryAck(
         [property: System.Text.Json.Serialization.JsonPropertyName("correlationId")] string CorrelationId,
         [property: System.Text.Json.Serialization.JsonPropertyName("delivered")] bool Delivered,
-        [property: System.Text.Json.Serialization.JsonPropertyName("uncertain")] bool Uncertain = false);
+        [property: System.Text.Json.Serialization.JsonPropertyName("uncertain")] bool Uncertain = false,
+        [property: System.Text.Json.Serialization.JsonPropertyName("durableAckExpected")] bool DurableAckExpected = false);
 }

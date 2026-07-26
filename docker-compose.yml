@@ -3,7 +3,7 @@
 #   Minimal (in-memory, single node, no free model):
 #     docker compose up mesh-relay
 #
-#   Durable + scalable (adds Redis for presence, quota and cross-node routing):
+#   Multi-replica plumbing (adds Redis; configure Cosmos separately for durability):
 #     docker compose --profile redis up
 #
 # Then point your Mesh client at http://your-host:8080 (or put it behind a TLS
@@ -19,8 +19,11 @@ services:
       - "8080:8080"
     environment:
       ASPNETCORE_URLS: http://+:8080
-      # Optional: connect Redis for multi-replica presence, durable quota and directed routing.
+      # Optional: configure Cosmos for restart-safe queues and Redis for multi-replica routing.
+      # COSMOS_CONNECTION: "AccountEndpoint=..."
       # REDIS_CONNECTION: "redis:6379"
+      # Production guard: fail startup unless Cosmos durable storage is configured.
+      # MESH_REQUIRE_DURABLE_STORAGE: "true"
       # Optional: offer a hosted free model to first-launch users on this relay.
       # Any OpenAI-compatible endpoint works (OpenAI, Groq, together, a local server, ...).
       # MODEL_ENDPOINT: "https://api.groq.com/openai"

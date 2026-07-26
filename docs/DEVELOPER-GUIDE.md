@@ -481,12 +481,12 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 
 ### 5.3 SignalR hub: connect, auth handshake, and routing
 
-The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, and `SendFanout`; the server emits `Challenge`, `Ready`, and `Receive`.
+The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, `SendFanout`, `AcknowledgeDelivery`, `RequestPendingDeliveries`, and `CancelQueuedEnvelope`; the server emits `Challenge`, `Ready`, and `Receive`. Protocol-5 clients append `deliveryAck=1` to the hub query.
 
 #### 5.3.1 Connect and auth handshake
 
 1. On connect the hub issues a **`Challenge`** with a nonce.
-2. The client **signs** the nonce with its device private key and calls **`Ready`** with the signature (and its device public key).
+2. The client **signs** the nonce with its device private key and calls **`Authenticate`** with its device public key and signature.
 3. The hub verifies the signature. Once verified, the connection is authenticated and associated with the handle/device.
 
 #### 5.3.2 Message routing
@@ -496,17 +496,19 @@ The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubPro
 1. **Verifies the signature** on the message.
 2. **Stamps** the authenticated `From` and `FromDevice` (clients cannot spoof these; the relay overwrites them from the authenticated connection).
 3. Routes via the **MeshRouter**:
-   - **Local delivery** if the recipient is connected to this instance.
-   - **Redis directed cross-instance forward** if the recipient is connected to another instance (owner lookup via the backplane).
-   - **Offline enqueue** (inbox) otherwise.
+   - Idempotently **enqueues before delivery** using the stable envelope ID.
+   - Attempts **local delivery** if the recipient is connected to this instance.
+   - Attempts a **Redis directed cross-instance forward** if the recipient is connected to another instance.
+   - Leaves the inbox item queued when no confirmed live handoff occurs.
+   - Keeps the item until `AcknowledgeDelivery` when the receiving connection advertised durable acknowledgement support.
 
 For fan-out, the hub additionally validates 1 to 128 distinct normalized recipients, checks the effective per-handle fan-out limit, consumes one Group token, resolves the registered device IDs for each transient handle, clones device-targeted envelopes, and dispatches devices concurrently. It does not persist the request cohort. Offline devices get device-specific inbox entries that only they drain; accepted fan-out is not an atomic or simultaneous physical-delivery guarantee.
 
-Per-device routing honors `ToDevice`: if set, the message targets that device, with **broadcast fallback** to all of the handle's devices when appropriate. A device sending to its own handle is **excluded from its own connection** (you do not receive an echo of your own send).
+Per-device routing honors `ToDevice`: if set, the message targets only that device and uses a device-specific inbox. An online sibling cannot consume it, and there is no broadcast fallback. A device sending to its own handle is **excluded from its own connection** (you do not receive an echo of your own send).
 
 Atomic agent requests are an explicit exception to broadcast fallback and the ordinary offline inbox. `AgentDispatchCoordinator` persists and assigns them, and `MeshRouter.RouteAtomicAgentRequestAsync` delivers to exactly one connection of the selected device. Atomic responses are routed only after the coordinator completes the durable fence.
 
-Delivery to clients uses the **`Receive`** method.
+Delivery to clients uses the **`Receive`** method. A protocol-5 client acknowledges only after signature verification, decryption, validation, and durable client-side persistence have succeeded. If the acknowledgement is lost, the relay releases or expires the lease and redelivers the same stable envelope ID. `CancelQueuedEnvelope` is authenticated and sender-scoped; it removes only a device-targeted inbox record created by that handle.
 
 ### 5.4 Storage and backplane abstractions
 
@@ -522,7 +524,7 @@ Delivery to clients uses the **`Receive`** method.
 | handles / directory | Handle registrations and public directory. | - |
 | rate-policies | Administrative per-handle logical-message policy overrides. | - |
 | invites | Device-link invites. | Native TTL. |
-| inbox | Offline message queue. | `DefaultTimeToLive` of **14 days**. Reserved handles get a per-item **ttl of -1** (never expire). |
+| inbox | Enqueue-first message queue with stable delivery IDs, leases, acknowledgement, redelivery attempts, and sender-scoped cancellation. | `DefaultTimeToLive` of **14 days**. Reserved handles get a per-item **ttl of -1** (never expire). |
 | agent-dispatches | Opaque atomic agent request envelope, encrypted recipient device ids, routing assignment, token, hash, and lifecycle timestamps. | `DefaultTimeToLive` of **14 days**. Completed records retain fence metadata/hash but clear request ciphertext and recipient device ids. |
 | services directory | Published capability/service listings. | - |
 
@@ -556,6 +558,7 @@ The admin API is deliberately not user-writable. Every GET/PUT/DELETE request un
 |---------|-----------------|---------|-------|
 | `COSMOS_CONNECTION` | `Cosmos:Connection` | none | If unset, storage is in-memory. |
 | `COSMOS_DB` | `Cosmos:Database` | `mesh` | Cosmos database name. |
+| `MESH_REQUIRE_DURABLE_STORAGE` | `Mesh:RequireDurableStorage` | `false` | When `true`, startup fails unless `COSMOS_CONNECTION` is configured. |
 | `REDIS_CONNECTION` | `Redis:Connection` | none | If unset, backplane is in-memory. |
 | `MODEL_ENDPOINT` | `Model:Endpoint` | `https://openrouter.ai/api` | Hosted-model upstream base. |
 | `MODEL_API_KEY` | `Model:ApiKey` | none | Hosted-model upstream API key. |

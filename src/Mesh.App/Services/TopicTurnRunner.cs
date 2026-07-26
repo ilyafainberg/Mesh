@@ -256,8 +256,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
 
         // Stream the reply to viewing devices as it is generated. The executing device renders its own
         // draft locally; here we coalesce the model's token-level fragments and forward them on the same
-        // topic.run.update channel (a live-only stream) so a viewer sees the answer build up instead of
-        // receiving one block. Per-run DeltaSeq gives the viewer ordered, exactly-once application.
+        // topic.run.update channel so a viewer sees the answer build up instead of receiving one block. The
+        // committed line remains authoritative, and per-run DeltaSeq gives the viewer ordered application.
         var coalescer = new AgentDeltaCoalescer();
         var deltaSeq = 0;
         var deltaProgress = new InlineProgress<AgentDelta>(fragment =>

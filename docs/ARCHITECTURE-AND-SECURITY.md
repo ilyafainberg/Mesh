@@ -379,10 +379,12 @@ After the handshake, the relay knows the authenticated handle (and device) behin
 | `PushHint` (optional) | Metadata-only notification discriminator. Currently `topic.response` indicates successful topic completion without exposing content. |
 | `AgentRequestId` (optional) | Original atomic agent request id, stamped on an assigned request and echoed by its response |
 | `AgentDispatchToken` (optional) | Opaque relay-issued token that fences one assigned response; removed before the answer is routed to the sender |
+| `RelayDeliveryId` (relay to client) | Opaque durable inbox identifier acknowledged after client-side processing |
+| `RelayDeviceScoped` (relay to client) | Selects the device-specific or handle-wide inbox when acknowledging |
 
 Because `From`/`FromDevice` are relay-stamped from the authenticated connection, a sender **cannot spoof identity**. A device sending to its **own** handle is **not echoed back** to the sending connection.
 
-`MeshFanoutRequest` is the logical fan-out unit. It carries `Id`, `Recipients` (1 to 128 transient handles), one encrypted `Body`, `Signature`, and `SentAt`. The relay converts it to ordinary per-recipient `MeshEnvelope` instances; it does not persist the request or recipient cohort. Both `SendEnvelope` and `SendFanout` return `MeshSendResult`, with `Accepted`, a machine-readable `Code` such as `accepted` or `rate_limited`, optional `RetryAfterMs`, and the accepted `RecipientCount`. A missing or rejected send is never represented as silent success.
+`MeshFanoutRequest` is the logical fan-out unit. It carries `Id`, `Recipients` (1 to 128 transient handles), one encrypted `Body`, `Signature`, and `SentAt`. The relay converts it to ordinary per-recipient `MeshEnvelope` instances; it does not persist the request or recipient cohort. Both `SendEnvelope` and `SendFanout` return `MeshSendResult`, with `Accepted`, a machine-readable `Code` such as `delivery_live`, `relay_queued`, or `rate_limited`, optional `RetryAfterMs`, the accepted `RecipientCount`, and an optional durable `QueueId`. A missing or rejected send is never represented as silent success.
 
 ### 5.3 Routing
 
@@ -390,21 +392,22 @@ The relay chooses a delivery path based on where the recipient's sockets live an
 
 - **Local delivery**: deliver to all of the recipient's connections on the current instance.
 - **Directed cross-instance forward**: if the target socket is on another instance, forward via the **Redis backplane** to the instance holding that socket.
-- **Directed device routing**: if `ToDevice` is set (for example home-device routing) and that device is online, route to it; **fall back to broadcast** to all the handle's devices if the target device is offline.
+- **Directed device routing**: if `ToDevice` is set, route only to that device. If it is unavailable, retain the envelope in its device-specific inbox. It never falls back to a sibling device.
 - **Atomic agent routing**: never broadcasts and never falls back to an unrelated device. It uses the configured primary, then the optional failover, through the durable dispatch fence described below.
-- **Offline**: if the recipient has no live connection anywhere, **queue** the message (see [Section 5.5](#55-offline-queue-and-ttl)).
+- **Durable admission**: enqueue ordinary envelopes before live delivery. A successful live handoff remains queued until an acknowledgement-capable client confirms processing.
 - **Fan-out**: clone the generic request into device-targeted ordinary envelopes, dispatch online devices concurrently, and enqueue a device-specific inbox record for each offline device. Acceptance is logical, not an atomic or simultaneous physical-delivery guarantee.
 
 ```mermaid
 flowchart TD
-    In["Authenticated envelope arrives"] --> Check{"Recipient online?"}
-    Check -->|"On this instance"| Local["Deliver to local connections"]
-    Check -->|"On another instance"| Fwd["Forward via Redis backplane<br/>to owning instance"]
-    Check -->|"Offline"| Q["Queue in offline inbox (TTL)"]
-    Fwd --> Dev{"ToDevice set and online?"}
-    Local --> Dev
-    Dev -->|"Yes"| Directed["Deliver to that device"]
-    Dev -->|"No"| Broadcast["Broadcast to all handle devices"]
+    In["Authenticated envelope arrives"] --> Q["Idempotently enqueue before delivery"]
+    Q --> Check{"Recipient connection available?"}
+    Check -->|"On this instance"| Local["Deliver to matching local connection(s)"]
+    Check -->|"On another instance"| Fwd["Forward through Redis and await receipt"]
+    Check -->|"Unavailable"| Keep["Keep queued until reconnect or TTL"]
+    Local --> Ack{"Client supports delivery acknowledgement?"}
+    Fwd --> Ack
+    Ack -->|"Yes"| Wait["Keep queued until client acknowledges processing"]
+    Ack -->|"Legacy client"| Remove["Remove after confirmed live handoff"]
 ```
 
 #### 5.3.1 Atomic Single-Device Agent Dispatch
@@ -448,13 +451,15 @@ For cross-replica delivery, protocol-4 relay instances advertise acknowledged si
 - **Redis backplane** provides: **presence** (short TTL), **per-handle quota** state, and **cross-replica directed routing** (knowing which instance holds a given socket).
 - Presence entries use a short TTL so that stale connections age out.
 
-### 5.5 Offline Queue and TTL
+### 5.5 Durable Inbox, Acknowledgement, and TTL
 
-- Messages for an offline recipient are **queued** in a durable **Cosmos DB inbox** and **drained on connect**, ordered by **queue time**.
-- Fan-out uses a device-specific inbox partition value and drains it only after that device authenticates. Legacy direct envelopes continue using the handle-wide inbox.
+- Ordinary envelopes are **idempotently enqueued before live delivery**. The delivery ID is derived from the normalized sender handle and stable envelope ID, so an exact retry does not create another inbox item.
+- Protocol-5 clients connect with `deliveryAck=1`. On authentication, the relay leases queued items instead of deleting them, adds `RelayDeliveryId` metadata, and waits for `AcknowledgeDelivery` after the client has verified, decrypted, and persisted the inbound work.
+- A dropped acknowledgement leaves the item queued. Its lease is released on disconnect or expires, so the next authenticated connection receives it again. Clients therefore process durable envelopes at least once and must deduplicate stable IDs.
+- `ToDevice` envelopes use a device-specific inbox and cannot be consumed by an online sibling. A sender can call `CancelQueuedEnvelope` with the stable envelope ID and target device to remove work that has not completed delivery; an encrypted cancellation envelope covers live-delivery races.
+- Older clients keep the legacy destructive drain path. A confirmed live handoff to a legacy client removes the enqueue-first copy for compatibility.
 - Atomic agent questions use a separate dispatch store rather than either inbox. Pending work is claimed in queue-time order only by the configured primary or failover; completed records clear request ciphertext but retain the hash and fence metadata until expiry.
-- Default retention is a **14-day TTL**.
-- **Reserved handles** (for example `meshreport`) get **no expiry** (per-item TTL of -1), so platform-critical messages are not dropped.
+- Default retention is a **14-day TTL**. **Reserved handles** (for example `meshreport`) get **no expiry** (per-item TTL of -1).
 
 ### 5.6 Rate Limiting
 

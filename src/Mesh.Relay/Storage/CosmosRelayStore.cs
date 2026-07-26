@@ -594,27 +594,304 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <inheritdoc />
-    public async Task EnqueueAsync(string toHandle, string envelopeJson, CancellationToken ct = default)
+    public async Task<InboxEnqueueResult> EnqueueAsync(
+        string toHandle,
+        string envelopeId,
+        string fromHandle,
+        string envelopeJson,
+        CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
-
+        var deliveryId = InboxDeliveryId.Create(fromHandle, envelopeId);
         var doc = new InboxDoc
         {
-            Id = Guid.NewGuid().ToString("N"),
+            Id = deliveryId,
+            EnvelopeId = envelopeId,
+            From = NormalizeHandle(fromHandle),
             To = toHandle,
             Json = envelopeJson,
             QueuedAt = DateTimeOffset.UtcNow
         };
-
-        // Messages queued for a reserved system handle (for example "meshreport") never expire:
-        // a per-item ttl of -1 overrides the container's 14-day DefaultTimeToLive. Normal recipients
-        // leave Ttl null so the existing 14-day default still applies.
-        if (Mesh.Shared.ReservedHandles.IsReserved(toHandle))
+        if (RelayInboxPolicy.NeverExpires(toHandle))
+        {
             doc.Ttl = -1;
+        }
+        else
+        {
+            doc.ExpiresAt = doc.QueuedAt + RelayInboxPolicy.Retention;
+            doc.Ttl = InboxTtlSeconds;
+        }
 
-        await inboxContainer
-            .CreateItemAsync(doc, new PartitionKey(toHandle), cancellationToken: ct)
-            .ConfigureAwait(false);
+        var created = true;
+        try
+        {
+            await inboxContainer
+                .CreateItemAsync(doc, new PartitionKey(toHandle), cancellationToken: ct)
+                .ConfigureAwait(false);
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
+        {
+            // Stable sender/envelope ids make retries idempotent. The first accepted ciphertext wins.
+            created = false;
+        }
+        return new InboxEnqueueResult(deliveryId, created);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<StoredEnvelope>> LeaseInboxAsync(
+        string toHandle,
+        string leaseOwner,
+        int maxItems = RelayInboxPolicy.DeliveryWindow,
+        TimeSpan? leaseDuration = null,
+        CancellationToken ct = default)
+    {
+        if (maxItems <= 0) return [];
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        var partition = new PartitionKey(toHandle);
+        var countQuery = new QueryDefinition(
+                "SELECT VALUE COUNT(1) FROM c WHERE c.leaseOwner = @owner AND c.leaseUntil > @now")
+            .WithParameter("@owner", leaseOwner)
+            .WithParameter("@now", now);
+        var options = new QueryRequestOptions { PartitionKey = partition };
+        long outstanding = 0;
+        using (var countIterator = inboxContainer.GetItemQueryIterator<long>(
+                   countQuery, requestOptions: options))
+        {
+            while (countIterator.HasMoreResults)
+            {
+                var page = await countIterator.ReadNextAsync(ct).ConfigureAwait(false);
+                outstanding += page.Resource.Sum();
+            }
+        }
+
+        var capacity = Math.Max(0, maxItems - (int)Math.Min(int.MaxValue, outstanding));
+        if (capacity == 0) return [];
+        var query = new QueryDefinition("""
+                SELECT * FROM c
+                WHERE NOT IS_DEFINED(c.leaseUntil) OR IS_NULL(c.leaseUntil) OR c.leaseUntil <= @now
+                ORDER BY c.queuedAt ASC
+                """)
+            .WithParameter("@now", now);
+        options.MaxItemCount = Math.Min(capacity, RelayInboxPolicy.DeliveryWindow);
+        var leaseUntil = now + (leaseDuration ?? RelayInboxPolicy.LeaseDuration);
+        var result = new List<StoredEnvelope>(capacity);
+        using var iterator = inboxContainer.GetItemQueryIterator<InboxDoc>(
+            query, requestOptions: options);
+        while (iterator.HasMoreResults && result.Count < capacity)
+        {
+            var page = await iterator.ReadNextAsync(ct).ConfigureAwait(false);
+            foreach (var candidate in page)
+            {
+                if (result.Count >= capacity) break;
+                try
+                {
+                    var read = await inboxContainer
+                        .ReadItemAsync<InboxDoc>(candidate.Id, partition, cancellationToken: ct)
+                        .ConfigureAwait(false);
+                    var doc = read.Resource;
+                    if (!RefreshInboxTtl(doc, now))
+                    {
+                        await inboxContainer.DeleteItemAsync<InboxDoc>(
+                            doc.Id,
+                            partition,
+                            new ItemRequestOptions { IfMatchEtag = read.ETag },
+                            ct).ConfigureAwait(false);
+                        continue;
+                    }
+                    if (doc.LeaseUntil > now) continue;
+                    doc.LeaseOwner = leaseOwner;
+                    doc.LeaseUntil = leaseUntil;
+                    doc.DeliveryAttempts++;
+                    var replaced = await inboxContainer
+                        .ReplaceItemAsync(doc, doc.Id, partition,
+                            new ItemRequestOptions { IfMatchEtag = read.ETag }, ct)
+                        .ConfigureAwait(false);
+                    result.Add(ToStoredEnvelope(replaced.Resource));
+                }
+                catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+                {
+                    // Another relay instance leased, acknowledged, cancelled, or expired it first.
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public async Task<StoredEnvelope?> AcknowledgeInboxAsync(
+        string toHandle,
+        string deliveryId,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var read = await inboxContainer.ReadItemAsync<InboxDoc>(
+                deliveryId, new PartitionKey(toHandle), cancellationToken: ct).ConfigureAwait(false);
+            await inboxContainer.DeleteItemAsync<InboxDoc>(
+                deliveryId,
+                new PartitionKey(toHandle),
+                new ItemRequestOptions { IfMatchEtag = read.ETag },
+                ct).ConfigureAwait(false);
+            return ToStoredEnvelope(read.Resource);
+        }
+        catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> TryLeaseInboxItemAsync(
+        string toHandle,
+        string deliveryId,
+        string leaseOwner,
+        TimeSpan? leaseDuration = null,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var partition = new PartitionKey(toHandle);
+        var now = DateTimeOffset.UtcNow;
+        try
+        {
+            var read = await inboxContainer.ReadItemAsync<InboxDoc>(
+                deliveryId, partition, cancellationToken: ct).ConfigureAwait(false);
+            var doc = read.Resource;
+            if (!RefreshInboxTtl(doc, now))
+            {
+                await inboxContainer.DeleteItemAsync<InboxDoc>(
+                    deliveryId,
+                    partition,
+                    new ItemRequestOptions { IfMatchEtag = read.ETag },
+                    ct).ConfigureAwait(false);
+                return false;
+            }
+            if (doc.LeaseUntil > now) return false;
+            doc.LeaseOwner = leaseOwner;
+            doc.LeaseUntil = now + (leaseDuration ?? RelayInboxPolicy.LeaseDuration);
+            doc.DeliveryAttempts++;
+            await inboxContainer.ReplaceItemAsync(
+                doc,
+                deliveryId,
+                partition,
+                new ItemRequestOptions { IfMatchEtag = read.ETag },
+                ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+        {
+            return false;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task ReleaseInboxLeaseAsync(
+        string toHandle,
+        string deliveryId,
+        string leaseOwner,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var partition = new PartitionKey(toHandle);
+        try
+        {
+            var read = await inboxContainer.ReadItemAsync<InboxDoc>(
+                deliveryId, partition, cancellationToken: ct).ConfigureAwait(false);
+            var doc = read.Resource;
+            if (!string.Equals(doc.LeaseOwner, leaseOwner, StringComparison.Ordinal)) return;
+            if (!RefreshInboxTtl(doc, DateTimeOffset.UtcNow))
+            {
+                await inboxContainer.DeleteItemAsync<InboxDoc>(
+                    deliveryId,
+                    partition,
+                    new ItemRequestOptions { IfMatchEtag = read.ETag },
+                    ct).ConfigureAwait(false);
+                return;
+            }
+            doc.LeaseOwner = null;
+            doc.LeaseUntil = null;
+            await inboxContainer.ReplaceItemAsync(
+                doc,
+                deliveryId,
+                partition,
+                new ItemRequestOptions { IfMatchEtag = read.ETag },
+                ct).ConfigureAwait(false);
+        }
+        catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+        {
+        }
+    }
+    /// <inheritdoc />
+    public async Task<bool> CancelInboxAsync(
+        string toHandle,
+        string deliveryId,
+        string fromHandle,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var read = await inboxContainer.ReadItemAsync<InboxDoc>(
+                deliveryId, new PartitionKey(toHandle), cancellationToken: ct).ConfigureAwait(false);
+            if (!string.Equals(read.Resource.From, NormalizeHandle(fromHandle), StringComparison.Ordinal))
+                return false;
+            await inboxContainer.DeleteItemAsync<InboxDoc>(
+                deliveryId,
+                new PartitionKey(toHandle),
+                new ItemRequestOptions { IfMatchEtag = read.ETag },
+                ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+        {
+            return false;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task ReleaseInboxLeasesAsync(
+        string toHandle,
+        string leaseOwner,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        var query = new QueryDefinition("SELECT * FROM c WHERE c.to = @to AND c.leaseOwner = @owner")
+            .WithParameter("@to", toHandle)
+            .WithParameter("@owner", leaseOwner);
+        var options = new QueryRequestOptions { PartitionKey = new PartitionKey(toHandle) };
+        using var iterator = inboxContainer.GetItemQueryIterator<InboxDoc>(query, requestOptions: options);
+        while (iterator.HasMoreResults)
+        {
+            var page = await iterator.ReadNextAsync(ct).ConfigureAwait(false);
+            foreach (var candidate in page)
+            {
+                try
+                {
+                    var read = await inboxContainer.ReadItemAsync<InboxDoc>(
+                        candidate.Id, new PartitionKey(toHandle), cancellationToken: ct).ConfigureAwait(false);
+                    var doc = read.Resource;
+                    if (!string.Equals(doc.LeaseOwner, leaseOwner, StringComparison.Ordinal)) continue;
+                    if (!RefreshInboxTtl(doc, DateTimeOffset.UtcNow))
+                    {
+                        await inboxContainer.DeleteItemAsync<InboxDoc>(
+                            doc.Id,
+                            new PartitionKey(toHandle),
+                            new ItemRequestOptions { IfMatchEtag = read.ETag },
+                            ct).ConfigureAwait(false);
+                        continue;
+                    }
+                    doc.LeaseOwner = null;
+                    doc.LeaseUntil = null;
+                    await inboxContainer.ReplaceItemAsync(
+                        doc, doc.Id, new PartitionKey(toHandle),
+                        new ItemRequestOptions { IfMatchEtag = read.ETag }, ct).ConfigureAwait(false);
+                }
+                catch (CosmosException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.PreconditionFailed)
+                {
+                }
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -654,6 +931,32 @@ public sealed class CosmosRelayStore : IRelayStore
         }
 
         return result;
+    }
+    public async Task<RelayInboxStats> GetInboxStatsAsync(CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+        long count = 0;
+        using (var countIterator = inboxContainer.GetItemQueryIterator<long>(
+                   new QueryDefinition("SELECT VALUE COUNT(1) FROM c")))
+        {
+            while (countIterator.HasMoreResults)
+            {
+                var page = await countIterator.ReadNextAsync(ct).ConfigureAwait(false);
+                count += page.Resource.Sum();
+            }
+        }
+
+        DateTimeOffset? oldest = null;
+        using (var oldestIterator = inboxContainer.GetItemQueryIterator<InboxQueuedAtProjection>(
+                   new QueryDefinition("SELECT TOP 1 c.queuedAt FROM c ORDER BY c.queuedAt ASC")))
+        {
+            if (oldestIterator.HasMoreResults)
+            {
+                var page = await oldestIterator.ReadNextAsync(ct).ConfigureAwait(false);
+                oldest = page.Resource.FirstOrDefault()?.QueuedAt;
+            }
+        }
+        return new RelayInboxStats(count, oldest);
     }
 
     /// <inheritdoc />
@@ -1371,11 +1674,54 @@ public sealed class CosmosRelayStore : IRelayStore
         public int Ttl { get; set; }
     }
 
+    private static bool RefreshInboxTtl(InboxDoc doc, DateTimeOffset now)
+    {
+        if (RelayInboxPolicy.NeverExpires(doc.To))
+        {
+            doc.ExpiresAt = null;
+            doc.Ttl = -1;
+            return true;
+        }
+
+        var expiresAt = doc.ExpiresAt ?? doc.QueuedAt + RelayInboxPolicy.Retention;
+        doc.ExpiresAt = expiresAt;
+        var remaining = expiresAt - now;
+        if (remaining <= TimeSpan.Zero) return false;
+        doc.Ttl = Math.Max(1, (int)Math.Ceiling(remaining.TotalSeconds));
+        return true;
+    }
+
+    private static StoredEnvelope ToStoredEnvelope(InboxDoc doc) => new()
+    {
+        Id = doc.Id,
+        EnvelopeId = doc.EnvelopeId,
+        From = doc.From,
+        To = doc.To,
+        Json = doc.Json,
+        QueuedAt = doc.QueuedAt,
+        ExpiresAt = doc.ExpiresAt,
+        LeaseOwner = doc.LeaseOwner,
+        LeaseUntil = doc.LeaseUntil,
+        DeliveryAttempts = doc.DeliveryAttempts
+    };
+
     /// <summary>Cosmos document for a queued envelope. Uses lowercase "to" as the partition key.</summary>
+    private sealed class InboxQueuedAtProjection
+    {
+        [JsonPropertyName("queuedAt")]
+        public DateTimeOffset QueuedAt { get; set; }
+    }
+
     private sealed class InboxDoc
     {
         [JsonPropertyName("id")]
         public string Id { get; set; } = "";
+
+        [JsonPropertyName("envelopeId")]
+        public string EnvelopeId { get; set; } = "";
+
+        [JsonPropertyName("from")]
+        public string From { get; set; } = "";
 
         [JsonPropertyName("to")]
         public string To { get; set; } = "";
@@ -1386,9 +1732,23 @@ public sealed class CosmosRelayStore : IRelayStore
         [JsonPropertyName("queuedAt")]
         public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
 
-        // Per-item time-to-live in seconds. When null it is omitted from the document so the
-        // container DefaultTimeToLive (14 days) applies. A value of -1 makes the item never
-        // expire, overriding the container default for reserved-handle queued messages.
+        [JsonPropertyName("expiresAt")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public DateTimeOffset? ExpiresAt { get; set; }
+
+        [JsonPropertyName("leaseOwner")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? LeaseOwner { get; set; }
+
+        [JsonPropertyName("leaseUntil")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public DateTimeOffset? LeaseUntil { get; set; }
+
+        [JsonPropertyName("deliveryAttempts")]
+        public int DeliveryAttempts { get; set; }
+
+        // The remaining seconds are rewritten after lease mutations so Cosmos TTL still expires
+        // the item 14 days after QueuedAt rather than 14 days after the latest delivery attempt.
         [JsonPropertyName("ttl")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public int? Ttl { get; set; }

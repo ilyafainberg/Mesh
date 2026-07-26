@@ -21,6 +21,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\ModelCallDispatcher.cs" Link="ModelCallDispatcher.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\CopilotAcpProtocol.cs" Link="CopilotAcpProtocol.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.cs" Link="MeshDb.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Durable.cs" Link="MeshDb.Durable.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\IAgentTool.cs" Link="IAgentTool.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AgentToolExecutor.cs" Link="AgentToolExecutor.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReasoningExtract.cs" Link="ReasoningExtract.cs" />

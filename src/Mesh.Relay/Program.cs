@@ -21,10 +21,17 @@ builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.W
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 512 * 1024);
 
 // ---- Durable storage + directed backplane (config-gated, in-memory by default) ------
-// Cosmos connection => durable handle registry / invites / offline inbox.
+// Cosmos connection => durable handle registry / invites / enqueue-first inbox.
 // Redis connection  => multi-replica presence + directed per-node message forwarding.
 var cosmosConn = Config(builder.Configuration, "COSMOS_CONNECTION", "Cosmos:Connection");
 var redisConn = Config(builder.Configuration, "REDIS_CONNECTION", "Redis:Connection");
+var requireDurableStorage = bool.TryParse(
+    Config(builder.Configuration, "MESH_REQUIRE_DURABLE_STORAGE", "Mesh:RequireDurableStorage"),
+    out var durableRequired) && durableRequired;
+if (requireDurableStorage && string.IsNullOrWhiteSpace(cosmosConn))
+    throw new InvalidOperationException(
+        "MESH_REQUIRE_DURABLE_STORAGE is enabled, but COSMOS_CONNECTION is not configured.");
+var durableStorage = !string.IsNullOrWhiteSpace(cosmosConn);
 
 IRelayStore store = string.IsNullOrWhiteSpace(cosmosConn)
     ? new InMemoryRelayStore()
@@ -143,24 +150,32 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
     }
     catch (JsonException)
     {
-        return false;
+        return BackplaneDeliveryReceipt.NotDelivered;
     }
-    if (envelope is null) return false;
+    if (envelope is null) return BackplaneDeliveryReceipt.NotDelivered;
     if (AgentDispatchProtocol.IsAtomicRequest(envelope.Kind))
-        return !string.IsNullOrWhiteSpace(envelope.ToDevice)
-               && await router.DeliverSingleLocalDeviceAsync(toHandle, envelopeJson, envelope.ToDevice);
-    return await router.DeliverLocalAsync(
+    {
+        var delivered = !string.IsNullOrWhiteSpace(envelope.ToDevice)
+                        && await router.DeliverSingleLocalDeviceAsync(
+                            toHandle, envelopeJson, envelope.ToDevice);
+        return delivered
+            ? new BackplaneDeliveryReceipt(BackplaneDeliveryOutcome.Delivered, false)
+            : BackplaneDeliveryReceipt.NotDelivered;
+    }
+    return await router.DeliverLocalWithReceiptAsync(
         toHandle, envelopeJson, excludeConnectionId: null, toDevice: envelope.ToDevice);
 });
 
 // ---- Health ---------------------------------------------------------------
 var transportCapabilities = new
 {
-    protocolVersion = 4,
+    protocolVersion = 5,
     sendResults = true,
     fanout = true,
     deviceSync = true,
     atomicAgentDispatch = true,
+    durableDelivery = true,
+    durableStorage,
     maxFanoutRecipients = FanoutProtocol.MaxRecipients
 };
 app.MapGet("/", () => Results.Ok(new
@@ -246,9 +261,11 @@ app.MapGet("/oauth/google/callback", (HttpContext context) =>
 
 // ---- Metrics (aggregate counts only, no handles/PII) ----------------------
 // Unauthenticated read so ops can scrape it; exposes only process-wide totals + a live gauge.
-app.MapGet("/metrics", () =>
+app.MapGet("/metrics", async (CancellationToken ct) =>
 {
     var s = metrics.Snapshot();
+    var inbox = await store.GetInboxStatsAsync(ct);
+    var now = DateTimeOffset.UtcNow;
     return Results.Ok(new
     {
         handlesRegistered = s.HandlesRegistered,
@@ -256,7 +273,20 @@ app.MapGet("/metrics", () =>
         hostedModelCalls = s.HostedModelCalls,
         rateLimitRejections = s.RateLimitRejections,
         connected = s.Connected,
-        time = DateTimeOffset.UtcNow
+        queueEnqueued = s.QueueEnqueued,
+        queueDepth = inbox.QueuedItems,
+        oldestQueueItemAgeSeconds = inbox.OldestQueuedAt is null
+            ? 0
+            : Math.Max(0, (long)(now - inbox.OldestQueuedAt.Value).TotalSeconds),
+        deliveryAcknowledged = s.DeliveryAcknowledged,
+        deliveryAckLatencyMsAverage = s.DeliveryAcknowledged == 0
+            ? 0
+            : s.DeliveryAckLatencyMsTotal / (double)s.DeliveryAcknowledged,
+        deliveryAckLatencyMsMax = s.DeliveryAckLatencyMsMax,
+        deliveryRedelivered = s.DeliveryRedelivered,
+        queueCancelled = s.QueueCancelled,
+        durableStorage,
+        time = now
     });
 });
 

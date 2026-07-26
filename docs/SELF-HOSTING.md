@@ -41,8 +41,10 @@ docker compose up mesh-relay
 ```
 
 That starts a fully working relay on `http://localhost:8080` with in-memory storage
-(single node, no free model). Point a Mesh client at `http://localhost:8080` (or the
-machine's address on your network) in onboarding or Settings, Relay URL.
+(single node, no free model). Acknowledgement and redelivery work while the process is
+running, but queued messages are lost when it restarts. Point a Mesh client at
+`http://localhost:8080` (or the machine's address on your network) in onboarding or
+Settings, Relay URL.
 
 For anything public you should terminate TLS in front of it (a reverse proxy such as
 Caddy, nginx, or a cloud load balancer) and give clients the `https://` URL. The
@@ -75,6 +77,7 @@ in-memory, single node, with no hosted model.
 | `ASPNETCORE_URLS` | standard ASP.NET Core | Listen address | `http://+:8080` (Docker) |
 | `COSMOS_CONNECTION` | `Cosmos:Connection` | Azure Cosmos connection string. Makes handles, agent-response routing and queued dispatches, rate policies, invites, and offline inbox durable. | in-memory |
 | `COSMOS_DB` | `Cosmos:Database` | Cosmos database name | `mesh` |
+| `MESH_REQUIRE_DURABLE_STORAGE` | `Mesh:RequireDurableStorage` | When `true`, fail startup unless `COSMOS_CONNECTION` is configured. Recommended for hosted relays. | `false` |
 | `REDIS_CONNECTION` | `Redis:Connection` | Shares presence, live Direct/Group buckets, quota, and cross-node routing across replicas. | in-memory |
 | `BLOB_CONNECTION` | `Blob:Connection` | Azure Storage connection string (with account key). Enables blob-backed attachments: clients upload encrypted attachment ciphertext to a relay-issued SAS URL and send only a pointer. Apply `_deploy/apply-attachments-lifecycle.ps1` for the 14-day auto-expiry. | disabled |
 | `BLOB_ATTACHMENTS_CONTAINER` | `Blob:AttachmentsContainer` | Private container for attachment ciphertext. | `attachments` |
@@ -142,7 +145,8 @@ to enable Android. With none set, the relay behaves exactly as before (no push).
 - **Durable + multi-replica**: set both `COSMOS_CONNECTION` and `REDIS_CONNECTION`,
   then run as many replicas as you like behind a load balancer with sticky sessions
   (the SignalR WebSocket connection must stay on one replica). Cosmos stores durable
-  handle records, queued atomic agent dispatches, and per-handle policy overrides;
+  handle records, acknowledged ordinary inboxes, queued atomic agent dispatches, and
+  per-handle policy overrides;
   Redis handles device presence, shared live rate buckets, and directed cross-replica
   message forwarding. Both services are required for durable atomic dispatch across replicas.
   Protocol-4 replicas also negotiate acknowledged single-connection delivery through

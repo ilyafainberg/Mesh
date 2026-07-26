@@ -14,10 +14,16 @@ public sealed class InMemoryRelayStore : IRelayStore
 {
     private readonly ConcurrentDictionary<string, StoredHandle> handles = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DateTimeOffset>> invites = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> inboxes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, List<StoredEnvelope>> inboxes = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, StoredAgentDispatch> agentDispatches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, StoredService> services = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, HandleRatePolicy> ratePolicies = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TimeProvider timeProvider;
+
+    public InMemoryRelayStore(TimeProvider? timeProvider = null)
+        => this.timeProvider = timeProvider ?? TimeProvider.System;
+
+    private DateTimeOffset UtcNow => timeProvider.GetUtcNow();
 
     public Task<StoredHandle?> GetHandleAsync(string handle, CancellationToken ct = default)
         => Task.FromResult(handles.TryGetValue(handle, out var rec) ? Clone(rec) : null);
@@ -52,7 +58,10 @@ public sealed class InMemoryRelayStore : IRelayStore
     {
         var removed = handles.TryRemove(handle, out _);
         invites.TryRemove(handle, out _);
-        inboxes.TryRemove(handle, out _);
+        foreach (var inboxKey in inboxes.Keys.Where(key =>
+                     string.Equals(key, handle, StringComparison.OrdinalIgnoreCase)
+                     || key.StartsWith(handle + "\u001f", StringComparison.OrdinalIgnoreCase)))
+            inboxes.TryRemove(inboxKey, out _);
         foreach (var item in agentDispatches)
             if (string.Equals(item.Value.To, handle, StringComparison.OrdinalIgnoreCase))
                 agentDispatches.TryRemove(item.Key, out _);
@@ -163,18 +172,204 @@ public sealed class InMemoryRelayStore : IRelayStore
         return Task.FromResult(ok);
     }
 
-    public Task EnqueueAsync(string toHandle, string envelopeJson, CancellationToken ct = default)
+    public Task<InboxEnqueueResult> EnqueueAsync(
+        string toHandle,
+        string envelopeId,
+        string fromHandle,
+        string envelopeJson,
+        CancellationToken ct = default)
     {
-        inboxes.GetOrAdd(toHandle, _ => new()).Enqueue(envelopeJson);
+        var deliveryId = InboxDeliveryId.Create(fromHandle, envelopeId);
+        var inbox = inboxes.GetOrAdd(toHandle, _ => new List<StoredEnvelope>());
+        var now = UtcNow;
+        var created = false;
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, now);
+            if (inbox.All(item => !string.Equals(item.Id, deliveryId, StringComparison.Ordinal)))
+            {
+                inbox.Add(new StoredEnvelope
+                {
+                    Id = deliveryId,
+                    EnvelopeId = envelopeId,
+                    From = LinkProtocol.Normalize(fromHandle),
+                    To = toHandle,
+                    Json = envelopeJson,
+                    QueuedAt = now,
+                    ExpiresAt = RelayInboxPolicy.NeverExpires(toHandle)
+                        ? null
+                        : now + RelayInboxPolicy.Retention
+                });
+                created = true;
+            }
+        }
+        return Task.FromResult(new InboxEnqueueResult(deliveryId, created));
+    }
+
+    public Task<IReadOnlyList<StoredEnvelope>> LeaseInboxAsync(
+        string toHandle,
+        string leaseOwner,
+        int maxItems = RelayInboxPolicy.DeliveryWindow,
+        TimeSpan? leaseDuration = null,
+        CancellationToken ct = default)
+    {
+        if (maxItems <= 0) return Task.FromResult<IReadOnlyList<StoredEnvelope>>([]);
+        if (!inboxes.TryGetValue(toHandle, out var inbox))
+            return Task.FromResult<IReadOnlyList<StoredEnvelope>>([]);
+        var now = UtcNow;
+        var until = now + (leaseDuration ?? RelayInboxPolicy.LeaseDuration);
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, now);
+            var outstanding = inbox.Count(item =>
+                string.Equals(item.LeaseOwner, leaseOwner, StringComparison.Ordinal)
+                && item.LeaseUntil > now);
+            var capacity = Math.Max(0, maxItems - outstanding);
+            var result = inbox
+                .Where(item => item.LeaseUntil is null || item.LeaseUntil <= now)
+                .OrderBy(item => item.QueuedAt)
+                .ThenBy(item => item.Id, StringComparer.Ordinal)
+                .Take(capacity)
+                .ToList();
+            foreach (var item in result)
+            {
+                item.LeaseOwner = leaseOwner;
+                item.LeaseUntil = until;
+                item.DeliveryAttempts++;
+            }
+            return Task.FromResult<IReadOnlyList<StoredEnvelope>>(
+                result.Select(CloneEnvelope).ToList());
+        }
+    }
+
+    public Task<StoredEnvelope?> AcknowledgeInboxAsync(
+        string toHandle,
+        string deliveryId,
+        CancellationToken ct = default)
+    {
+        if (!inboxes.TryGetValue(toHandle, out var inbox))
+            return Task.FromResult<StoredEnvelope?>(null);
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, UtcNow);
+            var index = inbox.FindIndex(item =>
+                string.Equals(item.Id, deliveryId, StringComparison.Ordinal));
+            if (index < 0) return Task.FromResult<StoredEnvelope?>(null);
+            var acknowledged = CloneEnvelope(inbox[index]);
+            inbox.RemoveAt(index);
+            return Task.FromResult<StoredEnvelope?>(acknowledged);
+        }
+    }
+
+    public Task<bool> TryLeaseInboxItemAsync(
+        string toHandle,
+        string deliveryId,
+        string leaseOwner,
+        TimeSpan? leaseDuration = null,
+        CancellationToken ct = default)
+    {
+        if (!inboxes.TryGetValue(toHandle, out var inbox)) return Task.FromResult(false);
+        var now = UtcNow;
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, now);
+            var item = inbox.FirstOrDefault(candidate =>
+                string.Equals(candidate.Id, deliveryId, StringComparison.Ordinal));
+            if (item is null || item.LeaseUntil > now) return Task.FromResult(false);
+            item.LeaseOwner = leaseOwner;
+            item.LeaseUntil = now + (leaseDuration ?? RelayInboxPolicy.LeaseDuration);
+            item.DeliveryAttempts++;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task ReleaseInboxLeaseAsync(
+        string toHandle,
+        string deliveryId,
+        string leaseOwner,
+        CancellationToken ct = default)
+    {
+        if (!inboxes.TryGetValue(toHandle, out var inbox)) return Task.CompletedTask;
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, UtcNow);
+            var item = inbox.FirstOrDefault(candidate =>
+                string.Equals(candidate.Id, deliveryId, StringComparison.Ordinal)
+                && string.Equals(candidate.LeaseOwner, leaseOwner, StringComparison.Ordinal));
+            if (item is not null)
+            {
+                item.LeaseOwner = null;
+                item.LeaseUntil = null;
+            }
+        }
+        return Task.CompletedTask;
+    }
+    public Task<bool> CancelInboxAsync(
+        string toHandle,
+        string deliveryId,
+        string fromHandle,
+        CancellationToken ct = default)
+    {
+        if (!inboxes.TryGetValue(toHandle, out var inbox)) return Task.FromResult(false);
+        var normalizedFrom = LinkProtocol.Normalize(fromHandle);
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, UtcNow);
+            var removed = inbox.RemoveAll(item =>
+                string.Equals(item.Id, deliveryId, StringComparison.Ordinal)
+                && string.Equals(item.From, normalizedFrom, StringComparison.Ordinal)) > 0;
+            return Task.FromResult(removed);
+        }
+    }
+
+    public Task ReleaseInboxLeasesAsync(
+        string toHandle,
+        string leaseOwner,
+        CancellationToken ct = default)
+    {
+        if (!inboxes.TryGetValue(toHandle, out var inbox)) return Task.CompletedTask;
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, UtcNow);
+            foreach (var item in inbox.Where(item =>
+                         string.Equals(item.LeaseOwner, leaseOwner, StringComparison.Ordinal)))
+            {
+                item.LeaseOwner = null;
+                item.LeaseUntil = null;
+            }
+        }
         return Task.CompletedTask;
     }
 
     public Task<IReadOnlyList<string>> DrainInboxAsync(string toHandle, CancellationToken ct = default)
     {
-        var result = new List<string>();
-        if (inboxes.TryGetValue(toHandle, out var q))
-            while (q.TryDequeue(out var item)) result.Add(item);
-        return Task.FromResult<IReadOnlyList<string>>(result);
+        if (!inboxes.TryGetValue(toHandle, out var inbox))
+            return Task.FromResult<IReadOnlyList<string>>([]);
+        lock (inbox)
+        {
+            PurgeExpiredInbox(inbox, UtcNow);
+            var result = inbox.OrderBy(item => item.QueuedAt).Select(item => item.Json).ToList();
+            inbox.Clear();
+            return Task.FromResult<IReadOnlyList<string>>(result);
+        }
+    }
+    public Task<RelayInboxStats> GetInboxStatsAsync(CancellationToken ct = default)
+    {
+        long count = 0;
+        DateTimeOffset? oldest = null;
+        var now = UtcNow;
+        foreach (var inbox in inboxes.Values)
+        {
+            lock (inbox)
+            {
+                PurgeExpiredInbox(inbox, now);
+                count += inbox.Count;
+                if (inbox.Count == 0) continue;
+                var candidate = inbox.Min(item => item.QueuedAt);
+                if (oldest is null || candidate < oldest) oldest = candidate;
+            }
+        }
+        return Task.FromResult(new RelayInboxStats(count, oldest));
     }
 
     public Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
@@ -466,6 +661,23 @@ public sealed class InMemoryRelayStore : IRelayStore
                     kv => new DevicePushToken { Platform = kv.Value.Platform, Token = kv.Value.Token, UpdatedAt = kv.Value.UpdatedAt })
             };
     }
+
+    private static void PurgeExpiredInbox(List<StoredEnvelope> inbox, DateTimeOffset now)
+        => inbox.RemoveAll(item => item.ExpiresAt is { } expiresAt && expiresAt <= now);
+
+    private static StoredEnvelope CloneEnvelope(StoredEnvelope envelope) => new()
+    {
+        Id = envelope.Id,
+        EnvelopeId = envelope.EnvelopeId,
+        From = envelope.From,
+        To = envelope.To,
+        Json = envelope.Json,
+        QueuedAt = envelope.QueuedAt,
+        ExpiresAt = envelope.ExpiresAt,
+        LeaseOwner = envelope.LeaseOwner,
+        LeaseUntil = envelope.LeaseUntil,
+        DeliveryAttempts = envelope.DeliveryAttempts
+    };
 
     private static StoredAgentDispatch CloneDispatch(StoredAgentDispatch dispatch) => new()
     {

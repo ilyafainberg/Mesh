@@ -25,12 +25,38 @@ public sealed record TopicDispatchResult(
     string Code,
     string? Error = null)
 {
-    public static TopicDispatchResult Ok(string runId) => new(true, runId, "accepted");
+    public static TopicDispatchResult Ok(string runId, string code = "accepted") => new(true, runId, code);
 
     public static TopicDispatchResult Reject(string code, string runId = "", string? error = null)
         => new(false, runId, code, error);
 }
 
+public static class TopicOutboxStates
+{
+    public const string Pending = "pending";
+    public const string RelayQueued = "relay_queued";
+    public const string DeviceQueued = "device_queued";
+    public const string Running = "running";
+    public const string CancelPending = "cancel_pending";
+    public const string Expired = "expired";
+    public const string Failed = "failed";
+}
+
+public static class InboundTopicRunStates
+{
+    public const string Accepted = "accepted";
+    public const string Running = "running";
+    public const string Completed = "completed";
+    public const string Failed = "failed";
+    public const string Cancelled = "cancelled";
+    public const string Interrupted = "interrupted";
+}
+
+public static class TopicTransportPolicy
+{
+    public static readonly TimeSpan RequestLifetime = TimeSpan.FromDays(14);
+    public static readonly TimeSpan DedupRetention = TimeSpan.FromDays(30);
+}
 /// <summary>Terminal result from one local topic turn.</summary>
 public sealed record TopicRunCompletion(
     string RunId,

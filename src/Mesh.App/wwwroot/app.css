@@ -443,6 +443,10 @@ input[type=checkbox]:not(.switch input):checked::after {
 /* per-bubble agent/person tag */
 .msg-tag { margin-top: 4px; font-size: .68rem; opacity: .7; display: inline-flex; align-items: center; gap: 4px; text-transform: uppercase; letter-spacing: .02em; }
 .msg-tag i.bi { font-size: .8rem; }
+.msg-tag.queue-tag { gap: 6px; }
+.queue-cancel { width: 24px; height: 24px; margin: -5px -5px -5px 1px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; opacity: .85; display: inline-grid; place-items: center; cursor: pointer; }
+.queue-cancel:hover, .queue-cancel:focus-visible { background: rgba(127,127,127,.18); opacity: 1; outline: none; }
+.queue-cancel i.bi { font-size: .72rem; }
 .bubble.user .msg-tag { color: rgba(255,255,255,.85); }
 .bubble.assistant .msg-tag { color: var(--fg-3); }
 
