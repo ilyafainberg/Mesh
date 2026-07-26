@@ -22,9 +22,6 @@ public class AppDelegate : MauiUIApplicationDelegate
 
     public override bool FinishedLaunching(UIApplication application, NSDictionary? launchOptions)
     {
-        // BlazorWebView manages HTML focus and viewport resizing itself. MAUI's native keyboard
-        // auto-scroll applies a second adjustment that pushes the entire web surface upward.
-        Microsoft.Maui.Platform.KeyboardAutoManagerScroll.Disconnect();
 
         // Present relay-composed alerts even while the app is foregrounded (iOS suppresses them by default).
         // UNUserNotificationCenter holds a weak delegate, so AppDelegate keeps the managed instance alive.
