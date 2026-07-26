@@ -1,8 +1,4 @@
 using Microsoft.AspNetCore.Components.WebView;
-#if IOS
-using Microsoft.Maui.Controls.PlatformConfiguration;
-using Microsoft.Maui.Controls.PlatformConfiguration.iOSSpecific;
-#endif
 using Mesh.App.Services;
 
 namespace Mesh.App;
@@ -13,8 +9,10 @@ public partial class MainPage : ContentPage
     {
         InitializeComponent();
 #if IOS
-        // Keep the entire Blazor surface below the status bar, Dynamic Island, and sensor housing.
-        On<iOS>().SetUseSafeArea(true);
+        // Match the exposed iOS safe areas to the white mobile navigation surface.
+        BackgroundColor = Colors.White;
+        blazorWebView.BackgroundColor = Colors.White;
+        SafeAreaEdges = Microsoft.Maui.SafeAreaEdges.All;
 #endif
     }
 

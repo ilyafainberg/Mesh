@@ -9,8 +9,9 @@ relay, and any Mesh client can point at it. This document explains how.
 - **Does not see**: message contents. Bodies are end-to-end encrypted to the
   recipient's device keys before they reach the relay.
 - **Sees**: the handle directory (handle to device-public-key mappings), presence
-  (who is connected), and routes ciphertext between handles. For a fan-out it also
-  sees the sender, transient recipient cohort, timing, and ciphertext size. It stamps
+  (who is connected), agent-response device policy and dispatch lifecycle metadata,
+  and routing metadata for ciphertext between handles. For a fan-out it also sees
+  the sender, transient recipient cohort, timing, and ciphertext size. It stamps
   the authenticated sender on every message.
 
 A fan-out carries one ciphertext and 1 to 128 transient recipient handles. The relay
@@ -26,6 +27,11 @@ Relay and client share a registration protocol. Since v1.1.0 the relay requires 
 signed proof-of-possession on handle registration (collision avoidance), so run a
 client of v1.1.0 or newer against a v1.1.0 or newer relay. Older clients cannot
 register on a v1.1.0 relay.
+
+Single-device agent responses require a relay whose health capabilities report
+`protocolVersion` 4 or newer and `atomicAgentDispatch: true`. New clients fall back
+to legacy agent routing when that capability is absent; legacy routing does not have
+the relay-enforced at-most-one-response guarantee.
 
 ## Quick start (Docker)
 
@@ -67,7 +73,7 @@ in-memory, single node, with no hosted model.
 | Env var | appsettings key | Purpose | Default |
 |---|---|---|---|
 | `ASPNETCORE_URLS` | standard ASP.NET Core | Listen address | `http://+:8080` (Docker) |
-| `COSMOS_CONNECTION` | `Cosmos:Connection` | Azure Cosmos connection string. Makes handles, rate policies, invites, and offline inbox durable. | in-memory |
+| `COSMOS_CONNECTION` | `Cosmos:Connection` | Azure Cosmos connection string. Makes handles, agent-response routing and queued dispatches, rate policies, invites, and offline inbox durable. | in-memory |
 | `COSMOS_DB` | `Cosmos:Database` | Cosmos database name | `mesh` |
 | `REDIS_CONNECTION` | `Redis:Connection` | Shares presence, live Direct/Group buckets, quota, and cross-node routing across replicas. | in-memory |
 | `BLOB_CONNECTION` | `Blob:Connection` | Azure Storage connection string (with account key). Enables blob-backed attachments: clients upload encrypted attachment ciphertext to a relay-issued SAS URL and send only a pointer. Apply `_deploy/apply-attachments-lifecycle.ps1` for the 14-day auto-expiry. | disabled |
@@ -136,8 +142,12 @@ to enable Android. With none set, the relay behaves exactly as before (no push).
 - **Durable + multi-replica**: set both `COSMOS_CONNECTION` and `REDIS_CONNECTION`,
   then run as many replicas as you like behind a load balancer with sticky sessions
   (the SignalR WebSocket connection must stay on one replica). Cosmos stores durable
-  per-handle policy overrides; Redis handles presence, shared live rate buckets, and
-  directed cross-replica message forwarding.
+  handle records, queued atomic agent dispatches, and per-handle policy overrides;
+  Redis handles device presence, shared live rate buckets, and directed cross-replica
+  message forwarding. Both services are required for durable atomic dispatch across replicas.
+  Protocol-4 replicas also negotiate acknowledged single-connection delivery through
+  Redis. During a rolling upgrade, atomic work for a device on an older replica stays
+  queued until it reconnects to an upgraded replica.
 
 ```bash
 docker compose --profile redis up   # relay + Redis locally

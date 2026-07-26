@@ -1,4 +1,5 @@
 using Mesh.Relay.RateLimiting;
+using Mesh.Shared;
 
 namespace Mesh.Relay.Storage;
 
@@ -35,6 +36,18 @@ public sealed class StoredHandle
     /// <summary>Remote-agent opt-in state keyed by stable device id.</summary>
     public Dictionary<string, bool> DeviceRemoteAgentEnabled { get; set; } = new();
 
+    /// <summary>Atomic agent-dispatch protocol support keyed by stable device id.</summary>
+    public Dictionary<string, bool> DeviceAtomicAgentDispatchEnabled { get; set; } = new();
+
+    /// <summary>The owner's selected device for answering agent-addressed Messages.</summary>
+    public string? AgentPrimaryDeviceId { get; set; }
+
+    /// <summary>An optional second device used only while the primary is unavailable.</summary>
+    public string? AgentFailoverDeviceId { get; set; }
+
+    public string AgentRoutingVersion { get; set; } = "";
+    public bool AgentPrimaryWasSelectedAutomatically { get; set; }
+
     /// <summary>
     /// Push tokens keyed by stable device id, used to wake a backgrounded device via APNs/FCM.
     /// The relay only sends a content-free/metadata alert; it never puts message contents here.
@@ -64,6 +77,78 @@ public sealed class StoredEnvelope
     public string To { get; set; } = "";
     public string Json { get; set; } = "";
     public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public static class AgentDispatchStates
+{
+    public const string Pending = "pending";
+    public const string Assigned = "assigned";
+    public const string Delivered = "delivered";
+    public const string Completed = "completed";
+}
+
+/// <summary>
+/// Durable relay-side metadata for one opaque, end-to-end encrypted agent request. The relay stores
+/// ciphertext plus routing state only. It never reads the question or answer.
+/// </summary>
+public sealed class StoredAgentDispatch
+{
+    public string Id { get; set; } = "";
+    public string RequestId { get; set; } = "";
+    public string From { get; set; } = "";
+    public string To { get; set; } = "";
+    public string EnvelopeJson { get; set; } = "";
+    public string EnvelopeHash { get; set; } = "";
+    public List<string> RecipientDeviceIds { get; set; } = new();
+    public string DispatchToken { get; set; } = "";
+    public string State { get; set; } = AgentDispatchStates.Pending;
+    public string? AssignedDeviceId { get; set; }
+    public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? AssignedAt { get; set; }
+    public DateTimeOffset? DeliveredAt { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; }
+}
+
+public enum AgentDispatchCreateStatus
+{
+    Created,
+    Duplicate,
+    Conflict
+}
+
+public sealed record AgentDispatchCreateResult(
+    AgentDispatchCreateStatus Status,
+    string State,
+    string? AssignedDeviceId);
+
+public static class AgentDispatchKey
+{
+    public static string Create(string fromHandle, string requestId)
+    {
+        var material = $"{LinkProtocol.Normalize(fromHandle)}\u001f{requestId}";
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(material))).ToLowerInvariant();
+    }
+}
+
+public static class AgentDispatchRecipientPolicy
+{
+    public static string? ChooseDevice(
+        IEnumerable<string>? recipientDeviceIds,
+        IEnumerable<string> candidateDeviceIds)
+    {
+        ArgumentNullException.ThrowIfNull(candidateDeviceIds);
+        var recipients = recipientDeviceIds?
+            .Where(deviceId => !string.IsNullOrWhiteSpace(deviceId))
+            .ToHashSet(StringComparer.Ordinal) ?? new HashSet<string>(StringComparer.Ordinal);
+        foreach (var candidate in candidateDeviceIds.Where(deviceId => !string.IsNullOrWhiteSpace(deviceId)))
+        {
+            // Empty recipient metadata is accepted only for records written before this field existed.
+            if (recipients.Count == 0 || recipients.Contains(candidate))
+                return candidate;
+        }
+        return null;
+    }
 }
 
 /// <summary>
@@ -111,6 +196,14 @@ public interface IRelayStore
         string? name,
         string platform,
         bool remoteAgentEnabled,
+        bool atomicAgentDispatchEnabled,
+        CancellationToken ct = default);
+
+    Task<bool> SetAgentRoutingAsync(
+        string handle,
+        string primaryDeviceId,
+        string? failoverDeviceId,
+        string expectedVersion,
         CancellationToken ct = default);
 
     /// <summary>
@@ -140,6 +233,42 @@ public interface IRelayStore
 
     /// <summary>Drains and returns all queued messages for a handle (FIFO), removing them.</summary>
     Task<IReadOnlyList<string>> DrainInboxAsync(string toHandle, CancellationToken ct = default);
+
+    Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
+        StoredAgentDispatch dispatch,
+        CancellationToken ct = default);
+
+    Task<StoredAgentDispatch?> GetAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        CancellationToken ct = default);
+
+    /// <summary>Assigns each pre-delivery request to the first candidate with an encrypted key slot.</summary>
+    Task AssignPendingAgentDispatchesAsync(
+        string toHandle,
+        IReadOnlyList<string> candidateDeviceIds,
+        CancellationToken ct = default);
+
+    /// <summary>Atomically claims at most one assigned request for a delivery attempt.</summary>
+    Task<IReadOnlyList<StoredAgentDispatch>> TakeAssignedAgentDispatchesAsync(
+        string toHandle,
+        string deviceId,
+        CancellationToken ct = default);
+
+    Task<bool> ReleaseAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        string deviceId,
+        string? nextDeviceId = null,
+        CancellationToken ct = default);
+
+    Task<bool> CompleteAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        string fromHandle,
+        string dispatchToken,
+        string respondingDeviceId,
+        CancellationToken ct = default);
 
     /// <summary>Loads an administrative per-handle rate-policy override, or null for defaults.</summary>
     Task<HandleRatePolicy?> GetHandleRatePolicyAsync(string handle, CancellationToken ct = default);

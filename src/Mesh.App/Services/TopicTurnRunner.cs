@@ -499,7 +499,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             Bound(step.Label, 4096)!,
             MapState(step.State),
             Bound(step.Arguments, 32 * 1024),
-            Bound(step.Result, 32 * 1024));
+            Bound(step.Result, 32 * 1024),
+            Bound(step.ToolName, TopicRunProtocol.MaxIdChars));
 
     private static TopicRunItemState MapState(AgentStepState state) => state switch
     {

@@ -17,6 +17,9 @@ This guide covers the two open-source components of Mesh: **Mesh.Relay** (the Si
 7. [Building and Running with Docker](#7-building-and-running-with-docker)
 8. [Testing and Contributing](#8-testing-and-contributing)
 9. [Extending the Relay](#9-extending-the-relay)
+10. [Mesh.App UI Mode (Developer Reference)](#10-meshapp-ui-mode-developer-reference)
+11. [GitHub Copilot CLI model provider](#11-github-copilot-cli-model-provider)
+12. [Client token optimization](#12-client-token-optimization)
 
 ---
 
@@ -233,6 +236,8 @@ The envelope is the unit of routing:
 | `FromDevice` (optional, trailing) | Sending device's routing id. Stamped by the relay from the authenticated connection. |
 | `ToDevice` (optional, trailing) | Target device routing id; enables per-device delivery with broadcast fallback. |
 | `PushHint` (optional, trailing) | Metadata-only notification hint. `topic.response` is valid only on a same-handle, device-targeted `topic.run.update`; the encrypted body remains opaque. |
+| `AgentRequestId` (optional, trailing) | Original atomic agent request id. The relay stamps it on an assigned request and requires the response to echo it. |
+| `AgentDispatchToken` (optional, trailing) | Opaque relay-issued fencing token for one assigned atomic request. The relay removes it before routing an accepted response to the original sender. |
 
 #### 4.2.2 MeshKinds
 
@@ -242,7 +247,8 @@ The envelope is the unit of routing:
 |-------------------|---------|
 | `chat` | Handle-to-handle chat message. |
 | `direct` | Direct message. |
-| agent request / agent response | Agent invocation request and its response. |
+| `agent.request` / `agent.response` | Legacy agent invocation and response. These retain broadcast behavior and do not provide an at-most-one-response guarantee. |
+| `agent.atomic.request` / `agent.atomic.response` | Capability-gated, relay-assigned agent invocation and its fenced response. Both bodies must be E2E encrypted. |
 | remote-agent request / remote-agent response | Cross-handle (remote) agent invocation and response. |
 | `fanout` | Generic relay-visible fan-out wrapper; the semantic type remains encrypted. |
 | `group.control` | Inner `MeshFanoutContent.Kind` for a complete client-side group snapshot. |
@@ -314,7 +320,7 @@ The relay must remain group-agnostic. Do not add group IDs, membership, roles, g
 
 | Type | Role |
 |------|------|
-| `RegisterHandleRequest` | Claim/register a handle. Carries `handle`, `devicePublicKey`, a `signature` proof-of-possession, a `recoveryPublicKey`, `deviceName`, and `displayName`. |
+| `RegisterHandleRequest` | Claim/register a handle. In addition to identity fields, a current client advertises `devicePlatform`, `remoteAgentEnabled`, and `atomicAgentDispatchEnabled`. |
 | `RegisterHandleResponse` | Result of registration. |
 | `ClaimProtocol` | Builds the **canonical claim message** that the device signs to prove possession of the device key when claiming a handle. |
 | `LinkInviteRequest` / `LinkInviteResponse` | Begin linking a new device to an existing handle. |
@@ -326,11 +332,42 @@ The relay must remain group-agnostic. Do not add group IDs, membership, roles, g
 
 | Type | Role |
 |------|------|
-| `DeviceInfo` | Per-device metadata. |
+| `DeviceInfo` | Public per-device metadata: stable id, name, online state, platform, model/remote-agent readiness, and atomic-dispatch capability. |
 | `DeviceProtocol.DeviceId` | Computes the per-device routing id (consistent with `MeshCrypto.DeviceId`). |
 | `HandleInfo` | Public directory view of a handle. |
 
-#### 4.2.6 Connectors and hosted model
+#### 4.2.6 Atomic agent dispatch
+
+Protocol version 4 relays advertise `atomicAgentDispatch: true` in the `capabilities` object returned by both `GET /` and `GET /health`. A supporting device sets `AtomicAgentDispatchEnabled = true` when it registers. It must refresh registration when its model readiness changes because `RemoteAgentEnabled` is part of execution eligibility.
+
+A device is **selectable** when it is registered, desktop-class, and atomic-protocol capable. It is **execution-ready** when it is also currently online and advertises `RemoteAgentEnabled = true`. Mobile devices are never selectable. The relay uses the explicit primary first, then the optional failover, and never chooses an unrelated third device. If no primary was saved, the first selectable desktop becomes a sticky automatic primary.
+
+The relay-authoritative routing policy uses these shared contracts:
+
+| Type | Role |
+|------|------|
+| `AgentRoutingQueryRequest` | Signed read request using `AgentRoutingProtocol.QueryMessage(handle)`. |
+| `AgentRoutingUpdateRequest` | Signed primary/failover update with `ExpectedVersion` for compare-and-swap. |
+| `AgentRoutingInfo` | Current primary, optional failover, version, and whether the primary was selected automatically. |
+| `AgentDispatchCodes` | Successful send codes: `agent_dispatch_accepted` or `agent_dispatch_queued`. |
+
+Clients read policy with `POST /handles/{handle}/agent-routing/query` and update it with `PUT /handles/{handle}/agent-routing`. The primary must be selectable; the failover must be a different selectable device or null. A stale `ExpectedVersion` returns HTTP 409 with the current policy, preventing one linked device from silently overwriting a newer choice.
+
+The atomic wire lifecycle is:
+
+1. After capability detection, the sender creates a stable envelope id, uses `agent.atomic.request`, encrypts the body to the recipient handle's device keys, and signs the ciphertext. There is no plaintext fallback.
+2. The relay rejects sender-supplied `ToDevice`, `AgentRequestId`, or `AgentDispatchToken`. It persists the opaque envelope, an envelope hash for idempotence, the registered recipient device ids that have wrapped content-key slots, sender/recipient metadata, a random dispatch token, and `pending` state.
+3. The relay orders the ready candidates as primary then failover and assigns each queued request to the first candidate that has a wrapped key slot in that request. `assigned` is pre-delivery and can be reclaimed after a restart or policy change. The relay claims one record at a time as `delivered` immediately before handoff, then sends it to exactly one connection with `ToDevice`, `AgentRequestId`, and `AgentDispatchToken` populated. If no ready configured device can decrypt the request, it remains queued.
+4. The assigned client deduplicates the envelope id, serializes guest-agent turns per sender, and replies with `agent.atomic.response`, the same request id and token, and an E2E-encrypted body.
+5. The relay accepts a response only while the dispatch is `delivered` and only from the assigned device with the matching original sender, request id, and token. One compare-and-swap changes the state to `completed`, clears the retained request ciphertext and recipient key-slot ids, strips the token from the routed response, and rejects every later completion attempt.
+
+A confirmed failure to find the selected connection reassigns directly to an online, decrypt-capable configured failover when one exists; otherwise it returns the dispatch to `pending`. A Redis acknowledgement timeout or remote send exception is uncertain, so the relay deliberately keeps the request fenced as `delivered` rather than risk executing it on a second device. This favors the at-most-one-answer guarantee over automatic failover after an ambiguous handoff.
+
+The dispatch key is derived from sender handle plus request id. An exact retry with the same retained envelope hash is idempotent, including after completion; reuse of that id for different envelope bytes is rejected as `agent_dispatch_id_conflict`. Cosmos keeps dispatch records in the `agent-dispatches` container with the same 14-day TTL as the offline inbox.
+
+Compatibility is capability-gated. A new client must use legacy kinds when the relay does not advertise atomic dispatch, and a new relay continues to route legacy kinds for older clients. Legacy traffic has no atomic guarantee. Across Redis, a replica also advertises an internal single-connection delivery capability; a protocol-4 coordinator does not forward atomic work to an older replica that lacks it, so rolling upgrades degrade to queueing rather than duplicate execution. An atomic request for a handle with no compatible desktop queues rather than broadcasting to incompatible devices.
+
+#### 4.2.7 Connectors and hosted model
 
 | Type | Role |
 |------|------|
@@ -339,7 +376,20 @@ The relay must remain group-agnostic. Do not add group IDs, membership, roles, g
 | `HostedModelRequest` | Request to the hosted free-model proxy. |
 | `HostedModelMessage` | A message in a hosted-model conversation. |
 
-#### 4.2.7 Capability directory (services)
+#### 4.2.8 Linked-device profile synchronization
+
+`DeviceSyncOperation` is the versioned unit used by interoperable clients to synchronize private profile state between authorized devices of the same handle. These operations are serialized inside end-to-end-encrypted device-targeted envelopes; the relay routes ciphertext and does not interpret the operation payload.
+
+`DeviceSyncKinds` defines both the envelope-level sync kinds and the operation kinds. Memory synchronization uses:
+
+| Operation kind | Payload |
+|------|------|
+| `memory.upsert` | `DeviceSyncMemory` with the owner-visible content, category, origin, salience metadata, source correlation, and timestamps. |
+| `memory.delete` | Empty payload plus the memory entity id and operation version. |
+
+`DeviceSyncMemory` deliberately omits local recall counters and last-recalled time. Those values describe use on one device and must not overwrite newer shared content. Clients should compare operation versions atomically, retain deletion tombstones, reject stale upserts, and allow recreation only with a version newer than both the prior upsert and delete.
+
+#### 4.2.9 Capability directory (services)
 
 | Type | Role |
 |------|------|
@@ -351,7 +401,7 @@ The relay must remain group-agnostic. Do not add group IDs, membership, roles, g
 | `ServiceDirectoryProtocol` | Directory helpers, including `WilsonScore` (ranking/scoring). |
 | `ServiceCategories` | The fixed list of service categories. |
 
-#### 4.2.8 System handles and links
+#### 4.2.10 System handles and links
 
 | Type | Role |
 |------|------|
@@ -382,6 +432,7 @@ Mesh.Relay is AGPL-3.0. It is a minimal-API ASP.NET Core application (`Program.c
                 |   - verify signature on every message     |
                 |   - stamp authenticated From/FromDevice   |
                 |   - MeshRouter                            |
+                |   - AgentDispatchCoordinator               |
                 +----------------+--------------------------+
                                  |
              +-------------------+--------------------+
@@ -408,6 +459,8 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 | POST | `/handles/{handle}/recover` | Recover a handle using the recovery key. | Signed (recovery) |
 | GET | `/handles/{handle}` | Public handle info. | Public |
 | GET | `/handles/{handle}/devices` | Device directory for a handle. | Public |
+| POST | `/handles/{handle}/agent-routing/query` | Read relay-authoritative primary/failover policy. | Signed device key |
+| PUT | `/handles/{handle}/agent-routing` | Compare-and-swap update of primary/failover policy. | Signed device key |
 | POST | `/handles/resolve` | Batch-resolve device public keys. Body: `HandleKeysBatchRequest`; missing handles are omitted. Limited to 10 requests/minute per IP in addition to the global REST limit. | Public |
 | DELETE | `/handles/{handle}` | Delete a handle. | Signed |
 | GET | `/admin/handles/{handle}/rate-policy` | Read the effective policy and whether an override exists. | `X-Mesh-Admin-Key` |
@@ -451,6 +504,8 @@ For fan-out, the hub additionally validates 1 to 128 distinct normalized recipie
 
 Per-device routing honors `ToDevice`: if set, the message targets that device, with **broadcast fallback** to all of the handle's devices when appropriate. A device sending to its own handle is **excluded from its own connection** (you do not receive an echo of your own send).
 
+Atomic agent requests are an explicit exception to broadcast fallback and the ordinary offline inbox. `AgentDispatchCoordinator` persists and assigns them, and `MeshRouter.RouteAtomicAgentRequestAsync` delivers to exactly one connection of the selected device. Atomic responses are routed only after the coordinator completes the durable fence.
+
 Delivery to clients uses the **`Receive`** method.
 
 ### 5.4 Storage and backplane abstractions
@@ -468,6 +523,7 @@ Delivery to clients uses the **`Receive`** method.
 | rate-policies | Administrative per-handle logical-message policy overrides. | - |
 | invites | Device-link invites. | Native TTL. |
 | inbox | Offline message queue. | `DefaultTimeToLive` of **14 days**. Reserved handles get a per-item **ttl of -1** (never expire). |
+| agent-dispatches | Opaque atomic agent request envelope, encrypted recipient device ids, routing assignment, token, hash, and lifecycle timestamps. | `DefaultTimeToLive` of **14 days**. Completed records retain fence metadata/hash but clear request ciphertext and recipient device ids. |
 | services directory | Published capability/service listings. | - |
 
 #### 5.4.2 Backplane
@@ -478,6 +534,7 @@ The backplane and live rate-limit store use **Redis** to provide:
 - **Atomic per-handle Direct and Group token buckets** shared by all replicas.
 - **Per-handle quota** tracking.
 - **Cross-instance publish** to the owner instance for directed forwarding.
+- **Acknowledged atomic forwarding** with per-replica single-connection capability negotiation and explicit uncertain outcomes.
 
 With no Redis configured the relay uses in-memory presence, routing, quota, and rate buckets. That fallback is local to one process and is suitable only when a global multi-replica limit is not required.
 
@@ -545,6 +602,9 @@ Optionally generate a **recovery keypair** for handle recovery.
   "signature": "<base64 signature over the canonical claim>",
   "recoveryPublicKey": "<base64 SPKI>",
   "deviceName": "laptop",
+  "devicePlatform": "windows",
+  "remoteAgentEnabled": true,
+  "atomicAgentDispatchEnabled": true,
   "displayName": "Alice"
 }
 ```
@@ -588,7 +648,7 @@ Do not set `From`/`FromDevice` yourself; the relay stamps the authenticated valu
 
 ### 6.7 Multi-recipient and multi-device
 
-`Encrypt` supports multiple recipient keys, producing one wrapped content key per deviceId in the `keys` map. This is how a message reaches all of a handle's devices. When a specific device is targeted with `ToDevice`, the relay routes to that device with broadcast fallback.
+`Encrypt` supports multiple recipient keys, producing one wrapped content key per deviceId in the `keys` map. This is how an ordinary message reaches all of a handle's devices. Ordinary `ToDevice` routing can use broadcast fallback; atomic agent requests must instead use the capability-gated coordinator path, which never broadcasts.
 
 ### 6.8 Implement client-side groups
 
@@ -601,6 +661,17 @@ Use the contracts and validation rules in [Section 4.2.3](#423-stateless-fan-out
 5. Invoke `MeshHubProtocol.SendFanout` once with 1 to 128 recipient handles and require an accepted `MeshSendResult`.
 
 Do not place group IDs, membership, or the inner group kind in relay-visible fields. A compatible client must retain enough local state to reject unknown groups, non-members, mismatched versions, and duplicate message IDs.
+
+### 6.9 Implement atomic agent questions
+
+Use the detailed contract in [Section 4.2.6](#426-atomic-agent-dispatch). An interoperable implementation must:
+
+1. Read the relay capability object and send atomic kinds only when `atomicAgentDispatch` is true.
+2. Advertise the device platform, current model readiness, and atomic support during registration. Advertise support only if the client implements request deduplication, exact-device checks, encrypted request/response handling, and token echoing.
+3. Use the signed routing endpoints and preserve the returned version for compare-and-swap updates.
+4. Encrypt every atomic body, keep request envelope ids stable across retries, and interpret both successful dispatch codes. `agent_dispatch_queued` is accepted queueing, not a send failure; it survives restart only when the relay uses durable storage.
+5. On receipt, require `ToDevice` to match the local device, require the request id and dispatch token, deduplicate before model execution, and serialize turns for the same sender. Echo the request id and token only on the matching atomic response.
+6. Treat `invalid_agent_dispatch_response` as terminal for that response. Never fall back to a legacy response after an atomic request because that would bypass the relay fence.
 
 ---
 
@@ -827,3 +898,26 @@ remains the single source of truth.
 
 Changing the selected model or effort restarts the ACP child process on the next request. `Auto` omits
 the corresponding CLI option and leaves the choice to Copilot.
+
+---
+
+## 12. Client token optimization
+
+The reference client exposes a provider-neutral **Token Optimization** setting. This is a client-only inference feature, not a `Mesh.Shared` wire field or relay configuration. Interoperable clients may implement their own equivalent or ignore it without affecting message compatibility.
+
+| Level | Request behavior |
+|---|---|
+| `Disabled` | Bypasses the optimization layer. Existing caller history windows and provider limits still apply. |
+| `MaxAccuracy` | Keeps all older turn groups and uses generous text and tool-result limits. |
+| `Balanced` | Default. Keeps recent turns plus the most relevant older turns, knowledge, and skills, and compacts repetitive or oversized machine output. |
+| `MaxSavings` | Keeps the smallest relevant context set and uses the tightest text, JSON-array, and tool-result limits. |
+
+The reference-client pipeline has these invariants:
+
+1. Contact, circle, owner-only, and public-service visibility rules run before relevance selection. Optimization can only remove data from an authorized set.
+2. System and security instructions and the latest user turn remain verbatim.
+3. The optimizer creates new request objects where text changes. Durable `ChatLine`, memory, knowledge, skill, and tool-result records are never rewritten.
+4. Optimization runs before provider-specific serialization, so OpenAI-compatible providers, Anthropic, Gemini, Azure OpenAI, the Mesh hosted model, browser providers, Foundry Local, and GitHub Copilot ACP share the same setting.
+5. In the standard provider tool loops, user-visible progress receives the raw clipped tool result before the model receives its optimized copy. The Copilot loopback MCP scope carries the same level and returns the optimized copy to ACP.
+
+The Mesh hosted `/model/chat` endpoint therefore receives already-optimized plaintext. The relay does not perform this optimization and does not know which level the client selected. This reduces token usage and quota consumption, but it does not make a hosted or cloud model request confidential from that model path.

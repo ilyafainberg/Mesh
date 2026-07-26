@@ -12,7 +12,7 @@ Welcome to Mesh. This guide explains what the Mesh app does and how to use it, s
 4. [Your Agent (Me and Threads)](#4-your-agent-me-and-threads)
 5. [Messaging People and Agents](#5-messaging-people-and-agents)
 6. [Contacts and Circles](#6-contacts-and-circles)
-7. [Knowledge, Skills, and Widgets](#7-knowledge-skills-and-widgets)
+7. [Memories, Knowledge, Skills, and Widgets](#7-memories-knowledge-skills-and-widgets)
 8. [Connecting Live Knowledge Sources](#8-connecting-live-knowledge-sources)
 9. [Local Tools and MCP](#9-local-tools-and-mcp)
 10. [Community and Public Services](#10-community-and-public-services)
@@ -31,7 +31,7 @@ Welcome to Mesh. This guide explains what the Mesh app does and how to use it, s
 Mesh is a private messenger with a personal AI agent built in. It combines three ideas that usually live in separate apps:
 
 - **A secure messenger.** You talk to other people using a simple handle (like a username). Your conversations are end-to-end encrypted, which means only the intended people can read them.
-- **A personal AI agent.** Every Mesh identity comes with its own agent: a private assistant that can chat with you, remember the knowledge you give it, run skills you define, build small apps for you, and (with your permission) talk to other people's agents on your behalf.
+- **A personal AI agent.** Every Mesh identity comes with its own agent: a private assistant that can chat with you, remember durable details across Me topics, use the knowledge you give it, run skills you define, build small apps for you, and (with your permission) talk to other people's agents on your behalf.
 - **An open relay.** Messages travel through a relay server whose only job is to route sealed, encrypted messages between devices. The relay cannot read your messages. It never sees the contents.
 
 The Mesh client is a desktop and mobile app. It runs on Windows and Android, with iOS builds as well. The look and behavior are consistent across platforms, though the layout adapts to each screen size.
@@ -110,11 +110,12 @@ Every message you send is encrypted on your device before it leaves, and it can 
 
 ## 4. Your Agent (Me and Threads)
 
-The **Me** screen is a private chat between you and your own agent. This is your personal space. Your agent here has **full access** to everything you have given it: your knowledge, your skills, your tools, and your connected sources.
+The **Me** screen is a private chat between you and your own agent. This is your personal space. Your agent here has **full access** to everything you have given it: your memories, your knowledge, your skills, your tools, and your connected sources.
 
 Use the Me chat to:
 
 - Ask questions and get help.
+- Have your agent recall durable preferences, facts, goals, workflows, and constraints across topics.
 - Have your agent search or summarize your knowledge.
 - Run your skills.
 - Ask your agent to build a widget (a small app) for you.
@@ -150,6 +151,14 @@ Each conversation has a per-conversation **Agent / Person toggle**. This decides
 - **Person:** your message goes to the **person directly**, like a normal chat.
 
 This toggle is powerful: it lets you get a quick answer from someone's agent (for example, "what are your office hours?") without interrupting the person, or reach the person directly when you need them.
+
+### How Mesh chooses the device that answers
+
+On relays that support single-device agent responses, each message sent with **Agent** selected is assigned to one compatible desktop for that contact. The first compatible desktop becomes the primary automatically. The owner can select a different primary and an optional failover under **Settings > Agent responses**.
+
+The relay hands the encrypted question to exactly one connection on the primary. It uses the failover only when the primary is offline or cannot run its configured model. If neither configured device is ready, the sender sees **"[Name]'s agent is unavailable. Message queued."** The relay keeps the encrypted request queued and dispatches it when an eligible configured device reconnects.
+
+Only the assigned device can complete the request, so opening the same identity on several devices does not produce duplicate agent replies. Older relays continue to use legacy routing and do not show these device settings.
 
 ### Delivery receipts
 
@@ -210,15 +219,23 @@ Add contacts by their **handle**. Your contacts list is how you keep track of th
 
 You organize contacts into **circles**. A circle is a named group of contacts (for example, "Family," "Work," or "Book club"). Circles are the heart of how Mesh keeps sharing private.
 
-### Sharing is scoped by circle
+### Sharing is scoped by audience
 
-This is the key privacy idea. When another person's agent talks to your agent, it only sees the **knowledge, skills, and widgets you have shared with that person's circle**. Nothing else. This is called **privacy by binding**: what a contact can access is bound to the circle you placed them in.
+This is the key privacy idea. Knowledge, skills, widgets, connected sources, folder grants, and tools each have an audience:
+
+- **Only me:** available only to your own agent.
+- **Selected circles:** choose one or more circles. A contact gains access when they belong to any selected circle.
+- **All allowed contacts:** available to every contact you have explicitly allowed.
+
+This is called **privacy by binding**: what a contact can access is bound to their circle membership and the audience you selected. "All allowed contacts" does not publish anything to Community. Public services remain a separate, explicitly configured feature.
 
 For example:
 
-- You share a "Recipes" knowledge item with your **Family** circle.
-- A contact in your **Work** circle asks your agent about recipes.
-- Your agent will not surface the recipes, because that contact is not in the circle you shared them with.
+- You share a "Recipes" knowledge item with **Family** and **Close friends**.
+- A contact in either circle can ask your agent about recipes.
+- A contact who belongs only to **Work** cannot access it.
+
+On desktop, the audience control opens beside the field. On phones, it opens as a bottom sheet. Select the circles you want, then tap **Done** to apply them together.
 
 ### Approval modes
 
@@ -227,17 +244,34 @@ Approval modes control whether your agent **auto-replies** to an approved contac
 - Let trusted contacts' requests be answered automatically by your agent.
 - Or require your approval before your agent responds, so you stay in the loop.
 
-You can tune this per your comfort level. Approved contacts are still limited to what their circle can see.
+You can tune this per your comfort level. Approved contacts are still limited to what their selected audience permits.
 
 ---
 
-## 7. Knowledge, Skills, and Widgets
+## 7. Memories, Knowledge, Skills, and Widgets
 
-These three building blocks give your agent its abilities. All three can be shared with circles (see above) and some can be published publicly (see [Community](#10-community-and-public-services)).
+These features help your agent work consistently across conversations. **Memories are always private to you.** Knowledge, skills, and widgets have separate sharing controls and can be shared with one or more circles; some can also be published through [Community](#10-community-and-public-services).
+
+### Memories
+
+**Memories** are short, durable details that help your agent across separate Me topics, such as a stable preference, personal fact, ongoing goal, recurring workflow, or standing constraint. Mesh selects only the memories relevant to the current topic instead of inserting the entire collection into every request.
+
+After a successful Me turn, the agent can automatically remember an important detail directly supported by your latest message. It does not treat every message as a memory, and it does not save tool results, documents, email, web content, assistant guesses, temporary plans, credentials, payment data, private keys, recovery material, or similar secrets. Sensitive personal information is remembered automatically only when you explicitly ask Mesh to remember it.
+
+Memory is separated from messaging and sharing by design:
+
+- Memories are available only to your own agent in **Me topics**.
+- They are never attached to **Messages**, guest-agent requests, circles, or Community services.
+- They have no visibility, sharing, or publishing control.
+- They are stored in your identity's encrypted database, included in encrypted backups, and synchronized to your linked devices through end-to-end-encrypted device sync.
+
+Open **Memories** between **Settings** and **Backup** in the navigation menu to search, add, edit, or delete memories. Automatic changes show a **Remembered**, **Updated memory**, or **Forgot** banner. Use **Undo** to reverse that change when it is still current, or **View** to open the complete list. Deleting a memory creates a synchronized deletion so an older linked device cannot silently restore it.
+
+Relevant memory text becomes part of the model request for that Me turn. If you use a cloud model provider, that provider receives the selected memory along with the rest of the prompt. Use an on-device model when you do not want Me-topic content sent to a cloud model.
 
 ### Knowledge
 
-**Knowledge** is documents and notes your agent can use. Add the things you want your agent to know about: reference material, personal notes, project details, FAQs, and so on. Your agent can search and use this knowledge when it helps you or an approved contact.
+**Knowledge** is documents and notes your agent can use. Add the things you want your agent to know about: reference material, personal notes, project details, FAQs, and so on. Your agent can search and use this knowledge when it helps you or an approved contact. Unlike Memories, Knowledge has explicit audience controls.
 
 ### Skills
 
@@ -245,7 +279,7 @@ These three building blocks give your agent its abilities. All three can be shar
 
 ### Widgets
 
-**Widgets** are mini HTML apps that your agent can **build** for you. You can **pin** widgets so they are easy to reach, and **share** them with circles. Widgets are handy for small interactive tools, dashboards, calculators, trackers, and similar lightweight apps that live inside Mesh.
+**Widgets** are mini HTML apps that your agent can **build** for you. You can **pin** widgets so they are easy to reach, and **share** them with one or more circles. Widgets are handy for small interactive tools, dashboards, calculators, trackers, and similar lightweight apps that live inside Mesh.
 
 ---
 
@@ -261,6 +295,8 @@ Beyond documents you add directly, you can connect **live knowledge sources** so
 
 These are connected as **on-demand tools**. That is an important distinction: **nothing is bulk-copied** into Mesh. Your agent reaches into the source only when it needs an answer, and only for what is relevant to your request. Your information stays where it lives, and Mesh pulls just what it needs, when it needs it.
 
+Each connected source can be kept private, shared with selected circles, or opened to all allowed contacts. When a whole mail or drive source stays private, individual folders can have their own multi-circle audience.
+
 ---
 
 ## 9. Local Tools and MCP
@@ -271,7 +307,7 @@ Mesh can give your agent access to **local tools** that run on your device. Thes
 
 - **Owner-gated:** only you, the owner of the device, can turn these on.
 - **Off by default:** every local tool starts disabled. Nothing runs until you deliberately enable it.
-- **Optionally shared to a circle:** if you choose, you can make a local tool available to a specific circle. It is never shared unless you decide to.
+- **Audience-controlled:** if you choose, you can make a local tool available to one or more selected circles, or to all allowed contacts. It is never shared unless you decide to.
 
 ### Available local tools
 
@@ -289,7 +325,7 @@ Mesh can give your agent access to **local tools** that run on your device. Thes
 
 Mesh also supports **MCP tool servers**, which add extra capabilities to your agent. Some are **bundled** with the app, and you can add your own **custom** ones. As with local tools, these expand what your agent can do, so enable only what you trust.
 
-> Tip: because these tools can act on your device, only enable the ones you understand and need, and be thoughtful before sharing any of them to a circle.
+> Tip: because these tools can act on your device, only enable the ones you understand and need, and be thoughtful before sharing any of them with contacts.
 
 ---
 
@@ -301,7 +337,7 @@ Creating, managing, and hosting services is available on Windows and macOS clien
 
 ### What a public service is
 
-You can **publish** some of your **Knowledge, Skills, and Widgets** as a public service. When someone uses your service, they are talking to a **sandboxed version of your agent** that can only use the items you attached to that service. It **never** exposes your private items or your local tools. Your personal Me chat, your private knowledge, and your device tools stay private.
+You can **publish** some of your **Knowledge, Skills, and Widgets** as a public service. When someone uses your service, they are talking to a **sandboxed version of your agent** that can only use the items you attached to that service. It **never** exposes your private items or your local tools. Your owner memories, personal Me chat, private knowledge, and device tools stay private.
 
 ### How each service is defined
 
@@ -401,7 +437,7 @@ Because your keys and data live on your device, backups and device moves work a 
 
 Create a **passphrase-encrypted backup**. This backup carries:
 
-- **All your data** (your identities, knowledge, skills, widgets, settings, and so on).
+- **All your data** (your identities, memories, knowledge, skills, widgets, settings, and so on).
 - A **handle recovery key**, which lets you re-establish your handle on a new device.
 
 Important: the backup **never** includes your **device signing keys**. Those are unique to each device and are never exported. Choose a strong passphrase and keep it safe, because it is what protects the backup.
@@ -420,7 +456,7 @@ There are two ways the new device gets re-authorized:
 | **Device linking** | An already-authorized device issues a **QR code or link invite**. Scan or open it on the new device to link it under your handle. |
 | **Recovery** | Use the **handle recovery key** from your backup to re-establish the handle on the new device. |
 
-Device linking is the smooth path when you still have an authorized device handy. Recovery is there for when you do not (for example, if your old device is lost).
+Device linking is the smooth path when you still have an authorized device handy. Recovery is there for when you do not (for example, if your old device is lost). Linked devices synchronize memory additions, updates, and deletions through the same end-to-end-encrypted device-sync channel used for other private profile state.
 
 ### Why this design is good for you
 
@@ -435,6 +471,27 @@ Everything you can configure lives in **Settings**. Here are the settings that m
 ### Model
 
 Choose how your agent thinks: the free **Mesh-hosted model**, **bring your own API key** (Anthropic, OpenAI, Gemini, Grok, Groq, Azure OpenAI, OpenRouter), or **on-device with Foundry Local**. See [Installing and First Run](#2-installing-and-first-run) for details. You can change this at any time.
+
+#### Token Optimization
+
+**Token Optimization** controls how much of the temporary context copy Mesh sends to the selected AI model. It applies to every provider, including the Mesh free model and GitHub Copilot CLI.
+
+| Setting | What Mesh sends |
+|---|---|
+| **Disabled** | The normal Mesh context window, with no extra optimization. |
+| **Max Accuracy** | The most conversation and tool context, with only conservative cleanup. |
+| **Balanced** | Recent context plus the most relevant older context, with repeated and oversized machine output shortened. This is the default and recommended setting. |
+| **Max Savings** | The smallest relevant context and the strongest compaction. This saves the most tokens but can omit useful detail. |
+
+At every level, Mesh keeps the current user message and system and safety instructions verbatim. It only changes the in-flight copy used for that model request. It does not rewrite or delete encrypted chats, memories, knowledge, skills, or saved tool details.
+
+Token Optimization reduces token use and can lower provider cost, but it is not an additional privacy boundary. A cloud model provider still receives everything included in the optimized request. Choose an on-device model when the request content must stay on the device.
+
+### Agent response devices
+
+On a compatible relay, use **Settings > Agent responses** to choose the **Primary agent response device** and, optionally, a **Failover response device**. Only compatible Windows and macOS desktops appear. Each entry shows whether it is ready, offline, or has no available agent model.
+
+The first compatible desktop is selected automatically. The failover is used only while the primary is offline or cannot run its model. Choose **None** to keep questions queued for the primary instead. This policy is stored on the relay for the whole identity, so linked devices see the same selection. If the relay is too old, Mesh explains that single-device responses are unavailable.
 
 ### Relay URL
 
@@ -482,11 +539,11 @@ Reports go privately to the Mesh operator. If you are **offline** when you submi
 
 ### Someone I shared with cannot see my knowledge/skills/widgets.
 
-Sharing is **scoped by circle**. Make sure the contact is in the **circle** you shared those items with. If they are in a different circle, they will not see items shared to another circle. This is intentional privacy by binding.
+Sharing is **scoped by audience**. If you chose Selected circles, make sure the contact belongs to at least one of them. Membership in any selected circle grants access; membership only in other circles does not. You can also choose All allowed contacts.
 
 ### My agent will not use a local tool.
 
-Local tools are **off by default** and **owner-gated**. Open **Settings** and enable the specific tool you want. If you want a contact's circle to use it, share it to that circle explicitly.
+Local tools are **off by default** and **owner-gated**. Open **Settings** and enable the specific tool you want. If you want contacts to use it, choose one or more circles or All allowed contacts explicitly.
 
 ### A connected source is not returning anything.
 
@@ -496,9 +553,23 @@ Live sources (Microsoft 365, Google, Dropbox, Notion, Slack) are **on-demand**. 
 
 Set your **home device** in **Settings** so that mobile requests go to the one device you intend, rather than all of your devices.
 
+### A contact's agent says "unavailable. Message queued."
+
+The contact's configured primary and failover devices are currently offline or cannot run a model. The encrypted question remains queued and is dispatched when an eligible configured device becomes ready. If this is your own agent, open **Settings > Agent responses**, connect the selected desktop and make sure its model is configured, or choose a ready failover device.
+
+The selected device must also have been one of the recipient keys when the question was encrypted. If a desktop was linked or selected later, the sender may need to verify the updated contact identity and send a new question, or you can choose an older eligible failover that already has a key slot.
+
 ### How do I move to a new phone or computer?
 
 Create a **passphrase-encrypted backup** on your current device, then **import** it on the new device. The new device mints its own key and re-authorizes under your handle via **device linking** (scan a QR/link from an authorized device) or **recovery** (using the handle recovery key in your backup). See [Backup, Moving Devices, and Recovery](#14-backup-moving-devices-and-recovery).
+
+### Mesh closed unexpectedly or showed a reload error. How do I report it?
+
+Reopen or reload Mesh, go to **Settings > Diagnostics**, and choose **Copy diagnostics**. Paste the result into your bug report together with what you were doing immediately before the app closed or showed the error. Mesh keeps this log only on your device and does not intentionally add message text, prompts, keys, or tool arguments.
+
+On every platform, the report includes managed exceptions and Blazor UI renderer failures. On iOS it also includes Objective-C exception boundaries, lifecycle state, memory warnings, and Apple MetricKit crash or hang payloads when iOS makes them available. MetricKit data can arrive after a later launch, so copy the diagnostics again if the first report does not identify the cause.
+
+You can clear the retained diagnostics from the same Settings card.
 
 ### Can people read my messages on the relay?
 
@@ -506,7 +577,7 @@ No. Messages are **end-to-end encrypted**. The relay only routes sealed envelope
 
 ### Can others use my agent without my permission?
 
-Only in the ways you allow. Approved contacts see only what their **circle** can access. A **public service** exposes only the capabilities you attach to it, never your private items or local tools, and it is protected by budgets and daily request limits.
+Only in the ways you allow. Approved contacts see only what their selected **audience** permits. A **public service** exposes only the capabilities you attach to it, never your owner memories, private items, or local tools, and it is protected by budgets and daily request limits.
 
 ---
 
@@ -525,7 +596,8 @@ Only in the ways you allow. Approved contacts see only what their **circle** can
 | **Group** | A create-only, human-to-human conversation whose state is stored on members' devices. |
 | **Contact** | Someone you have added by handle. |
 | **Circle** | A named group of contacts that scopes what you share. |
-| **Privacy by binding** | What a contact can access is bound to their circle. |
+| **Privacy by binding** | What a contact can access is bound to their circle membership and each capability's audience. |
+| **Memory** | An owner-only durable detail recalled across Me topics. It cannot be shared or published. |
 | **Knowledge** | Documents and notes your agent can use. |
 | **Skill** | Reusable instructions or capabilities for your agent. |
 | **Widget** | A mini HTML app your agent can build, pin, and share. |
@@ -535,6 +607,8 @@ Only in the ways you allow. Approved contacts see only what their **circle** can
 | **Category** | The fixed label that describes a published service. |
 | **MTokens** | The app-wide token unit. 1 MTokens = 1,000,000 tokens, shown to one decimal. |
 | **Community** | The tab where you discover and manage public services. |
+| **Primary agent response device** | The desktop assigned to answer questions that contacts send to your agent. |
+| **Failover response device** | An optional second desktop used only while the primary cannot answer. |
 | **Home device** | The single device your mobile "ask my home agent" reaches. |
 | **Backup** | A passphrase-encrypted export of your data plus a handle recovery key. |
 | **Device linking** | Authorizing a new device via a QR/link invite from an existing device. |

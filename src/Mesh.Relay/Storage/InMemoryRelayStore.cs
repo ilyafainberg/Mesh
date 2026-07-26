@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Mesh.Relay.RateLimiting;
+using Mesh.Shared;
 
 namespace Mesh.Relay.Storage;
 
@@ -14,6 +15,7 @@ public sealed class InMemoryRelayStore : IRelayStore
     private readonly ConcurrentDictionary<string, StoredHandle> handles = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DateTimeOffset>> invites = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> inboxes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, StoredAgentDispatch> agentDispatches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, StoredService> services = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, HandleRatePolicy> ratePolicies = new(StringComparer.OrdinalIgnoreCase);
 
@@ -51,6 +53,9 @@ public sealed class InMemoryRelayStore : IRelayStore
         var removed = handles.TryRemove(handle, out _);
         invites.TryRemove(handle, out _);
         inboxes.TryRemove(handle, out _);
+        foreach (var item in agentDispatches)
+            if (string.Equals(item.Value.To, handle, StringComparison.OrdinalIgnoreCase))
+                agentDispatches.TryRemove(item.Key, out _);
         ratePolicies.TryRemove(NormalizeHandle(handle), out _);
         return Task.FromResult(removed);
     }
@@ -75,6 +80,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         string? name,
         string platform,
         bool remoteAgentEnabled,
+        bool atomicAgentDispatchEnabled,
         CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))
@@ -84,8 +90,37 @@ public sealed class InMemoryRelayStore : IRelayStore
                     rec.DeviceNames[deviceId] = name;
                 rec.DevicePlatforms[deviceId] = platform;
                 rec.DeviceRemoteAgentEnabled[deviceId] = remoteAgentEnabled;
+                rec.DeviceAtomicAgentDispatchEnabled[deviceId] = atomicAgentDispatchEnabled;
+                if (string.IsNullOrWhiteSpace(rec.AgentPrimaryDeviceId)
+                    && DevicePlatforms.IsDesktop(platform)
+                    && atomicAgentDispatchEnabled)
+                {
+                    rec.AgentPrimaryDeviceId = deviceId;
+                    rec.AgentRoutingVersion = Guid.NewGuid().ToString("n");
+                    rec.AgentPrimaryWasSelectedAutomatically = true;
+                }
             }
         return Task.CompletedTask;
+    }
+
+    public Task<bool> SetAgentRoutingAsync(
+        string handle,
+        string primaryDeviceId,
+        string? failoverDeviceId,
+        string expectedVersion,
+        CancellationToken ct = default)
+    {
+        if (!handles.TryGetValue(handle, out var rec)) return Task.FromResult(false);
+        lock (rec)
+        {
+            if (!string.Equals(rec.AgentRoutingVersion, expectedVersion, StringComparison.Ordinal))
+                return Task.FromResult(false);
+            rec.AgentPrimaryDeviceId = primaryDeviceId;
+            rec.AgentFailoverDeviceId = failoverDeviceId;
+            rec.AgentRoutingVersion = Guid.NewGuid().ToString("n");
+            rec.AgentPrimaryWasSelectedAutomatically = false;
+            return Task.FromResult(true);
+        }
     }
 
     public Task SetDevicePushTokenAsync(string handle, string deviceId, string platform, string token, CancellationToken ct = default)
@@ -140,6 +175,148 @@ public sealed class InMemoryRelayStore : IRelayStore
         if (inboxes.TryGetValue(toHandle, out var q))
             while (q.TryDequeue(out var item)) result.Add(item);
         return Task.FromResult<IReadOnlyList<string>>(result);
+    }
+
+    public Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
+        StoredAgentDispatch dispatch,
+        CancellationToken ct = default)
+    {
+        var key = DispatchDictionaryKey(dispatch.To, dispatch.Id);
+        var stored = CloneDispatch(dispatch);
+        if (agentDispatches.TryAdd(key, stored))
+            return Task.FromResult(new AgentDispatchCreateResult(
+                AgentDispatchCreateStatus.Created, stored.State, stored.AssignedDeviceId));
+
+        var existing = agentDispatches[key];
+        lock (existing)
+        {
+            var duplicate = string.Equals(existing.RequestId, dispatch.RequestId, StringComparison.Ordinal)
+                && string.Equals(existing.From, dispatch.From, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(existing.To, dispatch.To, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(existing.EnvelopeHash, dispatch.EnvelopeHash, StringComparison.Ordinal);
+            return Task.FromResult(new AgentDispatchCreateResult(
+                duplicate ? AgentDispatchCreateStatus.Duplicate : AgentDispatchCreateStatus.Conflict,
+                existing.State,
+                existing.AssignedDeviceId));
+        }
+    }
+
+    public Task<StoredAgentDispatch?> GetAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        CancellationToken ct = default)
+    {
+        var key = DispatchDictionaryKey(toHandle, dispatchId);
+        if (!agentDispatches.TryGetValue(key, out var dispatch))
+            return Task.FromResult<StoredAgentDispatch?>(null);
+        lock (dispatch) return Task.FromResult<StoredAgentDispatch?>(CloneDispatch(dispatch));
+    }
+
+    public Task AssignPendingAgentDispatchesAsync(
+        string toHandle,
+        IReadOnlyList<string> candidateDeviceIds,
+        CancellationToken ct = default)
+    {
+        foreach (var dispatch in AgentDispatchesFor(toHandle))
+            lock (dispatch)
+            {
+                if (dispatch.State is not (AgentDispatchStates.Pending or AgentDispatchStates.Assigned)) continue;
+                var deviceId = AgentDispatchRecipientPolicy.ChooseDevice(
+                    dispatch.RecipientDeviceIds, candidateDeviceIds);
+                if (deviceId is null)
+                {
+                    if (dispatch.State == AgentDispatchStates.Assigned)
+                    {
+                        dispatch.State = AgentDispatchStates.Pending;
+                        dispatch.AssignedDeviceId = null;
+                        dispatch.AssignedAt = null;
+                    }
+                    continue;
+                }
+                if (dispatch.State == AgentDispatchStates.Assigned
+                    && string.Equals(dispatch.AssignedDeviceId, deviceId, StringComparison.Ordinal))
+                    continue;
+                dispatch.State = AgentDispatchStates.Assigned;
+                dispatch.AssignedDeviceId = deviceId;
+                dispatch.AssignedAt = DateTimeOffset.UtcNow;
+            }
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<StoredAgentDispatch>> TakeAssignedAgentDispatchesAsync(
+        string toHandle,
+        string deviceId,
+        CancellationToken ct = default)
+    {
+        var result = new List<StoredAgentDispatch>();
+        foreach (var dispatch in AgentDispatchesFor(toHandle))
+            lock (dispatch)
+            {
+                if (result.Count > 0) break;
+                if (!string.Equals(dispatch.State, AgentDispatchStates.Assigned, StringComparison.Ordinal)
+                    || !string.Equals(dispatch.AssignedDeviceId, deviceId, StringComparison.Ordinal))
+                    continue;
+                dispatch.State = AgentDispatchStates.Delivered;
+                dispatch.DeliveredAt = DateTimeOffset.UtcNow;
+                result.Add(CloneDispatch(dispatch));
+            }
+        return Task.FromResult<IReadOnlyList<StoredAgentDispatch>>(result);
+    }
+
+    public Task<bool> ReleaseAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        string deviceId,
+        string? nextDeviceId = null,
+        CancellationToken ct = default)
+    {
+        var key = DispatchDictionaryKey(toHandle, dispatchId);
+        if (!agentDispatches.TryGetValue(key, out var dispatch)) return Task.FromResult(false);
+        lock (dispatch)
+        {
+            if (!string.Equals(dispatch.State, AgentDispatchStates.Delivered, StringComparison.Ordinal)
+                || !string.Equals(dispatch.AssignedDeviceId, deviceId, StringComparison.Ordinal))
+                return Task.FromResult(false);
+            if (string.IsNullOrWhiteSpace(nextDeviceId))
+            {
+                dispatch.State = AgentDispatchStates.Pending;
+                dispatch.AssignedDeviceId = null;
+                dispatch.AssignedAt = null;
+            }
+            else
+            {
+                dispatch.State = AgentDispatchStates.Assigned;
+                dispatch.AssignedDeviceId = nextDeviceId;
+                dispatch.AssignedAt = DateTimeOffset.UtcNow;
+            }
+            dispatch.DeliveredAt = null;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<bool> CompleteAgentDispatchAsync(
+        string toHandle,
+        string dispatchId,
+        string fromHandle,
+        string dispatchToken,
+        string respondingDeviceId,
+        CancellationToken ct = default)
+    {
+        var key = DispatchDictionaryKey(toHandle, dispatchId);
+        if (!agentDispatches.TryGetValue(key, out var dispatch)) return Task.FromResult(false);
+        lock (dispatch)
+        {
+            if (!string.Equals(dispatch.State, AgentDispatchStates.Delivered, StringComparison.Ordinal)
+                || !string.Equals(dispatch.From, fromHandle, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(dispatch.DispatchToken, dispatchToken, StringComparison.Ordinal)
+                || !string.Equals(dispatch.AssignedDeviceId, respondingDeviceId, StringComparison.Ordinal))
+                return Task.FromResult(false);
+            dispatch.State = AgentDispatchStates.Completed;
+            dispatch.CompletedAt = DateTimeOffset.UtcNow;
+            dispatch.EnvelopeJson = "";
+            dispatch.RecipientDeviceIds.Clear();
+            return Task.FromResult(true);
+        }
     }
 
     public Task<HandleRatePolicy?> GetHandleRatePolicyAsync(string handle, CancellationToken ct = default)
@@ -257,6 +434,15 @@ public sealed class InMemoryRelayStore : IRelayStore
     private static string NormalizeHandle(string handle)
         => handle.Trim().TrimStart('@').ToLowerInvariant();
 
+    private IEnumerable<StoredAgentDispatch> AgentDispatchesFor(string toHandle)
+        => agentDispatches.Values
+            .Where(dispatch => string.Equals(dispatch.To, toHandle, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(dispatch => dispatch.QueuedAt)
+            .ThenBy(dispatch => dispatch.Id, StringComparer.Ordinal);
+
+    private static string DispatchDictionaryKey(string toHandle, string dispatchId)
+        => $"{NormalizeHandle(toHandle)}\u001f{dispatchId}";
+
     private static StoredHandle Clone(StoredHandle r)
     {
         lock (r)
@@ -270,9 +456,32 @@ public sealed class InMemoryRelayStore : IRelayStore
                 DeviceNames = new Dictionary<string, string>(r.DeviceNames),
                 DevicePlatforms = new Dictionary<string, string>(r.DevicePlatforms),
                 DeviceRemoteAgentEnabled = new Dictionary<string, bool>(r.DeviceRemoteAgentEnabled),
+                DeviceAtomicAgentDispatchEnabled = new Dictionary<string, bool>(r.DeviceAtomicAgentDispatchEnabled),
+                AgentPrimaryDeviceId = r.AgentPrimaryDeviceId,
+                AgentFailoverDeviceId = r.AgentFailoverDeviceId,
+                AgentRoutingVersion = r.AgentRoutingVersion,
+                AgentPrimaryWasSelectedAutomatically = r.AgentPrimaryWasSelectedAutomatically,
                 DevicePushTokens = r.DevicePushTokens.ToDictionary(
                     kv => kv.Key,
                     kv => new DevicePushToken { Platform = kv.Value.Platform, Token = kv.Value.Token, UpdatedAt = kv.Value.UpdatedAt })
             };
     }
+
+    private static StoredAgentDispatch CloneDispatch(StoredAgentDispatch dispatch) => new()
+    {
+        Id = dispatch.Id,
+        RequestId = dispatch.RequestId,
+        From = dispatch.From,
+        To = dispatch.To,
+        EnvelopeJson = dispatch.EnvelopeJson,
+        EnvelopeHash = dispatch.EnvelopeHash,
+        RecipientDeviceIds = dispatch.RecipientDeviceIds.ToList(),
+        DispatchToken = dispatch.DispatchToken,
+        State = dispatch.State,
+        AssignedDeviceId = dispatch.AssignedDeviceId,
+        QueuedAt = dispatch.QueuedAt,
+        AssignedAt = dispatch.AssignedAt,
+        DeliveredAt = dispatch.DeliveredAt,
+        CompletedAt = dispatch.CompletedAt
+    };
 }

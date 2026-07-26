@@ -144,6 +144,9 @@ curl http://localhost:8080/health
 # -> {"status":"ok",...}
 ```
 
+For single-device agent responses, confirm the nested `capabilities` object reports
+`"protocolVersion": 4` (or newer) and `"atomicAgentDispatch": true`.
+
 You can also open `http://localhost:8080/` for service status (including the
 instance id) and `http://localhost:8080/metrics` for aggregate counters.
 
@@ -430,16 +433,18 @@ Pick the smallest tier that meets your durability and availability needs.
 ### Tier 1: single small relay (in-memory)
 
 Defaults are fine: in-memory, one container, nothing to configure. State
-(handle directory, presence, offline queue) lives in process memory and is lost
-on restart. This is appropriate for a personal relay or a test relay.
+(handle directory, agent-response routing and queued dispatches, presence, and
+offline inbox) lives in process memory and is lost on restart. This is appropriate
+for a personal relay or a test relay.
 
 ### Tier 2: durable single node (Cosmos)
 
 Set `COSMOS_CONNECTION` (and optionally `COSMOS_DB`, default `mesh`). Now the
-handle directory, invites, and offline inbox persist across restarts. Offline
-messages are queued while a recipient is disconnected and drained when they
-reconnect. Queued messages have a default 14-day TTL; reserved system handles
-never expire.
+handle directory, agent-response routing, queued atomic agent dispatches, invites,
+and offline inbox persist across restarts. Offline messages are queued while their
+recipient is disconnected; atomic agent questions are queued while neither configured
+response device is eligible. Queued records use the default 14-day TTL; reserved
+system inbox records never expire.
 
 Cosmos containers used (created and managed for you, no pre-creation needed):
 
@@ -447,12 +452,13 @@ Cosmos containers used (created and managed for you, no pre-creation needed):
 - administrative per-handle policies (`rate-policies`)
 - invites (native per-item TTL)
 - offline inbox (14-day default TTL)
+- atomic agent dispatches (`agent-dispatches`, 14-day default TTL)
 - services directory
 
 ### Tier 3: durable and multi-replica (Cosmos + Redis)
 
 Set both `COSMOS_CONNECTION` and `REDIS_CONNECTION`, then run N replicas behind a
-load balancer. Two requirements:
+load balancer. Three requirements:
 
 1. **Sticky sessions are mandatory.** The SignalR WebSocket must stay on one
    replica for the life of the connection. Configure your load balancer for
@@ -462,6 +468,17 @@ load balancer. Two requirements:
    connected, and forwards directed messages to the replica that holds the
    recipient's connection. Because forwarding is directed rather than broadcast,
    load stays proportional to delivered messages rather than to replica count.
+3. **Atomic delivery is negotiated per replica.** Protocol-4 replicas advertise
+   acknowledged single-connection delivery internally. During a rolling upgrade,
+   atomic questions targeting a device connected to an older replica remain queued
+   instead of being forwarded through legacy fan-out behavior. Upgrade every replica
+   before expecting normal atomic-dispatch throughput across the cluster.
+
+Atomic agent routing uses both services: Cosmos provides the shared compare-and-swap
+dispatch fence and Redis provides exact device presence plus acknowledged directed
+forwarding. A confirmed miss may use the configured decrypt-capable failover, while an
+acknowledgement timeout or remote send exception remains fenced as an uncertain delivery.
+For durable at-most-one response behavior across replicas, configure both Cosmos and Redis.
 
 Compose example using the `redis` profile:
 
@@ -512,7 +529,7 @@ The relay exposes plain HTTP endpoints for status and observability.
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /health` | `{"status":"ok",...}` - liveness / readiness probe target |
+| `GET /health` | Liveness/readiness plus transport capabilities, including protocol version and atomic agent dispatch support |
 | `GET /` | Service status, including the instance id |
 | `GET /metrics` | Aggregate counters (see below) |
 
@@ -528,6 +545,11 @@ Normal and fan-out hub sends return explicit accepted or rejected results. An ac
 fan-out means the relay admitted the logical request and began routing or queueing its
 per-recipient envelopes. Online work is concurrent and offline users receive later;
 there is no atomic simultaneous physical-delivery guarantee.
+
+Atomic agent sends are different: `agent_dispatch_accepted` means the request reached
+its assigned device fence, while `agent_dispatch_queued` means the relay accepted
+it into its configured store but neither response device is currently eligible. Both
+are successful send results. Only one matching response can complete that dispatch.
 
 The metrics endpoint contains no handles and no PII, so it is safe to scrape.
 
@@ -580,6 +602,17 @@ the v1.1.0 boundary.
 | v1.1.0+ | v1.1.0+ | Works |
 | v1.1.0+ | older than v1.1.0 | Client cannot register (no proof-of-possession) |
 
+Single-device agent responses use capability negotiation rather than the registration
+version floor:
+
+| Relay capability | Client behavior | Result |
+| --- | --- | --- |
+| Protocol 4+, `atomicAgentDispatch: true` | Atomic-capable client | Primary/failover assignment, queueing (durable with Cosmos), relay-enforced at-most-one accepted response |
+| Capability absent | Current client | Falls back to legacy agent kinds; no single-device guarantee |
+| Capability present | Legacy client | Legacy kinds continue to route; no single-device guarantee |
+
+In a mixed relay cluster, protocol-4 coordinators queue atomic work rather than forward it to replicas that do not advertise single-connection atomic delivery.
+
 ---
 
 ## 11. Security and operational best practices
@@ -595,10 +628,10 @@ cannot read contents. You do not need to add an application-layer auth system fo
 this; it is intrinsic to the protocol.
 
 **Understand the metadata you hold.** As an operator you can see the handle
-directory and traffic metadata (who talks to whom, and when), but not message
-contents. Self-hosting keeps that metadata on your infrastructure instead of a
-third party's. Treat it as sensitive: it reveals communication patterns even
-though it never reveals content.
+directory, traffic metadata (who talks to whom, and when), selected agent-response
+device ids, and atomic dispatch lifecycle metadata, but not message contents.
+Self-hosting keeps that metadata on your infrastructure instead of a third party's.
+Treat it as sensitive: it reveals communication and device-availability patterns.
 
 **Manage secrets properly.** Cosmos and Redis connection strings, `MESH_ADMIN_KEY`, any
 `MODEL_API_KEY`, and any connector secrets should come from your platform secret
@@ -607,9 +640,10 @@ secrets, or your orchestrator's secret mechanism). Never commit them to version
 control and never inline them in a compose file that is checked in.
 
 **Back up Cosmos if you rely on durable delivery or recovery.** If you use Cosmos
-for durable storage, its data (handle directory, rate policies, invites, offline inbox,
-services directory) is your source of truth for recovery. Enable backups on the Cosmos
-account according to your recovery objectives.
+for durable storage, its data (handle directory and agent routing, queued atomic
+dispatches, rate policies, invites, offline inbox, services directory) is your source
+of truth for recovery. Enable backups on the Cosmos account according to your
+recovery objectives.
 
 **Honor the AGPL-3.0 obligations.** The relay is licensed AGPL-3.0. If you modify
 the relay and offer it to users over a network, you must offer those users your
@@ -648,7 +682,18 @@ changes.
 
 - This is expected in the default in-memory configuration.
 - Set `COSMOS_CONNECTION` (and optionally `COSMOS_DB`) for durable storage, so the
-  handle directory, invites, and offline inbox persist across restarts.
+  handle directory, agent-response routing, queued atomic dispatches, invites, and
+  offline inbox persist across restarts.
+
+### Agent questions remain queued
+
+- Check `GET /health` and confirm `capabilities.atomicAgentDispatch` is `true`.
+- Ask the recipient to open **Settings > Agent responses** and confirm the selected primary, plus optional failover, is a compatible desktop. The device must be online and advertise a configured model.
+- With failover set to **None**, questions intentionally stay queued until the primary is ready.
+- A queued request can run only on a configured device whose key existed when the sender encrypted it. After linking or selecting a new desktop, the sender may need to verify the updated contact identity and send a new question, or the owner can choose an older decrypt-capable failover.
+- During a rolling relay upgrade, a device connected to an older replica is intentionally ineligible for atomic forwarding until it reconnects to a protocol-4 replica.
+- In a multi-replica deployment, configure both Cosmos and Redis. Without shared durable dispatch state and shared device presence, atomic routing is not production-safe across replicas.
+- Cosmos dispatch records use a 14-day TTL. A question that remains unserviceable past that retention window expires.
 
 ### Free (hosted) model not working
 

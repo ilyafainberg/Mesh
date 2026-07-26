@@ -8,6 +8,7 @@
 @inject IHttpClientFactory HttpFactory
 @inject UpdateService Updater
 @inject IAppControl AppControl
+@inject RuntimeDiagnostics Diagnostics
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -396,6 +397,36 @@
                 </div>
             }
 
+            <div class="field token-optimization-field">
+                <div class="token-optimization-heading">
+                    <label for="token-optimization">Token Optimization</label>
+                    <span class="token-optimization-value">@TokenOptimizationLabel</span>
+                </div>
+                <div class="token-optimization-control" style="--token-opt-progress: @TokenOptimizationProgress;">
+                    <input id="token-optimization" class="token-optimization-slider" type="range"
+                           min="0" max="3" step="1" value="@tokenOptimizationIndex"
+                           @oninput="OnTokenOptimizationInput"
+                           aria-valuetext="@TokenOptimizationLabel"
+                           aria-describedby="token-optimization-hint" />
+                    <div class="token-optimization-options">
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 0 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 0">Disabled</button>
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 1 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 1">Max Accuracy</button>
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 2 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 2">
+                            <span>Balanced</span>
+                            <small>Recommended</small>
+                        </button>
+                        <button type="button" class="token-optimization-option @(tokenOptimizationIndex == 3 ? "active" : "")"
+                                @onclick="() => tokenOptimizationIndex = 3">Max Savings</button>
+                    </div>
+                </div>
+                <div id="token-optimization-hint" class="field-hint">
+                    @TokenOptimizationDescription Mesh only shortens the temporary copy sent to the AI. Your encrypted chats and saved data are not changed.
+                </div>
+            </div>
+
             <div class="field" style="margin-top:8px;">
                 <button class="primary" @onclick="ChangeModel" disabled="@Setup.Running">
                     <i class="bi bi-check-lg"></i> @(Setup.Running ? "Working…" : "Change model")
@@ -451,6 +482,55 @@
                 </select>
                 <div class="field-hint">When on, your agent drafts a reply and waits for you on the Messages page before sending.</div>
             </div>
+            <div class="field">
+                <label>Primary agent response device</label>
+                @if (!Mesh.SupportsAtomicAgentDispatch)
+                {
+                    <div class="field-hint">This relay does not support single-device agent responses. Update the relay to configure this setting.</div>
+                }
+                else
+                {
+                    <div class="model-row">
+                        <select class="full" value="@primaryAgentDeviceId" @onchange="OnPrimaryAgentDeviceChanged"
+                                disabled="@(loadingAgentRouting || savingAgentRouting || AgentRoutingDevices.Count == 0)">
+                            @if (AgentRoutingDevices.Count == 0)
+                            {
+                                <option value="">No compatible desktop device</option>
+                            }
+                            @foreach (var device in AgentRoutingDevices)
+                            {
+                                <option value="@device.DeviceId">@AgentDeviceLabel(device)</option>
+                            }
+                        </select>
+                        <button class="ghost icon-btn" title="Refresh devices" aria-label="Refresh agent response devices"
+                                disabled="@(loadingAgentRouting || savingAgentRouting)" @onclick="LoadAgentRoutingAsync">
+                            <i class="bi @(loadingAgentRouting ? "bi-hourglass-split" : "bi-arrow-repeat")"></i>
+                        </button>
+                    </div>
+                    <div class="field-hint">
+                        The first compatible desktop is selected automatically. Only this device runs and answers each agent question.
+                    </div>
+                }
+            </div>
+            @if (Mesh.SupportsAtomicAgentDispatch)
+            {
+                <div class="field">
+                    <label>Failover response device</label>
+                    <select class="full" value="@failoverAgentDeviceId" @onchange="OnFailoverAgentDeviceChanged"
+                            disabled="@(loadingAgentRouting || savingAgentRouting || string.IsNullOrWhiteSpace(primaryAgentDeviceId))">
+                        <option value="">None</option>
+                        @foreach (var device in AgentRoutingDevices.Where(device => device.DeviceId != primaryAgentDeviceId))
+                        {
+                            <option value="@device.DeviceId">@AgentDeviceLabel(device)</option>
+                        }
+                    </select>
+                    <div class="field-hint">Used only when the primary is offline or cannot run its configured model. Choose None to keep questions queued for the primary.</div>
+                </div>
+                @if (!string.IsNullOrWhiteSpace(agentRoutingError))
+                {
+                    <div class="err-text" role="alert">@agentRoutingError</div>
+                }
+            }
             <div class="field-row">
                 <div>
                     <div class="field-label">Plan before acting</div>
@@ -624,6 +704,37 @@
             </div>
         </div>
         }
+        <div class="card-panel">
+            <h3>Diagnostics</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Mesh keeps a small technical UI, lifecycle, and crash log on this device. It does not intentionally add
+                message text, prompts, keys, or tool arguments.
+                @if (OperatingSystem.IsIOS())
+                {
+                    <span> Apple crash and hang diagnostics can arrive after the next launch.</span>
+                }
+            </div>
+            @if (Diagnostics.PreviousSessionEndedUnexpectedly)
+            {
+                <div class="field-hint err-text" style="margin-bottom:12px;">
+                    The previous session ended unexpectedly while the app was @Diagnostics.PreviousSessionPhase.
+                    Copy diagnostics and include them with the crash report.
+                </div>
+            }
+            <div class="model-row">
+                <button class="ghost" @onclick="CopyDiagnostics">
+                    <i class="bi bi-clipboard"></i> Copy diagnostics
+                </button>
+                <button class="ghost" @onclick="ClearDiagnostics" disabled="@(!Diagnostics.HasEntries)">
+                    Clear
+                </button>
+            </div>
+            @if (!string.IsNullOrWhiteSpace(diagnosticsStatus))
+            {
+                <div class="field-hint">@diagnosticsStatus</div>
+            }
+        </div>
+
 
     </div>
 </div>
@@ -637,6 +748,7 @@
     string apiKey = "";
     string apiVersion = "";
     string reasoningEffort = "Auto";
+    int tokenOptimizationIndex = (int)TokenOptimizationLevel.Balanced;
     string copilotExecutable = "copilot";
     string copilotEffort = "Auto";
     string browserEngine = "Firefox";
@@ -651,6 +763,18 @@
     string approvalMode = "PerCircle";
     bool allowApps = true;
     int replyBudget = 100;
+    List<Mesh.Shared.DeviceInfo> agentDevices = new();
+    string primaryAgentDeviceId = "";
+    string failoverAgentDeviceId = "";
+    bool loadingAgentRouting;
+    bool savingAgentRouting;
+    bool agentRoutingAttempted;
+    string? agentRoutingError;
+    string? diagnosticsStatus;
+
+    IReadOnlyList<Mesh.Shared.DeviceInfo> AgentRoutingDevices => agentDevices
+        .Where(device => device.IsDesktop && device.AtomicAgentDispatchEnabled)
+        .ToList();
 
     string BudgetUsageLabel => replyBudget <= 0
         ? "Unlimited"
@@ -702,6 +826,7 @@
                 SyncFields();
                 await Mesh.RegisterAsync();
                 await Mesh.ConnectAsync();
+                await LoadAgentRoutingAsync();
             }
         }
         finally { switching = false; }
@@ -721,6 +846,35 @@
             if (copiedHandle == a.Handle) { copiedHandle = null; StateHasChanged(); }
         }
         catch { /* clipboard is best-effort */ }
+    }
+
+    async Task CopyDiagnostics()
+    {
+        try
+        {
+            await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(
+                Diagnostics.CreateReport());
+            diagnosticsStatus = "Diagnostics copied. Paste them into the crash report.";
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.RecordException("diagnostics-copy", ex);
+            diagnosticsStatus = "Could not copy diagnostics: " + ex.Message;
+        }
+    }
+
+    void ClearDiagnostics()
+    {
+        try
+        {
+            Diagnostics.Clear();
+            diagnosticsStatus = "Diagnostics cleared.";
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.RecordException("diagnostics-clear", ex);
+            diagnosticsStatus = "Could not clear diagnostics: " + ex.Message;
+        }
     }
 
     async Task DeleteAccount(AccountRef a)
@@ -758,6 +912,7 @@
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
         reasoningEffort = p.Model.ReasoningEffort.ToString();
+        tokenOptimizationIndex = (int)TokenOptimizer.Normalize(p.Model.TokenOptimization);
         copilotExecutable = string.IsNullOrWhiteSpace(p.Model.CopilotExecutable) ? "copilot" : p.Model.CopilotExecutable;
         copilotEffort = p.Model.CopilotEffort.ToString();
         browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
@@ -771,7 +926,42 @@
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
+        primaryAgentDeviceId = p.AgentPrimaryDeviceId ?? "";
+        failoverAgentDeviceId = p.AgentFailoverDeviceId ?? "";
         SyncModelCustomFlag();
+    }
+
+    TokenOptimizationLevel SelectedTokenOptimization =>
+        TokenOptimizer.Normalize((TokenOptimizationLevel)Math.Clamp(tokenOptimizationIndex, 0, 3));
+
+    string TokenOptimizationLabel => SelectedTokenOptimization switch
+    {
+        TokenOptimizationLevel.Disabled => "Disabled",
+        TokenOptimizationLevel.MaxAccuracy => "Max Accuracy",
+        TokenOptimizationLevel.Balanced => "Balanced",
+        _ => "Max Savings"
+    };
+
+    string TokenOptimizationProgress => SelectedTokenOptimization switch
+    {
+        TokenOptimizationLevel.Disabled => "0%",
+        TokenOptimizationLevel.MaxAccuracy => "33.333%",
+        TokenOptimizationLevel.Balanced => "66.667%",
+        _ => "100%"
+    };
+
+    string TokenOptimizationDescription => SelectedTokenOptimization switch
+    {
+        TokenOptimizationLevel.Disabled => "Uses the normal context window without extra compaction.",
+        TokenOptimizationLevel.MaxAccuracy => "Keeps the most context and only removes obvious machine-generated repetition.",
+        TokenOptimizationLevel.Balanced => "Keeps recent and relevant context while trimming repetition and oversized results.",
+        _ => "Uses the smallest relevant context and the strongest result compaction."
+    };
+
+    void OnTokenOptimizationInput(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var value))
+            tokenOptimizationIndex = Math.Clamp(value, 0, 3);
     }
 
     string ModelPlaceholder=> provider switch
@@ -828,6 +1018,7 @@
         endpoint = p.Model.Endpoint ?? "";
         apiVersion = p.Model.ApiVersion ?? "";
         reasoningEffort = p.Model.ReasoningEffort.ToString();
+        tokenOptimizationIndex = (int)TokenOptimizer.Normalize(p.Model.TokenOptimization);
         copilotExecutable = string.IsNullOrWhiteSpace(p.Model.CopilotExecutable) ? "copilot" : p.Model.CopilotExecutable;
         copilotEffort = p.Model.CopilotEffort.ToString();
         browserEngine = string.IsNullOrWhiteSpace(p.Model.BrowserEngine) ? "Firefox" : p.Model.BrowserEngine;
@@ -840,6 +1031,8 @@
         approvalMode = p.ApprovalMode.ToString();
         allowApps = p.AllowInteractiveApps;
         replyBudget = p.AgentDailyReplyBudget;
+        primaryAgentDeviceId = p.AgentPrimaryDeviceId ?? "";
+        failoverAgentDeviceId = p.AgentFailoverDeviceId ?? "";
         // Use the list cached at app startup, do NOT reload here (that would reset the selection).
         foundryModels = Foundry.CachedModels.ToList();
         SyncModelCustomFlag();
@@ -862,6 +1055,7 @@
     {
         if (provider == "GitHubCopilot")
             await LoadCopilotModelsAsync();
+        await LoadAgentRoutingAsync();
     }
 
     async Task OnDeviceNameChanged(ChangeEventArgs e)
@@ -877,6 +1071,8 @@
         {
             if (!await Mesh.RegisterAsync())
                 registrationError = "Could not update this device on the relay. Check your connection and try again.";
+            else
+                await LoadAgentRoutingAsync();
         }
         catch { registrationError = "Could not update this device on the relay. Check your connection and try again."; }
     }
@@ -890,6 +1086,8 @@
     }
     void Refresh()
     {
+        if (Mesh.SupportsAtomicAgentDispatch && !agentRoutingAttempted && !loadingAgentRouting)
+            _ = LoadAgentRoutingAsync();
         // Keep the dropdown in sync if the startup preload finishes while Settings is open.
         if (foundryModels.Count == 0 && Foundry.CachedModels.Count > 0)
             foundryModels = Foundry.CachedModels.ToList();
@@ -1051,6 +1249,7 @@
     async Task ChangeModel()
     {
         var apiKeyToSet = apiKey;
+        var tokenOptimizationToSet = SelectedTokenOptimization;
         apiKey = "";
 
         // The save + model test runs in a background singleton, so it keeps going
@@ -1066,6 +1265,7 @@
             p.Model.Endpoint = string.IsNullOrWhiteSpace(endpoint) ? null : endpoint.Trim();
             p.Model.ApiVersion = string.IsNullOrWhiteSpace(apiVersion) ? null : apiVersion.Trim();
             p.Model.ReasoningEffort = Enum.TryParse<ReasoningEffort>(reasoningEffort, out var effort) ? effort : ReasoningEffort.Auto;
+            p.Model.TokenOptimization = tokenOptimizationToSet;
             p.Model.CopilotExecutable = string.IsNullOrWhiteSpace(copilotExecutable) ? "copilot" : copilotExecutable.Trim();
             p.Model.CopilotEffort = Enum.TryParse<CopilotEffort>(copilotEffort, out var cliEffort) ? cliEffort : CopilotEffort.Auto;
             p.Model.BrowserEngine = browserEngine;
@@ -1086,7 +1286,94 @@
         State.ResetTokenCounter();
 
         await Mesh.RegisterAsync();
+        await LoadAgentRoutingAsync();
     }
+
+    async Task LoadAgentRoutingAsync()
+    {
+        if (!Mesh.SupportsAtomicAgentDispatch || loadingAgentRouting) return;
+        agentRoutingAttempted = true;
+        loadingAgentRouting = true;
+        agentRoutingError = null;
+        try
+        {
+            var devicesTask = Mesh.ListMyDevicesAsync();
+            var routingTask = Mesh.GetAgentRoutingAsync();
+            await Task.WhenAll(devicesTask, routingTask);
+            agentDevices = (await devicesTask).ToList();
+            var routing = await routingTask;
+            if (routing is null)
+            {
+                agentRoutingError = "Could not load agent response devices from the relay.";
+                return;
+            }
+            primaryAgentDeviceId = routing.PrimaryDeviceId ?? "";
+            failoverAgentDeviceId = routing.FailoverDeviceId ?? "";
+        }
+        finally
+        {
+            loadingAgentRouting = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    async Task OnPrimaryAgentDeviceChanged(ChangeEventArgs e)
+    {
+        var primary = e.Value?.ToString() ?? "";
+        if (string.IsNullOrWhiteSpace(primary)) return;
+        var failover = string.Equals(primary, failoverAgentDeviceId, StringComparison.Ordinal)
+            ? null
+            : NullIfBlank(failoverAgentDeviceId);
+        await SaveAgentRoutingAsync(primary, failover);
+    }
+
+    async Task OnFailoverAgentDeviceChanged(ChangeEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(primaryAgentDeviceId)) return;
+        await SaveAgentRoutingAsync(
+            primaryAgentDeviceId,
+            NullIfBlank(e.Value?.ToString()));
+    }
+
+    async Task SaveAgentRoutingAsync(string primary, string? failover)
+    {
+        if (savingAgentRouting) return;
+        savingAgentRouting = true;
+        agentRoutingError = null;
+        try
+        {
+            var result = await Mesh.SetAgentRoutingAsync(primary, failover);
+            if (!result.Success || result.Routing is null)
+            {
+                agentRoutingError = result.Error ?? "Could not save the agent response devices.";
+                primaryAgentDeviceId = State.Profile.AgentPrimaryDeviceId ?? primaryAgentDeviceId;
+                failoverAgentDeviceId = State.Profile.AgentFailoverDeviceId ?? "";
+                return;
+            }
+            primaryAgentDeviceId = result.Routing.PrimaryDeviceId ?? "";
+            failoverAgentDeviceId = result.Routing.FailoverDeviceId ?? "";
+        }
+        finally
+        {
+            savingAgentRouting = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    string AgentDeviceLabel(Mesh.Shared.DeviceInfo device)
+    {
+        var name = string.IsNullOrWhiteSpace(device.Name) ? "Desktop device" : device.Name;
+        var mine = string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal)
+            ? ", this device"
+            : "";
+        var status = !device.RemoteAgentEnabled
+            ? "agent unavailable"
+            : device.Online ? "ready" : "offline";
+        return $"{name} ({status}{mine})";
+    }
+
+    static string? NullIfBlank(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value;
 
     // ---- auto-save for non-model settings (persist immediately on change) ----
     void OnDisplayChanged(ChangeEventArgs e)
@@ -1120,7 +1407,7 @@
         if (string.IsNullOrWhiteSpace(url)) return;
         Toggle(p => p.RelayUrl = url);
         // A handle is registered per relay, so switching relays re-registers there and reconnects.
-        try { await Mesh.RegisterAsync(); await Mesh.ConnectAsync(); } catch { }
+        try { await Mesh.RegisterAsync(); await Mesh.ConnectAsync(); await LoadAgentRoutingAsync(); } catch { }
     }
 
     // Estimated spend for the current model's live token counter (null when the model has no price).

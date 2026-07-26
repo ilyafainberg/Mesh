@@ -8,6 +8,7 @@
 @inject NavigationManager Nav
 @inject IAppControl AppControl
 @inject UpdateService Updater
+@inject MemoryService Memories
 @inject ConnectorCatalogService Catalog
 @inject IJSRuntime JS
 @inject IUiModeService UiModeSvc
@@ -75,6 +76,19 @@ else
                         <button class="gb-close" @onclick="Updater.DismissBanner" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
                     </div>
                 }
+                @if (Memories.Notice is { } memoryNotice)
+                {
+                    <div class="global-banner memory" role="status" aria-live="polite">
+                        <i class="bi @MemoryNoticeIcon(memoryNotice.Message)"></i>
+                        <span class="gb-text">@memoryNotice.Message</span>
+                        @if (memoryNotice.CanUndo)
+                        {
+                            <button type="button" class="gb-action" @onclick="UndoMemoryNotice">Undo</button>
+                        }
+                        <a class="gb-link" href="memories">View</a>
+                        <button type="button" class="gb-close" @onclick='() => Memories.DismissNotice(memoryNotice.Id)' title="Dismiss" aria-label="Dismiss memory notice"><i class="bi bi-x-lg"></i></button>
+                    </div>
+                }
                 <div class="content">
                     @Body
                 </div>
@@ -113,6 +127,7 @@ else
         Mesh.StateChanged += Refresh;
         Setup.Changed += Refresh;
         Updater.Changed += Refresh;
+        Memories.Changed += Refresh;
         UiModeSvc.Changed += OnModeChanged;
 
         // When a toast is clicked, bring the window up and navigate to the relevant page.
@@ -174,6 +189,20 @@ else
     {
         onboardingActive = false;
         Refresh();
+    }
+
+    private void UndoMemoryNotice()
+    {
+        if (Memories.Notice is { } current)
+            Memories.UndoNotice(current.Id);
+    }
+
+    private static string MemoryNoticeIcon(string message)
+    {
+        if (message.StartsWith("Could not", StringComparison.Ordinal)) return "bi-exclamation-triangle";
+        if (message.StartsWith("Forgot", StringComparison.Ordinal)) return "bi-trash3";
+        if (message.StartsWith("Updated", StringComparison.Ordinal)) return "bi-arrow-repeat";
+        return "bi-brain";
     }
 
     // Raised from any thread by UiModeService; marshal to the UI thread.
@@ -243,6 +272,7 @@ else
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
         Updater.Changed -= Refresh;
+        Memories.Changed -= Refresh;
         UiModeSvc.Changed -= OnModeChanged;
 #if WINDOWS
         global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = null;

@@ -1,4 +1,4 @@
-@page "/tools"
+﻿@page "/tools"
 @inject AppState State
 @inject McpHost McpHostSvc
 @inject IHttpClientFactory HttpFactory
@@ -29,8 +29,8 @@
             <h3>Local tools</h3>
             <div class="field-hint" style="margin-bottom:12px;">
                 Let your agent use this machine: run scripts, search the web, read and write files.
-                These are off by default. Shared tools let that circle's agents run them on your machine;
-                only enable sharing for people you fully trust.
+                These are off by default. Shared tools let contacts in any selected circle, or every approved contact
+                when you choose that audience, run them on your machine. Only share with people you fully trust.
             </div>
             @foreach (var lt in VisibleLocalToolRows)
             {
@@ -81,16 +81,11 @@
                                 }
                                 else
                                 {
-                                    <select value="@setting.Visibility"
-                                            @onchange="e => SetLocalToolVisibility(lt.Kind, e.Value?.ToString())"
-                                            aria-label="@($"Visibility for {lt.Name}")">
-                                        <option value="private">Only me (Me chat)</option>
-                                        @foreach (var c in State.CircleNames)
-                                        {
-                                            <option value="@($"shared:{c}")">Share with @c</option>
-                                        }
-                                        <option value="public">Anyone allowed</option>
-                                    </select>
+                                    <AudiencePicker Value="@setting.Visibility"
+                                                    ValueChanged="value => SetLocalToolVisibility(lt.Kind, value)"
+                                                    Circles="@State.Profile.Circles"
+                                                    Class="compact"
+                                                    AriaLabel="@($"Who can use {lt.Name}")" />
                                 }
                             </div>
                             <div class="lt-approval">
@@ -123,7 +118,7 @@
                 <h3>Built-in tool servers</h3>
                 <div class="field-hint" style="margin-bottom:12px;">
                     MCP servers that ship with Mesh and start automatically when enabled.
-                    Same rules as local tools: off by default, private unless shared with a circle.
+                    Same rules as local tools: off by default, private unless shared with selected circles or all allowed contacts.
                 </div>
                 @foreach (var def in McpServerRegistry.All)
                 {
@@ -152,16 +147,11 @@
                             <div class="lt-extras">
                                 <div class="lt-share">
                                     <span class="lt-share-label">Who can use it</span>
-                                    <select value="@bsetting.Visibility"
-                                            @onchange="e => SetMcpVisibility(def.Id, e.Value?.ToString())"
-                                            aria-label="@($"Visibility for {def.DisplayName}")">
-                                        <option value="private">Only me (Me chat)</option>
-                                        @foreach (var c in State.CircleNames)
-                                        {
-                                            <option value="@($"shared:{c}")">Share with @c</option>
-                                        }
-                                        <option value="public">Anyone allowed</option>
-                                    </select>
+                                    <AudiencePicker Value="@bsetting.Visibility"
+                                                    ValueChanged="value => SetMcpVisibility(def.Id, value)"
+                                                    Circles="@State.Profile.Circles"
+                                                    Class="compact"
+                                                    AriaLabel="@($"Who can use {def.DisplayName}")" />
                                 </div>
                                 <div class="lt-approval">
                                     <span class="lt-share-label">Permission level</span>
@@ -195,7 +185,7 @@
                 @(PlatformCaps.IsMobile
                     ? "Remote (HTTP) servers work on mobile."
                     : "Local (stdio) servers run as a process on this machine; remote (HTTP) servers connect over the network.")
-                Off by default, private unless shared with a circle.
+                Off by default, private unless shared with selected circles or all allowed contacts.
             </div>
 
             @foreach (var srv in VisibleCustomServers)
@@ -271,16 +261,11 @@
                         <div class="lt-extras">
                             <div class="lt-share">
                                 <span class="lt-share-label">Who can use it</span>
-                                <select value="@srv.Visibility"
-                                        @onchange="e => SetCustomVisibility(srv, e.Value?.ToString())"
-                                        aria-label="@($"Visibility for {CustomLabel(srv)}")">
-                                    <option value="private">Only me (Me chat)</option>
-                                    @foreach (var cir in State.CircleNames)
-                                    {
-                                        <option value="@($"shared:{cir}")">Share with @cir</option>
-                                    }
-                                    <option value="public">Anyone allowed</option>
-                                </select>
+                                <AudiencePicker Value="@srv.Visibility"
+                                                ValueChanged="value => SetCustomVisibility(srv, value)"
+                                                Circles="@State.Profile.Circles"
+                                                Class="compact"
+                                                AriaLabel="@($"Who can use {CustomLabel(srv)}")" />
                             </div>
                             <div class="lt-approval">
                                 <span class="lt-share-label">Permission level</span>
@@ -480,7 +465,7 @@
         => State.Mutate(p =>
         {
             if (!p.LocalTools.TryGetValue(kind, out var s) || s is null) { s = new LocalToolSetting(); p.LocalTools[kind] = s; }
-            s.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!;
+            s.Visibility = CapabilityAudience.Parse(visibility).ToVisibility();
         });
 
     void SetLocalToolApproval(LocalToolKind kind, ToolApprovalLevel level)
@@ -512,7 +497,7 @@
         => State.Mutate(p =>
         {
             if (!p.McpServers.TryGetValue(id, out var s) || s is null) { s = new LocalToolSetting(); p.McpServers[id] = s; }
-            s.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!;
+            s.Visibility = CapabilityAudience.Parse(visibility).ToVisibility();
         });
 
     void SetMcpApproval(string id, ToolApprovalLevel level)
@@ -616,7 +601,7 @@
         => State.Mutate(_ => c.Enabled = enabled);
 
     void SetCustomVisibility(CustomMcpServer c, string? visibility)
-        => State.Mutate(_ => c.Visibility = string.IsNullOrWhiteSpace(visibility) ? "private" : visibility!);
+        => State.Mutate(_ => c.Visibility = CapabilityAudience.Parse(visibility).ToVisibility());
 
     void SetCustomApproval(CustomMcpServer c, ToolApprovalLevel level)
         => State.Mutate(_ => c.ApprovalLevel = level);

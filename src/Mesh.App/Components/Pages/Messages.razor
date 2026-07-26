@@ -7,6 +7,7 @@
 
 <div class="split">
     <div class="conv-list">
+        <div class="conversation-list-head">
         <h2>Messages</h2>
         <div class="new-conv">
             <input @bind="newHandle" @bind:event="oninput" @onkeydown="OnNewKey" list="msg-handles" placeholder="Add by handle…" aria-label="Add a conversation by handle" />
@@ -15,6 +16,8 @@
             </datalist>
             <button class="primary icon-primary" @onclick="StartConversation" title="Start conversation" aria-label="Start conversation"><i class="bi bi-plus-lg"></i></button>
         </div>
+        </div>
+        <div class="conversation-list-scroll">
         <button class="ghost new-group-btn" @onclick="ShowGroupCreator" aria-expanded="@showGroupCreator">
             <i class="bi bi-people"></i> New group
         </button>
@@ -120,6 +123,7 @@
                 }
             </div>
         }
+        </div>
     </div>
 
     <div class="thread">
@@ -191,9 +195,21 @@
             <div class="messages-frame">
                 <div class="messages" @ref="scrollEl">
                     <div class="messages-wrap">
-                    @foreach (var line in conv.Lines)
+                    @{
+                        var renderedLines = MessageRenderWindow.Latest(conv.Lines, messageRenderCount);
+                        var hiddenMessageCount = MessageRenderWindow.HiddenCount(conv.Lines.Count, messageRenderCount);
+                    }
+                    @if (hiddenMessageCount > 0)
                     {
-                        <div class="bubble @(line.Role == "user" ? "assistant" : "user")">
+                        <div class="message-history-more">
+                            <button type="button" class="ghost" @onclick="ShowEarlierMessages">
+                                <i class="bi bi-clock-history"></i> Show @MessageRenderWindow.NextPageSize(conv.Lines.Count, messageRenderCount) earlier messages
+                            </button>
+                        </div>
+                    }
+                    @foreach (var line in renderedLines)
+                    {
+                        <div class="bubble @(line.Role == "user" ? "assistant" : "user")" @key="line.Id">
                             <MessageContent Text="@line.Text" From="@InboundAuthor(conv, line)"
                                             OnPin="html => PinWidget(html, line)" />
                             <div class="msg-tag">
@@ -202,7 +218,7 @@
                                 {
                                     <span class="msg-status" title="Queued - will send after the current turn"><i class="bi bi-hourglass-split"></i> queued</span>
                                 }
-                                @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status))
+                                @if (line.Role == "assistant" && !string.IsNullOrEmpty(line.Status) && line.Status != "agent_queued")
                                 {
                                     var shownStatus = conv.IsGroup && line.Status == "delivered" ? "sent" : line.Status;
                                     <span class="msg-status @shownStatus" title="@shownStatus">
@@ -213,6 +229,12 @@
                                     </span>
                                 }
                             </div>
+                        @if (line.Role == "assistant" && line.Status == "agent_queued")
+                        {
+                            <div class="agent-queued-note" role="status">
+                                <i class="bi bi-hourglass-split"></i> @AgentQueuedLabel(conv)
+                            </div>
+                        }
                         </div>
                     }
                     @if (ActiveIsService && State.IsAwaiting(active!))
@@ -334,6 +356,8 @@
 
 @code {
     string? activeValue;
+    int messageRenderCount = MessageRenderWindow.InitialCount;
+    bool preserveHistoryScroll;
     string? active
     {
         get => activeValue;
@@ -341,7 +365,9 @@
         {
             if (string.Equals(activeValue, value, StringComparison.OrdinalIgnoreCase)) return;
             activeValue = value;
+            messageRenderCount = MessageRenderWindow.InitialCount;
             inputValue = value is null ? "" : State.GetConversationDraft(value);
+            State.SetLastDesktopConversationKey(value);
         }
     }
     string? confirmDelete;
@@ -430,6 +456,14 @@
         }
 
         OpenPendingDeepLink();
+        if (active is null)
+        {
+            var remembered = State.GetLastDesktopConversationKey();
+            if (!string.IsNullOrWhiteSpace(remembered) && State.FindConversation(remembered) is not null)
+                Select(remembered);
+            else if (!string.IsNullOrWhiteSpace(remembered))
+                State.SetLastDesktopConversationKey(null);
+        }
     }
 
     // Opens a conversation a mesh:// deep link asked for (the router pre-created it and set the key).
@@ -494,6 +528,12 @@
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
 
+        if (preserveHistoryScroll)
+        {
+            preserveHistoryScroll = false;
+            return;
+        }
+
         var count = State.GetOrCreateConversation(active).Lines.Count;
         // Scroll on new messages or when switching into a conversation.
         var activeChanged = active != lastActive;
@@ -508,6 +548,14 @@
             var method = activeChanged ? "meshUI.scrollToBottom" : "meshUI.scrollToBottomIfPinned";
             try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
         }
+    }
+
+    void ShowEarlierMessages()
+    {
+        if (active is null) return;
+        var totalCount = State.GetOrCreateConversation(active).Lines.Count;
+        messageRenderCount = MessageRenderWindow.NextCount(totalCount, messageRenderCount);
+        preserveHistoryScroll = true;
     }
 
     async Task ScrollToLatest()
@@ -582,6 +630,7 @@
     {
         if (active is null) return;
         State.ClearConversation(active);
+        messageRenderCount = MessageRenderWindow.InitialCount;
         confirmDelete = null;
     }
 
@@ -630,6 +679,9 @@
         if (mine) return agent ? "to their agent" : "to them";
         return agent ? "their agent" : "them";
     }
+
+    string AgentQueuedLabel(Conversation conv)
+        => $"{State.DisplayNameFor(conv.Handle)}'s agent is unavailable. Message queued.";
 
     async Task PickFile()
     {
@@ -800,7 +852,7 @@
             State.Save();
             return;
         }
-        var kind = direct ? MeshKinds.DirectMessage : MeshKinds.Chat;
+        var kind = direct ? MeshKinds.DirectMessage : Mesh.AgentQuestionKind;
         await Mesh.SendAsync(handle, kind, toSend, line.Id);
     }
 

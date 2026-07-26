@@ -45,12 +45,13 @@ public sealed class CopilotAcpHost : IAsyncDisposable
         IReadOnlyList<(string Role, string Text)> history,
         IReadOnlyList<(string MimeType, byte[] Data)> images,
         IReadOnlyList<IAgentTool> tools,
+        TokenOptimizationLevel tokenOptimization,
         IProgress<AgentStep>? progress = null,
         IProgress<AgentDelta>? delta = null,
         CancellationToken ct = default)
         => pool.UseAsync(
             worker => worker.CompleteAsync(
-                config, systemPrompt, history, images, tools, progress, delta, ct), ct);
+                config, systemPrompt, history, images, tools, tokenOptimization, progress, delta, ct), ct);
 
     public async ValueTask DisposeAsync()
     {

@@ -27,6 +27,8 @@ public sealed class MeshDb : IDisposable
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private const string ConversationDraftKind = "conversation";
     private const string TopicDraftKind = "topic";
+    private const string LastDesktopTopicMetaKey = "ui.desktop.last_topic";
+    private const string LastDesktopConversationMetaKey = "ui.desktop.last_conversation";
     private static bool nativeInit;
 
     private readonly SqliteConnection conn;
@@ -96,6 +98,24 @@ public sealed class MeshDb : IDisposable
                 entity_id TEXT NOT NULL,
                 text TEXT NOT NULL,
                 PRIMARY KEY(kind, entity_id));
+            CREATE TABLE IF NOT EXISTS memories(
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                category TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                importance REAL NOT NULL,
+                confidence REAL NOT NULL,
+                stability REAL NOT NULL,
+                reinforcement_count INTEGER NOT NULL,
+                source_thread_id TEXT,
+                source_line_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_reinforced_at TEXT NOT NULL,
+                recall_count INTEGER NOT NULL DEFAULT 0,
+                last_recalled_at TEXT);
+            CREATE INDEX IF NOT EXISTS ix_memories_updated ON memories(updated_at DESC, id);
             CREATE TABLE IF NOT EXISTS sync_versions(
                 entity_key TEXT PRIMARY KEY,
                 version TEXT NOT NULL);
@@ -237,6 +257,44 @@ public sealed class MeshDb : IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    // ---- local UI state ----------------------------------------------------
+
+    public string? GetLastDesktopTopicId()
+        => GetMetaValue(LastDesktopTopicMetaKey);
+
+    public void SetLastDesktopTopicId(string? threadId)
+        => SetMetaValue(LastDesktopTopicMetaKey, threadId);
+
+    public string? GetLastDesktopConversationKey()
+        => GetMetaValue(LastDesktopConversationMetaKey);
+
+    public void SetLastDesktopConversationKey(string? conversationKey)
+        => SetMetaValue(LastDesktopConversationMetaKey, conversationKey);
+
+    private string? GetMetaValue(string key)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT v FROM meta WHERE k = $key;";
+        cmd.Parameters.AddWithValue("$key", key);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    private void SetMetaValue(string key, string? value)
+    {
+        using var cmd = conn.CreateCommand();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            cmd.CommandText = "DELETE FROM meta WHERE k = $key;";
+        }
+        else
+        {
+            cmd.CommandText = "INSERT INTO meta(k, v) VALUES($key, $value) ON CONFLICT(k) DO UPDATE SET v = excluded.v;";
+            cmd.Parameters.AddWithValue("$value", value);
+        }
+        cmd.Parameters.AddWithValue("$key", key);
+        cmd.ExecuteNonQuery();
+    }
+
     // ---- profile + history --------------------------------------------------
 
     /// <summary>Loads the full profile including chat history, or null when the database is empty.</summary>
@@ -253,6 +311,7 @@ public sealed class MeshDb : IDisposable
         var profile = JsonSerializer.Deserialize<MeshProfile>(json, JsonOpts) ?? new MeshProfile();
         profile.Conversations = LoadConversations();
         profile.OwnThreads = LoadOwnThreads();
+        profile.Memories = LoadMemories();
         profile.OwnChat = new List<ChatLine>();
         return profile;
     }
@@ -426,6 +485,182 @@ public sealed class MeshDb : IDisposable
         return threads;
     }
 
+    private List<MemoryItem> LoadMemories()
+    {
+        var memories = new List<MemoryItem>();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, title, content, category, origin, importance, confidence, stability,
+                   reinforcement_count, source_thread_id, source_line_id, created_at, updated_at,
+                   last_reinforced_at, recall_count, last_recalled_at
+            FROM memories ORDER BY updated_at DESC, id;
+            """;
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            memories.Add(new MemoryItem
+            {
+                Id = reader.GetString(0),
+                Title = reader.GetString(1),
+                Content = reader.GetString(2),
+                Category = reader.GetString(3),
+                Origin = reader.GetString(4),
+                Importance = reader.GetDouble(5),
+                Confidence = reader.GetDouble(6),
+                Stability = reader.GetDouble(7),
+                ReinforcementCount = reader.GetInt32(8),
+                SourceThreadId = reader.IsDBNull(9) ? null : reader.GetString(9),
+                SourceLineId = reader.IsDBNull(10) ? null : reader.GetString(10),
+                CreatedAt = ParseAt(reader.GetString(11)),
+                UpdatedAt = ParseAt(reader.GetString(12)),
+                LastReinforcedAt = ParseAt(reader.GetString(13)),
+                RecallCount = reader.GetInt32(14),
+                LastRecalledAt = reader.IsDBNull(15) ? null : ParseAt(reader.GetString(15))
+            });
+        }
+        return memories;
+    }
+
+    public void UpsertMemory(MemoryItem memory)
+    {
+        using var transaction = conn.BeginTransaction(deferred: false);
+        UpsertMemory(transaction, memory, preserveLocalUsage: false);
+        transaction.Commit();
+    }
+
+    public void DeleteMemory(string id)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM memories WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    internal bool TryApplyMemoryUpsert(
+        MemoryItem memory,
+        string versionKey,
+        string version,
+        string deleteKind)
+    {
+        using var transaction = conn.BeginTransaction(deferred: false);
+        var newest = Newest(
+            GetSyncVersion(transaction, versionKey),
+            GetSyncTombstoneVersion(transaction, deleteKind, memory.Id));
+        if (!DeviceSyncVersion.IsNewer(version, newest))
+        {
+            transaction.Rollback();
+            return false;
+        }
+
+        UpsertMemory(transaction, memory, preserveLocalUsage: true);
+        UpsertSyncVersion(transaction, versionKey, version);
+        transaction.Commit();
+        return true;
+    }
+
+    internal bool TryApplyMemoryDelete(
+        string id,
+        string tombstoneKind,
+        string version,
+        string upsertKey)
+    {
+        using var transaction = conn.BeginTransaction(deferred: false);
+        var newest = Newest(
+            GetSyncTombstoneVersion(transaction, tombstoneKind, id),
+            GetSyncVersion(transaction, upsertKey));
+        if (!DeviceSyncVersion.IsNewer(version, newest))
+        {
+            transaction.Rollback();
+            return false;
+        }
+
+        using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = transaction;
+            delete.CommandText = "DELETE FROM memories WHERE id = $id;";
+            delete.Parameters.AddWithValue("$id", id);
+            delete.ExecuteNonQuery();
+        }
+        UpsertSyncTombstone(transaction, tombstoneKind, id, version);
+        transaction.Commit();
+        return true;
+    }
+
+    public void TouchMemories(IReadOnlyCollection<string> ids, DateTimeOffset at)
+    {
+        if (ids.Count == 0) return;
+        using var transaction = conn.BeginTransaction(deferred: false);
+        foreach (var id in ids.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal))
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = """
+                UPDATE memories
+                SET recall_count = recall_count + 1, last_recalled_at = $at
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$at", at.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+        transaction.Commit();
+    }
+
+    private void UpsertMemory(
+        SqliteTransaction transaction,
+        MemoryItem memory,
+        bool preserveLocalUsage)
+    {
+        var localUpdates = preserveLocalUsage
+            ? ""
+            : ", recall_count = excluded.recall_count, last_recalled_at = excluded.last_recalled_at";
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = $"""
+            INSERT INTO memories(
+                id, title, content, category, origin, importance, confidence, stability,
+                reinforcement_count, source_thread_id, source_line_id, created_at, updated_at,
+                last_reinforced_at, recall_count, last_recalled_at)
+            VALUES(
+                $id, $title, $content, $category, $origin, $importance, $confidence, $stability,
+                $reinforcement, $sourceThread, $sourceLine, $created, $updated,
+                $reinforced, $recallCount, $lastRecalled)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                content = excluded.content,
+                category = excluded.category,
+                origin = excluded.origin,
+                importance = excluded.importance,
+                confidence = excluded.confidence,
+                stability = excluded.stability,
+                reinforcement_count = excluded.reinforcement_count,
+                source_thread_id = excluded.source_thread_id,
+                source_line_id = excluded.source_line_id,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                last_reinforced_at = excluded.last_reinforced_at{localUpdates};
+            """;
+        cmd.Parameters.AddWithValue("$id", memory.Id);
+        cmd.Parameters.AddWithValue("$title", memory.Title);
+        cmd.Parameters.AddWithValue("$content", memory.Content);
+        cmd.Parameters.AddWithValue("$category", memory.Category);
+        cmd.Parameters.AddWithValue("$origin", memory.Origin);
+        cmd.Parameters.AddWithValue("$importance", memory.Importance);
+        cmd.Parameters.AddWithValue("$confidence", memory.Confidence);
+        cmd.Parameters.AddWithValue("$stability", memory.Stability);
+        cmd.Parameters.AddWithValue("$reinforcement", memory.ReinforcementCount);
+        cmd.Parameters.AddWithValue("$sourceThread", (object?)memory.SourceThreadId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$sourceLine", (object?)memory.SourceLineId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$created", memory.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$updated", memory.UpdatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$reinforced", memory.LastReinforcedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$recallCount", memory.RecallCount);
+        cmd.Parameters.AddWithValue("$lastRecalled", memory.LastRecalledAt.HasValue
+            ? memory.LastRecalledAt.Value.ToString("O")
+            : DBNull.Value);
+        cmd.ExecuteNonQuery();
+    }
+
     /// <summary>
     /// Writes the profile blob (config, keys, contacts, and the rest) EXCLUDING conversations and
     /// own-chat, which are persisted as rows via the append methods so history stays scalable.
@@ -512,6 +747,7 @@ public sealed class MeshDb : IDisposable
         {
             DeviceSyncKinds.ContactUpsert => DeviceSyncKinds.ContactDelete,
             DeviceSyncKinds.CircleUpsert => DeviceSyncKinds.CircleDelete,
+            DeviceSyncKinds.MemoryUpsert => DeviceSyncKinds.MemoryDelete,
             _ => ""
         };
         return deleteKind.Length > 0 && entityId.Length > 0;
@@ -526,6 +762,7 @@ public sealed class MeshDb : IDisposable
         {
             DeviceSyncKinds.ContactDelete => DeviceSyncKinds.ContactUpsert,
             DeviceSyncKinds.CircleDelete => DeviceSyncKinds.CircleUpsert,
+            DeviceSyncKinds.MemoryDelete => DeviceSyncKinds.MemoryUpsert,
             _ => ""
         };
         entityKey = upsertKind.Length == 0 ? "" : upsertKind + "\u001f" + entityId;
@@ -538,6 +775,7 @@ public sealed class MeshDb : IDisposable
         node.Remove("conversations");
         node.Remove("ownChat");
         node.Remove("ownThreads");
+        node.Remove("memories");
         var json = node.ToJsonString(JsonOpts);
         cmd.CommandText = "INSERT INTO profile(id, json) VALUES(1, $j) ON CONFLICT(id) DO UPDATE SET json = $j;";
         cmd.Parameters.AddWithValue("$j", json);

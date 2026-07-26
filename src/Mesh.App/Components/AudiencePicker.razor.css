@@ -1,0 +1,311 @@
+.audience-picker {
+    position: relative;
+    min-width: 160px;
+}
+
+.audience-picker.full {
+    width: 100%;
+}
+
+.audience-picker.grow {
+    flex: 1 1 180px;
+}
+
+.audience-picker.compact {
+    flex: 1 1 180px;
+    max-width: 280px;
+}
+
+.audience-trigger {
+    width: 100%;
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    color: var(--fg-1);
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-2);
+    border-bottom-color: var(--stroke-accessible);
+    border-radius: var(--radius-s);
+    font: inherit;
+    font-size: .86rem;
+    text-align: left;
+}
+
+.audience-trigger:hover {
+    background: var(--bg-hover);
+}
+
+.audience-trigger:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
+}
+
+.audience-trigger > span {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.audience-trigger.priv > i:first-child {
+    color: var(--fg-3);
+}
+
+.audience-trigger.shared > i:first-child,
+.audience-trigger.pub > i:first-child {
+    color: var(--brand);
+}
+
+.audience-chevron {
+    color: var(--fg-3);
+    font-size: .7rem;
+}
+
+.audience-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 3000;
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+
+.audience-panel {
+    position: absolute;
+    z-index: 3001;
+    top: calc(100% + 6px);
+    right: 0;
+    width: min(340px, calc(100vw - 32px));
+    overflow: hidden;
+    color: var(--fg-1);
+    background: var(--bg-1);
+    border: 1px solid var(--stroke-2);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-4, 0 18px 45px rgba(0, 0, 0, .2));
+}
+
+.audience-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 14px 10px;
+    border-bottom: 1px solid var(--stroke-1);
+}
+
+.audience-head strong,
+.audience-head span {
+    display: block;
+}
+
+.audience-head strong {
+    font-size: .95rem;
+}
+
+.audience-head span {
+    margin-top: 2px;
+    color: var(--fg-3);
+    font-size: .76rem;
+}
+
+.audience-close {
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--fg-3);
+}
+
+.audience-close:hover {
+    color: var(--fg-1);
+    background: var(--bg-hover);
+}
+
+.audience-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px;
+}
+
+.audience-mode {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-m);
+    background: transparent;
+    color: var(--fg-1);
+    text-align: left;
+}
+
+.audience-mode:hover:not(:disabled) {
+    background: var(--bg-hover);
+}
+
+.audience-mode.active {
+    border-color: var(--brand-tint-2);
+    background: var(--brand-tint);
+}
+
+.audience-mode:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+.audience-mode > i {
+    width: 20px;
+    color: var(--brand);
+    font-size: 1rem;
+    text-align: center;
+}
+
+.audience-mode > span,
+.audience-mode b,
+.audience-mode small {
+    display: block;
+}
+
+.audience-mode > span {
+    flex: 1;
+    min-width: 0;
+}
+
+.audience-mode b {
+    font-size: .86rem;
+}
+
+.audience-mode small {
+    margin-top: 1px;
+    color: var(--fg-3);
+    font-size: .73rem;
+    font-weight: 400;
+}
+
+.audience-circles {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 190px;
+    margin: 0 4px 4px 40px;
+    padding: 6px;
+    overflow-y: auto;
+    border-left: 2px solid var(--brand-tint-2);
+}
+
+.audience-circle {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 9px;
+    border-radius: var(--radius-s);
+    color: var(--fg-2);
+    cursor: pointer;
+}
+
+.audience-circle:hover,
+.audience-circle.selected {
+    background: var(--bg-hover);
+}
+
+.audience-circle input {
+    margin: 0;
+}
+
+.audience-circle span {
+    flex: 1;
+    min-width: 0;
+}
+
+.audience-circle i {
+    color: var(--brand);
+}
+
+.audience-empty {
+    padding: 8px;
+    color: var(--fg-3);
+    font-size: .78rem;
+}
+
+.audience-warning {
+    margin: 0 14px 4px;
+    color: var(--danger);
+    font-size: .76rem;
+}
+
+.audience-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 10px 14px 14px;
+    border-top: 1px solid var(--stroke-1);
+    background: var(--bg-1);
+}
+
+@media (max-width: 840.98px) {
+    .audience-picker,
+    .audience-picker.compact,
+    .audience-picker.grow {
+        width: 100%;
+        max-width: none;
+    }
+
+    .audience-backdrop {
+        background: rgba(0, 0, 0, .42);
+    }
+
+    .audience-panel {
+        position: fixed;
+        top: auto;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        width: 100%;
+        max-height: min(82vh, 680px);
+        overflow-y: auto;
+        border-right: 0;
+        border-bottom: 0;
+        border-left: 0;
+        border-radius: 18px 18px 0 0;
+        padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    .audience-head {
+        padding: 18px 18px 12px;
+    }
+
+    .audience-body {
+        padding: 10px 12px;
+    }
+
+    .audience-mode,
+    .audience-circle {
+        min-height: 44px;
+    }
+
+    .audience-circles {
+        max-height: none;
+        margin-left: 42px;
+    }
+
+    .audience-actions {
+        position: sticky;
+        bottom: 0;
+        padding: 12px 18px calc(12px + env(safe-area-inset-bottom));
+    }
+
+    .audience-actions button {
+        min-height: 44px;
+    }
+}

@@ -1,0 +1,254 @@
+.tool-detail-view {
+    width: 100%;
+    min-width: 0;
+    margin: 1px 0 5px;
+}
+
+.tool-detail-toolbar {
+    min-height: 26px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 3px;
+}
+
+.tool-detail-kind,
+.tool-detail-section-label {
+    color: var(--fg-3, #616161);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .045em;
+    text-transform: uppercase;
+}
+
+.tool-detail-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
+}
+
+.tool-detail-action {
+    width: 25px;
+    height: 25px;
+    min-width: 25px;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--fg-3, #616161);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.tool-detail-action.mode {
+    width: auto;
+    padding: 0 6px;
+}
+
+.tool-detail-action:hover,
+.tool-detail-action:focus-visible,
+.tool-detail-action[aria-pressed="true"] {
+    background: var(--bg-3, #f0f0f0);
+    color: var(--fg-1, #242424);
+}
+
+.tool-detail-action:focus-visible {
+    outline: 2px solid var(--brand, #0f6cbd);
+    outline-offset: 1px;
+}
+
+.tool-detail-action.copied {
+    color: var(--ok, #107c10);
+}
+
+.tool-detail-action.copy-failed {
+    color: var(--danger, #b10e1c);
+}
+
+.tool-detail-section + .tool-detail-section {
+    margin-top: 6px;
+}
+
+.tool-detail-section-label {
+    margin: 0 0 3px 2px;
+}
+
+.tool-detail-code {
+    width: 100%;
+    max-height: 220px;
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--stroke-1, #e0e0e0);
+    border-radius: 6px;
+    background: var(--bg-2, #fafafa);
+    color: var(--fg-2, #424242);
+    overflow: auto;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    tab-size: 4;
+}
+
+.expanded .tool-detail-code {
+    max-height: none;
+}
+
+.wrap .tool-detail-code,
+.wrap .tool-detail-code code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.nowrap .tool-detail-code,
+.nowrap .tool-detail-code code {
+    white-space: pre;
+    overflow-wrap: normal;
+    word-break: normal;
+}
+
+.tool-detail-code code {
+    display: block;
+    min-width: 100%;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+}
+
+.tool-detail-section.error .tool-detail-code {
+    border-left-color: var(--danger, #b10e1c);
+}
+
+.tool-detail-status {
+    min-height: 30px;
+    padding: 5px 8px;
+    border: 1px solid var(--stroke-1, #e0e0e0);
+    border-radius: 6px;
+    background: var(--bg-2, #fafafa);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg-2, #424242);
+    font-size: 12px;
+}
+
+.tool-detail-status span {
+    color: var(--fg-3, #616161);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+}
+
+.tool-detail-status code {
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 12px;
+}
+
+.tool-detail-section.success .tool-detail-status i {
+    color: var(--ok, #107c10);
+}
+
+.tool-detail-section.warning .tool-detail-status i {
+    color: #9a6700;
+}
+
+.tool-detail-section.error .tool-detail-status i {
+    color: var(--danger, #b10e1c);
+}
+
+/* Highlight.js GitHub-light inspired palette, scoped to readable tool details. */
+.tool-detail-code ::deep .hljs-comment,
+.tool-detail-code ::deep .hljs-quote {
+    color: #6e7781;
+    font-style: italic;
+}
+
+.tool-detail-code ::deep .hljs-keyword,
+.tool-detail-code ::deep .hljs-selector-tag,
+.tool-detail-code ::deep .hljs-built_in,
+.tool-detail-code ::deep .hljs-name,
+.tool-detail-code ::deep .hljs-tag {
+    color: #cf222e;
+}
+
+.tool-detail-code ::deep .hljs-string,
+.tool-detail-code ::deep .hljs-regexp,
+.tool-detail-code ::deep .hljs-addition,
+.tool-detail-code ::deep .hljs-attribute,
+.tool-detail-code ::deep .hljs-meta .hljs-string {
+    color: #0a3069;
+}
+
+.tool-detail-code ::deep .hljs-number,
+.tool-detail-code ::deep .hljs-literal,
+.tool-detail-code ::deep .hljs-symbol,
+.tool-detail-code ::deep .hljs-bullet {
+    color: #0550ae;
+}
+
+.tool-detail-code ::deep .hljs-title,
+.tool-detail-code ::deep .hljs-title.class_,
+.tool-detail-code ::deep .hljs-title.function_ {
+    color: #8250df;
+}
+
+.tool-detail-code ::deep .hljs-variable,
+.tool-detail-code ::deep .hljs-template-variable,
+.tool-detail-code ::deep .hljs-type,
+.tool-detail-code ::deep .hljs-selector-class,
+.tool-detail-code ::deep .hljs-selector-attr,
+.tool-detail-code ::deep .hljs-selector-pseudo {
+    color: #953800;
+}
+
+.tool-detail-code ::deep .hljs-attr,
+.tool-detail-code ::deep .hljs-property,
+.tool-detail-code ::deep .hljs-doctag,
+.tool-detail-code ::deep .hljs-meta {
+    color: #116329;
+}
+
+.tool-detail-code ::deep .hljs-deletion {
+    color: #82071e;
+    background: #ffebe9;
+}
+
+.tool-detail-code ::deep .hljs-addition {
+    background: #dafbe1;
+}
+
+.tool-detail-code ::deep .hljs-emphasis {
+    font-style: italic;
+}
+
+.tool-detail-code ::deep .hljs-strong {
+    font-weight: 700;
+}
+
+@media (max-width: 720px) {
+    .tool-detail-code {
+        max-height: 200px;
+        padding: 7px 8px;
+        font-size: 11.5px;
+    }
+
+    .expanded .tool-detail-code {
+        max-height: none;
+    }
+
+    .tool-detail-action {
+        width: 28px;
+        height: 28px;
+        min-width: 28px;
+    }
+}

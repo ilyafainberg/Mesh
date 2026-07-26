@@ -1,6 +1,18 @@
 ﻿<Router AppAssembly="typeof(MauiProgram).Assembly" NotFoundPage="typeof(Pages.NotFound)">
     <Found Context="routeData">
-        <RouteView RouteData="routeData" DefaultLayout="typeof(Layout.MainLayout)" />
-        <FocusOnNavigate RouteData="routeData" Selector="h1" />
+        <ErrorBoundary MaximumErrorCount="3">
+            <ChildContent>
+                <RouteView RouteData="routeData" DefaultLayout="typeof(Layout.MainLayout)" />
+                <FocusOnNavigate RouteData="routeData" Selector="h1" />
+            </ChildContent>
+            <ErrorContent>
+                <main class="route-error" role="alert">
+                    <i class="bi bi-exclamation-triangle"></i>
+                    <h1>Mesh hit a display error</h1>
+                    <p>The technical details were saved locally. Reload this view, then copy diagnostics from Settings if it happens again.</p>
+                    <a class="primary" href=".">Reload view</a>
+                </main>
+            </ErrorContent>
+        </ErrorBoundary>
     </Found>
 </Router>

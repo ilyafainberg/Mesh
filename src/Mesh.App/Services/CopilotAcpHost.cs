@@ -19,6 +19,7 @@ internal sealed class CopilotAcpLane(
         public sealed class ToolProgress
         {
             public string Label { get; set; } = "Copilot action";
+            public string? ToolName { get; set; }
             public string? Arguments { get; set; }
             public bool StartedReported { get; set; }
         }
@@ -29,7 +30,9 @@ internal sealed class CopilotAcpLane(
         public IProgress<AgentDelta>? Delta { get; init; }
         public required TokenMeter.UsageContext UsageContext { get; init; }
         public HashSet<string> AllowedToolNames { get; init; } = new(StringComparer.Ordinal);
+        public HashSet<string> InternalToolNames { get; init; } = new(StringComparer.Ordinal);
         public HashSet<string> MeshToolCallIds { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> InternalToolCallIds { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, ToolProgress> ToolCalls { get; } = new(StringComparer.Ordinal);
         public CopilotAcpUsageAccumulator Usage { get; } = new();
         private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
@@ -132,6 +135,7 @@ internal sealed class CopilotAcpLane(
                 new[] { ("user", "Reply with exactly OK") },
                 Array.Empty<(string MimeType, byte[] Data)>(),
                 Array.Empty<IAgentTool>(),
+                TokenOptimizationLevel.Disabled,
                 progress: null,
                 delta: null,
                 ct).ConfigureAwait(false);
@@ -151,11 +155,12 @@ internal sealed class CopilotAcpLane(
         IReadOnlyList<(string Role, string Text)> history,
         IReadOnlyList<(string MimeType, byte[] Data)> images,
         IReadOnlyList<IAgentTool> tools,
+        TokenOptimizationLevel tokenOptimization,
         IProgress<AgentStep>? progress = null,
         IProgress<AgentDelta>? delta = null,
         CancellationToken ct = default)
         => CompleteCoreAsync(
-            config, systemPrompt, history, images, tools, progress, delta, ct);
+            config, systemPrompt, history, images, tools, tokenOptimization, progress, delta, ct);
 
     private async Task<string> CompleteCoreAsync(
         CopilotAcpConfig config,
@@ -163,6 +168,7 @@ internal sealed class CopilotAcpLane(
         IReadOnlyList<(string Role, string Text)> history,
         IReadOnlyList<(string MimeType, byte[] Data)> images,
         IReadOnlyList<IAgentTool> tools,
+        TokenOptimizationLevel tokenOptimization,
         IProgress<AgentStep>? progress,
         IProgress<AgentDelta>? delta,
         CancellationToken ct)
@@ -176,7 +182,8 @@ internal sealed class CopilotAcpLane(
                 tools.Select(tool => $"mesh-{tool.Name}").OrderBy(name => name, StringComparer.Ordinal));
             var effectiveConfig = config with { ToolFilter = toolFilter };
             await EnsureProcessAsync(effectiveConfig, ct).ConfigureAwait(false);
-            mcpRegistration = await mcpBridge.RegisterAsync(tools, ct).ConfigureAwait(false);
+            mcpRegistration = await mcpBridge.RegisterAsync(
+                tools, tokenOptimization, ct).ConfigureAwait(false);
             var session = await NewSessionAsync(mcpRegistration, ct).ConfigureAwait(false);
             sessionId = SessionId(session);
             var content = new List<object>
@@ -201,6 +208,10 @@ internal sealed class CopilotAcpLane(
                 Delta = delta,
                 UsageContext = tokenMeter.CaptureContext(),
                 AllowedToolNames = tools
+                    .SelectMany(tool => new[] { tool.Name, $"mesh-{tool.Name}" })
+                    .ToHashSet(StringComparer.Ordinal),
+                InternalToolNames = tools
+                    .Where(tool => tool.IsInternal)
                     .SelectMany(tool => new[] { tool.Name, $"mesh-{tool.Name}" })
                     .ToHashSet(StringComparer.Ordinal)
             };
@@ -528,7 +539,11 @@ internal sealed class CopilotAcpLane(
             if (turn.AllowedToolNames.Any(name =>
                     string.Equals(titleText, name, StringComparison.Ordinal)))
                 turn.MeshToolCallIds.Add(toolCallId);
+            if (turn.InternalToolNames.Any(name =>
+                    string.Equals(titleText, name, StringComparison.Ordinal)))
+                turn.InternalToolCallIds.Add(toolCallId);
         }
+        if (turn.InternalToolCallIds.Contains(toolCallId)) return;
 
         if (!turn.ToolCalls.TryGetValue(toolCallId, out var tracked))
         {
@@ -536,7 +551,10 @@ internal sealed class CopilotAcpLane(
             turn.ToolCalls[toolCallId] = tracked;
         }
         if (!string.IsNullOrWhiteSpace(titleText))
+        {
+            tracked.ToolName = AcpToolName(titleText);
             tracked.Label = FriendlyToolLabel(titleText, turn.AllowedToolNames);
+        }
         if (update.TryGetProperty("rawInput", out var rawInput))
             tracked.Arguments = ToolTrace.Clip(rawInput.GetRawText());
 
@@ -554,7 +572,8 @@ internal sealed class CopilotAcpLane(
                 stepKey,
                 tracked.Label,
                 AgentStepState.Started,
-                tracked.Arguments));
+                tracked.Arguments,
+                ToolName: tracked.ToolName));
             tracked.StartedReported = true;
         }
         if (state != AgentStepState.Started)
@@ -564,18 +583,30 @@ internal sealed class CopilotAcpLane(
                 tracked.Label,
                 state,
                 tracked.Arguments,
-                ExtractToolResult(update)));
+                ExtractToolResult(update),
+                tracked.ToolName));
         }
     }
 
     private static string FriendlyToolLabel(string title, IReadOnlySet<string> allowedToolNames)
     {
-        var toolName = title.StartsWith("mesh-", StringComparison.Ordinal)
-            ? title["mesh-".Length..]
-            : title;
+        var toolName = AcpToolName(title);
         return allowedToolNames.Contains(title) || allowedToolNames.Contains(toolName)
             ? ReasoningExtract.Label(toolName)
             : title;
+    }
+
+    private static string AcpToolName(string title)
+    {
+        var name = title.Trim();
+        var dot = name.LastIndexOf('.');
+        if (dot >= 0 && dot < name.Length - 1)
+            name = name[(dot + 1)..];
+        if (name.StartsWith("mesh-", StringComparison.Ordinal))
+            name = name["mesh-".Length..];
+        else if (name.StartsWith("mesh_", StringComparison.Ordinal))
+            name = name["mesh_".Length..];
+        return name.Replace('-', '_');
     }
 
     private static string? ExtractToolResult(JsonElement update)

@@ -316,19 +316,16 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
 
     /// <summary>
     /// Guest path: a source's email tool is offered whole-mailbox when the source
-    /// itself is visible to the guest's circles, else scoped to just the folders
-    /// shared with those circles. Teams + files are only offered when the whole source is visible.
+    /// is visible to the guest's audience, else scoped to just the folders visible to that audience.
+    /// Teams + files are only offered when the whole source is visible.
     /// </summary>
     public IReadOnlyList<IAgentTool> GuestTools(
         IEnumerable<ConnectedSource> sources,
         List<string> circles,
         IReadOnlyDictionary<LocalToolKind, LocalToolSetting>? localTools = null)
     {
-        static bool Vis(string v, List<string> cs) =>
-            v == "public" || (v.StartsWith("shared:") && cs.Contains(v["shared:".Length..]));
-
         var tools = new List<IAgentTool>();
-        // Local tools the owner has explicitly shared with one of this guest's circles.
+        // Local tools the owner has explicitly shared with this guest's audience.
         if (localTools is not null)
             tools.AddRange(LocalTools(localTools, owner: false, circles: circles));
         foreach (var src in sources)
@@ -336,7 +333,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
             if (!src.Enabled) continue;
             var label = LabelFor(src);
             var suffix = NameSuffix(src);
-            var sourceVisible = Vis(src.Visibility, circles);
+            var sourceVisible = AudiencePolicy.CanAccess(src.Visibility, circles);
 
             if (sourceVisible)
             {
@@ -349,14 +346,14 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
 
             // Not fully visible: offer per-grant scoped tools (mail folders and/or drive paths).
             var visibleFolders = src.Folders
-                .Where(f => Vis(f.Visibility, circles))
+                .Where(f => AudiencePolicy.CanAccess(f.Visibility, circles))
                 .Select(f => new FolderRef(f.Id, f.Name))
                 .ToList();
             if (HasEmail(src.Provider) && visibleFolders.Count > 0)
                 tools.Add(EmailTool(src, label, suffix, visibleFolders));
 
             var visiblePaths = src.DrivePaths
-                .Where(f => Vis(f.Visibility, circles))
+                .Where(f => AudiencePolicy.CanAccess(f.Visibility, circles))
                 .Select(f => new FolderRef(f.Id, f.Name))
                 .ToList();
             if (visiblePaths.Count > 0)
@@ -374,17 +371,14 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
 
     /// <summary>
     /// Builds the enabled local-machine tools (scripts, browser, desktop, files). For the OWNER,
-    /// every enabled tool is included. For a GUEST, only tools whose visibility is shared with one of
-    /// the guest's circles (or public) are included. Off-by-default: absent settings mean disabled.
+    /// every enabled tool is included. For a GUEST, only tools shared with a matching selected circle
+    /// or all allowed contacts are included. Off-by-default: absent settings mean disabled.
     /// </summary>
     private IReadOnlyList<IAgentTool> LocalTools(
         IReadOnlyDictionary<LocalToolKind, LocalToolSetting> settings,
         bool owner,
         List<string>? circles)
     {
-        static bool Vis(string v, List<string> cs) =>
-            v == "public" || (v.StartsWith("shared:") && cs.Contains(v["shared:".Length..]));
-
         var tools = new List<IAgentTool>();
         foreach (var (kind, setting) in settings)
         {
@@ -397,8 +391,8 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
             if (PlatformCaps.IsMobile && kind.IsDesktopOnly()) continue;
             if (!owner)
             {
-                // Guest: only if explicitly shared with one of their circles (or public).
-                if (circles is null || !Vis(setting.Visibility, circles)) continue;
+                // Guest: only if explicitly shared with a matching circle or all allowed contacts.
+                if (circles is null || !AudiencePolicy.CanAccess(setting.Visibility, circles)) continue;
             }
             var tool = MakeLocalTool(kind);
             if (tool is not null)
@@ -426,7 +420,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
     /// <summary>
     /// Tools from the bundled MCP servers (e.g. TotalControl), gated the same way as local tools:
     /// the owner gets every enabled server's tools; a guest gets a server's tools only when the owner
-    /// shared that server with one of the guest's circles. Connects to enabled servers on demand.
+    /// shared that server with a matching circle or all allowed contacts. Connects to enabled servers on demand.
     /// </summary>
     public async Task<IReadOnlyList<IAgentTool>> McpToolsAsync(
         IReadOnlyDictionary<string, LocalToolSetting>? servers,
@@ -435,9 +429,6 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         List<string>? circles,
         CancellationToken ct = default)
     {
-        static bool Vis(string v, List<string> cs) =>
-            v == "public" || (v.StartsWith("shared:") && cs.Contains(v["shared:".Length..]));
-
         var tools = new List<IAgentTool>();
 
         // Bundled servers (e.g. TotalControl), governed by per-server grants.
@@ -445,7 +436,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
             foreach (var (id, setting) in servers)
             {
                 if (setting is null || !setting.Enabled) continue;
-                if (!owner && (circles is null || !Vis(setting.Visibility, circles))) continue;
+                if (!owner && (circles is null || !AudiencePolicy.CanAccess(setting.Visibility, circles))) continue;
                 var def = McpServerRegistry.Find(id);
                 if (def is null || !mcpHost.IsAvailable(def)) continue;
                 tools.AddRange((await mcpHost.GetToolsAsync(def, ct))
@@ -457,7 +448,7 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
             foreach (var c in customServers)
             {
                 if (!c.Enabled) continue;
-                if (!owner && (circles is null || !Vis(c.Visibility, circles))) continue;
+                if (!owner && (circles is null || !AudiencePolicy.CanAccess(c.Visibility, circles))) continue;
                 var def = McpServerRegistry.FromCustom(c);
                 if (!mcpHost.IsAvailable(def)) continue;
                 tools.AddRange((await mcpHost.GetToolsAsync(def, ct))

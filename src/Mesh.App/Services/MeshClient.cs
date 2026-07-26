@@ -31,6 +31,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     private readonly ConcurrentDictionary<string, ActiveTopicRun> activeTopicRuns = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> topicRunReplay = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> topicEnvelopeReplay = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> guestAgentGates = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<long, Task> backgroundTasks = new();
     private long nextBackgroundTaskId;
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
@@ -42,6 +43,7 @@ public sealed class MeshClient : IDeviceTopicTransport
     private volatile bool supportsSendResults;
     private volatile bool supportsFanout;
     private volatile bool supportsDeviceSync;
+    private volatile bool supportsAtomicAgentDispatch;
     private volatile DeviceSyncIdentity? authenticatedDeviceSyncIdentity;
     private volatile bool wantConnected;   // the user intends to be connected; drives auto-recovery
     private int reconnectScheduled;         // 0/1 guard so only one recovery loop runs at a time
@@ -89,6 +91,10 @@ public sealed class MeshClient : IDeviceTopicTransport
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
     public bool IsDeviceSnapshotSyncing => deviceSyncActivity.IsActive;
+    public bool SupportsAtomicAgentDispatch => supportsAtomicAgentDispatch;
+    public string AgentQuestionKind => supportsAtomicAgentDispatch
+        ? MeshKinds.AtomicAgentRequest
+        : MeshKinds.Chat;
     public event Action? StateChanged;
     public event Action? DeviceSyncStateChanged;
     public event Action<string>? Log;
@@ -142,7 +148,8 @@ public sealed class MeshClient : IDeviceTopicTransport
                     sig,
                     deviceName,
                     PlatformCaps.DevicePlatform,
-                    PlatformCaps.CanRunAgent && agent.IsModelReady));
+                    PlatformCaps.CanRunAgent && agent.IsModelReady,
+                    AtomicAgentDispatchEnabled: true));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
             if (resp.IsSuccessStatusCode) return true;
 
@@ -410,6 +417,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         supportsSendResults = false;
         supportsFanout = false;
         supportsDeviceSync = false;
+        supportsAtomicAgentDispatch = false;
         try
         {
             var http = httpFactory.CreateClient("relay");
@@ -423,6 +431,8 @@ public sealed class MeshClient : IDeviceTopicTransport
                 && fanout.ValueKind == JsonValueKind.True;
             supportsDeviceSync = capabilities.TryGetProperty("deviceSync", out var deviceSync)
                 && deviceSync.ValueKind == JsonValueKind.True;
+            supportsAtomicAgentDispatch = capabilities.TryGetProperty("atomicAgentDispatch", out var atomicDispatch)
+                && atomicDispatch.ValueKind == JsonValueKind.True;
         }
         catch (Exception ex)
         {
@@ -489,6 +499,15 @@ public sealed class MeshClient : IDeviceTopicTransport
         if (env.Kind is MeshKinds.RemoteAgentRequest or MeshKinds.RemoteAgentResponse)
         {
             Log?.Invoke($"dropped retired remote-agent envelope {env.Kind}");
+            return;
+        }
+        if (AgentDispatchProtocol.IsAtomicRequest(env.Kind)
+            && (!string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal)
+                || string.IsNullOrWhiteSpace(env.AgentRequestId)
+                || !string.Equals(env.AgentRequestId, env.Id, StringComparison.Ordinal)
+                || string.IsNullOrWhiteSpace(env.AgentDispatchToken)))
+        {
+            Log?.Invoke("dropped atomic agent request with invalid assignment metadata");
             return;
         }
         var isGroupKind = env.Kind is MeshKinds.GroupControl or MeshKinds.GroupMessage or MeshKinds.Fanout;
@@ -595,11 +614,24 @@ public sealed class MeshClient : IDeviceTopicTransport
             return;
         }
 
+        var isAtomicAgentEnvelope = AgentDispatchProtocol.IsAtomicRequest(env.Kind)
+                                    || AgentDispatchProtocol.IsAtomicResponse(env.Kind);
+        if (isAtomicAgentEnvelope && !MessageCrypto.IsEncrypted(env.Body))
+        {
+            Log?.Invoke($"dropped {env.Kind} from @{from}: encryption is required");
+            return;
+        }
+
         // Decrypt end-to-end payloads addressed to this device. Plaintext bodies pass through.
         var text = env.Body;
         if (MessageCrypto.IsEncrypted(env.Body))
         {
             var (ok, plain) = MessageCrypto.TryDecrypt(env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
+            if (!ok && isAtomicAgentEnvelope)
+            {
+                Log?.Invoke($"dropped {env.Kind} from @{from}: this device could not decrypt it");
+                return;
+            }
             text = ok ? plain! : "[encrypted message this device can't read]";
         }
 
@@ -710,11 +742,29 @@ public sealed class MeshClient : IDeviceTopicTransport
         // agent, or a request their agent addressed to ours) is tagged "agent"; a message a
         // person typed to the human (chat or a direct message) is "person". Chat still engages
         // our guest agent below, but for labeling/history it is treated as person-authored.
-        var via = env.Kind is MeshKinds.AgentResponse or MeshKinds.AgentRequest ? "agent" : "person";
-        state.AddChatLine(from, new ChatLine { Role = "user", Text = text, Via = via, AddressedToAgent = via == "agent" });
+        var via = env.Kind is MeshKinds.AgentResponse or MeshKinds.AgentRequest or MeshKinds.AtomicAgentResponse
+            ? "agent"
+            : "person";
+        var receiptable = env.Kind is MeshKinds.DirectMessage or MeshKinds.Chat
+            or MeshKinds.AgentRequest or MeshKinds.AgentResponse
+            or MeshKinds.AtomicAgentRequest or MeshKinds.AtomicAgentResponse;
+        if (state.FindConversation(from)?.Lines.Any(line =>
+                string.Equals(line.Id, env.Id, StringComparison.Ordinal)) == true)
+        {
+            if (receiptable) TrackBackground(SendReceiptAsync(from, env.Id), "duplicate delivery receipt");
+            return;
+        }
+        state.AddChatLine(from, new ChatLine
+        {
+            Id = env.Id,
+            Role = "user",
+            Text = text,
+            Via = via,
+            AddressedToAgent = via == "agent"
+        });
 
         // Acknowledge receipt of any real message so the sender sees "delivered".
-        if (env.Kind is MeshKinds.DirectMessage or MeshKinds.Chat or MeshKinds.AgentRequest or MeshKinds.AgentResponse)
+        if (receiptable)
             TrackBackground(SendReceiptAsync(from, env.Id), "delivery receipt");
 
         // A person-to-person message to the human: mark unread and toast the owner (unless muted/DND).
@@ -745,56 +795,70 @@ public sealed class MeshClient : IDeviceTopicTransport
         }
 
         // Allowed -> guest agent drafts a scoped reply, subject to the daily cost budget.
-        if (env.Kind is MeshKinds.Chat or MeshKinds.AgentRequest && agent.IsModelReady)
+        if ((env.Kind is MeshKinds.Chat or MeshKinds.AgentRequest or MeshKinds.AtomicAgentRequest)
+            && agent.IsModelReady)
+            await HandleAgentQuestionAsync(env, from, text, display, ct);
+        StateChanged?.Invoke();
+    }
+
+    private async Task HandleAgentQuestionAsync(
+        MeshEnvelope request,
+        string from,
+        string text,
+        string display,
+        CancellationToken ct)
+    {
+        var gate = guestAgentGates.GetOrAdd(from, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
         {
             if (!state.TryConsumeAgentReply())
             {
-                // Cost control: the daily automatic-reply budget is spent. Hold the message as
-                // a normal conversation line but do not invoke the paid model.
                 Log?.Invoke($"agent reply to @{from} skipped: daily budget reached");
-                StateChanged?.Invoke();
                 return;
             }
 
             var conv = state.GetOrCreateConversation(from);
             var reply = await agent.RespondAsGuestAsync(from, conv.Lines.ToList(), ct);
-
-            // If the model could not produce a real answer (unavailable, over limit, provider
-            // error), do NOT send the error text to the peer as if it were the agent's reply.
-            // Refund the consumed budget and leave the inbound message in the conversation for
-            // the owner to see and handle.
             if (ModelReply.IsFailure(reply))
             {
                 state.RefundAgentReply();
                 Log?.Invoke($"agent reply to @{from} skipped: model unavailable");
-                StateChanged?.Invoke();
                 return;
             }
 
+            var atomic = AgentDispatchProtocol.IsAtomicRequest(request.Kind);
             if (state.RequiresApproval(from))
             {
-                // Human-in-the-loop: hold the draft for owner review, do NOT send yet.
                 state.Mutate(x => x.Approvals.Add(new PendingApproval
                 {
                     From = from,
                     RequestBody = text,
-                    DraftReply = reply
+                    DraftReply = reply,
+                    AgentRequestId = atomic ? request.AgentRequestId : null,
+                    AgentDispatchToken = atomic ? request.AgentDispatchToken : null
                 }));
                 if (!state.Profile.DoNotDisturb)
                     notifier.Notify("Reply needs your approval",
                         $"Your agent drafted a reply to {display}.", NotifyKind.Approval, "messages");
                 Log?.Invoke($"draft reply to @{from} awaiting approval");
+                return;
             }
-            else
-            {
-                // The guest agent's own reply travels on the agent channel (Via defaults to
-                // "agent" so it stays in the guest history and shows the agent icon), but it
-                // answers the requesting person, so it is AddressedToAgent == false -> "to them".
-                state.AddChatLine(from, new ChatLine { Role = "assistant", Text = reply, AddressedToAgent = false });
-                await SendAsync(from, MeshKinds.AgentResponse, reply);
-            }
+
+            var line = new ChatLine { Role = "assistant", Text = reply, AddressedToAgent = false };
+            state.AddChatLine(from, line);
+            await SendAsync(
+                from,
+                atomic ? MeshKinds.AtomicAgentResponse : MeshKinds.AgentResponse,
+                reply,
+                line.Id,
+                agentRequestId: atomic ? request.AgentRequestId : null,
+                agentDispatchToken: atomic ? request.AgentDispatchToken : null);
         }
-        StateChanged?.Invoke();
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private async Task HandleInboundTopicAsync(MeshEnvelope env, string from, CancellationToken ct)
@@ -1854,7 +1918,15 @@ public sealed class MeshClient : IDeviceTopicTransport
         var line = new ChatLine { Role = "assistant", Text = text, AddressedToAgent = false };
         state.AddChatLine(approval.From, line);
         state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
-        await SendAsync(approval.From, MeshKinds.AgentResponse, text, line.Id);
+        var atomic = !string.IsNullOrWhiteSpace(approval.AgentRequestId)
+                     && !string.IsNullOrWhiteSpace(approval.AgentDispatchToken);
+        await SendAsync(
+            approval.From,
+            atomic ? MeshKinds.AtomicAgentResponse : MeshKinds.AgentResponse,
+            text,
+            line.Id,
+            agentRequestId: approval.AgentRequestId,
+            agentDispatchToken: approval.AgentDispatchToken);
     }
 
     public void RejectDraft(string approvalId)
@@ -2064,6 +2136,93 @@ public sealed class MeshClient : IDeviceTopicTransport
     /// Settings UI can offer a "home device" picker. Best-effort: returns an empty list on any error
     /// (unreachable relay, bad response) rather than throwing.
     /// </summary>
+    public async Task<AgentRoutingInfo?> GetAgentRoutingAsync(CancellationToken ct = default)
+    {
+        if (!supportsAtomicAgentDispatch) return null;
+        var p = state.Profile;
+        var handle = AppState.Norm(p.Handle);
+        if (handle.Length == 0) return null;
+        try
+        {
+            var signature = IdentityService.Sign(
+                p.PrivateKey,
+                AgentRoutingProtocol.QueryMessage(handle));
+            var http = httpFactory.CreateClient("relay");
+            var response = await http.PostAsJsonAsync(
+                $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(handle)}/agent-routing/query",
+                new AgentRoutingQueryRequest(p.PublicKey, signature),
+                ct);
+            if (!response.IsSuccessStatusCode) return null;
+            var info = await response.Content.ReadFromJsonAsync<AgentRoutingInfo>(cancellationToken: ct);
+            if (info is not null) CacheAgentRouting(info);
+            return info;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log?.Invoke($"agent routing lookup failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    public async Task<(bool Success, AgentRoutingInfo? Routing, string? Error)> SetAgentRoutingAsync(
+        string primaryDeviceId,
+        string? failoverDeviceId,
+        CancellationToken ct = default)
+    {
+        if (!supportsAtomicAgentDispatch)
+            return (false, null, "The connected relay does not support atomic agent routing.");
+        var p = state.Profile;
+        var handle = AppState.Norm(p.Handle);
+        var version = p.AgentRoutingVersion;
+        if (string.IsNullOrWhiteSpace(version))
+        {
+            var current = await GetAgentRoutingAsync(ct);
+            version = current?.Version ?? "";
+        }
+        var message = AgentRoutingProtocol.UpdateMessage(
+            handle,
+            primaryDeviceId,
+            failoverDeviceId,
+            version);
+        var signature = IdentityService.Sign(p.PrivateKey, message);
+        try
+        {
+            var http = httpFactory.CreateClient("relay");
+            var response = await http.PutAsJsonAsync(
+                $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(handle)}/agent-routing",
+                new AgentRoutingUpdateRequest(
+                    p.PublicKey,
+                    primaryDeviceId,
+                    failoverDeviceId,
+                    version,
+                    signature),
+                ct);
+            if (!response.IsSuccessStatusCode)
+            {
+                if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+                    await GetAgentRoutingAsync(ct);
+                return (false, null, $"Relay rejected the device selection ({(int)response.StatusCode}).");
+            }
+            var info = await response.Content.ReadFromJsonAsync<AgentRoutingInfo>(cancellationToken: ct);
+            if (info is null) return (false, null, "Relay returned an invalid routing response.");
+            CacheAgentRouting(info);
+            return (true, info, null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return (false, null, ex.Message);
+        }
+    }
+
+    private void CacheAgentRouting(AgentRoutingInfo info)
+        => state.Mutate(profile =>
+        {
+            profile.AgentPrimaryDeviceId = info.PrimaryDeviceId;
+            profile.AgentFailoverDeviceId = info.FailoverDeviceId;
+            profile.AgentRoutingVersion = info.Version;
+            profile.AgentPrimaryWasSelectedAutomatically = info.PrimaryWasSelectedAutomatically;
+        });
+
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListMyDevicesAsync(CancellationToken ct = default)
     {
         try
@@ -2316,7 +2475,14 @@ public sealed class MeshClient : IDeviceTopicTransport
     }
 
 
-    public async Task<bool> SendAsync(string toHandle, string kind, string body, string? lineId = null, string? toDevice = null)
+    public async Task<bool> SendAsync(
+        string toHandle,
+        string kind,
+        string body,
+        string? lineId = null,
+        string? toDevice = null,
+        string? agentRequestId = null,
+        string? agentDispatchToken = null)
     {
         if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
         {
@@ -2337,6 +2503,13 @@ public sealed class MeshClient : IDeviceTopicTransport
             var enc = MessageCrypto.Encrypt(body, keys);
             if (enc is not null) wire = enc;
         }
+        if ((AgentDispatchProtocol.IsAtomicRequest(kind) || AgentDispatchProtocol.IsAtomicResponse(kind))
+            && !MessageCrypto.IsEncrypted(wire))
+        {
+            Log?.Invoke("atomic agent send failed: recipient encryption keys are unavailable");
+            if (lineId is not null) state.SetLineStatus(lineId, "failed");
+            return false;
+        }
 
         // Client-side backstop for the relay's hard envelope cap: never inline large content. Large
         // payloads must be sent as blob attachment pointers, so the body itself stays well under 2 MB.
@@ -2348,12 +2521,23 @@ public sealed class MeshClient : IDeviceTopicTransport
             return false;
         }
         var sig = IdentityService.Sign(p.PrivateKey, wire);
-        var env = MeshEnvelope.Create(p.Handle, to, kind, wire, sig, toDevice: toDevice);
+        var env = MeshEnvelope.Create(
+            p.Handle,
+            to,
+            kind,
+            wire,
+            sig,
+            toDevice: toDevice,
+            agentRequestId: agentRequestId,
+            agentDispatchToken: agentDispatchToken,
+            id: lineId);
         try
         {
+            var resultCode = "accepted";
             if (supportsSendResults)
             {
                 var result = await hub.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, env);
+                resultCode = result.Code;
                 if (!result.Accepted)
                 {
                     Log?.Invoke($"send rejected: {DescribeResult(result)}");
@@ -2366,7 +2550,15 @@ public sealed class MeshClient : IDeviceTopicTransport
                 // Legacy relays route SendEnvelope but return no acknowledgement payload.
                 await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
             }
-            if (lineId is not null) state.SetLineStatus(lineId, "sent");
+            if (lineId is not null)
+            {
+                var status = AgentDispatchProtocol.IsAtomicRequest(kind)
+                             && supportsSendResults
+                             && string.Equals(resultCode, AgentDispatchCodes.Queued, StringComparison.Ordinal)
+                    ? "agent_queued"
+                    : "sent";
+                state.SetLineStatus(lineId, status);
+            }
             return true;
         }
         catch (Exception ex)
@@ -2415,11 +2607,25 @@ public sealed class MeshClient : IDeviceTopicTransport
     // on. No-op on platforms without push (Windows/Mac) or until native token acquisition is provisioned
     // (IPushService returns null), so behavior is unchanged there.
     private volatile string? registeredPushToken;
+    private int pushRegistrationInProgress;
 
     private void TryRegisterPushToken()
     {
         if (!push.IsSupported) return;
-        TrackBackground(RegisterPushTokenAsync(), "push token registration");
+        if (Interlocked.CompareExchange(ref pushRegistrationInProgress, 1, 0) != 0) return;
+        TrackBackground(RegisterPushTokenGuardedAsync(), "push token registration");
+    }
+
+    private async Task RegisterPushTokenGuardedAsync()
+    {
+        try
+        {
+            await RegisterPushTokenAsync();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref pushRegistrationInProgress, 0);
+        }
     }
 
     private async Task RegisterPushTokenAsync()
@@ -2427,7 +2633,7 @@ public sealed class MeshClient : IDeviceTopicTransport
         string? token;
         try { token = await push.RegisterAsync(); }
         catch (Exception ex) { Log?.Invoke($"push token request failed: {ex.Message}"); return; }
-        if (string.IsNullOrWhiteSpace(token)) return;                       // unsupported, denied, or unprovisioned
+        if (string.IsNullOrWhiteSpace(token)) return; // unsupported, denied, timed out, or unprovisioned
         var pushToken = token!;
 
         var p = state.Profile;

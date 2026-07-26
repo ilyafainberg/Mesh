@@ -25,7 +25,7 @@ public sealed class AccountRef
 /// databases are kept so the user can switch back. No data leaves the device except through an
 /// explicit passphrase-encrypted export (see <see cref="MeshExport"/>).
 /// </summary>
-public sealed class AppState
+public sealed class AppState : IMemoryState
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
@@ -222,6 +222,173 @@ public sealed class AppState
         activeDb?.SetTopicDraft(threadId, text);
     }
 
+    /// <summary>Gets the last Me topic opened in the desktop UI on this device.</summary>
+    public string? GetLastDesktopTopicId()
+        => activeDb?.GetLastDesktopTopicId();
+
+    /// <summary>Stores the last Me topic opened in the desktop UI without syncing it.</summary>
+    public void SetLastDesktopTopicId(string? threadId)
+        => activeDb?.SetLastDesktopTopicId(threadId);
+
+    /// <summary>Gets the last Messages conversation opened in the desktop UI on this device.</summary>
+    public string? GetLastDesktopConversationKey()
+        => activeDb?.GetLastDesktopConversationKey();
+
+    /// <summary>Stores the last Messages conversation opened in the desktop UI without syncing it.</summary>
+    public void SetLastDesktopConversationKey(string? conversationKey)
+        => activeDb?.SetLastDesktopConversationKey(conversationKey);
+
+    public MemorySnapshot SnapshotMemories()
+    {
+        lock (profileSyncGate)
+            return new MemorySnapshot(
+                activeId,
+                Profile.Memories.Select(MemoryPolicy.Clone).ToList());
+    }
+
+    /// <summary>Persists and synchronizes an owner-only memory.</summary>
+    public bool UpsertMemory(
+        string? accountId,
+        MemoryItem memory,
+        MemoryItem? expected,
+        out MemoryItem? previous)
+    {
+        var normalized = MemoryPolicy.Normalize(memory);
+        DeviceSyncOperation? operation = null;
+        previous = null;
+        lock (profileSyncGate)
+        {
+            if (activeDb is null
+                || !string.Equals(activeId, accountId, StringComparison.Ordinal))
+                return false;
+            var existing = Profile.Memories.FirstOrDefault(item =>
+                string.Equals(item.Id, normalized.Id, StringComparison.Ordinal));
+            previous = existing is null ? null : MemoryPolicy.Clone(existing);
+            if (expected is null
+                ? existing is not null
+                : existing is null || !MemoryPolicy.SharedEquals(existing, expected))
+                return false;
+            if (existing is not null && MemoryPolicy.SharedEquals(existing, normalized)) return false;
+
+            var deviceId = LocalDeviceId();
+            if (deviceId is null)
+            {
+                activeDb.UpsertMemory(normalized);
+            }
+            else
+            {
+                var operationId = NewId();
+                var versionKey = SyncKey(DeviceSyncKinds.MemoryUpsert, normalized.Id);
+                var version = CreateNewerVersion(deviceId, operationId,
+                [
+                    activeDb.GetSyncVersion(versionKey),
+                    activeDb.GetSyncTombstoneVersion(DeviceSyncKinds.MemoryDelete, normalized.Id)
+                ]);
+                if (!activeDb.TryApplyMemoryUpsert(
+                        normalized,
+                        versionKey,
+                        version,
+                        DeviceSyncKinds.MemoryDelete))
+                    return false;
+                operation = new DeviceSyncOperation(
+                    operationId,
+                    deviceId,
+                    DeviceSyncKinds.MemoryUpsert,
+                    normalized.Id,
+                    version,
+                    JsonSerializer.Serialize(MemoryPolicy.ToSync(normalized), SyncJson));
+            }
+
+            if (existing is null)
+                Profile.Memories.Add(normalized);
+            else
+                MemoryPolicy.CopyShared(normalized, existing);
+        }
+        if (operation is not null) DeviceSyncOperationCreated?.Invoke(operation);
+        NotifyChanged();
+        return true;
+    }
+
+    /// <summary>Deletes and synchronizes an owner-only memory.</summary>
+    public bool DeleteMemory(
+        string? accountId,
+        string id,
+        MemoryItem expected,
+        out MemoryItem? previous)
+    {
+        DeviceSyncOperation? operation = null;
+        previous = null;
+        lock (profileSyncGate)
+        {
+            if (activeDb is null
+                || !string.Equals(activeId, accountId, StringComparison.Ordinal)
+                || !TopicRunProtocol.IsValidIdentifier(id))
+                return false;
+            var existing = Profile.Memories.FirstOrDefault(item =>
+                string.Equals(item.Id, id, StringComparison.Ordinal));
+            previous = existing is null ? null : MemoryPolicy.Clone(existing);
+            if (existing is null || !MemoryPolicy.SharedEquals(existing, expected)) return false;
+
+            var deviceId = LocalDeviceId();
+            if (deviceId is null)
+            {
+                activeDb.DeleteMemory(id);
+            }
+            else
+            {
+                var operationId = NewId();
+                var version = CreateNewerVersion(deviceId, operationId,
+                [
+                    activeDb.GetSyncTombstoneVersion(DeviceSyncKinds.MemoryDelete, id),
+                    activeDb.GetSyncVersion(SyncKey(DeviceSyncKinds.MemoryUpsert, id))
+                ]);
+                if (!activeDb.TryApplyMemoryDelete(
+                        id,
+                        DeviceSyncKinds.MemoryDelete,
+                        version,
+                        SyncKey(DeviceSyncKinds.MemoryUpsert, id)))
+                    return false;
+                operation = new DeviceSyncOperation(
+                    operationId,
+                    deviceId,
+                    DeviceSyncKinds.MemoryDelete,
+                    id,
+                    version,
+                    "");
+            }
+            Profile.Memories.Remove(existing);
+        }
+        if (operation is not null) DeviceSyncOperationCreated?.Invoke(operation);
+        NotifyChanged();
+        return true;
+    }
+
+    /// <summary>Records local retrieval use without creating cross-device sync traffic.</summary>
+    public void TouchMemories(
+        string? accountId,
+        IEnumerable<string> ids,
+        DateTimeOffset? recalledAt = null)
+    {
+        var distinct = ids
+            .Where(TopicRunProtocol.IsValidIdentifier)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (distinct.Count == 0) return;
+        var at = recalledAt ?? DateTimeOffset.UtcNow;
+        lock (profileSyncGate)
+        {
+            if (activeDb is null
+                || !string.Equals(activeId, accountId, StringComparison.Ordinal))
+                return;
+            activeDb.TouchMemories(distinct, at);
+            foreach (var memory in Profile.Memories.Where(memory => distinct.Contains(memory.Id, StringComparer.Ordinal)))
+            {
+                memory.RecallCount = Math.Min(1_000_000, memory.RecallCount + 1);
+                memory.LastRecalledAt = at;
+            }
+        }
+    }
+
     private void PrepareProfileStorage()
     {
         // Adopt: onboarding/link just filled a fresh profile with no active id yet.
@@ -267,6 +434,12 @@ public sealed class AppState
                         thread.ExecutionDeviceName,
                         thread.ExecutionDevicePlatform);
                 foreach (var line in thread.Lines) activeDb.AppendOwnChat(thread.Id, line);
+            }
+            for (var i = 0; i < Profile.Memories.Count; i++)
+            {
+                var memory = MemoryPolicy.Normalize(Profile.Memories[i]);
+                Profile.Memories[i] = memory;
+                activeDb.UpsertMemory(memory);
             }
         }
     }
@@ -812,6 +985,21 @@ public sealed class AppState
             }
         }
 
+        foreach (var memory in Profile.Memories)
+        {
+            var version = GetOrCreateSnapshotVersion(
+                SyncKey(DeviceSyncKinds.MemoryUpsert, memory.Id),
+                memory.UpdatedAt,
+                DeviceSyncKinds.MemoryUpsert,
+                memory.Id);
+            operations.Add(SnapshotOperation(
+                deviceId,
+                DeviceSyncKinds.MemoryUpsert,
+                memory.Id,
+                version,
+                MemoryPolicy.ToSync(memory)));
+        }
+
         var profileState = ProfileSyncState.Snapshot(Profile);
         foreach (var (entityId, projectedCircle) in profileState.Circles)
         {
@@ -935,8 +1123,51 @@ public sealed class AppState
             DeviceSyncKinds.ContactDelete => ApplyContactDelete(operation),
             DeviceSyncKinds.CircleUpsert => ApplyCircleUpsert(operation),
             DeviceSyncKinds.CircleDelete => ApplyCircleDelete(operation),
+            DeviceSyncKinds.MemoryUpsert => ApplyMemoryUpsert(operation),
+            DeviceSyncKinds.MemoryDelete => ApplyMemoryDelete(operation),
             _ => false
         };
+    }
+
+    private bool ApplyMemoryUpsert(DeviceSyncOperation operation)
+    {
+        var dto = DeserializePayload<DeviceSyncMemory>(operation);
+        if (!MemoryPolicy.IsValid(dto)
+            || !string.Equals(dto.Id, operation.EntityId, StringComparison.Ordinal)
+            || IsBlockedByTombstone(DeviceSyncKinds.MemoryDelete, dto.Id, operation.Version)
+            || !IsNewer(operation, DeviceSyncKinds.MemoryUpsert))
+            return false;
+
+        var incoming = MemoryPolicy.FromSync(dto);
+        var existing = Profile.Memories.FirstOrDefault(memory =>
+            string.Equals(memory.Id, incoming.Id, StringComparison.Ordinal));
+        var changed = existing is null || !MemoryPolicy.SharedEquals(existing, incoming);
+        if (!activeDb!.TryApplyMemoryUpsert(
+                incoming,
+                SyncKey(DeviceSyncKinds.MemoryUpsert, incoming.Id),
+                operation.Version,
+                DeviceSyncKinds.MemoryDelete))
+            return false;
+
+        if (existing is null)
+            Profile.Memories.Add(incoming);
+        else
+            MemoryPolicy.CopyShared(incoming, existing);
+        return changed;
+    }
+
+    private bool ApplyMemoryDelete(DeviceSyncOperation operation)
+    {
+        if (!TopicRunProtocol.IsValidIdentifier(operation.EntityId)
+            || !CanApplyProfileDelete(operation, DeviceSyncKinds.MemoryUpsert)
+            || !activeDb!.TryApplyMemoryDelete(
+                operation.EntityId,
+                DeviceSyncKinds.MemoryDelete,
+                operation.Version,
+                SyncKey(DeviceSyncKinds.MemoryUpsert, operation.EntityId)))
+            return false;
+        return Profile.Memories.RemoveAll(memory =>
+            string.Equals(memory.Id, operation.EntityId, StringComparison.Ordinal)) > 0;
     }
 
     private bool ApplyTopicUpsert(DeviceSyncOperation operation)
@@ -1856,6 +2087,7 @@ public sealed class AppState
                 or DeviceSyncKinds.ConversationDelete
                 or DeviceSyncKinds.ContactDelete
                 or DeviceSyncKinds.CircleDelete
+                or DeviceSyncKinds.MemoryDelete
                 => activeDb!.GetSyncTombstoneVersion(operation.Kind, operation.EntityId),
             _ => activeDb!.GetSyncVersion(SyncKey(operation.Kind, operation.EntityId))
         };
@@ -1944,7 +2176,9 @@ public sealed class AppState
             or DeviceSyncKinds.ContactUpsert
             or DeviceSyncKinds.ContactDelete
             or DeviceSyncKinds.CircleUpsert
-            or DeviceSyncKinds.CircleDelete;
+            or DeviceSyncKinds.CircleDelete
+            or DeviceSyncKinds.MemoryUpsert
+            or DeviceSyncKinds.MemoryDelete;
     }
 
     private static bool IsVersion(string? version)
@@ -2380,6 +2614,7 @@ public sealed class AppState
     // ChatLine is committed. It lets the UI show the model's reasoning and answer building up live
     // instead of appearing all at once when the turn finishes.
     private readonly Dictionary<string, AssistantDraft> assistantDrafts = new(StringComparer.Ordinal);
+    private readonly AssistantDraftRefreshGate assistantDraftRefreshGate = new();
 
     /// <summary>A thread's live streamed reply: reasoning and answer accumulated as chunks arrive.</summary>
     public sealed class AssistantDraft
@@ -2407,6 +2642,7 @@ public sealed class AppState
     /// <summary>Starts a fresh streamed draft for a thread at the start of a turn.</summary>
     public void BeginAssistantDraft(string key)
     {
+        assistantDraftRefreshGate.Reset(key);
         assistantDrafts[key] = new AssistantDraft();
         NotifyChanged();
     }
@@ -2416,13 +2652,17 @@ public sealed class AppState
     {
         if (!assistantDrafts.TryGetValue(key, out var draft))
             assistantDrafts[key] = draft = new AssistantDraft();
-        if (draft.Append(delta)) NotifyChanged();
+        if (draft.Append(delta)
+            && assistantDraftRefreshGate.ShouldPublish(key, delta.Kind, Environment.TickCount64))
+            NotifyChanged();
     }
 
     /// <summary>Clears a thread's streamed draft once its turn ends and the final line is committed.</summary>
     public void EndAssistantDraft(string key)
     {
-        if (assistantDrafts.Remove(key)) NotifyChanged();
+        var removed = assistantDrafts.Remove(key);
+        assistantDraftRefreshGate.Reset(key);
+        if (removed) NotifyChanged();
     }
 
     // Per-thread owner-turn run state, held here (in the singleton app state) rather than in the Me
@@ -2605,7 +2845,11 @@ public sealed class AppState
                 assistantDrafts[threadId] = draft = new AssistantDraft();
             appended = draft.Append(new AgentDelta(kind, update.Delta));
         }
-        if (appended) NotifyChanged();
+        if (appended
+            && assistantDraftRefreshGate.ShouldPublish(
+                threadId,
+                update.DeltaKind == TopicRunDeltaKind.Reasoning ? AgentDeltaKind.Reasoning : AgentDeltaKind.Answer,
+                Environment.TickCount64)) NotifyChanged();
     }
 
     /// <summary>Applies a remote run update projection for a thread and refreshes the UI.</summary>
@@ -2655,6 +2899,7 @@ public sealed class AppState
                 terminalRemoteRuns.Add(correlationKey);
                 remoteDeltaSeq.Remove(correlationKey);
                 assistantDrafts.Remove(threadId);
+                assistantDraftRefreshGate.Reset(threadId);
             }
             else
             {
@@ -2699,6 +2944,8 @@ public sealed class AppState
             terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
             thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
+            assistantDrafts.Remove(threadId);
+            assistantDraftRefreshGate.Reset(threadId);
         }
         EmitTopicUpsert(thread!);
         NotifyChanged();
@@ -2742,6 +2989,7 @@ public sealed class AppState
             terminalRemoteRuns.Add(thread.Id + "\0" + projection.RunId);
             remoteDeltaSeq.Remove(thread.Id + "\0" + projection.RunId);
             assistantDrafts.Remove(thread.Id);
+            assistantDraftRefreshGate.Reset(thread.Id);
             return true;
         }
     }
@@ -3108,6 +3356,12 @@ public sealed class AppState
                     thread.ExecutionDeviceName,
                     thread.ExecutionDevicePlatform);
             foreach (var line in thread.Lines) db.AppendOwnChat(thread.Id, line);
+        }
+        for (var i = 0; i < imported.Memories.Count; i++)
+        {
+            var memory = MemoryPolicy.Normalize(imported.Memories[i]);
+            imported.Memories[i] = memory;
+            db.UpsertMemory(memory);
         }
         db.SaveProfile(imported);
 

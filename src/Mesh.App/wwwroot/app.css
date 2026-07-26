@@ -73,6 +73,18 @@ a:hover { text-decoration: underline; }
 #blazor-error-ui .dismiss { cursor: pointer; position: absolute; right: .75rem; top: .5rem; }
 .blazor-error-boundary { background: #b32121; padding: 1rem; color: #fff; }
 .blazor-error-boundary::after { content: "An error has occurred."; }
+.route-error {
+  align-self: center; width: min(520px, calc(100% - 32px)); margin: auto; padding: 32px;
+  display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center;
+  background: var(--bg-1); border: 1px solid var(--stroke-1); border-radius: var(--radius-l); box-shadow: var(--shadow-8);
+}
+.route-error > i { color: var(--danger); font-size: 2rem; }
+.route-error p { margin: 0; color: var(--fg-2); }
+.route-error a.primary {
+  display: inline-flex; align-items: center; justify-content: center; margin-top: 4px; padding: 8px 16px;
+  color: var(--fg-on-brand); background: var(--brand); border-radius: var(--radius-s); font-weight: 600;
+}
+.route-error a.primary:hover { background: var(--brand-hover); text-decoration: none; }
 /* ============================================================
    App shell
    ============================================================ */
@@ -368,6 +380,8 @@ input[type=checkbox]:not(.switch input):checked::after {
 .messages-frame > .messages { min-height: 0; width: 100%; }
 .messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 18px 24px; }
 .messages-wrap { max-width: 820px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+.message-history-more { display: flex; justify-content: center; padding: 2px 0 8px; }
+.message-history-more button { color: var(--fg-3); font-size: .85rem; }
 .scroll-to-latest {
   position: absolute; left: 50%; bottom: 12px; z-index: 8;
   display: inline-flex; align-items: center; justify-content: center;
@@ -651,6 +665,8 @@ input[type=checkbox]:not(.switch input):checked::after {
 .msg-status.delivered i.bi { color: var(--brand); }
 .msg-status.sent i.bi { color: var(--fg-3); }
 .msg-status.failed i.bi { color: var(--danger, #d13438); }
+.agent-queued-note { margin-top: 6px; font-size: .72rem; color: rgba(255,255,255,.9); }
+.agent-queued-note i.bi { margin-right: 3px; }
 .conv-empty { text-align: left; margin: 6px 2px; max-width: none; font-size: .84rem; }
 
 .requests { margin-top: 16px; border-top: 1px solid var(--stroke-1); padding-top: 12px; }
@@ -804,6 +820,9 @@ input[type=checkbox]:not(.switch input):checked::after {
 .global-banner.ok { background: #EEF6EC; color: #0E700E; }
 .global-banner.err { background: var(--warn-bg); color: #9A2A2A; }
 .global-banner .gb-link { color: inherit; font-weight: 600; text-decoration: underline; flex: 0 0 auto; }
+.global-banner.memory { background: var(--brand-tint); color: var(--fg-1); }
+.global-banner.memory > .bi { color: var(--brand); }
+.global-banner .gb-action { background: transparent; border: none; color: inherit; padding: 2px 4px; font: inherit; font-weight: 600; text-decoration: underline; flex: 0 0 auto; }
 .global-banner .gb-close { background: transparent; border: none; color: inherit; padding: 2px 4px; flex: 0 0 auto; }
 .global-banner .gb-close:hover { background: transparent; opacity: .7; }
 

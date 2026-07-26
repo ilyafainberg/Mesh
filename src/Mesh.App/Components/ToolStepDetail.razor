@@ -1,0 +1,209 @@
+@using Microsoft.Extensions.Logging
+@inject IJSRuntime JS
+@inject Microsoft.Extensions.Logging.ILogger<ToolStepDetail> Logger
+@implements IDisposable
+
+<div class="tool-detail-view @(wrap ? "wrap" : "nowrap") @(expanded ? "expanded" : "")" @ref="container">
+    <div class="tool-detail-toolbar">
+        <span class="tool-detail-kind">@(IsOutput ? "output" : "input")</span>
+        <div class="tool-detail-actions">
+            @if (document.HasFormattedView)
+            {
+                <button type="button" class="tool-detail-action mode" @onclick="ToggleMode"
+                        title="@(showFormatted ? "Show raw details" : "Show formatted details")"
+                        aria-label="@(showFormatted ? "Show raw details" : "Show formatted details")">
+                    <i class="bi bi-braces"></i>
+                    <span>@(showFormatted ? "Raw" : "Formatted")</span>
+                </button>
+            }
+            <button type="button" class="tool-detail-action" @onclick="ToggleWrap"
+                    title="@(wrap ? "Disable line wrapping" : "Wrap long lines")"
+                    aria-label="@(wrap ? "Disable line wrapping" : "Wrap long lines")"
+                    aria-pressed="@wrap">
+                <i class="bi bi-text-wrap"></i>
+            </button>
+            <button type="button" class="tool-detail-action" @onclick="ToggleExpanded"
+                    title="@(expanded ? "Collapse details" : "Expand details")"
+                    aria-label="@(expanded ? "Collapse details" : "Expand details")"
+                    aria-pressed="@expanded">
+                <i class="bi @(expanded ? "bi-arrows-angle-contract" : "bi-arrows-angle-expand")"></i>
+            </button>
+            <button type="button" class="tool-detail-action @CopyClass" @onclick="CopyAsync"
+                    title="@CopyTitle" aria-label="@CopyTitle">
+                <i class="bi @CopyIcon"></i>
+            </button>
+        </div>
+    </div>
+
+    @foreach (var section in VisibleSections)
+    {
+        <div class="tool-detail-section @ToneClass(section.Tone)">
+            @if (IsExitStatus(section))
+            {
+                <div class="tool-detail-status">
+                    <i class="bi @StatusIcon(section.Tone)"></i>
+                    <span>@section.Label</span>
+                    <code>@section.Text</code>
+                </div>
+            }
+            else
+            {
+                @if (!string.IsNullOrWhiteSpace(section.Label))
+                {
+                    <div class="tool-detail-section-label">@section.Label</div>
+                }
+                <pre class="tool-detail-code"><code data-mesh-highlight="true" data-language="@section.Language">@section.Text</code></pre>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public string Tool { get; set; } = "";
+    [Parameter, EditorRequired] public string Content { get; set; } = "";
+    [Parameter] public bool IsOutput { get; set; }
+
+    private ElementReference container;
+    private ToolDetailDocument document = new("", "plaintext", Array.Empty<ToolDetailSection>(), false);
+    private readonly CancellationTokenSource lifetime = new();
+    private string? lastTool;
+    private string? lastContent;
+    private bool lastIsOutput;
+    private bool showFormatted;
+    private bool wrap = true;
+    private bool expanded;
+    private bool copied;
+    private bool copyFailed;
+    private bool highlightPending;
+    private bool disposed;
+    private int copyVersion;
+
+    private IReadOnlyList<ToolDetailSection> VisibleSections => showFormatted
+        ? document.Sections
+        : [new ToolDetailSection(null, document.Raw, document.RawLanguage)];
+
+    private string CopyClass => copied ? "copied" : copyFailed ? "copy-failed" : "";
+    private string CopyTitle => copied ? "Copied" : copyFailed ? "Copy failed" : "Copy details";
+    private string CopyIcon => copied ? "bi-check2" : copyFailed ? "bi-exclamation-triangle" : "bi-copy";
+
+    protected override void OnParametersSet()
+    {
+        if (string.Equals(Tool, lastTool, StringComparison.Ordinal)
+            && string.Equals(Content, lastContent, StringComparison.Ordinal)
+            && IsOutput == lastIsOutput)
+            return;
+
+        lastTool = Tool;
+        lastContent = Content;
+        lastIsOutput = IsOutput;
+        document = ToolDetailFormatter.Format(
+            Tool,
+            IsOutput ? ToolDetailDirection.Output : ToolDetailDirection.Input,
+            Content);
+        showFormatted = document.HasFormattedView;
+        highlightPending = true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!highlightPending) return;
+        highlightPending = false;
+        try
+        {
+            await JS.InvokeVoidAsync("meshUI.highlightCode", lifetime.Token, container);
+        }
+        catch (OperationCanceledException) when (disposed)
+        {
+            // Navigation disposed the component while WebView highlighting was in flight.
+        }
+        catch (Exception ex) when (ex is JSException or ObjectDisposedException or InvalidOperationException)
+        {
+            if (!disposed) Logger.LogWarning(ex, "Could not syntax-highlight tool details.");
+        }
+    }
+
+    private void ToggleMode()
+    {
+        showFormatted = !showFormatted;
+        highlightPending = true;
+    }
+
+    private void ToggleWrap() => wrap = !wrap;
+
+    private void ToggleExpanded() => expanded = !expanded;
+
+    private async Task CopyAsync()
+    {
+        try
+        {
+            await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(VisibleText());
+            if (disposed) return;
+            copied = true;
+            copyFailed = false;
+        }
+        catch (Exception ex)
+        {
+            if (disposed) return;
+            copied = false;
+            copyFailed = true;
+            Logger.LogWarning(ex, "Could not copy tool details to the clipboard.");
+        }
+
+        if (disposed) return;
+        var version = ++copyVersion;
+        _ = ResetCopyStateAsync(version);
+    }
+
+    private string VisibleText()
+    {
+        if (!showFormatted) return document.Raw;
+        return string.Join(
+            "\n\n",
+            document.Sections.Select(section => string.IsNullOrWhiteSpace(section.Label)
+                ? section.Text
+                : $"{section.Label}:\n{section.Text}"));
+    }
+
+    private async Task ResetCopyStateAsync(int version)
+    {
+        try
+        {
+            await Task.Delay(1600, lifetime.Token);
+            if (disposed || version != copyVersion) return;
+            copied = false;
+            copyFailed = false;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (OperationCanceledException) when (disposed)
+        {
+            // Expected when the details view is removed before the copy indicator resets.
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+        {
+            if (!disposed) Logger.LogWarning(ex, "Could not reset the tool-detail copy indicator.");
+        }
+    }
+
+    private static bool IsExitStatus(ToolDetailSection section)
+        => string.Equals(section.Label, "exit code", StringComparison.OrdinalIgnoreCase);
+
+    private static string ToneClass(ToolDetailTone tone)
+        => tone.ToString().ToLowerInvariant();
+
+    private static string StatusIcon(ToolDetailTone tone) => tone switch
+    {
+        ToolDetailTone.Success => "bi-check-circle-fill",
+        ToolDetailTone.Warning => "bi-clock-fill",
+        ToolDetailTone.Error => "bi-x-circle-fill",
+        _ => "bi-info-circle-fill"
+    };
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        copyVersion++;
+        lifetime.Cancel();
+        lifetime.Dispose();
+    }
+}

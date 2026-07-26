@@ -12,7 +12,7 @@
     gap: 3px;
 }
 
-/* Verbose per-step detail: raw tool arguments and output, shown when "Show details" is on. */
+/* Per-step tool arguments and output, shown when "Show details" is on. */
 .agent-step-detail {
     margin: 2px 0 4px 21px;
     border-left: 2px solid var(--border, #e2e5e9);
@@ -22,27 +22,6 @@
     gap: 2px;
 }
 
-.step-detail-label {
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-3, #8a929c);
-}
-
-.step-detail-body {
-    margin: 0 0 4px;
-    padding: 6px 8px;
-    background: var(--bg-2, #f6f7f9);
-    border-radius: 6px;
-    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-    font-size: 0.74rem;
-    line-height: 1.4;
-    color: var(--text-2, #5b6470);
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 220px;
-    overflow: auto;
-}
 
 .step-details-toggle {
     align-self: flex-start;
@@ -175,6 +154,18 @@
 }
 
 
+.conv-list {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.topic-list-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
 .thread-groups { display: flex; flex-direction: column; gap: 2px; }
 .thread-group-label {
     display: flex;
@@ -230,8 +221,15 @@
 .topic-open:active {
     background: transparent;
 }
-.topic-open .conv-name {
+.topic-title-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     flex: 1 1 auto;
+    min-width: 0;
+}
+.topic-open .conv-name {
+    flex: 0 1 auto;
     min-width: 0;
     text-align: left;
     overflow: hidden;
@@ -260,15 +258,23 @@
     display: inline-flex;
     align-items: center;
     gap: 3px;
-    max-width: 90px;
-    padding: 2px 6px;
+    flex: none;
+    max-width: calc(1em + 3px + 6ch + 12px);
+    padding-block: 2px;
+    padding-inline: 6px;
     border-radius: 999px;
     background: var(--bg-3, #eef0f3);
     color: var(--fg-2, #5b6470);
     font-size: .66rem;
     white-space: nowrap;
+}
+.topic-device-pill i { flex: none; }
+.topic-device-name {
+    min-width: 0;
+    max-width: 6ch;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .topic-device-pill.offline { opacity: .55; }
 
@@ -294,7 +300,7 @@
     line-height: 1.45;
 }
 .split-create {
-    position: static;
+    position: relative;
     display: inline-flex;
     align-items: stretch;
     gap: 0;
@@ -344,6 +350,12 @@
     border-radius: 12px;
     background: var(--bg-1, #fff);
     box-shadow: var(--shadow-3, 0 10px 30px rgba(0,0,0,.16));
+}
+.split-create > .device-menu {
+    left: auto;
+    right: 0;
+    width: min(260px, calc(100vw - 32px));
+    min-width: min(240px, calc(100vw - 32px));
 }
 .device-menu-title {
     padding: 6px 9px;

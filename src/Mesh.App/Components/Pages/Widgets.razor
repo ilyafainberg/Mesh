@@ -1,4 +1,4 @@
-@page "/widgets"
+﻿@page "/widgets"
 @inject AppState State
 @inject AgentService Agent
 @inject IJSRuntime JS
@@ -271,18 +271,12 @@
                             </div>
 
                             <div class="wgt-visibility">
-                                <label for="@($"vis-{w.Id}")" class="wgt-vis-label">Visibility</label>
-                                <select id="@($"vis-{w.Id}")"
-                                        value="@w.Visibility"
-                                        @onchange="e => SetVisibility(w, e)"
-                                        aria-label="@($"Visibility for {w.Name}")">
-                                    <option value="private">Only me</option>
-                                    <option value="public">Public</option>
-                                    @foreach (var c in State.Profile.Circles)
-                                    {
-                                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                                    }
-                                </select>
+                                <span class="wgt-vis-label">Who can use it</span>
+                                <AudiencePicker Value="@w.Visibility"
+                                                ValueChanged="value => SetVisibility(w, value)"
+                                                Circles="@State.Profile.Circles"
+                                                Class="compact"
+                                                AriaLabel="@($"Who can use {w.Name}")" />
                             </div>
 
                             <div class="app-frame wgt-frame">
@@ -873,8 +867,8 @@
     }
 
     // ---- Visibility ----
-    void SetVisibility(Widget w, ChangeEventArgs e)
-        => State.Mutate(_ => w.Visibility = e.Value?.ToString() ?? "private");
+    void SetVisibility(Widget w, string visibility)
+        => State.Mutate(_ => w.Visibility = CapabilityAudience.Parse(visibility).ToVisibility());
 
     // ---- Helpers ----
     bool IsDuplicateName(string name, string? excludeId)

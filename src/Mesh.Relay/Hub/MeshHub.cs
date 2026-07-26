@@ -23,6 +23,7 @@ namespace Mesh.Relay.Hub;
 public sealed class MeshHub(
     ConnectionRegistry registry,
     MeshRouter router,
+    AgentDispatchCoordinator agentDispatch,
     IRelayStore store,
     IBackplane backplane,
     IMessageRateLimiter rateLimiter,
@@ -76,6 +77,7 @@ public sealed class MeshHub(
         await backplane.SetPresenceAsync(state.Handle);
         await backplane.SetDevicePresenceAsync(state.Handle, deviceId);
         await Clients.Caller.SendAsync(MeshHubProtocol.Ready);
+        await agentDispatch.DispatchAvailableAsync(state.Handle, Context.ConnectionAborted);
 
         // Device-targeted fan-out must drain only on the intended device. Legacy handle-wide
         // messages are drained afterward for backward compatibility.
@@ -150,6 +152,27 @@ public sealed class MeshHub(
             metrics.RateLimitRejected();
             logger.LogWarning("message rate limited: {Handle}", state.Handle);
             return MeshSendResult.Reject("rate_limited", decision.RetryAfterMs);
+        }
+
+        if (AgentDispatchProtocol.IsAtomicRequest(stamped.Kind))
+        {
+            var result = await agentDispatch.RouteRequestAsync(stamped, Context.ConnectionAborted);
+            if (result.Accepted) metrics.MessageRouted();
+            return result;
+        }
+
+        if (AgentDispatchProtocol.IsAtomicResponse(stamped.Kind))
+        {
+            if (!string.IsNullOrWhiteSpace(stamped.ToDevice)
+                || !await agentDispatch.CompleteResponseAsync(
+                    stamped,
+                    state.DeviceId ?? "",
+                    Context.ConnectionAborted))
+                return MeshSendResult.Reject("invalid_agent_dispatch_response");
+
+            await router.RouteAsync(stamped with { AgentDispatchToken = null });
+            metrics.MessageRouted();
+            return MeshSendResult.Ok();
         }
 
         if (stamped.Kind == MeshKinds.RemoteAgentRequest)

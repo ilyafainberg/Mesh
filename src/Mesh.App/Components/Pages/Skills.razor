@@ -6,7 +6,7 @@
 <div class="pane-scroll">
     <div class="pane-narrow">
     <SectionHeader Title="Skills"
-                   Description="Expose capabilities your agent can perform - share them with circles so guest agents can request them." />
+                   Description="Expose capabilities your agent can perform - keep them private, share them with selected circles, or allow every approved contact." />
 
     <div class="card-panel">
         <div class="field">
@@ -23,14 +23,10 @@
         </div>
         <div class="field">
             <label>Who can use it</label>
-            <select class="full" @bind="visibility">
-                <option value="private">Private (owner only)</option>
-                <option value="public">Public (any allowed contact)</option>
-                @foreach (var c in State.Profile.Circles)
-                {
-                    <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                }
-            </select>
+            <AudiencePicker @bind-Value="visibility"
+                            Circles="@State.Profile.Circles"
+                            Class="full"
+                            AriaLabel="Who can use this skill" />
         </div>
         <button class="primary" @onclick="Add" disabled="@string.IsNullOrWhiteSpace(name)">
             <i class="bi bi-plus-lg"></i> Add skill
@@ -193,7 +189,7 @@
         @if (State.Profile.Skills.Count == 0 && !skillHintDismissed)
         {
             <div class="kn-hint" role="note" aria-label="Getting started tip">
-                <span class="kn-hint-text">Try "Book a 30-min intro call" - name a skill, describe it, write how your agent should handle it, then share it with a circle.</span>
+                <span class="kn-hint-text">Try "Book a 30-min intro call" - name a skill, describe it, write how your agent should handle it, then choose who may use it.</span>
                 <button class="kn-hint-close" @onclick="() => skillHintDismissed = true" aria-label="Dismiss tip"><i class="bi bi-x-lg"></i></button>
             </div>
         }
@@ -215,14 +211,10 @@
                         <textarea class="full" rows="6" @bind="editInstructions"></textarea>
                     </div>
                     <div class="kn-row">
-                        <select @bind="editVisibility">
-                            <option value="private">Private</option>
-                            <option value="public">Public</option>
-                            @foreach (var c in State.Profile.Circles)
-                            {
-                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                            }
-                        </select>
+                        <AudiencePicker @bind-Value="editVisibility"
+                                        Circles="@State.Profile.Circles"
+                                        Class="grow"
+                                        AriaLabel="Who can use this skill" />
                         <button class="primary" @onclick="() => SaveEdit(s)"><i class="bi bi-check-lg"></i> Save</button>
                         <button class="ghost" @onclick="() => editingId = null"><i class="bi bi-x-lg"></i> Cancel</button>
                     </div>
@@ -234,7 +226,7 @@
                             <input type="checkbox" checked="@s.Enabled" @onchange="e => Toggle(s, e)" />
                         </label>
                         <b>@s.Name</b>
-                        <span class="vis @VisClass(s.Visibility)">@s.Visibility</span>
+                        <span class="vis @VisClass(s.Visibility)">@AudiencePolicy.DisplayLabel(s.Visibility)</span>
                         @if (s.SourceMarketplaceId is not null)
                         {
                             <span class="mp-badge"><i class="bi bi-shop"></i> from @MarketNameFor(s.SourceMarketplaceId)</span>
@@ -254,7 +246,7 @@
         {
             <EmptyState Icon="bi-lightning-charge"
                         Title="No skills yet"
-                        Description="Add a skill and share it with a circle so guest agents can request it." />
+                        Description="Add a skill and choose which contacts may request it." />
         }
     </div>
     </div>
@@ -298,7 +290,7 @@
     void Toggle(Skill s, ChangeEventArgs e) => State.Mutate(_ => s.Enabled = (bool)(e.Value ?? false));
     void Remove(Skill s) => State.Mutate(p => p.Skills.Remove(s));
 
-    static string VisClass(string v) => v == "private" ? "priv" : v == "public" ? "pub" : "shared";
+    static string VisClass(string visibility) => AudiencePolicy.CssClass(visibility);
 
     // ---- Skill marketplaces ----
     string marketUrl = "";

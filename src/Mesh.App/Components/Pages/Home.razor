@@ -62,82 +62,90 @@
             </div>
             <span class="muted topic-list-subtitle">your private topic chats</span>
         </div>
-        <div class="thread-groups">
-            @if (Mesh.IsDeviceSnapshotSyncing)
-            {
-                <DeviceSyncPlaceholder Text="More chats are syncing..." />
-            }
-            @if (PinnedThreads.Count > 0)
-            {
-                <div class="thread-group-label"><i class="bi bi-pin-angle-fill"></i> Pinned</div>
-                @foreach (var t in PinnedThreads)
+        <div class="topic-list-scroll">
+            <div class="thread-groups">
+                @if (Mesh.IsDeviceSnapshotSyncing)
                 {
-                    <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
-                        <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
-                                @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
-                            <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                            @if (IsRemoteBound(t))
-                            {
-                                <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
-                                      title="@DeviceStatusText(t)">
-                                    <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
-                                </span>
-                            }
-                            @if (IsTopicBusy(t))
-                            {
-                                <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
-                                    <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
-                                </span>
-                            }
-                            else if (State.IsThreadCompleted(t.Id))
-                            {
-                                <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
-                            }
-                        </button>
-                        <button class="thread-pin" title="Unpin topic" aria-label="Unpin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
-                            <i class="bi bi-pin-angle-fill"></i>
-                        </button>
-                    </div>
+                    <DeviceSyncPlaceholder Text="More chats are syncing..." />
                 }
-            }
-            @if (RecentThreads.Count > 0)
-            {
-                <div class="thread-group-label"><i class="bi bi-clock-history"></i> Recent</div>
-                @foreach (var t in RecentThreads)
+                @if (PinnedThreads.Count > 0)
                 {
-                    <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
-                        <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
-                                @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
-                            <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                            @if (IsRemoteBound(t))
-                            {
-                                <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
-                                      title="@DeviceStatusText(t)">
-                                    <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>@ThreadDeviceName(t)
+                    <div class="thread-group-label"><i class="bi bi-pin-angle-fill"></i> Pinned</div>
+                    @foreach (var t in PinnedThreads)
+                    {
+                        <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
+                            <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
+                                    @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
+                                <span class="topic-title-line">
+                                    <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                                    @if (IsRemoteBound(t))
+                                    {
+                                        <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                              title="@DeviceStatusText(t)">
+                                            <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
+                                            <span class="topic-device-name">@ThreadDeviceName(t)</span>
+                                        </span>
+                                    }
                                 </span>
-                            }
-                            @if (IsTopicBusy(t))
-                            {
-                                <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
-                                    <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
-                                </span>
-                            }
-                            else if (State.IsThreadCompleted(t.Id))
-                            {
-                                <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
-                            }
-                        </button>
-                        <button class="thread-pin unpinned" title="Pin topic" aria-label="Pin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
-                            <i class="bi bi-pin-angle"></i>
-                        </button>
-                    </div>
+                                @if (IsTopicBusy(t))
+                                {
+                                    <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
+                                        <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
+                                    </span>
+                                }
+                                else if (State.IsThreadCompleted(t.Id))
+                                {
+                                    <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
+                                }
+                            </button>
+                            <button class="thread-pin" title="Unpin topic" aria-label="Unpin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
+                                <i class="bi bi-pin-angle-fill"></i>
+                            </button>
+                        </div>
+                    }
                 }
+                @if (RecentThreads.Count > 0)
+                {
+                    <div class="thread-group-label"><i class="bi bi-clock-history"></i> Recent</div>
+                    @foreach (var t in RecentThreads)
+                    {
+                        <div class="topic-row @(t.Id == activeThread ? "active" : "")" @key="ThreadRenderKey(t)">
+                            <button class="topic-open" aria-label="Open @(ThreadTitle(t))"
+                                    @onclick="() => Select(t.Id)" @onkeydown="e => OnThreadKey(e, t.Id)">
+                                <span class="topic-title-line">
+                                    <span class="conv-name">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
+                                    @if (IsRemoteBound(t))
+                                    {
+                                        <span class="topic-device-pill @(!IsDeviceOnline(t.ExecutionDeviceId) ? "offline" : "")"
+                                              title="@DeviceStatusText(t)">
+                                            <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
+                                            <span class="topic-device-name">@ThreadDeviceName(t)</span>
+                                        </span>
+                                    }
+                                </span>
+                                @if (IsTopicBusy(t))
+                                {
+                                    <span class="topic-busy-indicator" title="Agent is working" aria-label="Agent is working">
+                                        <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i>
+                                    </span>
+                                }
+                                else if (State.IsThreadCompleted(t.Id))
+                                {
+                                    <span class="topic-unread" title="Agent finished" aria-label="Agent finished"></span>
+                                }
+                            </button>
+                            <button class="thread-pin unpinned" title="Pin topic" aria-label="Pin @(ThreadTitle(t))" @onclick:stopPropagation="true" @onclick="() => TogglePin(t)">
+                                <i class="bi bi-pin-angle"></i>
+                            </button>
+                        </div>
+                    }
+                }
+            </div>
+            @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsDeviceSnapshotSyncing)
+            {
+                <div class="empty conv-empty">No chats yet. Start one with the + above, or just type below.</div>
             }
         </div>
-        @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsDeviceSnapshotSyncing)
-        {
-            <div class="empty conv-empty">No chats yet. Start one with the + above, or just type below.</div>
-        }
     </div>
 
     <div class="thread">
@@ -228,6 +236,19 @@
         <div class="messages-frame">
             <div class="messages" @ref="scrollEl">
                 <div class="messages-wrap">
+                @{
+                    var allVisibleLines = OrderedVisibleLines;
+                    var renderedLines = MessageRenderWindow.Latest(allVisibleLines, messageRenderCount);
+                    var hiddenMessageCount = MessageRenderWindow.HiddenCount(allVisibleLines.Count, messageRenderCount);
+                }
+                @if (hiddenMessageCount > 0)
+                {
+                    <div class="message-history-more">
+                        <button type="button" class="ghost" @onclick="ShowEarlierMessages">
+                            <i class="bi bi-clock-history"></i> Show @MessageRenderWindow.NextPageSize(allVisibleLines.Count, messageRenderCount) earlier messages
+                        </button>
+                    </div>
+                }
                 @if (Active is null || Active.Lines.Count == 0)
                 {
                     <div class="empty">
@@ -237,9 +258,9 @@
                 }
                 @if (Active is not null)
                 {
-                    @foreach (var line in OrderedVisibleLines.Where(line => !IsQueued(line)))
+                    @foreach (var line in renderedLines.Where(line => !IsQueued(line)))
                     {
-                        <div class="bubble @(line.Role)">
+                        <div class="bubble @(line.Role)" @key="line.Id">
                             @if (!string.IsNullOrEmpty(line.Reasoning))
                             {
                                 <button class="reasoning-toggle" @onclick="() => ToggleReasoning(line)" aria-label="Show reasoning">
@@ -300,13 +321,13 @@
                                                 <div class="agent-step-detail">
                                                     @if (!string.IsNullOrEmpty(step.Arguments))
                                                     {
-                                                        <div class="step-detail-label">input</div>
-                                                        <pre class="step-detail-body">@step.Arguments</pre>
+                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                        Content="@step.Arguments" />
                                                     }
                                                     @if (!string.IsNullOrEmpty(step.Result))
                                                     {
-                                                        <div class="step-detail-label">output</div>
-                                                        <pre class="step-detail-body">@step.Result</pre>
+                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                        Content="@step.Result" IsOutput="true" />
                                                     }
                                                 </div>
                                             }
@@ -352,13 +373,13 @@
                                             <div class="agent-step-detail">
                                                 @if (!string.IsNullOrEmpty(s.Arguments))
                                                 {
-                                                    <div class="step-detail-label">input</div>
-                                                    <pre class="step-detail-body">@s.Arguments</pre>
+                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                    Content="@s.Arguments" />
                                                 }
                                                 @if (!string.IsNullOrEmpty(s.Result))
                                                 {
-                                                    <div class="step-detail-label">output</div>
-                                                    <pre class="step-detail-body">@s.Result</pre>
+                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                    Content="@s.Result" IsOutput="true" />
                                                 }
                                             </div>
                                         }
@@ -394,9 +415,9 @@
                         }
                     </div>
                 }
-                @foreach (var line in OrderedVisibleLines.Where(IsQueued))
+                @foreach (var line in renderedLines.Where(IsQueued))
                 {
-                    <div class="bubble @(line.Role)">
+                    <div class="bubble @(line.Role)" @key="line.Id">
                         <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                         OnPin="html => PinWidget(html, line)" />
                         <div class="msg-tag"><i class="bi bi-hourglass-split"></i> queued</div>
@@ -559,6 +580,8 @@
     bool renaming;
     string renameText = "";
     string? activeThreadValue;
+    int messageRenderCount = MessageRenderWindow.InitialCount;
+    bool preserveHistoryScroll;
     string? activeThread
     {
         get => activeThreadValue;
@@ -566,7 +589,9 @@
         {
             if (string.Equals(activeThreadValue, value, StringComparison.Ordinal)) return;
             activeThreadValue = value;
+            messageRenderCount = MessageRenderWindow.InitialCount;
             inputValue = value is null ? "" : State.GetTopicDraft(value);
+            State.SetLastDesktopTopicId(value);
         }
     }
     ReportDialog? reportDialog;
@@ -698,13 +723,20 @@
     {
         State.Changed += Refresh;
         Mesh.DeviceSyncStateChanged += Refresh;
-        // Deep-link: /?thread=id opens that topic (used by Search). Otherwise land in the most recent.
+        // Deep links take precedence, then local desktop history, then the existing recent-topic fallback.
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
         var wanted = ParseQueryValue(uri.Query, "thread");
+        var remembered = State.GetLastDesktopTopicId();
         if (!string.IsNullOrWhiteSpace(wanted) && State.Profile.OwnThreads.Any(t => t.Id == wanted))
             activeThread = wanted;
+        else if (!string.IsNullOrWhiteSpace(remembered)
+                 && State.Profile.OwnThreads.Any(t => t.Id == remembered))
+            activeThread = remembered;
         else if (activeThread is null && State.Profile.OwnThreads.Count > 0)
             activeThread = State.Profile.OwnThreads[^1].Id;
+        else if (!string.IsNullOrWhiteSpace(remembered))
+            State.SetLastDesktopTopicId(null);
+
         if (activeThread is not null) State.MarkThreadSeen(activeThread);
     }
 
@@ -746,6 +778,12 @@
         }
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
+
+        if (preserveHistoryScroll)
+        {
+            preserveHistoryScroll = false;
+            return;
+        }
 
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
         // (busy true->false): the reply is added while the thread is still busy, so tracking that
@@ -797,6 +835,12 @@
             attachError = "Could not read the pasted file.";
         }
         return InvokeAsync(StateHasChanged);
+    }
+
+    void ShowEarlierMessages()
+    {
+        messageRenderCount = MessageRenderWindow.NextCount(OrderedVisibleLines.Count, messageRenderCount);
+        preserveHistoryScroll = true;
     }
 
     void Select(string id)
@@ -998,6 +1042,7 @@
     void ClearActive()
     {
         if (Active is not null) State.ClearOwnThread(Active.Id);
+        messageRenderCount = MessageRenderWindow.InitialCount;
         confirmDelete = false;
     }
 

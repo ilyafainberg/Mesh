@@ -1,0 +1,261 @@
+@page "/memories"
+@using Mesh.App.Domain
+@inject AppState State
+@inject MemoryService Memory
+@implements IDisposable
+
+<div class="pane-scroll">
+    <div class="pane-narrow memory-page">
+        <SectionHeader Title="Memories"
+                       Description="Mesh remembers durable details that help your agent across Me topics." />
+
+        <div class="memory-intro" role="note">
+            <i class="bi bi-shield-lock"></i>
+            <div>
+                <b>Private to your Me topics</b>
+                <p>Memories are encrypted, synchronized across your devices, and never used in Messages, guest agents, or Community services. Mesh automatically recalls the memories most useful to each topic.</p>
+            </div>
+        </div>
+
+        <div class="memory-toolbar">
+            <label class="memory-search">
+                <i class="bi bi-search"></i>
+                <input @bind="search" @bind:event="oninput" placeholder="Search memories" aria-label="Search memories" />
+            </label>
+            <button class="primary" @onclick="StartAdd">
+                <i class="bi bi-plus-lg"></i> Add memory
+            </button>
+        </div>
+
+        @if (pageError is not null)
+        {
+            <div class="memory-error" role="alert"><i class="bi bi-exclamation-triangle"></i> @pageError</div>
+        }
+
+        @if (editorOpen)
+        {
+            <div class="memory-editor card-panel">
+                <div class="editor-heading">
+                    <div>
+                        <b>@(editingId is null ? "Add a memory" : "Edit memory")</b>
+                        <small>Keep each memory focused on one durable fact, preference, goal, workflow, or constraint.</small>
+                    </div>
+                    <button class="icon-btn" @onclick="CancelEdit" title="Close" aria-label="Close memory editor"><i class="bi bi-x-lg"></i></button>
+                </div>
+                <label>
+                    <span>Title</span>
+                    <input class="full" @bind="title" maxlength="@MemoryPolicy.MaxTitleChars" placeholder="Optional short title" />
+                </label>
+                <label>
+                    <span>Memory</span>
+                    <textarea class="full" rows="4" @bind="content" maxlength="@MemoryPolicy.MaxContentChars" placeholder="What should Mesh remember?"></textarea>
+                </label>
+                <label>
+                    <span>Category</span>
+                    <select @bind="category">
+                        @foreach (var value in MemoryCategories.All)
+                        {
+                            <option value="@value">@MemoryPolicy.CategoryLabel(value)</option>
+                        }
+                    </select>
+                </label>
+                @if (editorError is not null)
+                {
+                    <div class="memory-error" role="alert"><i class="bi bi-exclamation-triangle"></i> @editorError</div>
+                }
+                <div class="editor-actions">
+                    <button class="ghost" @onclick="CancelEdit">Cancel</button>
+                    <button class="primary" @onclick="Save" disabled="@string.IsNullOrWhiteSpace(content)">
+                        <i class="bi bi-check-lg"></i> Save
+                    </button>
+                </div>
+            </div>
+        }
+
+        <div class="memory-summary">
+            <span>@Filtered.Count @(Filtered.Count == 1 ? "memory" : "memories")</span>
+            @if (State.Profile.Memories.Count > 0)
+            {
+                <small>Mesh decides what to recall using relevance, stability, repetition, and long-term usefulness.</small>
+            }
+        </div>
+
+        @if (Filtered.Count == 0)
+        {
+            <div class="memory-empty">
+                <i class="bi bi-brain"></i>
+                @if (State.Profile.Memories.Count == 0)
+                {
+                    <b>No memories yet</b>
+                    <p>Mesh will learn durable details from your Me topics, or you can add one yourself.</p>
+                }
+                else
+                {
+                    <b>No matching memories</b>
+                    <p>Try a different search.</p>
+                }
+            </div>
+        }
+        else
+        {
+            <div class="memory-list">
+                @foreach (var item in Filtered)
+                {
+                    <article class="memory-card" @key="item.Id">
+                        <div class="memory-card-head">
+                            <div class="memory-title-row">
+                                <span class="memory-category">@MemoryPolicy.CategoryLabel(item.Category)</span>
+                                <h3>@item.Title</h3>
+                            </div>
+                            @if (deleteId != item.Id)
+                            {
+                                <div class="memory-actions">
+                                    <button class="icon-btn" @onclick="() => StartEdit(item)" title="Edit" aria-label="@($"Edit {item.Title}")"><i class="bi bi-pencil"></i></button>
+                                    <button class="icon-btn danger" @onclick="() => StartDelete(item)" title="Delete" aria-label="@($"Delete {item.Title}")"><i class="bi bi-trash"></i></button>
+                                </div>
+                            }
+                        </div>
+                        <p class="memory-content">@item.Content</p>
+                        <div class="memory-meta">
+                            <span><i class="bi bi-stars"></i> @OriginLabel(item)</span>
+                            <span><i class="bi bi-clock"></i> Updated @FormatDate(item.UpdatedAt)</span>
+                        </div>
+                        @if (deleteId == item.Id)
+                        {
+                            <div class="delete-confirm" role="alert">
+                                <span>Delete this memory on all synchronized devices?</span>
+                                <button class="ghost small" @onclick="CancelDelete">Cancel</button>
+                                <button class="danger-btn small" @onclick="() => Delete(item)">Delete</button>
+                            </div>
+                        }
+                    </article>
+                }
+            </div>
+        }
+    </div>
+</div>
+
+@code {
+    string search = "";
+    string? editingId;
+    MemoryItem? editingBaseline;
+    string? deleteId;
+    MemoryItem? deleteBaseline;
+    string title = "";
+    string content = "";
+    string category = MemoryCategories.Preference;
+    string? editorError;
+    string? pageError;
+    bool editorOpen;
+
+    List<MemoryItem> Filtered
+    {
+        get
+        {
+            var query = search.Trim();
+            return State.Profile.Memories
+                .Where(item => query.Length == 0
+                    || item.Title.Contains(query, StringComparison.OrdinalIgnoreCase)
+                    || item.Content.Contains(query, StringComparison.OrdinalIgnoreCase)
+                    || MemoryPolicy.CategoryLabel(item.Category).Contains(query, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(item => item.UpdatedAt)
+                .ThenBy(item => item.Title, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+    }
+
+    protected override void OnInitialized()
+        => State.Changed += Refresh;
+
+    void Refresh() => InvokeAsync(StateHasChanged);
+
+    void StartAdd()
+    {
+        editingId = null;
+        editingBaseline = null;
+        title = "";
+        content = "";
+        category = MemoryCategories.Preference;
+        editorError = null;
+        pageError = null;
+        CancelDelete();
+        editorOpen = true;
+    }
+
+    void StartEdit(MemoryItem item)
+    {
+        editingId = item.Id;
+        editingBaseline = MemoryPolicy.Clone(item);
+        title = item.Title;
+        content = item.Content;
+        category = item.Category;
+        editorError = null;
+        pageError = null;
+        CancelDelete();
+        editorOpen = true;
+    }
+
+    void CancelEdit()
+    {
+        editorOpen = false;
+        editingId = null;
+        editingBaseline = null;
+        editorError = null;
+    }
+
+    void Save()
+    {
+        editorError = null;
+        try
+        {
+            Memory.SaveManual(editingId, title, content, category, editingBaseline);
+            CancelEdit();
+        }
+        catch (ArgumentException ex)
+        {
+            editorError = ex.Message;
+        }
+        catch (InvalidOperationException ex)
+        {
+            editorError = ex.Message;
+        }
+    }
+
+    void StartDelete(MemoryItem item)
+    {
+        deleteId = item.Id;
+        deleteBaseline = MemoryPolicy.Clone(item);
+    }
+
+    void CancelDelete()
+    {
+        deleteId = null;
+        deleteBaseline = null;
+    }
+
+    void Delete(MemoryItem item)
+    {
+        pageError = Memory.DeleteManual(item.Id, deleteBaseline)
+            ? null
+            : "The memory could not be deleted because it changed on another device.";
+        if (editingId == item.Id && pageError is null) CancelEdit();
+        CancelDelete();
+    }
+
+    string OriginLabel(MemoryItem item)
+    {
+        var origin = MemoryPolicy.OriginLabel(item.Origin);
+        if (item.SourceThreadId is null) return origin;
+        var topic = State.Profile.OwnThreads.FirstOrDefault(thread => thread.Id == item.SourceThreadId);
+        if (topic is null) return origin;
+        return item.Origin == MemoryOrigins.Manual
+            ? $"Edited by you; originally learned in {topic.Title}"
+            : $"{origin} in {topic.Title}";
+    }
+
+    static string FormatDate(DateTimeOffset value)
+        => value.ToLocalTime().ToString("MMM d, yyyy");
+
+    public void Dispose()
+        => State.Changed -= Refresh;
+}

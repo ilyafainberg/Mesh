@@ -22,6 +22,63 @@
     overflow-x: hidden;
 }
 
+.memory-notice {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 10px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--brand);
+    border-radius: var(--radius-l);
+    background: var(--bg-1);
+    box-shadow: var(--shadow-8);
+    color: var(--fg-1);
+}
+
+.memory-notice > i {
+    flex: 0 0 auto;
+    color: var(--brand);
+    font-size: 20px;
+}
+
+.memory-notice-copy {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    flex-direction: column;
+}
+
+.memory-notice-copy strong,
+.memory-notice-copy span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.memory-notice-copy span {
+    color: var(--fg-2);
+    font-size: .78rem;
+}
+
+.memory-notice button {
+    flex: 0 0 auto;
+    padding: 5px 7px;
+    border: 0;
+    background: transparent;
+    color: var(--brand);
+    font: inherit;
+    font-size: .78rem;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.memory-notice .memory-notice-dismiss {
+    padding: 5px 0 5px 4px;
+    color: var(--fg-3);
+}
 /* Bottom tab bar. In-flow flex child (NOT position:fixed): a fixed bar sibling to a
    -webkit-overflow-scrolling scroll container has its touches swallowed by the scroll
    layer on Android WebView, making the tabs untappable. A normal flex child at the

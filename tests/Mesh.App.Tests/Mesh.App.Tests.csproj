@@ -21,6 +21,17 @@
     <Compile Include="..\..\src\Mesh.App\Services\ModelCallDispatcher.cs" Link="ModelCallDispatcher.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\CopilotAcpProtocol.cs" Link="CopilotAcpProtocol.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.cs" Link="MeshDb.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\IAgentTool.cs" Link="IAgentTool.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\AgentToolExecutor.cs" Link="AgentToolExecutor.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReasoningExtract.cs" Link="ReasoningExtract.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ToolDetailFormatter.cs" Link="ToolDetailFormatter.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ToolApprovalService.cs" Link="ToolApprovalService.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\TokenOptimizer.cs" Link="TokenOptimizer.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\RuntimeDiagnostics.cs" Link="RuntimeDiagnostics.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MessageRenderWindow.cs" Link="MessageRenderWindow.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\AssistantDraftRefreshGate.cs" Link="AssistantDraftRefreshGate.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MemoryPolicy.cs" Link="MemoryPolicy.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MemoryService.cs" Link="MemoryService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProfileSyncState.cs" Link="ProfileSyncState.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionContracts.cs" Link="TopicExecutionContracts.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionRouter.cs" Link="TopicExecutionRouter.cs" />

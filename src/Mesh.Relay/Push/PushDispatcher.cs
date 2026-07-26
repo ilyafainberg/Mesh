@@ -60,7 +60,8 @@ public sealed class PushDispatcher(
     {
         MeshKinds.Fanout or MeshKinds.GroupMessage => PushCategory.Group,
         MeshKinds.Chat or MeshKinds.DirectMessage or MeshKinds.AgentRequest
-            or MeshKinds.AgentResponse or MeshKinds.ServiceRequest or MeshKinds.ServiceResponse
+            or MeshKinds.AgentResponse or MeshKinds.AtomicAgentRequest or MeshKinds.AtomicAgentResponse
+            or MeshKinds.ServiceRequest or MeshKinds.ServiceResponse
             => PushCategory.Message,
         _ => PushCategory.None,
     };

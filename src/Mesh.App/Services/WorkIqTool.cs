@@ -6,7 +6,7 @@ namespace Mesh.App.Services;
 /// Asks WorkIQ (the Microsoft 365 knowledge assistant) a natural-language question and returns its
 /// answer. WorkIQ reasons across the owner's M365 data (email, Teams, files, calendar, people), so
 /// this is owner-scoped by nature: enabling it lets the agent query the owner's work context, and
-/// sharing it with a circle lets that circle's agents ask questions grounded in the owner's M365.
+/// sharing it with selected circles lets those contacts' agents ask questions grounded in the owner's M365.
 /// Backed by the local WorkIQ CLI (workiq.cmd ask -q "...").
 /// </summary>
 public sealed class AskWorkIqTool : IAgentTool

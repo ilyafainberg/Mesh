@@ -85,7 +85,7 @@
         flex-direction: column;
     }
 
-    .lt-share select,
+    .lt-share ::deep .audience-picker,
     .approval-seg {
         width: 100%;
         max-width: 100%;

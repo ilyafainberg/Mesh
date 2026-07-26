@@ -140,9 +140,9 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
             foreach (var widget in profile.Widgets.OrderByDescending(w => w.ModifiedAt))
             {
                 ct.ThrowIfCancellationRequested();
-                if (!Matches(widget.Name, widget.Prompt, widget.Visibility)) continue;
+                if (!Matches(widget.Name, widget.Prompt, AudiencePolicy.DetailedLabel(widget.Visibility))) continue;
                 Add("widget", widget.Id, widget.Name,
-                    $"{widget.Prompt}; visibility: {widget.Visibility}", widget.ModifiedAt);
+                    $"{widget.Prompt}; visibility: {AudiencePolicy.DetailedLabel(widget.Visibility)}", widget.ModifiedAt);
                 if (Full()) break;
             }
         }
@@ -152,9 +152,9 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
             foreach (var item in profile.Knowledge.OrderByDescending(k => k.UpdatedAt))
             {
                 ct.ThrowIfCancellationRequested();
-                if (!Matches(item.Title, item.Content, item.SourceRef, item.Visibility)) continue;
+                if (!Matches(item.Title, item.Content, item.SourceRef, AudiencePolicy.DetailedLabel(item.Visibility))) continue;
                 Add("knowledge", item.Id, item.Title,
-                    $"{item.Content}; source: {item.Source}; visibility: {item.Visibility}", item.UpdatedAt);
+                    $"{item.Content}; source: {item.Source}; visibility: {AudiencePolicy.DetailedLabel(item.Visibility)}", item.UpdatedAt);
                 if (Full()) break;
             }
         }
@@ -164,9 +164,9 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
             foreach (var skill in profile.Skills.OrderBy(s => s.Name))
             {
                 ct.ThrowIfCancellationRequested();
-                if (!Matches(skill.Name, skill.Description, skill.Instructions, skill.Visibility)) continue;
+                if (!Matches(skill.Name, skill.Description, skill.Instructions, AudiencePolicy.DetailedLabel(skill.Visibility))) continue;
                 Add("skill", skill.Id, skill.Name,
-                    $"{skill.Description}; enabled: {skill.Enabled}; visibility: {skill.Visibility}");
+                    $"{skill.Description}; enabled: {skill.Enabled}; visibility: {AudiencePolicy.DetailedLabel(skill.Visibility)}");
                 if (Full()) break;
             }
         }
@@ -191,10 +191,10 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
             foreach (var source in profile.Sources.OrderBy(s => s.Provider).ThenBy(s => s.ConnectedAs))
             {
                 ct.ThrowIfCancellationRequested();
-                if (!Matches(source.Provider.ToString(), source.ConnectedAs, source.Visibility)) continue;
+                if (!Matches(source.Provider.ToString(), source.ConnectedAs, AudiencePolicy.DetailedLabel(source.Visibility))) continue;
                 Add("source", source.Id, source.Provider.ToString(),
                     $"account: {source.ConnectedAs ?? "not available"}; enabled: {source.Enabled}; "
-                    + $"visibility: {source.Visibility}; mail grants: {source.Folders.Count}; drive grants: {source.DrivePaths.Count}");
+                    + $"visibility: {AudiencePolicy.DetailedLabel(source.Visibility)}; mail grants: {source.Folders.Count}; drive grants: {source.DrivePaths.Count}");
                 if (Full()) break;
             }
         }
@@ -204,9 +204,9 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
             foreach (var (kind, setting) in profile.LocalTools.OrderBy(x => x.Key.ToString()))
             {
                 ct.ThrowIfCancellationRequested();
-                if (!Matches(kind.ToString(), setting.Visibility, setting.ApprovalLevel.ToString())) continue;
+                if (!Matches(kind.ToString(), AudiencePolicy.DetailedLabel(setting.Visibility), setting.ApprovalLevel.ToString())) continue;
                 Add("local_tool", kind.ToString(), kind.ToString(),
-                    $"enabled: {setting.Enabled}; visibility: {(kind == LocalToolKind.MeshData ? "private" : setting.Visibility)}; approval: {setting.ApprovalLevel}");
+                    $"enabled: {setting.Enabled}; visibility: {(kind == LocalToolKind.MeshData ? "Only me" : AudiencePolicy.DetailedLabel(setting.Visibility))}; approval: {setting.ApprovalLevel}");
                 if (Full()) break;
             }
 
@@ -214,9 +214,9 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
             {
                 if (Full()) break;
                 ct.ThrowIfCancellationRequested();
-                if (!Matches(server.Name, server.Transport.ToString(), server.Visibility)) continue;
+                if (!Matches(server.Name, server.Transport.ToString(), AudiencePolicy.DetailedLabel(server.Visibility))) continue;
                 Add("mcp_server", server.Id, server.Name,
-                    $"transport: {server.Transport}; enabled: {server.Enabled}; visibility: {server.Visibility}; approval: {server.ApprovalLevel}");
+                    $"transport: {server.Transport}; enabled: {server.Enabled}; visibility: {AudiencePolicy.DetailedLabel(server.Visibility)}; approval: {server.ApprovalLevel}");
             }
         }
 

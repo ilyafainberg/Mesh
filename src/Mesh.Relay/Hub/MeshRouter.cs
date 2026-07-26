@@ -135,6 +135,30 @@ public sealed class MeshRouter(
     }
 
     /// <summary>
+    /// Delivers one atomic agent request to one connection of one device. This path never queues or
+    /// fans out. Durable assignment and retry state live in AgentDispatchCoordinator.
+    /// </summary>
+    public async Task<BackplaneDeliveryOutcome> RouteAtomicAgentRequestAsync(
+        MeshEnvelope env,
+        CancellationToken ct = default)
+    {
+        if (!AgentDispatchProtocol.IsAtomicRequest(env.Kind)
+            || string.IsNullOrWhiteSpace(env.ToDevice))
+            return BackplaneDeliveryOutcome.NotDelivered;
+
+        var to = Normalize(env.To);
+        var envelopeJson = JsonSerializer.Serialize(env, Json);
+        if (await DeliverSingleLocalDeviceAsync(to, envelopeJson, env.ToDevice))
+            return BackplaneDeliveryOutcome.Delivered;
+
+        var owner = await backplane.GetInstanceForDeviceAsync(to, env.ToDevice, ct);
+        if (owner is null || owner == backplane.InstanceId)
+            return BackplaneDeliveryOutcome.NotDelivered;
+
+        return await backplane.PublishAtomicToOwnerAsync(owner, to, envelopeJson, ct);
+    }
+
+    /// <summary>
     /// Delivers an envelope JSON to every local connection for a handle (optionally excluding one
     /// connection). Returns true if at least one local connection received it. Used both by the
     /// local fast path and by the backplane when another instance forwards a message to this one.
@@ -156,6 +180,21 @@ public sealed class MeshRouter(
             conns = conns.Where(c => c != excludeConnectionId).ToList();
         if (conns.Count == 0) return false;
         await hub.Clients.Clients(conns).SendAsync(MeshHubProtocol.Receive, envelopeJson);
+        return true;
+    }
+
+    public async Task<bool> DeliverSingleLocalDeviceAsync(
+        string handle,
+        string envelopeJson,
+        string deviceId,
+        string? excludeConnectionId = null)
+    {
+        var connection = registry.ConnectionsForDevice(Normalize(handle), deviceId)
+            .Where(id => !string.Equals(id, excludeConnectionId, StringComparison.Ordinal))
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (connection is null) return false;
+        await hub.Clients.Client(connection).SendAsync(MeshHubProtocol.Receive, envelopeJson);
         return true;
     }
 
