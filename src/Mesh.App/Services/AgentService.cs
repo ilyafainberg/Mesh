@@ -225,6 +225,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             {
                 Role = "assistant",
                 Text = finalAnswer,
+                ModelId = model.ResponseModelId,
                 Reasoning = reasoning,
                 ReplyToLineId = triggerLineId
             });
@@ -745,6 +746,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         sb.AppendLine("- For a complicated task with independent workstreams, you may declare 'Plan - Hyperscale', split it into non-conflicting subtasks, run independent tool calls in parallel where supported, then integrate and verify one result.");
         sb.AppendLine("- You remain responsible for the integrated answer. Report important deviations and verification at the end.");
         sb.AppendLine("- Images attached to a user message are already loaded in memory and visible to you. Analyze them directly. Never open them in another app or take a screenshot merely to inspect them.");
+        if (p.Model.Provider == ModelProvider.OpenRouter)
+            sb.AppendLine("- Never guess or claim your underlying model identity. If asked, say Mesh shows the provider-reported model on the reply.");
         AppendAppCapability(sb, compact);
         AppendTools(sb, agentTools, compact);
         AppendWidgets(sb, p.Widgets, "insert");

@@ -1,0 +1,14 @@
+@if (!string.IsNullOrWhiteSpace(ModelId))
+{
+    <div class="model-attribution"
+         title="@($"Provider-reported model: {ModelId}")"
+         aria-label="@($"Provider-reported model: {ModelId}")">
+        <i class="bi bi-cpu"></i>
+        <strong>Model</strong>
+        <span>@ModelId</span>
+    </div>
+}
+
+@code {
+    [Parameter] public string? ModelId { get; set; }
+}

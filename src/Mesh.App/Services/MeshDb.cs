@@ -159,11 +159,13 @@ public sealed class MeshDb : IDisposable
         AddColumnIfMissing("chat_lines", "sender_handle", "TEXT");
         AddColumnIfMissing("chat_lines", "internal", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("chat_lines", "reasoning", "TEXT");
+        AddColumnIfMissing("chat_lines", "model_id", "TEXT");
         AddColumnIfMissing("own_chat", "thread_id", "TEXT");
         // Transcript + reasoning persistence: internal lines are the model's hidden execution record;
         // reasoning is the collapsible "thinking" (previously not persisted, so lost on restart).
         AddColumnIfMissing("own_chat", "internal", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("own_chat", "reasoning", "TEXT");
+        AddColumnIfMissing("own_chat", "model_id", "TEXT");
         AddColumnIfMissing("own_chat", "sender_handle", "TEXT");
         AddColumnIfMissing("own_chat", "reply_to_line_id", "TEXT");
         // User-defined topic order. Existing rows retain their creation order through the fallback sort.
@@ -363,7 +365,7 @@ public sealed class MeshDb : IDisposable
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = """
-                SELECT handle, role, text, via, at, line_id, status, sender_handle, internal, reasoning
+                SELECT handle, role, text, via, at, line_id, status, sender_handle, internal, reasoning, model_id
                 FROM chat_lines ORDER BY id;
                 """;
             using var r = cmd.ExecuteReader();
@@ -380,7 +382,8 @@ public sealed class MeshDb : IDisposable
                     Status = r.IsDBNull(6) ? "" : r.GetString(6),
                     SenderHandle = r.IsDBNull(7) ? null : r.GetString(7),
                     Internal = !r.IsDBNull(8) && r.GetInt64(8) != 0,
-                    Reasoning = r.IsDBNull(9) ? null : r.GetString(9)
+                    Reasoning = r.IsDBNull(9) ? null : r.GetString(9),
+                    ModelId = r.IsDBNull(10) ? null : r.GetString(10)
                 });
             }
         }
@@ -460,7 +463,7 @@ public sealed class MeshDb : IDisposable
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = """
-                SELECT thread_id, role, text, via, at, line_id, status, internal, reasoning, sender_handle, reply_to_line_id
+                SELECT thread_id, role, text, via, at, line_id, status, internal, reasoning, sender_handle, reply_to_line_id, model_id
                 FROM own_chat WHERE thread_id IS NOT NULL ORDER BY id;
                 """;
             using var r = cmd.ExecuteReader();
@@ -478,7 +481,8 @@ public sealed class MeshDb : IDisposable
                     Internal = !r.IsDBNull(7) && r.GetInt64(7) != 0,
                     Reasoning = r.IsDBNull(8) ? null : r.GetString(8),
                     SenderHandle = r.IsDBNull(9) ? null : r.GetString(9),
-                    ReplyToLineId = r.IsDBNull(10) ? null : r.GetString(10)
+                    ReplyToLineId = r.IsDBNull(10) ? null : r.GetString(10),
+                    ModelId = r.IsDBNull(11) ? null : r.GetString(11)
                 });
             }
         }
@@ -1300,8 +1304,8 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO chat_lines(
-                line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning)
-            VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning);
+                line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning, model_id)
+            VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning, $modelId);
             """;
         cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$h", handle);
@@ -1313,6 +1317,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$internal", line.Internal ? 1 : 0);
         cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$modelId", (object?)line.ModelId ?? DBNull.Value);
         cmd.ExecuteNonQuery();
         AdvanceConversationActivity(handle, line.At);
     }
@@ -1329,7 +1334,7 @@ public sealed class MeshDb : IDisposable
             update.CommandText = """
                 UPDATE chat_lines
                 SET role = $r, text = $x, via = $v, status = $s, at = $a,
-                    sender_handle = $sender, internal = $internal, reasoning = $reasoning
+                    sender_handle = $sender, internal = $internal, reasoning = $reasoning, model_id = COALESCE($modelId, model_id)
                 WHERE handle = $h AND line_id = $lid;
                 """;
             AddChatLineParameters(update, handle, line);
@@ -1341,8 +1346,8 @@ public sealed class MeshDb : IDisposable
             insert.Transaction = tx;
             insert.CommandText = """
                 INSERT INTO chat_lines(
-                    line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning)
-                VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning);
+                    line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning, model_id)
+                VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning, $modelId);
                 """;
             AddChatLineParameters(insert, handle, line);
             insert.ExecuteNonQuery();
@@ -1362,6 +1367,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$internal", line.Internal ? 1 : 0);
         cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$modelId", (object?)line.ModelId ?? DBNull.Value);
     }
 
     /// <summary>Appends a single line to a "Me" topic thread.</summary>
@@ -1370,8 +1376,8 @@ public sealed class MeshDb : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO own_chat(
-                line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle)
-            VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $i, $rz, $sender);
+                line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle, model_id)
+            VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $i, $rz, $sender, $modelId);
             """;
         cmd.Parameters.AddWithValue("$lid", line.Id);
         cmd.Parameters.AddWithValue("$tid", threadId);
@@ -1383,6 +1389,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$i", line.Internal ? 1 : 0);
         cmd.Parameters.AddWithValue("$rz", (object?)line.Reasoning ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$modelId", (object?)line.ModelId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$replyTo", (object?)line.ReplyToLineId ?? DBNull.Value);
         cmd.ExecuteNonQuery();
         AdvanceOwnThreadActivity(threadId, line.At);
@@ -1400,7 +1407,7 @@ public sealed class MeshDb : IDisposable
                 UPDATE own_chat
                 SET role = $r, text = $x, reply_to_line_id = $replyTo,
                     via = $v, status = $s, at = $a,
-                    internal = $internal, reasoning = $reasoning, sender_handle = $sender
+                    internal = $internal, reasoning = $reasoning, sender_handle = $sender, model_id = COALESCE($modelId, model_id)
                 WHERE thread_id = $tid AND line_id = $lid;
                 """;
             AddOwnChatParameters(update, threadId, line);
@@ -1412,8 +1419,8 @@ public sealed class MeshDb : IDisposable
             insert.Transaction = tx;
             insert.CommandText = """
                 INSERT INTO own_chat(
-                    line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle)
-                VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $internal, $reasoning, $sender);
+                    line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle, model_id)
+                VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $internal, $reasoning, $sender, $modelId);
                 """;
             AddOwnChatParameters(insert, threadId, line);
             insert.ExecuteNonQuery();
@@ -1455,7 +1462,7 @@ public sealed class MeshDb : IDisposable
                 UPDATE own_chat
                 SET role = $r, text = $x, reply_to_line_id = $replyTo,
                     via = $v, status = $s, at = $a,
-                    internal = $internal, reasoning = $reasoning, sender_handle = $sender
+                    internal = $internal, reasoning = $reasoning, sender_handle = $sender, model_id = COALESCE($modelId, model_id)
                 WHERE thread_id = $tid AND line_id = $lid;
                 """;
             AddOwnChatParameters(update, threadId, line);
@@ -1467,8 +1474,8 @@ public sealed class MeshDb : IDisposable
             insert.Transaction = tx;
             insert.CommandText = """
                 INSERT INTO own_chat(
-                    line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle)
-                VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $internal, $reasoning, $sender);
+                    line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle, model_id)
+                VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $internal, $reasoning, $sender, $modelId);
                 """;
             AddOwnChatParameters(insert, threadId, line);
             insert.ExecuteNonQuery();
@@ -1512,7 +1519,7 @@ public sealed class MeshDb : IDisposable
             update.CommandText = """
                 UPDATE chat_lines
                 SET role = $r, text = $x, via = $v, status = $s, at = $a,
-                    sender_handle = $sender, internal = $internal, reasoning = $reasoning
+                    sender_handle = $sender, internal = $internal, reasoning = $reasoning, model_id = COALESCE($modelId, model_id)
                 WHERE handle = $h AND line_id = $lid;
                 """;
             AddChatLineParameters(update, handle, line);
@@ -1524,8 +1531,8 @@ public sealed class MeshDb : IDisposable
             insert.Transaction = tx;
             insert.CommandText = """
                 INSERT INTO chat_lines(
-                    line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning)
-                VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning);
+                    line_id, handle, role, text, via, status, at, sender_handle, internal, reasoning, model_id)
+                VALUES($lid, $h, $r, $x, $v, $s, $a, $sender, $internal, $reasoning, $modelId);
                 """;
             AddChatLineParameters(insert, handle, line);
             insert.ExecuteNonQuery();
@@ -1549,6 +1556,7 @@ public sealed class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$reasoning", (object?)line.Reasoning ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$sender", (object?)line.SenderHandle ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$replyTo", (object?)line.ReplyToLineId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$modelId", (object?)line.ModelId ?? DBNull.Value);
     }
 
     /// <summary>Records that a "Me" thread exists so an empty thread survives a reload.</summary>

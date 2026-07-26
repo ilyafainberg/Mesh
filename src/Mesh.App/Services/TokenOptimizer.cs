@@ -545,6 +545,7 @@ internal static class TokenOptimizer
             AddressedToAgent = source.AddressedToAgent,
             Status = source.Status,
             Reasoning = source.Reasoning,
+            ModelId = source.ModelId,
             Internal = source.Internal,
             At = source.At
         };

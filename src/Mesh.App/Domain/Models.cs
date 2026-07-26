@@ -670,6 +670,8 @@ public sealed class ChatLine
     /// reasoning field); null when the model returned no reasoning.
     /// </summary>
     public string? Reasoning { get; set; }
+    /// <summary>The model id reported by the provider for this assistant reply.</summary>
+    public string? ModelId { get; set; }
     /// <summary>
     /// Internal transcript line: part of the agent's own execution record (tool calls with their
     /// arguments and results) that the MODEL sees on later turns and resumes so it never loses the

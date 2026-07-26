@@ -261,6 +261,7 @@
                     @foreach (var line in renderedLines.Where(line => !IsQueued(line)))
                     {
                         <div class="bubble @(line.Role)" @key="line.Id">
+                            <ModelAttribution ModelId="@line.ModelId" />
                             @if (!string.IsNullOrEmpty(line.Reasoning))
                             {
                                 <button class="reasoning-toggle" @onclick="() => ToggleReasoning(line)" aria-label="Show reasoning">
