@@ -392,6 +392,104 @@ window.meshUI = {
     el.style.overflowY = 'hidden';
   },
 
+  // Dismiss the software keyboard before a native picker takes over. Waiting for one animation
+  // beat prevents WKWebView from restoring a half-shifted viewport when the picker closes.
+  prepareForNativePicker: function (el) {
+    if (el && typeof el.blur === 'function') el.blur();
+    return new Promise(function (resolve) {
+      requestAnimationFrame(function () { setTimeout(resolve, 100); });
+    });
+  },
+
+  // iOS keeps the layout viewport at full height while the keyboard shrinks and pans the visual
+  // viewport. Size mobile thread overlays to the visual viewport so the attachment row and
+  // composer remain directly above the keyboard without leaving a phantom gap.
+  initMobileViewport: function () {
+    if (window._meshMobileViewport) return;
+    window._meshMobileViewport = true;
+
+    var root = document.documentElement;
+    var scheduled = false;
+    var settleTimer = 0;
+    var baselineHeight = 0;
+    var lastWidth = 0;
+
+    function isEditable(element) {
+      if (!element || !element.tagName) return false;
+      var tag = element.tagName.toLowerCase();
+      return tag === 'input' || tag === 'textarea' || element.isContentEditable;
+    }
+
+    function measure() {
+      scheduled = false;
+      var viewport = window.visualViewport;
+      var height = viewport && viewport.height > 0 ? viewport.height : window.innerHeight;
+      var width = viewport && viewport.width > 0 ? viewport.width : window.innerWidth;
+      var layoutHeight = Math.max(
+        document.documentElement.clientHeight || 0,
+        height || 0);
+
+      var focused = isEditable(document.activeElement);
+      if (!lastWidth || Math.abs(width - lastWidth) > 60) {
+        baselineHeight = focused
+          ? Math.max(baselineHeight, layoutHeight, height)
+          : Math.max(layoutHeight, height);
+        lastWidth = width;
+      }
+
+      baselineHeight = Math.max(baselineHeight, layoutHeight, height);
+
+      var keyboardOpen = focused && baselineHeight - height > 80;
+      var top = viewport ? Math.max(0, viewport.offsetTop || 0) : 0;
+      if (layoutHeight > height) top = Math.min(top, layoutHeight - height);
+      if (!keyboardOpen && !focused) top = 0;
+
+      root.style.setProperty('--mesh-visual-viewport-height', Math.round(height) + 'px');
+      root.style.setProperty('--mesh-visual-viewport-top', Math.round(top) + 'px');
+      root.classList.toggle('mesh-keyboard-open', keyboardOpen);
+      if (keyboardOpen) root.style.setProperty('--mesh-composer-safe-bottom', '0px');
+      else root.style.removeProperty('--mesh-composer-safe-bottom');
+
+      // WKWebView can retain a document-level scroll offset after the keyboard closes even though
+      // Mesh scrolls only its inner panes. Clear that stale offset once focus has left the editor.
+      if (!keyboardOpen && !focused && (window.scrollX || window.scrollY)) {
+        window.scrollTo(0, 0);
+      }
+    }
+
+    function schedule(settle) {
+      if (!scheduled) {
+        scheduled = true;
+        requestAnimationFrame(measure);
+      }
+      if (!settle) return;
+      clearTimeout(settleTimer);
+      settleTimer = setTimeout(measure, 300);
+    }
+
+    var viewport = window.visualViewport;
+    if (viewport) {
+      viewport.addEventListener('resize', function () { schedule(true); }, { passive: true });
+      viewport.addEventListener('scroll', function () { schedule(false); }, { passive: true });
+    }
+    window.addEventListener('resize', function () { schedule(true); }, { passive: true });
+    window.addEventListener('orientationchange', function () {
+      lastWidth = 0;
+      schedule(true);
+    }, { passive: true });
+    document.addEventListener('focusin', function (event) {
+      if (isEditable(event.target)) schedule(true);
+    }, true);
+    document.addEventListener('focusout', function (event) {
+      if (isEditable(event.target)) setTimeout(function () { schedule(true); }, 0);
+    }, true);
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) schedule(true);
+    });
+
+    measure();
+  },
+
   // Highlight already-normalized tool details. Text is read from textContent on every pass so
   // switching between formatted and raw views never re-highlights generated markup.
   highlightCode: function (root) {
@@ -424,3 +522,5 @@ window.meshUI = {
     });
   }
 };
+
+window.meshUI.initMobileViewport();

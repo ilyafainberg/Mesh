@@ -418,14 +418,17 @@ button:disabled {
 /* ---------- B) THREAD SCREEN (full-screen overlay) ---------- */
 .m-thread {
     position: fixed;
-    inset: 0;
+    top: var(--mesh-visual-viewport-top, 0px);
+    right: 0;
+    bottom: auto;
+    left: 0;
     background: var(--bg-1);
     z-index: 20;
     display: flex;
     flex-direction: column;
     width: 100%;
     height: 100vh;
-    height: 100dvh;
+    height: var(--mesh-visual-viewport-height, 100dvh);
     overflow: hidden;
 }
 
@@ -601,7 +604,7 @@ button:disabled {
     flex: none;
     background: var(--bg-1);
     border-top: 1px solid var(--stroke-1);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-bottom: var(--mesh-composer-safe-bottom, env(safe-area-inset-bottom, 0px));
 }
 
 .composer-inner {

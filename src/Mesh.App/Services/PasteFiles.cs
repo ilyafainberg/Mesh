@@ -36,7 +36,7 @@ public static class PasteFiles
 
     // A filesystem-safe display name, defaulting the extension from the mime type when the pasted
     // item had no usable name (common for images copied from another app).
-    private static string SafeName(string name, string mime)
+    internal static string SafeName(string name, string? mime)
     {
         var n = string.IsNullOrWhiteSpace(name) ? "pasted" : name.Trim();
         foreach (var c in System.IO.Path.GetInvalidFileNameChars()) n = n.Replace(c, '_');
@@ -48,7 +48,7 @@ public static class PasteFiles
         return n.Length > 120 ? n[^120..] : n;
     }
 
-    private static string? ExtFor(string mime) => (mime ?? "").ToLowerInvariant() switch
+    private static string? ExtFor(string? mime) => (mime ?? "").ToLowerInvariant() switch
     {
         "image/png" => ".png",
         "image/jpeg" or "image/jpg" => ".jpg",

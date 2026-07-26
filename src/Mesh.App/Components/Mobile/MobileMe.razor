@@ -1115,18 +1115,13 @@ else
         attachError = null;
         try
         {
+            await JS.InvokeVoidAsync("meshUI.prepareForNativePicker", composerEl);
             var file = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
             if (file is null) return;
-            var path = file.FullPath;
-            if (string.IsNullOrWhiteSpace(path) || !System.IO.File.Exists(path))
-            {
-                attachError = "Could not resolve that file's path on disk.";
-                return;
-            }
-            long size = 0;
-            try { size = new System.IO.FileInfo(path).Length; } catch { }
-            LocalFiles.Allow(path);
-            attachments.Add(new StagedFile(file.FileName, path, size));
+            await using var stream = await file.OpenReadAsync();
+            var staged = await PickedFileStager.StageAsync(file.FileName, file.ContentType, stream);
+            LocalFiles.Allow(staged.Path);
+            attachments.Add(new StagedFile(staged.Name, staged.Path, staged.Size));
         }
         catch (Exception ex) { attachError = "Couldn't attach that file: " + ex.Message; }
     }
@@ -1249,11 +1244,10 @@ else
 
     static async Task<IReadOnlyList<ChatAttachment>> LoadAttachmentsAsync(List<StagedFile> files, CancellationToken ct)
     {
-        const long maxAttachmentBytes = 20 * 1024 * 1024;
         var result = new List<ChatAttachment>();
         foreach (var file in files)
         {
-            if (file.Size > maxAttachmentBytes) throw new InvalidOperationException($"{file.Name} is larger than the 20 MB attachment limit.");
+            if (file.Size > PickedFileStager.MaxAttachmentBytes) throw new InvalidOperationException($"{file.Name} is larger than the 20 MB attachment limit.");
             var extension = System.IO.Path.GetExtension(file.Path);
             var mime = AttachmentMimes.TryGetValue(extension, out var known) ? known : "application/octet-stream";
             var bytes = await System.IO.File.ReadAllBytesAsync(file.Path, ct);
