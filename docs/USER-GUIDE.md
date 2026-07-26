@@ -219,15 +219,23 @@ Add contacts by their **handle**. Your contacts list is how you keep track of th
 
 You organize contacts into **circles**. A circle is a named group of contacts (for example, "Family," "Work," or "Book club"). Circles are the heart of how Mesh keeps sharing private.
 
-### Sharing is scoped by circle
+### Sharing is scoped by audience
 
-This is the key privacy idea. When another person's agent talks to your agent, it only sees the **knowledge, skills, and widgets you have shared with that person's circle**. Nothing else. This is called **privacy by binding**: what a contact can access is bound to the circle you placed them in.
+This is the key privacy idea. Knowledge, skills, widgets, connected sources, folder grants, and tools each have an audience:
+
+- **Only me:** available only to your own agent.
+- **Selected circles:** choose one or more circles. A contact gains access when they belong to any selected circle.
+- **All allowed contacts:** available to every contact you have explicitly allowed.
+
+This is called **privacy by binding**: what a contact can access is bound to their circle membership and the audience you selected. "All allowed contacts" does not publish anything to Community. Public services remain a separate, explicitly configured feature.
 
 For example:
 
-- You share a "Recipes" knowledge item with your **Family** circle.
-- A contact in your **Work** circle asks your agent about recipes.
-- Your agent will not surface the recipes, because that contact is not in the circle you shared them with.
+- You share a "Recipes" knowledge item with **Family** and **Close friends**.
+- A contact in either circle can ask your agent about recipes.
+- A contact who belongs only to **Work** cannot access it.
+
+On desktop, the audience control opens beside the field. On phones, it opens as a bottom sheet. Select the circles you want, then tap **Done** to apply them together.
 
 ### Approval modes
 
@@ -236,13 +244,13 @@ Approval modes control whether your agent **auto-replies** to an approved contac
 - Let trusted contacts' requests be answered automatically by your agent.
 - Or require your approval before your agent responds, so you stay in the loop.
 
-You can tune this per your comfort level. Approved contacts are still limited to what their circle can see.
+You can tune this per your comfort level. Approved contacts are still limited to what their selected audience permits.
 
 ---
 
 ## 7. Memories, Knowledge, Skills, and Widgets
 
-These features help your agent work consistently across conversations. **Memories are always private to you.** Knowledge, skills, and widgets have separate sharing controls and can be shared with circles; some can also be published through [Community](#10-community-and-public-services).
+These features help your agent work consistently across conversations. **Memories are always private to you.** Knowledge, skills, and widgets have separate sharing controls and can be shared with one or more circles; some can also be published through [Community](#10-community-and-public-services).
 
 ### Memories
 
@@ -263,7 +271,7 @@ Relevant memory text becomes part of the model request for that Me turn. If you 
 
 ### Knowledge
 
-**Knowledge** is documents and notes your agent can use. Add the things you want your agent to know about: reference material, personal notes, project details, FAQs, and so on. Your agent can search and use this knowledge when it helps you or an approved contact. Unlike Memories, Knowledge has explicit visibility controls.
+**Knowledge** is documents and notes your agent can use. Add the things you want your agent to know about: reference material, personal notes, project details, FAQs, and so on. Your agent can search and use this knowledge when it helps you or an approved contact. Unlike Memories, Knowledge has explicit audience controls.
 
 ### Skills
 
@@ -271,7 +279,7 @@ Relevant memory text becomes part of the model request for that Me turn. If you 
 
 ### Widgets
 
-**Widgets** are mini HTML apps that your agent can **build** for you. You can **pin** widgets so they are easy to reach, and **share** them with circles. Widgets are handy for small interactive tools, dashboards, calculators, trackers, and similar lightweight apps that live inside Mesh.
+**Widgets** are mini HTML apps that your agent can **build** for you. You can **pin** widgets so they are easy to reach, and **share** them with one or more circles. Widgets are handy for small interactive tools, dashboards, calculators, trackers, and similar lightweight apps that live inside Mesh.
 
 ---
 
@@ -287,6 +295,8 @@ Beyond documents you add directly, you can connect **live knowledge sources** so
 
 These are connected as **on-demand tools**. That is an important distinction: **nothing is bulk-copied** into Mesh. Your agent reaches into the source only when it needs an answer, and only for what is relevant to your request. Your information stays where it lives, and Mesh pulls just what it needs, when it needs it.
 
+Each connected source can be kept private, shared with selected circles, or opened to all allowed contacts. When a whole mail or drive source stays private, individual folders can have their own multi-circle audience.
+
 ---
 
 ## 9. Local Tools and MCP
@@ -297,7 +307,7 @@ Mesh can give your agent access to **local tools** that run on your device. Thes
 
 - **Owner-gated:** only you, the owner of the device, can turn these on.
 - **Off by default:** every local tool starts disabled. Nothing runs until you deliberately enable it.
-- **Optionally shared to a circle:** if you choose, you can make a local tool available to a specific circle. It is never shared unless you decide to.
+- **Audience-controlled:** if you choose, you can make a local tool available to one or more selected circles, or to all allowed contacts. It is never shared unless you decide to.
 
 ### Available local tools
 
@@ -315,7 +325,7 @@ Mesh can give your agent access to **local tools** that run on your device. Thes
 
 Mesh also supports **MCP tool servers**, which add extra capabilities to your agent. Some are **bundled** with the app, and you can add your own **custom** ones. As with local tools, these expand what your agent can do, so enable only what you trust.
 
-> Tip: because these tools can act on your device, only enable the ones you understand and need, and be thoughtful before sharing any of them to a circle.
+> Tip: because these tools can act on your device, only enable the ones you understand and need, and be thoughtful before sharing any of them with contacts.
 
 ---
 
@@ -529,11 +539,11 @@ Reports go privately to the Mesh operator. If you are **offline** when you submi
 
 ### Someone I shared with cannot see my knowledge/skills/widgets.
 
-Sharing is **scoped by circle**. Make sure the contact is in the **circle** you shared those items with. If they are in a different circle, they will not see items shared to another circle. This is intentional privacy by binding.
+Sharing is **scoped by audience**. If you chose Selected circles, make sure the contact belongs to at least one of them. Membership in any selected circle grants access; membership only in other circles does not. You can also choose All allowed contacts.
 
 ### My agent will not use a local tool.
 
-Local tools are **off by default** and **owner-gated**. Open **Settings** and enable the specific tool you want. If you want a contact's circle to use it, share it to that circle explicitly.
+Local tools are **off by default** and **owner-gated**. Open **Settings** and enable the specific tool you want. If you want contacts to use it, choose one or more circles or All allowed contacts explicitly.
 
 ### A connected source is not returning anything.
 
@@ -567,7 +577,7 @@ No. Messages are **end-to-end encrypted**. The relay only routes sealed envelope
 
 ### Can others use my agent without my permission?
 
-Only in the ways you allow. Approved contacts see only what their **circle** can access. A **public service** exposes only the capabilities you attach to it, never your owner memories, private items, or local tools, and it is protected by budgets and daily request limits.
+Only in the ways you allow. Approved contacts see only what their selected **audience** permits. A **public service** exposes only the capabilities you attach to it, never your owner memories, private items, or local tools, and it is protected by budgets and daily request limits.
 
 ---
 
@@ -586,7 +596,7 @@ Only in the ways you allow. Approved contacts see only what their **circle** can
 | **Group** | A create-only, human-to-human conversation whose state is stored on members' devices. |
 | **Contact** | Someone you have added by handle. |
 | **Circle** | A named group of contacts that scopes what you share. |
-| **Privacy by binding** | What a contact can access is bound to their circle. |
+| **Privacy by binding** | What a contact can access is bound to their circle membership and each capability's audience. |
 | **Memory** | An owner-only durable detail recalled across Me topics. It cannot be shared or published. |
 | **Knowledge** | Documents and notes your agent can use. |
 | **Skill** | Reusable instructions or capabilities for your agent. |

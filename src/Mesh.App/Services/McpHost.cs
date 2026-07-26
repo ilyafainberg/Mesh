@@ -24,7 +24,7 @@ public sealed record McpServerDef(
 
 /// <summary>
 /// The MCP servers Mesh ships with. Each is launched on demand as a child process and its tools are
-/// surfaced to the agent (owner-gated, optionally shared with a circle, like the native local tools).
+/// surfaced to the agent (owner-gated, optionally shared with selected circles or all allowed contacts, like the native local tools).
 /// TotalControl is the desktop-control server, bundled next to the Windows client so there is a
 /// single source of truth for desktop automation instead of a second copy inside Mesh.
 /// </summary>

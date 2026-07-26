@@ -10,7 +10,7 @@ public readonly record struct ServiceReply(string Text, long Tokens);
 /// <summary>
 /// Runs the user's agent in one of two contexts:
 ///  - Owner context: full knowledge + the user's own chat.
-///  - Guest context: scoped to public + the requesting handle's circles ONLY.
+///  - Guest context: scoped to matching selected circles or all allowed contacts ONLY.
 /// Private knowledge is never placed into a guest context, so it cannot be
 /// extracted by a hostile peer agent (privacy by binding, not by instruction).
 /// </summary>
@@ -549,11 +549,9 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         }
 
         // Tools scoped to this contact's circles (whole-source or per-folder grants).
-        static bool Visible(string vis, List<string> cs) =>
-            vis == "public" || (vis.StartsWith("shared:") && cs.Contains(vis["shared:".Length..]));
         var agentTools = tools.GuestTools(p.Sources, circles, p.LocalTools).ToList();
         agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: false, circles: circles, ct));
-        var widgets = p.Widgets.Where(w => Visible(w.Visibility, circles)).ToList();
+        var widgets = p.Widgets.Where(w => AudiencePolicy.CanAccess(w.Visibility, circles)).ToList();
 
         var currentRequest = agentHistory.LastOrDefault(line =>
             string.Equals(line.Role, "user", StringComparison.Ordinal))?.Text ?? "";
@@ -750,24 +748,22 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         AppendAppCapability(sb, compact);
         AppendTools(sb, agentTools, compact);
         AppendWidgets(sb, p.Widgets, "insert");
-        AppendKnowledge(sb, p.Knowledge, compact, p.Model.TokenOptimization, query);
+        AppendKnowledge(sb, p.Knowledge, compact, p.Model.TokenOptimization, query, includeAudienceLabels: true);
         AppendSkills(
             sb,
             p.Skills.Where(s => s.Enabled).ToList(),
             p.Model.TokenOptimization,
-            query);
+            query,
+            includeAudienceLabels: true);
         return sb.ToString();
     }
 
     private static string BuildGuestSystemPrompt(MeshProfile p, string fromHandle, List<string> circles,
         IReadOnlyList<IAgentTool> agentTools, IReadOnlyList<Widget> widgets, string query)
     {
-        static bool Visible(string vis, List<string> circles) =>
-            vis == "public" || (vis.StartsWith("shared:") && circles.Contains(vis["shared:".Length..]));
-
-        // Only public + items shared with a circle the guest belongs to.
-        var knowledge = p.Knowledge.Where(k => Visible(k.Visibility, circles)).ToList();
-        var skills = p.Skills.Where(s => s.Enabled && Visible(s.Visibility, circles)).ToList();
+        // Only items shared with at least one matching circle, or all allowed contacts.
+        var knowledge = p.Knowledge.Where(k => AudiencePolicy.CanAccess(k.Visibility, circles)).ToList();
+        var skills = p.Skills.Where(s => s.Enabled && AudiencePolicy.CanAccess(s.Visibility, circles)).ToList();
         var compact = IsSmall(p.Model.Provider);
 
         var sb = new StringBuilder();
@@ -917,7 +913,8 @@ Widget runtime restrictions:
         IReadOnlyList<KnowledgeItem> items,
         bool compact,
         TokenOptimizationLevel optimization,
-        string query)
+        string query,
+        bool includeAudienceLabels = false)
     {
         if (items.Count == 0) { sb.AppendLine(); sb.AppendLine("(No knowledge items yet.)"); return; }
         var selection = TokenOptimizer.SelectKnowledge(items, query, optimization);
@@ -926,7 +923,10 @@ Widget runtime restrictions:
         var perItem = TokenOptimizer.KnowledgeContentLimit(optimization, compact);
         foreach (var k in selection.Included)
         {
-            sb.AppendLine($"## {k.Title} [{k.Visibility}]");
+            var audienceLabel = includeAudienceLabels
+                ? $" [{AudiencePolicy.DisplayLabel(k.Visibility)}]"
+                : "";
+            sb.AppendLine($"## {k.Title}{audienceLabel}");
             sb.AppendLine(TokenOptimizer.Normalize(optimization) == TokenOptimizationLevel.Disabled
                 ? Truncate(k.Content, perItem)
                 : TokenOptimizer.FitContextText(k.Content, perItem));
@@ -940,7 +940,8 @@ Widget runtime restrictions:
         StringBuilder sb,
         IReadOnlyList<Skill> skills,
         TokenOptimizationLevel optimization,
-        string query)
+        string query,
+        bool includeAudienceLabels = false)
     {
         if (skills.Count == 0) return;
         var selection = TokenOptimizer.SelectSkills(skills, query, optimization);
@@ -949,7 +950,10 @@ Widget runtime restrictions:
         sb.AppendLine("=== Skills you can offer ===");
         foreach (var s in selection.Included)
         {
-            sb.AppendLine($"## {s.Name} [{s.Visibility}]");
+            var audienceLabel = includeAudienceLabels
+                ? $" [{AudiencePolicy.DisplayLabel(s.Visibility)}]"
+                : "";
+            sb.AppendLine($"## {s.Name}{audienceLabel}");
             if (!string.IsNullOrWhiteSpace(s.Description)) sb.AppendLine(s.Description);
             if (!string.IsNullOrWhiteSpace(s.Instructions))
                 sb.AppendLine("How: " + (instructionLimit == int.MaxValue

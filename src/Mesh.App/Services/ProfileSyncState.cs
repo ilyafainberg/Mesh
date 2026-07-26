@@ -172,12 +172,7 @@ internal static class ProfileSyncState
                 contact.Circles.Any(circle => CircleEntityId(circle) == entityId)))
             return true;
         return Visibilities(profile).Any(visibility =>
-            visibility.StartsWith("shared:", StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(
-                visibility,
-                SystemCircles.PublicVisibility,
-                StringComparison.Ordinal)
-            && CircleEntityId(visibility["shared:".Length..]) == entityId);
+            AudiencePolicy.ReferencesCircle(visibility, entityId));
     }
 
     public static List<Contact> CloneContacts(IEnumerable<Contact> contacts)
@@ -256,17 +251,23 @@ internal static class ProfileSyncState
         string? replacement)
     {
         string Rewrite(string visibility)
+            => replacement is null
+                ? AudiencePolicy.RemoveCircle(visibility, circleEntityId)
+                : AudiencePolicy.RenameCircle(visibility, circleEntityId, replacement);
+
+        void RewriteGrants(List<FolderGrant> grants)
         {
-            if (string.Equals(
-                    visibility,
-                    SystemCircles.PublicVisibility,
-                    StringComparison.Ordinal))
-                return visibility;
-            const string prefix = "shared:";
-            if (!visibility.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-                || CircleEntityId(visibility[prefix.Length..]) != circleEntityId)
-                return visibility;
-            return replacement is null ? "private" : prefix + replacement;
+            for (var i = grants.Count - 1; i >= 0; i--)
+            {
+                var grant = grants[i];
+                if (!AudiencePolicy.ReferencesCircle(grant.Visibility, circleEntityId)) continue;
+                var rewritten = Rewrite(grant.Visibility);
+                if (replacement is null
+                    && CapabilityAudience.Parse(rewritten).Mode == CapabilityAudienceMode.Private)
+                    grants.RemoveAt(i);
+                else
+                    grant.Visibility = rewritten;
+            }
         }
 
         foreach (var item in profile.Knowledge) item.Visibility = Rewrite(item.Visibility);
@@ -275,8 +276,8 @@ internal static class ProfileSyncState
         foreach (var item in profile.Sources)
         {
             item.Visibility = Rewrite(item.Visibility);
-            foreach (var folder in item.Folders) folder.Visibility = Rewrite(folder.Visibility);
-            foreach (var path in item.DrivePaths) path.Visibility = Rewrite(path.Visibility);
+            RewriteGrants(item.Folders);
+            RewriteGrants(item.DrivePaths);
         }
         foreach (var item in profile.LocalTools.Values) item.Visibility = Rewrite(item.Visibility);
         foreach (var item in profile.McpServers.Values) item.Visibility = Rewrite(item.Visibility);

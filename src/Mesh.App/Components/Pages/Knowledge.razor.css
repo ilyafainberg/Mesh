@@ -39,3 +39,27 @@
     outline: 2px solid var(--brand, #5c6ef8);
     outline-offset: 2px;
 }
+
+@media (max-width: 840.98px) {
+    .src-row {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .src-controls,
+    .grant-row,
+    .grant-vis-row {
+        width: 100%;
+        flex-wrap: wrap;
+    }
+
+    .grant-name {
+        flex: 1 1 100%;
+    }
+
+    .src-controls ::deep .audience-picker,
+    .grant-row ::deep .audience-picker,
+    .grant-vis-row ::deep .audience-picker {
+        max-width: none;
+    }
+}

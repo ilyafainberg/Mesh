@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using Mesh.Shared;
 
@@ -13,6 +14,166 @@ public enum CopilotEffort { Auto, None, Minimal, Low, Medium, High, XHigh, Max }
 
 /// <summary>How aggressively Mesh reduces the ephemeral context sent to a model.</summary>
 public enum TokenOptimizationLevel { Disabled, MaxAccuracy, Balanced, MaxSavings }
+
+/// <summary>Who may use an audience-scoped capability through an approved contact.</summary>
+public enum CapabilityAudienceMode { Private, SelectedCircles, AllAllowedContacts }
+
+/// <summary>
+/// Parsed capability audience. Legacy single-circle values stay readable, while multi-circle values
+/// use a distinct encoding that older clients fail closed on instead of granting too much access.
+/// </summary>
+public sealed class CapabilityAudience
+{
+    public const string PrivateVisibility = "private";
+    public const string AllAllowedContactsVisibility = "public";
+    public const string SharedPrefix = "shared:";
+    public const string MultiCirclePrefix = "shared-multi:";
+
+    private static readonly CapabilityAudience PrivateAudience =
+        new(CapabilityAudienceMode.Private, Array.Empty<string>());
+    private static readonly CapabilityAudience AllContactsAudience =
+        new(CapabilityAudienceMode.AllAllowedContacts, Array.Empty<string>());
+
+    private CapabilityAudience(CapabilityAudienceMode mode, IReadOnlyList<string> circles)
+    {
+        Mode = mode;
+        Circles = circles;
+    }
+
+    public CapabilityAudienceMode Mode { get; }
+    public IReadOnlyList<string> Circles { get; }
+
+    public static CapabilityAudience Private => PrivateAudience;
+    public static CapabilityAudience AllAllowedContacts => AllContactsAudience;
+
+    public static CapabilityAudience Parse(string? visibility)
+    {
+        var value = visibility?.Trim();
+        if (string.IsNullOrEmpty(value)
+            || value.Equals(PrivateVisibility, StringComparison.OrdinalIgnoreCase))
+            return Private;
+        if (value.Equals(AllAllowedContactsVisibility, StringComparison.OrdinalIgnoreCase))
+            return AllAllowedContacts;
+
+        if (value.StartsWith(MultiCirclePrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var circles = JsonSerializer.Deserialize<List<string>>(value[MultiCirclePrefix.Length..]);
+                return ForCircles(circles);
+            }
+            catch (JsonException)
+            {
+                return Private;
+            }
+        }
+
+        if (value.StartsWith(SharedPrefix, StringComparison.OrdinalIgnoreCase))
+            return ForCircles([value[SharedPrefix.Length..]]);
+
+        return Private;
+    }
+
+    public static CapabilityAudience ForCircles(IEnumerable<string>? circleNames)
+    {
+        var normalized = (circleNames ?? Enumerable.Empty<string>())
+            .Select(name => name?.Trim() ?? "")
+            .Where(name => name.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return normalized.Count == 0
+            ? Private
+            : new CapabilityAudience(CapabilityAudienceMode.SelectedCircles, normalized.AsReadOnly());
+    }
+
+    public bool IncludesCircle(string? circleName)
+        => !string.IsNullOrWhiteSpace(circleName)
+           && Circles.Contains(circleName.Trim(), StringComparer.OrdinalIgnoreCase);
+
+    public string ToVisibility()
+        => Mode switch
+        {
+            CapabilityAudienceMode.AllAllowedContacts => AllAllowedContactsVisibility,
+            CapabilityAudienceMode.SelectedCircles when Circles.Count == 1 => SharedPrefix + Circles[0],
+            CapabilityAudienceMode.SelectedCircles when Circles.Count > 1 =>
+                MultiCirclePrefix + JsonSerializer.Serialize(Circles),
+            _ => PrivateVisibility
+        };
+}
+
+/// <summary>Central authorization and lifecycle helpers for capability audiences.</summary>
+public static class AudiencePolicy
+{
+    public static bool CanAccess(string? visibility, IEnumerable<string>? guestCircles)
+    {
+        var audience = CapabilityAudience.Parse(visibility);
+        if (audience.Mode == CapabilityAudienceMode.AllAllowedContacts) return true;
+        if (audience.Mode != CapabilityAudienceMode.SelectedCircles) return false;
+        var allowed = new HashSet<string>(guestCircles ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        return audience.Circles.Any(allowed.Contains);
+    }
+
+    public static bool ReferencesCircle(string? visibility, string? circleName)
+        => CapabilityAudience.Parse(visibility).IncludesCircle(circleName);
+
+    public static string RenameCircle(string? visibility, string oldName, string newName)
+    {
+        var audience = CapabilityAudience.Parse(visibility);
+        if (audience.Mode != CapabilityAudienceMode.SelectedCircles || !audience.IncludesCircle(oldName))
+            return audience.ToVisibility();
+        return CapabilityAudience.ForCircles(audience.Circles.Select(circle =>
+            circle.Equals(oldName, StringComparison.OrdinalIgnoreCase) ? newName : circle)).ToVisibility();
+    }
+
+    public static string RemoveCircle(string? visibility, string circleName)
+    {
+        var audience = CapabilityAudience.Parse(visibility);
+        if (audience.Mode != CapabilityAudienceMode.SelectedCircles || !audience.IncludesCircle(circleName))
+            return audience.ToVisibility();
+        return CapabilityAudience.ForCircles(audience.Circles.Where(circle =>
+            !circle.Equals(circleName, StringComparison.OrdinalIgnoreCase))).ToVisibility();
+    }
+
+    public static string DisplayLabel(string? visibility)
+    {
+        var audience = CapabilityAudience.Parse(visibility);
+        return audience.Mode switch
+        {
+            CapabilityAudienceMode.AllAllowedContacts => "All allowed contacts",
+            CapabilityAudienceMode.SelectedCircles when audience.Circles.Count == 1 => audience.Circles[0],
+            CapabilityAudienceMode.SelectedCircles when audience.Circles.Count == 2 => string.Join(", ", audience.Circles),
+            CapabilityAudienceMode.SelectedCircles => $"{audience.Circles.Count} circles",
+            _ => "Only me"
+        };
+    }
+
+    public static string DetailedLabel(string? visibility)
+    {
+        var audience = CapabilityAudience.Parse(visibility);
+        return audience.Mode switch
+        {
+            CapabilityAudienceMode.AllAllowedContacts => "All allowed contacts",
+            CapabilityAudienceMode.SelectedCircles => string.Join(", ", audience.Circles),
+            _ => "Only me"
+        };
+    }
+
+    public static string CssClass(string? visibility)
+        => CapabilityAudience.Parse(visibility).Mode switch
+        {
+            CapabilityAudienceMode.AllAllowedContacts => "pub",
+            CapabilityAudienceMode.SelectedCircles => "shared",
+            _ => "priv"
+        };
+
+    public static string IconClass(string? visibility)
+        => CapabilityAudience.Parse(visibility).Mode switch
+        {
+            CapabilityAudienceMode.AllAllowedContacts => "bi-people-fill",
+            CapabilityAudienceMode.SelectedCircles => "bi-diagram-3",
+            _ => "bi-lock"
+        };
+}
 
 /// <summary>Where a knowledge item's content came from.</summary>
 public enum KnowledgeSource { Manual, File }
@@ -31,7 +192,7 @@ public sealed class ConnectedSource
     public string? ConnectedAs { get; set; }
     /// <summary>Stable account identity for token acquisition (MSAL home account id, or Gmail address).</summary>
     public string? AccountId { get; set; }
-    /// <summary>Which tiers may use these tools: "private" | "public" | "shared:&lt;circle&gt;".</summary>
+    /// <summary>Who may use these tools: only the owner, selected circles, or all allowed contacts.</summary>
     public string Visibility { get; set; } = "private";
     public bool Enabled { get; set; } = true;
     /// <summary>
@@ -54,7 +215,7 @@ public sealed class FolderGrant
 {
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
-    /// <summary>"private" | "public" | "shared:&lt;circle&gt;"</summary>
+    /// <summary>Selected circles or all allowed contacts that may access this folder.</summary>
     public string Visibility { get; set; } = "private";
 }
 
@@ -64,7 +225,7 @@ public enum ApprovalMode { Off, All, PerCircle }
 /// <summary>
 /// A powerful local-machine capability the owner's agent can be granted (run scripts, control the
 /// browser or desktop, work with files). These are OFF by default and, when enabled, are owner-only
-/// unless the owner explicitly shares them with a circle (same visibility model as knowledge/skills).
+/// unless the owner explicitly shares them with selected circles or all allowed contacts.
 /// </summary>
 public enum LocalToolKind
 {
@@ -93,7 +254,7 @@ public enum ToolApprovalLevel
 public sealed class LocalToolSetting
 {
     public bool Enabled { get; set; }
-    /// <summary>"private" (owner only) | "public" | "shared:&lt;circle&gt;".</summary>
+    /// <summary>Who may use the tool beyond the owner.</summary>
     public string Visibility { get; set; } = "private";
     public ToolApprovalLevel ApprovalLevel { get; set; } = ToolApprovalLevel.ReadOnlyAuto;
 }
@@ -110,7 +271,7 @@ public enum McpTransport
 /// <summary>
 /// A user-added MCP tool server. Two transports: a local <see cref="McpTransport.Stdio"/> command Mesh
 /// launches over stdio (desktop only), or a remote <see cref="McpTransport.Http"/> endpoint reached over
-/// the network (works on mobile too). Same off-by-default, owner-first, optionally-circle-shared model
+/// the network (works on mobile too). Same off-by-default, owner-first, audience-scoped model
 /// as the bundled servers.
 /// </summary>
 public sealed class CustomMcpServer
@@ -126,7 +287,7 @@ public sealed class CustomMcpServer
     /// <summary>The remote endpoint URL for an <see cref="McpTransport.Http"/> server (e.g. https://host/mcp).</summary>
     public string Url { get; set; } = "";
     public bool Enabled { get; set; }
-    /// <summary>"private" | "public" | "shared:&lt;circle&gt;".</summary>
+    /// <summary>Who may use this server beyond the owner.</summary>
     public string Visibility { get; set; } = "private";
     public ToolApprovalLevel ApprovalLevel { get; set; } = ToolApprovalLevel.ReadOnlyAuto;
 }
@@ -182,7 +343,7 @@ public sealed class KnowledgeItem
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Title { get; set; } = "";
     public string Content { get; set; } = "";
-    /// <summary>"private" | "public" | "shared:&lt;circle&gt;"</summary>
+    /// <summary>Who may use this item through the owner's agent.</summary>
     public string Visibility { get; set; } = "private";
     public KnowledgeSource Source { get; set; } = KnowledgeSource.Manual;
     /// <summary>File path or connector reference the content was grounded in.</summary>
@@ -281,7 +442,7 @@ public sealed class Widget
     public string Prompt { get; set; } = "";
     /// <summary>Self-contained HTML document.</summary>
     public string Html { get; set; } = "";
-    /// <summary>"private" | "public" | "shared:&lt;circle&gt;", who your agent may send it to.</summary>
+    /// <summary>Who the owner's agent may send this widget to.</summary>
     public string Visibility { get; set; } = "private";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset ModifiedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -310,7 +471,8 @@ public static class SystemCircles
     public const string PublicVisibility = "shared:__public__";
 
     /// <summary>True when a capability's visibility marks it public-listed (in the Community directory).</summary>
-    public static bool IsPublicListed(string? visibility) => visibility == PublicVisibility;
+    public static bool IsPublicListed(string? visibility)
+        => CapabilityAudience.Parse(visibility).IncludesCircle(Public);
 }
 
 /// <summary>
@@ -1087,13 +1249,13 @@ public sealed class MeshProfile
     /// <summary>
     /// Local-machine tool grants (run scripts, control browser, file access), keyed by tool.
     /// All OFF by default. Enabled tools are always available to the owner in their private chat, and
-    /// only reach a guest agent when the owner has shared that tool with one of the guest's circles.
+    /// only reach a guest agent when the owner has shared that tool with a matching circle or all allowed contacts.
     /// </summary>
     public Dictionary<LocalToolKind, LocalToolSetting> LocalTools { get; set; } = new();
 
     /// <summary>
     /// Grants for bundled MCP tool servers (e.g. TotalControl desktop control), keyed by server id.
-    /// Same off-by-default, owner-first, optionally-circle-shared model as <see cref="LocalTools"/>.
+    /// Same off-by-default, owner-first, audience-scoped model as <see cref="LocalTools"/>.
     /// Each server can expose several tools; the grant governs the whole server.
     /// </summary>
     public Dictionary<string, LocalToolSetting> McpServers { get; set; } = new();

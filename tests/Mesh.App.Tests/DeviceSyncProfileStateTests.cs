@@ -74,6 +74,72 @@ public sealed class DeviceSyncProfileStateTests
     }
 
     [TestMethod]
+    public void CapabilityAudience_LegacyAndMultiCircleValuesRoundTrip()
+    {
+        var legacy = CapabilityAudience.Parse("shared:Friends");
+        CollectionAssert.AreEqual(new[] { "Friends" }, legacy.Circles.ToArray());
+
+        var encoded = CapabilityAudience.ForCircles(["Friends", "Work", "Family", "friends"]).ToVisibility();
+        StringAssert.StartsWith(encoded, CapabilityAudience.MultiCirclePrefix);
+        Assert.IsFalse(encoded.StartsWith(CapabilityAudience.SharedPrefix, StringComparison.OrdinalIgnoreCase));
+        var roundTrip = CapabilityAudience.Parse(encoded);
+
+        CollectionAssert.AreEqual(new[] { "Friends", "Work", "Family" }, roundTrip.Circles.ToArray());
+        Assert.AreEqual("3 circles", AudiencePolicy.DisplayLabel(encoded));
+        Assert.AreEqual("Friends, Work, Family", AudiencePolicy.DetailedLabel(encoded));
+        Assert.IsTrue(AudiencePolicy.CanAccess(encoded, ["work"]));
+        Assert.IsFalse(AudiencePolicy.CanAccess(encoded, ["Book club"]));
+    }
+
+    [TestMethod]
+    public void CapabilityAudience_ProfileStorageRoundTripsEveryVisibilitySurface()
+    {
+        var visibility = CapabilityAudience.ForCircles(["Friends", "Work"]).ToVisibility();
+        var profile = Profile();
+        AddVisibilitySurfaces(profile, visibility);
+
+        using (var db = MeshDb.Open(databasePath, key))
+            db.SaveProfile(profile);
+        using var reopened = MeshDb.Open(databasePath, key);
+
+        AssertVisibilities(reopened.LoadProfile()!, visibility);
+    }
+
+    [TestMethod]
+    public void CapabilityAudience_MalformedAndUnknownValuesFailClosed()
+    {
+        Assert.AreEqual(
+            CapabilityAudienceMode.Private,
+            CapabilityAudience.Parse("shared-multi:not-json").Mode);
+        Assert.AreEqual(
+            CapabilityAudienceMode.Private,
+            CapabilityAudience.Parse("unexpected").Mode);
+        Assert.IsFalse(AudiencePolicy.CanAccess("shared-multi:not-json", ["Friends"]));
+    }
+
+    [TestMethod]
+    public void CapabilityAudience_AllAllowedContactsDoesNotRequireCircleMembership()
+    {
+        Assert.IsTrue(AudiencePolicy.CanAccess("public", []));
+        Assert.IsFalse(AudiencePolicy.CanAccess("private", ["Friends"]));
+        Assert.AreEqual("All allowed contacts", AudiencePolicy.DisplayLabel("public"));
+    }
+
+    [TestMethod]
+    public void CapabilityAudience_RenameAndDeletePreserveOtherSelections()
+    {
+        var visibility = CapabilityAudience.ForCircles(["Friends", "Work"]).ToVisibility();
+        var renamed = AudiencePolicy.RenameCircle(visibility, "friends", "Close Friends");
+        CollectionAssert.AreEqual(
+            new[] { "Close Friends", "Work" },
+            CapabilityAudience.Parse(renamed).Circles.ToArray());
+
+        var remaining = AudiencePolicy.RemoveCircle(renamed, "close friends");
+        Assert.AreEqual("shared:Work", remaining);
+        Assert.AreEqual("private", AudiencePolicy.RemoveCircle(remaining, "Work"));
+    }
+
+    [TestMethod]
     public void RecreatedCircle_CanBeJoinedOnlyAfterNewerUpsertAndLaterContact()
     {
         var delete = Version(20, "delete");
@@ -202,7 +268,7 @@ public sealed class DeviceSyncProfileStateTests
     }
 
     [TestMethod]
-    public void DeleteCircle_RemovesMembershipAndMakesEveryVisibilityPrivate()
+    public void DeleteCircle_RemovesMembershipAndRevokesEveryVisibilitySurface()
     {
         var profile = Profile(
             contacts: [new Contact { Handle = "alice", Circles = ["FRIENDS", "Work"] }],
@@ -212,7 +278,24 @@ public sealed class DeviceSyncProfileStateTests
         ProfileSyncState.DeleteCircleReferences(profile, "friends");
 
         CollectionAssert.AreEqual(new[] { "Work" }, profile.Contacts[0].Circles.ToArray());
-        AssertVisibilities(profile, "private");
+        AssertVisibilities(profile, "private", expectFolderGrants: false);
+        Assert.AreEqual(0, profile.Sources[0].Folders.Count);
+        Assert.AreEqual(0, profile.Sources[0].DrivePaths.Count);
+    }
+
+    [TestMethod]
+    public void DeleteCircle_FromMultiCircleAudienceKeepsRemainingAccess()
+    {
+        var profile = Profile(
+            contacts: [new Contact { Handle = "alice", Circles = ["Friends", "Work"] }],
+            circles: [new Circle { Name = "Friends" }, new Circle { Name = "Work" }]);
+        var visibility = CapabilityAudience.ForCircles(["Friends", "Work"]).ToVisibility();
+        AddVisibilitySurfaces(profile, visibility);
+
+        ProfileSyncState.DeleteCircleReferences(profile, "friends");
+
+        CollectionAssert.AreEqual(new[] { "Work" }, profile.Contacts[0].Circles.ToArray());
+        AssertVisibilities(profile, "shared:Work");
     }
 
     [TestMethod]
@@ -454,14 +537,20 @@ public sealed class DeviceSyncProfileStateTests
         profile.CustomMcpServers.Add(new CustomMcpServer { Visibility = visibility });
     }
 
-    private static void AssertVisibilities(MeshProfile profile, string expected)
+    private static void AssertVisibilities(
+        MeshProfile profile,
+        string expected,
+        bool expectFolderGrants = true)
     {
         Assert.AreEqual(expected, profile.Knowledge[0].Visibility);
         Assert.AreEqual(expected, profile.Skills[0].Visibility);
         Assert.AreEqual(expected, profile.Widgets[0].Visibility);
         Assert.AreEqual(expected, profile.Sources[0].Visibility);
-        Assert.AreEqual(expected, profile.Sources[0].Folders[0].Visibility);
-        Assert.AreEqual(expected, profile.Sources[0].DrivePaths[0].Visibility);
+        if (expectFolderGrants)
+        {
+            Assert.AreEqual(expected, profile.Sources[0].Folders[0].Visibility);
+            Assert.AreEqual(expected, profile.Sources[0].DrivePaths[0].Visibility);
+        }
         Assert.AreEqual(expected, profile.LocalTools[LocalToolKind.Browser].Visibility);
         Assert.AreEqual(expected, profile.McpServers["server"].Visibility);
         Assert.AreEqual(expected, profile.CustomMcpServers[0].Visibility);

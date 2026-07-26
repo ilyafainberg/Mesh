@@ -11,7 +11,7 @@
 <div class="pane-scroll">
     <div class="pane-narrow">
     <SectionHeader Title="Knowledge"
-                   Description="Teach your agent what you know - private items stay with you, shared or public items are visible to the circles you choose." />
+                   Description="Teach your agent what you know - keep items to yourself, share them with selected circles, or allow every approved contact." />
 
     <div class="tabs">
         <button class="tab @(tab == "sources" ? "on" : "")" @onclick='() => tab = "sources"'>Connect a source</button>
@@ -22,17 +22,13 @@
     @if (tab == "manual")
     {
         <div class="card-panel">
-            <input class="full" @bind="title" placeholder="Title (e.g. My public bio)" aria-label="Title" />
+            <input class="full" @bind="title" placeholder="Title (e.g. My bio)" aria-label="Title" />
             <textarea class="full" rows="4" @bind="content" placeholder="Content the agent can use…" aria-label="Content"></textarea>
             <div class="kn-row">
-                <select @bind="visibility" aria-label="Visibility">
-                    <option value="private">Private (owner only)</option>
-                    <option value="public">Public (any allowed handle)</option>
-                    @foreach (var c in State.Profile.Circles)
-                    {
-                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                    }
-                </select>
+                <AudiencePicker @bind-Value="visibility"
+                                Circles="@State.Profile.Circles"
+                                Class="grow"
+                                AriaLabel="Who can use this knowledge" />
                 <button class="primary" @onclick="AddItem" disabled="@string.IsNullOrWhiteSpace(title)">
                     <i class="bi bi-plus-lg"></i> Add
                 </button>
@@ -48,14 +44,10 @@
                 <button class="ghost" @onclick="Browse"><i class="bi bi-folder2-open"></i> Browse</button>
             </div>
             <div class="kn-row">
-                <select @bind="visibility" aria-label="Visibility">
-                    <option value="private">Private</option>
-                    <option value="public">Public</option>
-                    @foreach (var c in State.Profile.Circles)
-                    {
-                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                    }
-                </select>
+                <AudiencePicker @bind-Value="visibility"
+                                Circles="@State.Profile.Circles"
+                                Class="grow"
+                                AriaLabel="Who can use this document" />
                 <button class="primary" @onclick="Import" disabled="@(importing || string.IsNullOrWhiteSpace(importRef))">
                     <i class="bi bi-download"></i> @(importing ? "Importing…" : "Import")
                 </button>
@@ -144,14 +136,11 @@
                                 <label class="switch" title="@(s.Enabled ? "Enabled" : "Disabled")">
                                     <input type="checkbox" checked="@s.Enabled" @onchange="e => ToggleSource(s, e)" aria-label="@($"Enable {ToolRegistry.DisplayName(s.Provider)}")" />
                                 </label>
-                                <select value="@s.Visibility" @onchange="e => SetVisibility(s, e)" aria-label="Source visibility">
-                                    <option value="private">Only me</option>
-                                    <option value="public">Public</option>
-                                    @foreach (var c in State.Profile.Circles)
-                                    {
-                                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                                    }
-                                </select>
+                                <AudiencePicker Value="@s.Visibility"
+                                                ValueChanged="value => SetVisibility(s, value)"
+                                                Circles="@State.Profile.Circles"
+                                                Class="compact"
+                                                AriaLabel="@($"Who can use {ToolRegistry.DisplayName(s.Provider)}")" />
                                 <button class="icon-btn" title="Disconnect" @onclick="() => Disconnect(s)" aria-label="Disconnect"><i class="bi bi-trash"></i></button>
                             </div>
                         </div>
@@ -162,7 +151,7 @@
                                 <button class="link-btn" @onclick="() => ToggleFolders(s)">
                                     <i class="bi @(expandedSource == s.Id ? "bi-chevron-down" : "bi-chevron-right")"></i>
                                     @(s.Folders.Count == 0
-                                        ? (s.Provider == SourceProvider.Google ? "Share specific labels with a circle" : "Share specific folders with a circle")
+                                        ? (s.Provider == SourceProvider.Google ? "Share specific labels with circles" : "Share specific folders with circles")
                                         : $"{s.Folders.Count} folder grant{(s.Folders.Count == 1 ? "" : "s")}")
                                 </button>
 
@@ -170,8 +159,8 @@
                                 {
                                     <div class="folder-panel">
                                         <p class="hint">
-                                            When the whole source is <b>Only me</b>, you can still let a circle's agent search
-                                            just these folders. Each folder is exposed to the circle you pick.
+                                            When the whole source is <b>Only me</b>, you can still let contacts in selected circles search
+                                            just these folders. Each folder is exposed to any circle you select.
                                         </p>
 
                                         @if (s.Folders.Count > 0)
@@ -181,13 +170,12 @@
                                                 {
                                                     <div class="grant-row">
                                                         <span class="grant-name"><i class="bi bi-folder2"></i> @g.Name</span>
-                                                        <select value="@g.Visibility" @onchange="e => SetFolderVisibility(s, g, e)" aria-label="Folder visibility">
-                                                            <option value="public">Public</option>
-                                                            @foreach (var c in State.Profile.Circles)
-                                                            {
-                                                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                                                            }
-                                                        </select>
+                                                        <AudiencePicker Value="@g.Visibility"
+                                                                        ValueChanged="value => SetFolderVisibility(g, value)"
+                                                                        Circles="@State.Profile.Circles"
+                                                                        AllowPrivate="false"
+                                                                        Class="compact"
+                                                                        AriaLabel="@($"Who can use {g.Name}")" />
                                                         <button class="icon-btn" title="Remove" @onclick="() => RemoveFolder(s, g)" aria-label="Remove folder"><i class="bi bi-x-lg"></i></button>
                                                     </div>
                                                 }
@@ -213,13 +201,11 @@
                                                         <option value="@f.Id">@f.Name</option>
                                                     }
                                                 </select>
-                                                <select @bind="newFolderVis" aria-label="New folder visibility">
-                                                    <option value="public">Public</option>
-                                                    @foreach (var c in State.Profile.Circles)
-                                                    {
-                                                        <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                                                    }
-                                                </select>
+                                                <AudiencePicker @bind-Value="newFolderVis"
+                                                                Circles="@State.Profile.Circles"
+                                                                AllowPrivate="false"
+                                                                Class="grow"
+                                                                AriaLabel="Who can use this folder" />
                                                 <button class="primary" @onclick="() => AddFolder(s)" disabled="@string.IsNullOrEmpty(newFolderId)">
                                                     <i class="bi bi-plus-lg"></i> Add
                                                 </button>
@@ -236,7 +222,7 @@
                                 <button class="link-btn" @onclick="() => ToggleDrivePaths(s)">
                                     <i class="bi @(expandedDrive == s.Id ? "bi-chevron-down" : "bi-chevron-right")"></i>
                                     @(s.DrivePaths.Count == 0
-                                        ? (s.Provider == SourceProvider.Google ? "Share specific Drive folders with a circle" : "Share specific OneDrive folders with a circle")
+                                        ? (s.Provider == SourceProvider.Google ? "Share specific Drive folders with circles" : "Share specific OneDrive folders with circles")
                                         : $"{s.DrivePaths.Count} folder grant{(s.DrivePaths.Count == 1 ? "" : "s")}")
                                 </button>
 
@@ -244,8 +230,8 @@
                                 {
                                     <div class="folder-panel">
                                         <p class="hint">
-                                            Let a circle's agent search inside specific @(s.Provider == SourceProvider.Google ? "Drive" : "OneDrive") folders,
-                                            even when the whole drive stays <b>Only me</b>. Browse to a folder, then Add it for a circle.
+                                            Let selected circles search inside specific @(s.Provider == SourceProvider.Google ? "Drive" : "OneDrive") folders,
+                                            even when the whole drive stays <b>Only me</b>. Browse to a folder, then Add it for selected circles.
                                         </p>
 
                                         @if (s.DrivePaths.Count > 0)
@@ -255,13 +241,12 @@
                                                 {
                                                     <div class="grant-row">
                                                         <span class="grant-name"><i class="bi bi-folder2"></i> @g.Name</span>
-                                                        <select value="@g.Visibility" @onchange="e => SetDrivePathVisibility(s, g, e)" aria-label="Folder visibility">
-                                                            <option value="public">Public</option>
-                                                            @foreach (var c in State.Profile.Circles)
-                                                            {
-                                                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                                                            }
-                                                        </select>
+                                                        <AudiencePicker Value="@g.Visibility"
+                                                                        ValueChanged="value => SetDrivePathVisibility(g, value)"
+                                                                        Circles="@State.Profile.Circles"
+                                                                        AllowPrivate="false"
+                                                                        Class="compact"
+                                                                        AriaLabel="@($"Who can use {g.Name}")" />
                                                         <button class="icon-btn" title="Remove" @onclick="() => RemoveDrivePath(s, g)" aria-label="Remove folder"><i class="bi bi-x-lg"></i></button>
                                                     </div>
                                                 }
@@ -301,7 +286,7 @@
                                                             </button>
                                                             <button class="ghost add-here" @onclick="() => AddDrivePath(s, f)"
                                                                     disabled="@(s.DrivePaths.Any(g => g.Id == f.Id))"
-                                                                    title="Grant this folder to a circle">
+                                                                    title="Grant this folder to selected circles">
                                                                 <i class="bi bi-plus-lg"></i> Add
                                                             </button>
                                                         </div>
@@ -316,13 +301,11 @@
                                                 }
                                                 <div class="grant-vis-row">
                                                     <span class="muted">New grants go to:</span>
-                                                    <select @bind="newDriveVis" aria-label="New grant visibility">
-                                                        <option value="public">Public</option>
-                                                        @foreach (var c in State.Profile.Circles)
-                                                        {
-                                                            <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                                                        }
-                                                    </select>
+                                                    <AudiencePicker @bind-Value="newDriveVis"
+                                                                    Circles="@State.Profile.Circles"
+                                                                    AllowPrivate="false"
+                                                                    Class="compact"
+                                                                    AriaLabel="Who can use new folder grants" />
                                                 </div>
                                             }
                                         </div>
@@ -340,7 +323,7 @@
         @if (State.Profile.Knowledge.Count == 0 && !hintDismissed)
         {
             <div class="kn-hint" role="note" aria-label="Getting started tip">
-                <span class="kn-hint-text">Start with a short public bio so guest agents know who you are.</span>
+                <span class="kn-hint-text">Start with a short profile note and choose which contacts may use it.</span>
                 <button class="kn-hint-close" @onclick="() => hintDismissed = true" aria-label="Dismiss tip"><i class="bi bi-x-lg"></i></button>
             </div>
         }
@@ -352,14 +335,10 @@
                     <input class="full" @bind="editTitle" aria-label="Title" />
                     <textarea class="full" rows="4" @bind="editContent" aria-label="Content"></textarea>
                     <div class="kn-row">
-                        <select @bind="editVisibility" aria-label="Visibility">
-                            <option value="private">Private</option>
-                            <option value="public">Public</option>
-                            @foreach (var c in State.Profile.Circles)
-                            {
-                                <option value="@($"shared:{c.Name}")">Shared: @c.Name</option>
-                            }
-                        </select>
+                        <AudiencePicker @bind-Value="editVisibility"
+                                        Circles="@State.Profile.Circles"
+                                        Class="grow"
+                                        AriaLabel="Who can use this knowledge" />
                         <button class="primary" @onclick="() => SaveEdit(k)"><i class="bi bi-check-lg"></i> Save</button>
                         <button class="ghost" @onclick="() => editingId = null"><i class="bi bi-x-lg"></i> Cancel</button>
                     </div>
@@ -368,7 +347,7 @@
                 {
                     <div class="kn-head">
                         <b>@k.Title</b>
-                        <span class="vis @VisClass(k.Visibility)">@k.Visibility</span>
+                        <span class="vis @VisClass(k.Visibility)">@AudiencePolicy.DisplayLabel(k.Visibility)</span>
                         <span class="src"><i class="bi @SourceIcon(k.Source)"></i> @k.Source</span>
                         <span class="spacer"></span>
                         <button class="icon-btn" title="Edit" @onclick="() => BeginEdit(k)" aria-label="Edit"><i class="bi bi-pencil"></i></button>
@@ -388,7 +367,7 @@
         {
             <EmptyState Icon="bi-journal-text"
                         Title="No knowledge yet"
-                        Description="Add a public bio so guest agents have something to say about you.">
+                        Description="Add a profile note and choose which contacts may use it.">
                 <Action>
                     <button class="primary" @onclick='() => tab = "manual"'><i class="bi bi-plus-lg"></i> Write something</button>
                 </Action>
@@ -560,8 +539,8 @@
     void ToggleSource(ConnectedSource s, ChangeEventArgs e)
         => State.Mutate(_ => s.Enabled = e.Value is bool b && b);
 
-    void SetVisibility(ConnectedSource s, ChangeEventArgs e)
-        => State.Mutate(_ => s.Visibility = e.Value?.ToString() ?? "private");
+    void SetVisibility(ConnectedSource s, string visibility)
+        => State.Mutate(_ => s.Visibility = CapabilityAudience.Parse(visibility).ToVisibility());
 
     async Task Disconnect(ConnectedSource s)
     {
@@ -612,8 +591,8 @@
         newFolderId = "";
     }
 
-    void SetFolderVisibility(ConnectedSource s, FolderGrant g, ChangeEventArgs e)
-        => State.Mutate(_ => g.Visibility = e.Value?.ToString() ?? "public");
+    void SetFolderVisibility(FolderGrant g, string visibility)
+        => State.Mutate(_ => g.Visibility = CapabilityAudience.Parse(visibility).ToVisibility());
 
     void RemoveFolder(ConnectedSource s, FolderGrant g)
         => State.Mutate(_ => s.Folders.Remove(g));
@@ -674,8 +653,8 @@
         State.Mutate(_ => s.DrivePaths.Add(new FolderGrant { Id = folder.Id, Name = name, Visibility = newDriveVis }));
     }
 
-    void SetDrivePathVisibility(ConnectedSource s, FolderGrant g, ChangeEventArgs e)
-        => State.Mutate(_ => g.Visibility = e.Value?.ToString() ?? "public");
+    void SetDrivePathVisibility(FolderGrant g, string visibility)
+        => State.Mutate(_ => g.Visibility = CapabilityAudience.Parse(visibility).ToVisibility());
 
     void RemoveDrivePath(ConnectedSource s, FolderGrant g)
         => State.Mutate(_ => s.DrivePaths.Remove(g));
@@ -731,7 +710,7 @@
         finally { importing = false; }
     }
 
-    static string VisClass(string v) => v == "private" ? "priv" : v == "public" ? "pub" : "shared";
+    static string VisClass(string visibility) => AudiencePolicy.CssClass(visibility);
     static string SourceIcon(KnowledgeSource s) => s switch
     {
         KnowledgeSource.File => "bi-file-earmark-text",

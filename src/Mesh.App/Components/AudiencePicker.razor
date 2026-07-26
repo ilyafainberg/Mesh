@@ -1,0 +1,162 @@
+<div class="audience-picker @Class" @onkeydown="OnKeyDown">
+    <button type="button"
+            class="audience-trigger @AudiencePolicy.CssClass(Value)"
+            @onclick="Open"
+            aria-haspopup="dialog"
+            aria-expanded="@open"
+            aria-label="@AriaLabel"
+            title="@($"{AriaLabel}: {AudiencePolicy.DisplayLabel(Value)}")">
+        <i class="bi @AudiencePolicy.IconClass(Value)" aria-hidden="true"></i>
+        <span>@AudiencePolicy.DisplayLabel(Value)</span>
+        <i class="bi bi-chevron-down audience-chevron" aria-hidden="true"></i>
+    </button>
+
+    @if (open)
+    {
+        <button type="button" class="audience-backdrop" tabindex="-1" @onclick="Close" aria-label="Close audience picker"></button>
+        <section class="audience-panel" role="dialog" aria-modal="true" aria-label="@AriaLabel" @onclick:stopPropagation="true">
+            <header class="audience-head">
+                <div>
+                    <strong>Who can use this?</strong>
+                    <span>Choose the audience for this capability.</span>
+                </div>
+                <button type="button" class="audience-close" @onclick="Close" aria-label="Close">
+                    <i class="bi bi-x-lg" aria-hidden="true"></i>
+                </button>
+            </header>
+
+            <div class="audience-body" role="radiogroup" aria-label="Audience mode">
+                @if (AllowPrivate)
+                {
+                    <button type="button"
+                            class="audience-mode @(IsMode(CapabilityAudienceMode.Private) ? "active" : "")"
+                            role="radio"
+                            aria-checked="@IsMode(CapabilityAudienceMode.Private)"
+                            @onclick="() => SelectMode(CapabilityAudienceMode.Private)">
+                        <i class="bi bi-lock" aria-hidden="true"></i>
+                        <span><b>Only me</b><small>Available only to you in Mesh.</small></span>
+                    </button>
+                }
+
+                <button type="button"
+                        class="audience-mode @(IsMode(CapabilityAudienceMode.SelectedCircles) ? "active" : "")"
+                        role="radio"
+                        aria-checked="@IsMode(CapabilityAudienceMode.SelectedCircles)"
+                        disabled="@(Circles.Count == 0)"
+                        @onclick="() => SelectMode(CapabilityAudienceMode.SelectedCircles)">
+                    <i class="bi bi-diagram-3" aria-hidden="true"></i>
+                    <span><b>Selected circles</b><small>Contacts in any circle you choose.</small></span>
+                </button>
+
+                @if (IsMode(CapabilityAudienceMode.SelectedCircles))
+                {
+                    <div class="audience-circles" aria-label="Select circles">
+                        @if (Circles.Count == 0)
+                        {
+                            <div class="audience-empty">Create a circle in Contacts first.</div>
+                        }
+                        else
+                        {
+                            @foreach (var circle in Circles)
+                            {
+                                <label class="audience-circle @(selectedCircles.Contains(circle.Name) ? "selected" : "")">
+                                    <input type="checkbox"
+                                           checked="@selectedCircles.Contains(circle.Name)"
+                                           @onchange="e => ToggleCircle(circle.Name, e.Value is bool value && value)" />
+                                    <span>@circle.Name</span>
+                                    @if (selectedCircles.Contains(circle.Name))
+                                    {
+                                        <i class="bi bi-check-lg" aria-hidden="true"></i>
+                                    }
+                                </label>
+                            }
+                        }
+                    </div>
+                }
+
+                <button type="button"
+                        class="audience-mode @(IsMode(CapabilityAudienceMode.AllAllowedContacts) ? "active" : "")"
+                        role="radio"
+                        aria-checked="@IsMode(CapabilityAudienceMode.AllAllowedContacts)"
+                        @onclick="() => SelectMode(CapabilityAudienceMode.AllAllowedContacts)">
+                    <i class="bi bi-people-fill" aria-hidden="true"></i>
+                    <span><b>All allowed contacts</b><small>Every contact you have explicitly allowed.</small></span>
+                </button>
+            </div>
+
+            @if (IsMode(CapabilityAudienceMode.SelectedCircles) && selectedCircles.Count == 0)
+            {
+                <div class="audience-warning" role="status">Select at least one circle.</div>
+            }
+
+            <footer class="audience-actions">
+                <button type="button" class="ghost" @onclick="Close">Cancel</button>
+                <button type="button" class="primary" @onclick="Apply" disabled="@(!CanApply)">Done</button>
+            </footer>
+        </section>
+    }
+</div>
+
+@code {
+    [Parameter] public string Value { get; set; } = CapabilityAudience.PrivateVisibility;
+    [Parameter] public EventCallback<string> ValueChanged { get; set; }
+    [Parameter] public IReadOnlyList<Circle> Circles { get; set; } = Array.Empty<Circle>();
+    [Parameter] public bool AllowPrivate { get; set; } = true;
+    [Parameter] public string AriaLabel { get; set; } = "Who can use this";
+    [Parameter] public string? Class { get; set; }
+
+    readonly HashSet<string> selectedCircles = new(StringComparer.OrdinalIgnoreCase);
+    CapabilityAudienceMode draftMode = CapabilityAudienceMode.Private;
+    bool open;
+
+    bool CanApply => (AllowPrivate || draftMode != CapabilityAudienceMode.Private)
+                     && (draftMode != CapabilityAudienceMode.SelectedCircles || selectedCircles.Count > 0);
+
+    void Open()
+    {
+        var audience = CapabilityAudience.Parse(Value);
+        draftMode = audience.Mode;
+        selectedCircles.Clear();
+        foreach (var circle in Circles)
+            if (audience.IncludesCircle(circle.Name)) selectedCircles.Add(circle.Name);
+        if (!AllowPrivate && draftMode == CapabilityAudienceMode.Private)
+            draftMode = CapabilityAudienceMode.SelectedCircles;
+        open = true;
+    }
+
+    void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Close();
+    }
+
+    void Close() => open = false;
+
+    bool IsMode(CapabilityAudienceMode mode) => draftMode == mode;
+
+    void SelectMode(CapabilityAudienceMode mode)
+    {
+        if (mode == CapabilityAudienceMode.SelectedCircles && Circles.Count == 0) return;
+        draftMode = mode;
+    }
+
+    void ToggleCircle(string circleName, bool selected)
+    {
+        if (selected) selectedCircles.Add(circleName);
+        else selectedCircles.Remove(circleName);
+    }
+
+    async Task Apply()
+    {
+        if (!CanApply) return;
+        var next = draftMode switch
+        {
+            CapabilityAudienceMode.AllAllowedContacts => CapabilityAudience.AllAllowedContacts.ToVisibility(),
+            CapabilityAudienceMode.SelectedCircles => CapabilityAudience.ForCircles(
+                Circles.Select(circle => circle.Name).Where(selectedCircles.Contains)).ToVisibility(),
+            _ => CapabilityAudience.Private.ToVisibility()
+        };
+        open = false;
+        if (!string.Equals(next, Value, StringComparison.Ordinal))
+            await ValueChanged.InvokeAsync(next);
+    }
+}
