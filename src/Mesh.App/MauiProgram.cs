@@ -61,7 +61,12 @@ public static class MauiProgram
 			c.Timeout = TimeSpan.FromMinutes(30);
 			c.DefaultRequestHeaders.UserAgent.ParseAdd("Mesh-Updater");
 		});
+#if IOS
+		builder.Services.AddSingleton<ISecretStore, Mesh.App.Platforms.iOS.AppleSecretStore>();
+#else
 		builder.Services.AddSingleton<ISecretStore, SecretStore>();
+#endif
+		builder.Services.AddSingleton<IAppLifecycleState, AppLifecycleState>();
 #if WINDOWS
 		builder.Services.AddSingleton<IAppControl, Mesh.App.Platforms.Windows.WindowsAppControl>();
 		builder.Services.AddSingleton<INotifier, Mesh.App.Platforms.Windows.WindowsNotifier>();
@@ -112,6 +117,9 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ModelSetupService>();
 		builder.Services.AddSingleton<UpdateService>();
 		builder.Services.AddSingleton<MeshClient>();
+		builder.Services.AddSingleton<IBackgroundSyncTransport>(services =>
+			services.GetRequiredService<MeshClient>());
+		builder.Services.AddSingleton<BackgroundSyncCoordinator>();
 		builder.Services.AddSingleton<IDeviceTopicTransport>(services =>
 			services.GetRequiredService<MeshClient>());
 		builder.Services.AddSingleton<TopicExecutionRouter>();
@@ -129,6 +137,7 @@ public static class MauiProgram
 		// Bind the singleton service to the static bridge so the Windows platform layer
 		// can forward --ui-mode args from a second launch without a service-locator call.
 		UiModeActivationBridge.Register(app.Services.GetRequiredService<IUiModeService>());
+		BackgroundSyncBridge.Register(app.Services.GetRequiredService<BackgroundSyncCoordinator>());
 
 		// Auto-update marketplace-imported skills in the background at startup (never blocks launch).
 		_ = Task.Run(async () =>

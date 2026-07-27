@@ -47,7 +47,7 @@ public sealed class FirebasePushService : IPushService
 #endif
 
     /// <inheritdoc />
-    public Task<string?> RegisterAsync(CancellationToken ct = default)
+    public Task<PushRegistrationInfo?> RegisterAsync(CancellationToken ct = default)
     {
 #if ANDROID
         RequestPostNotificationsIfNeeded();
@@ -56,11 +56,11 @@ public sealed class FirebasePushService : IPushService
 #else
         // No Firebase SDK in this build (MeshPushEnabled not set): the permission is requested above, but
         // there is no token source yet, so the relay cannot wake this device.
-        return Task.FromResult<string?>(null);
+        return Task.FromResult<PushRegistrationInfo?>(null);
 #endif
 #else
         // Harmless fallback if this file is ever compiled for a non-Android target.
-        return Task.FromResult<string?>(null);
+        return Task.FromResult<PushRegistrationInfo?>(null);
 #endif
     }
 
@@ -85,7 +85,13 @@ public sealed class FirebasePushService : IPushService
 #endif
 
 #if ANDROID && MESH_FIREBASE
-    private static async Task<string?> GetFcmTokenAsync(CancellationToken ct)
+    private static async Task<PushRegistrationInfo?> GetFcmTokenAsync(CancellationToken ct)
+    {
+        var token = await GetFcmTokenValueAsync(ct).ConfigureAwait(false);
+        return PushRegistrationPolicy.Create(token, alertsEnabled: true);
+    }
+
+    private static async Task<string?> GetFcmTokenValueAsync(CancellationToken ct)
     {
         if (latestToken is not null) return latestToken;
         try

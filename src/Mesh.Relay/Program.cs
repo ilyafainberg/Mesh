@@ -157,24 +157,32 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
     {
         var delivered = !string.IsNullOrWhiteSpace(envelope.ToDevice)
                         && await router.DeliverSingleLocalDeviceAsync(
-                            toHandle, envelopeJson, envelope.ToDevice);
+                            toHandle,
+                            envelopeJson,
+                            envelope.ToDevice,
+                            includeBackgroundSync: false);
         return delivered
             ? new BackplaneDeliveryReceipt(BackplaneDeliveryOutcome.Delivered, false)
             : BackplaneDeliveryReceipt.NotDelivered;
     }
     return await router.DeliverLocalWithReceiptAsync(
-        toHandle, envelopeJson, excludeConnectionId: null, toDevice: envelope.ToDevice);
+        toHandle,
+        envelopeJson,
+        excludeConnectionId: null,
+        toDevice: envelope.ToDevice,
+        includeBackgroundSync: !BackgroundSyncProtocol.RequiresForeground(envelope.Kind));
 });
 
 // ---- Health ---------------------------------------------------------------
 var transportCapabilities = new
 {
-    protocolVersion = 5,
+    protocolVersion = 6,
     sendResults = true,
     fanout = true,
     deviceSync = true,
     atomicAgentDispatch = true,
     durableDelivery = true,
+    backgroundSync = true,
     durableStorage,
     maxFanoutRecipients = FanoutProtocol.MaxRecipients
 };
@@ -761,7 +769,8 @@ app.MapPost("/handles/{handle}/push", async (string handle, SetDevicePushTokenRe
     if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
         return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
 
-    await store.SetDevicePushTokenAsync(key, deviceId, platform, req.Token);
+    await store.SetDevicePushTokenAsync(
+        key, deviceId, platform, req.Token, req.AlertsEnabled);
     return Results.Ok(new { registered = deviceId });
 });
 

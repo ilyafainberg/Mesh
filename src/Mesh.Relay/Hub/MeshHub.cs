@@ -55,7 +55,9 @@ public sealed class MeshHub(
         var nonce = MeshCrypto.NewNonce();
         var supportsDurableDelivery = string.Equals(
             http?.Request.Query["deliveryAck"].ToString(), "1", StringComparison.Ordinal);
-        registry.Add(Context.ConnectionId, handle, nonce, supportsDurableDelivery);
+        var isBackgroundSync = string.Equals(
+            http?.Request.Query["backgroundSync"].ToString(), "1", StringComparison.Ordinal);
+        registry.Add(Context.ConnectionId, handle, nonce, supportsDurableDelivery, isBackgroundSync);
         metrics.ConnectionOpened();
         logger.LogInformation("hub connection opened: {Handle}", handle);
         await Clients.Caller.SendAsync(MeshHubProtocol.Challenge, nonce);
@@ -79,10 +81,14 @@ public sealed class MeshHub(
 
         registry.MarkAuthenticated(Context.ConnectionId, publicKey);
         var deviceId = DeviceProtocol.DeviceId(publicKey);
-        await backplane.SetPresenceAsync(state.Handle);
-        await backplane.SetDevicePresenceAsync(state.Handle, deviceId);
+        if (!state.IsBackgroundSync)
+        {
+            await backplane.SetPresenceAsync(state.Handle);
+            await backplane.SetDevicePresenceAsync(state.Handle, deviceId);
+        }
         await Clients.Caller.SendAsync(MeshHubProtocol.Ready);
-        await agentDispatch.DispatchAvailableAsync(state.Handle, Context.ConnectionAborted);
+        if (!state.IsBackgroundSync)
+            await agentDispatch.DispatchAvailableAsync(state.Handle, Context.ConnectionAborted);
 
         // Device-targeted fan-out must drain only on the intended device. Legacy handle-wide
         // messages are delivered afterward for backward compatibility.
@@ -185,6 +191,13 @@ public sealed class MeshHub(
                 if (envelope is null)
                 {
                     await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
+                    continue;
+                }
+                if (connection.IsBackgroundSync
+                    && BackgroundSyncProtocol.RequiresForeground(envelope.Kind))
+                {
+                    await store.ReleaseInboxLeaseAsync(
+                        inboxKey, item.Id, Context.ConnectionId, Context.ConnectionAborted);
                     continue;
                 }
                 if (item.DeliveryAttempts > 1) metrics.DeliveryRedelivered();
@@ -456,8 +469,9 @@ public sealed class MeshHub(
                 connection?.Authenticated == true,
                 exception?.Message ?? "none");
         }
-        if (connection is { Authenticated: true, Handle: not null, DeviceId: not null }
-            && registry.ConnectionsForDevice(connection.Handle, connection.DeviceId).Count == 0)
+        if (connection is { Authenticated: true, IsBackgroundSync: false, Handle: not null, DeviceId: not null }
+            && registry.ConnectionsForDevice(
+                connection.Handle, connection.DeviceId, includeBackgroundSync: false).Count == 0)
             await backplane.ClearDevicePresenceAsync(connection.Handle, connection.DeviceId);
         if (handle is not null)
             await backplane.ClearPresenceAsync(handle); // only when it was the last local connection

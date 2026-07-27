@@ -10,5 +10,6 @@ public sealed class NoopPushService : IPushService
     public bool IsSupported => false;
 
     /// <inheritdoc />
-    public Task<string?> RegisterAsync(CancellationToken ct = default) => Task.FromResult<string?>(null);
+    public Task<PushRegistrationInfo?> RegisterAsync(CancellationToken ct = default)
+        => Task.FromResult<PushRegistrationInfo?>(null);
 }

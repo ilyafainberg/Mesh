@@ -94,6 +94,7 @@ public sealed partial class AppState : IMemoryState
         dir = StoragePaths.DataDir;
         Directory.CreateDirectory(dir);
         indexPath = Path.Combine(dir, "accounts.json");
+        StorageProtection.TryEnsureBackgroundReadable(indexPath);
         Load();
     }
 
@@ -108,8 +109,15 @@ public sealed partial class AppState : IMemoryState
 
     private MeshDb OpenDb(string id)
     {
-        var key = secrets.GetOrCreateDbKey(id);
-        return MeshDb.Open(DbPath(id), key);
+        var path = DbPath(id);
+        var key = secrets.GetDbKey(id);
+        if (key is null)
+        {
+            if (File.Exists(path))
+                throw new InvalidOperationException("The database key is unavailable for an existing identity.");
+            key = secrets.GetOrCreateDbKey(id);
+        }
+        return MeshDb.Open(path, key);
     }
 
     public void Load()
@@ -180,6 +188,7 @@ public sealed partial class AppState : IMemoryState
         {
             File.WriteAllText(indexPath, JsonSerializer.Serialize(
                 new AccountIndex { ActiveId = activeId, Accounts = accounts }, JsonOpts));
+            StorageProtection.TryEnsureBackgroundReadable(indexPath);
         }
         catch { /* best-effort */ }
     }
@@ -1415,7 +1424,21 @@ public sealed partial class AppState : IMemoryState
         MergeLine(line, dto);
         conversation.LastActivityAt = ActivityTimestamp.Advance(
             conversation.LastActivityAt, dto.At);
-        return changed;
+        var markedUnread = DeviceSyncUnreadPolicy.ShouldMarkConversationUnread(dto.Role)
+                           && MarkUnreadFromDeviceSync(handle);
+        return changed || markedUnread;
+    }
+
+    private bool MarkUnreadFromDeviceSync(string handle)
+    {
+        var normalized = Norm(handle);
+        if (!unread.Add(normalized)) return false;
+        if (!Profile.UnreadFrom.Contains(normalized))
+        {
+            Profile.UnreadFrom.Add(normalized);
+            activeDb?.SaveProfile(Profile);
+        }
+        return true;
     }
 
     private bool ApplyConversationClear(DeviceSyncOperation operation)

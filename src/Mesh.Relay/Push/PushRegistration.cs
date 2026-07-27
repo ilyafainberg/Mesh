@@ -13,6 +13,7 @@ namespace Mesh.Relay.Push;
 ///   APNS_BUNDLE_ID    - the app bundle id (used as apns-topic)
 ///   APNS_PRIVATE_KEY  - the .p8 PEM contents, or a path to the .p8 file
 ///   APNS_PRODUCTION   - "true" for production APNs; otherwise the sandbox host is used
+///   PUSH_BACKGROUND_SYNC_ENABLED - "false" restores alert-only APNs behavior
 ///
 /// FCM (Android):
 ///   FCM_SERVICE_ACCOUNT_JSON - the Google service-account JSON, or a path to the .json file
@@ -21,6 +22,11 @@ public static class PushRegistration
 {
     public static IServiceCollection AddMeshPush(this IServiceCollection services, IConfiguration cfg)
     {
+        var backgroundSyncEnabled = !string.Equals(
+            Read(cfg, "PUSH_BACKGROUND_SYNC_ENABLED", "Push:BackgroundSyncEnabled"),
+            "false", StringComparison.OrdinalIgnoreCase);
+        services.AddSingleton(new PushDispatchOptions(backgroundSyncEnabled));
+
         // APNs (iOS)
         var apnsKeyId = Read(cfg, "APNS_KEY_ID", "Push:Apns:KeyId");
         var apnsTeamId = Read(cfg, "APNS_TEAM_ID", "Push:Apns:TeamId");

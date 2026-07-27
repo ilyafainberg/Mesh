@@ -604,17 +604,19 @@ the v1.1.0 boundary.
 | v1.1.0+ | v1.1.0+ | Works |
 | v1.1.0+ | older than v1.1.0 | Client cannot register (no proof-of-possession) |
 
-Single-device agent responses use capability negotiation rather than the registration
-version floor:
+Transport features use capability negotiation rather than the registration version
+floor:
 
 | Relay capability | Client behavior | Result |
 | --- | --- | --- |
+| Protocol 6+, `durableDelivery: true`, `backgroundSync: true` | Current iOS client with `deliveryAck=1&backgroundSync=1` | Bounded passive inbox drain without foreground presence or agent/topic execution |
 | Protocol 5+, `durableDelivery: true` | Current client with `deliveryAck=1` | Enqueue-before-deliver, lease/ack redelivery, strict device inboxes, and queued-envelope cancellation |
 | Protocol 4+, `atomicAgentDispatch: true` | Atomic-capable client | Primary/failover assignment, queueing (durable with Cosmos), relay-enforced at-most-one accepted response |
-| Capability absent | Current client | Falls back to legacy agent kinds; no single-device guarantee |
+| `backgroundSync` absent | Current iOS client | Skips silent background sessions and drains queued records in the foreground |
+| `atomicAgentDispatch` absent | Current client | Falls back to legacy agent kinds; no single-device guarantee |
 | Capability present | Legacy client | Legacy kinds continue to route; no single-device guarantee |
 
-In a mixed relay cluster, protocol-4 coordinators queue atomic work rather than forward it to replicas that do not advertise single-connection atomic delivery.
+Protocol version alone is not sufficient: background clients require both capability flags. In a mixed relay cluster, protocol-4 coordinators queue atomic work rather than forward it to replicas that do not advertise single-connection atomic delivery.
 
 ---
 

@@ -47,7 +47,7 @@ public sealed class FcmPushSender : IPushSender, IDisposable
         key.ImportFromPem(pem);
     }
 
-    public async Task SendAsync(string token, PushAlert alert, CancellationToken ct = default)
+    public async Task<PushSendResult> SendAsync(string token, PushAlert alert, CancellationToken ct = default)
     {
         var access = await GetAccessTokenAsync(ct).ConfigureAwait(false);
         var message = new
@@ -67,11 +67,11 @@ public sealed class FcmPushSender : IPushSender, IDisposable
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", access);
 
         using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
-        if (!resp.IsSuccessStatusCode)
-        {
-            var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            logger.LogWarning("FCM push rejected {Status}: {Body}", (int)resp.StatusCode, body);
-        }
+        if (resp.IsSuccessStatusCode) return PushSendResult.Sent();
+
+        var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        logger.LogWarning("FCM push rejected {Status}: {Body}", (int)resp.StatusCode, body);
+        return PushSendResult.Rejected((int)resp.StatusCode, body);
     }
 
     // OAuth2 service-account flow: sign an RS256 JWT bearer assertion and exchange it for an access token.

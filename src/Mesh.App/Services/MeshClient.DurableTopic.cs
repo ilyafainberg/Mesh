@@ -10,12 +10,55 @@ namespace Mesh.App.Services;
 public sealed partial class MeshClient
 {
     private static readonly TimeSpan DurableMaintenanceInterval = TimeSpan.FromSeconds(15);
+
+    private void OnForegroundChanged(bool isForeground)
+    {
+        if (isForeground)
+        {
+            ResumeTransport();
+            return;
+        }
+
+        TrackBackground(SuspendForegroundTransportAsync(), "foreground transport suspension");
+    }
+
+    private async Task SuspendForegroundTransportAsync()
+    {
+        await connectionGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (lifecycle.IsForeground) return;
+            var current = hub;
+            hub = null;
+            authenticated = false;
+            authenticatedDeviceSyncIdentity = null;
+            StateChanged?.Invoke();
+            if (current is null) return;
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+            try { await current.StopAsync(timeout.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+            {
+                TraceTransport("background-suspend-timeout", "foreground connection stop timed out");
+            }
+            catch (Exception ex) { TraceTransport("background-suspend-stop-failed", ex.Message); }
+
+            try { await current.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { TraceTransport("background-suspend-dispose-failed", ex.Message); }
+        }
+        finally
+        {
+            connectionGate.Release();
+        }
+    }
+
     public void ResumeTransport()
     {
-        if (!wantConnected) return;
+        if (!wantConnected || !lifecycle.IsForeground) return;
         var identity = authenticatedDeviceSyncIdentity;
         if (identity is not null && Connected && IsCurrentDeviceSyncIdentity(identity))
         {
+            TryRegisterPushToken();
             TrackBackground(RecoverDurableDeliveryAsync(identity), "durable delivery resume");
             return;
         }
@@ -27,7 +70,7 @@ public sealed partial class MeshClient
 
     private void ScheduleDurableDeliveryRetry()
     {
-        if (!wantConnected || Interlocked.Exchange(ref durableRetryScheduled, 1) == 1) return;
+        if (!wantConnected || !lifecycle.IsForeground || Interlocked.Exchange(ref durableRetryScheduled, 1) == 1) return;
         TrackBackground(Task.Run(async () =>
         {
             try
@@ -42,7 +85,7 @@ public sealed partial class MeshClient
             finally
             {
                 Interlocked.Exchange(ref durableRetryScheduled, 0);
-                if (wantConnected && Connected && HasLocalDurableWork())
+                if (wantConnected && lifecycle.IsForeground && Connected && HasLocalDurableWork())
                     ScheduleDurableDeliveryRetry();
             }
         }), "durable delivery retry");
@@ -52,20 +95,24 @@ public sealed partial class MeshClient
         => state.ListTopicOutbox().Any(item => item.State is TopicOutboxStates.Pending
             or TopicOutboxStates.CancelPending)
            || state.ListDeviceEnvelopeOutbox().Count > 0;
-    private async Task AcknowledgeDeliveryAsync(HubConnection connection, MeshEnvelope envelope)
+    private async Task AcknowledgeDeliveryAsync(
+        HubConnection connection,
+        MeshEnvelope envelope,
+        CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(envelope.RelayDeliveryId)) return;
         var acknowledged = await connection.InvokeAsync<bool>(
             MeshHubProtocol.AcknowledgeDelivery,
             envelope.RelayDeliveryId,
-            envelope.RelayDeviceScoped);
+            envelope.RelayDeviceScoped,
+            ct);
         if (!acknowledged)
             TraceTransport("delivery-ack-rejected", envelope.RelayDeviceScoped ? "device" : "handle");
     }
 
     private async Task MaintainDurableDeliveryAsync(DeviceSyncIdentity identity)
     {
-        while (IsCurrentDeviceSyncIdentity(identity))
+        while (lifecycle.IsForeground && IsCurrentDeviceSyncIdentity(identity))
         {
             await Task.Delay(DurableMaintenanceInterval);
             if (!IsCurrentDeviceSyncIdentity(identity)) return;

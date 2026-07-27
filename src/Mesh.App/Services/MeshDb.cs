@@ -52,8 +52,10 @@ public sealed partial class MeshDb : IDisposable
     public static MeshDb Open(string path, byte[] key)
     {
         EnsureNativeInit();
+        StorageProtection.TryEnsureBackgroundReadable(Path.GetDirectoryName(path) ?? path);
         var conn = new SqliteConnection($"Data Source={path}");
         conn.Open();
+        StorageProtection.TryEnsureBackgroundReadable(path);
         ApplyKey(conn, key);
         var db = new MeshDb(conn);
         db.CreateSchema();

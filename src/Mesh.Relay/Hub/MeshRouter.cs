@@ -52,7 +52,9 @@ public sealed class MeshRouter(
             clean with { RelayDeliveryId = deliveryId, RelayDeviceScoped = false }, Json);
         // A thrown or uncertain send may have reached the owning socket. In that case the live lease
         // remains until timeout so an immediate retry cannot race the first delivery attempt.
-        var receipt = await DeliverLocalWithReceiptAsync(to, envelopeJson, excludeConnectionId);
+        var receipt = await DeliverLocalWithReceiptAsync(
+            to, envelopeJson, excludeConnectionId,
+            includeBackgroundSync: !BackgroundSyncProtocol.RequiresForeground(clean.Kind));
         if (receipt.Outcome != BackplaneDeliveryOutcome.Delivered)
         {
             var owner = await backplane.GetInstanceForAsync(to);
@@ -98,7 +100,8 @@ public sealed class MeshRouter(
         var envelopeJson = JsonSerializer.Serialize(
             clean with { RelayDeliveryId = deliveryId, RelayDeviceScoped = true }, Json);
         var receipt = await DeliverLocalWithReceiptAsync(
-            to, envelopeJson, excludeConnectionId, clean.ToDevice);
+            to, envelopeJson, excludeConnectionId, clean.ToDevice,
+            includeBackgroundSync: !BackgroundSyncProtocol.RequiresForeground(clean.Kind));
         if (receipt.Outcome != BackplaneDeliveryOutcome.Delivered)
         {
             var owner = await backplane.GetInstanceForDeviceAsync(to, clean.ToDevice);
@@ -135,7 +138,8 @@ public sealed class MeshRouter(
 
         var to = Normalize(env.To);
         var envelopeJson = JsonSerializer.Serialize(env, Json);
-        if (await DeliverLocalAsync(to, envelopeJson, excludeConnectionId, env.ToDevice))
+        if (await DeliverLocalAsync(
+                to, envelopeJson, excludeConnectionId, env.ToDevice, includeBackgroundSync: false))
             return true;
 
         var owner = await backplane.GetInstanceForDeviceAsync(to, env.ToDevice, ct);
@@ -159,7 +163,8 @@ public sealed class MeshRouter(
 
         var to = Normalize(env.To);
         var envelopeJson = JsonSerializer.Serialize(env, Json);
-        if (await DeliverSingleLocalDeviceAsync(to, envelopeJson, env.ToDevice))
+        if (await DeliverSingleLocalDeviceAsync(
+                to, envelopeJson, env.ToDevice, includeBackgroundSync: false))
             return BackplaneDeliveryOutcome.Delivered;
 
         var owner = await backplane.GetInstanceForDeviceAsync(to, env.ToDevice, ct);
@@ -181,12 +186,16 @@ public sealed class MeshRouter(
     /// it here so a cross-instance forward re-applies the same per-device filter on the owning instance.
     /// </param>
     public async Task<BackplaneDeliveryReceipt> DeliverLocalWithReceiptAsync(
-        string handle, string envelopeJson, string? excludeConnectionId = null, string? toDevice = null)
+        string handle,
+        string envelopeJson,
+        string? excludeConnectionId = null,
+        string? toDevice = null,
+        bool includeBackgroundSync = true)
     {
         var normalized = Normalize(handle);
         var conns = toDevice is not null
-            ? registry.ConnectionsForDevice(normalized, toDevice)
-            : registry.ConnectionsFor(normalized);
+            ? registry.ConnectionsForDevice(normalized, toDevice, includeBackgroundSync)
+            : registry.ConnectionsFor(normalized, includeBackgroundSync);
         if (excludeConnectionId is not null)
             conns = conns.Where(c => c != excludeConnectionId).ToList();
         if (conns.Count == 0) return BackplaneDeliveryReceipt.NotDelivered;
@@ -197,18 +206,23 @@ public sealed class MeshRouter(
     }
 
     public async Task<bool> DeliverLocalAsync(
-        string handle, string envelopeJson, string? excludeConnectionId = null, string? toDevice = null)
+        string handle,
+        string envelopeJson,
+        string? excludeConnectionId = null,
+        string? toDevice = null,
+        bool includeBackgroundSync = true)
         => (await DeliverLocalWithReceiptAsync(
-            handle, envelopeJson, excludeConnectionId, toDevice)).Outcome
+            handle, envelopeJson, excludeConnectionId, toDevice, includeBackgroundSync)).Outcome
            == BackplaneDeliveryOutcome.Delivered;
 
     public async Task<BackplaneDeliveryReceipt> DeliverSingleLocalDeviceWithReceiptAsync(
         string handle,
         string envelopeJson,
         string deviceId,
-        string? excludeConnectionId = null)
+        string? excludeConnectionId = null,
+        bool includeBackgroundSync = true)
     {
-        var connection = registry.ConnectionsForDevice(Normalize(handle), deviceId)
+        var connection = registry.ConnectionsForDevice(Normalize(handle), deviceId, includeBackgroundSync)
             .Where(id => !string.Equals(id, excludeConnectionId, StringComparison.Ordinal))
             .OrderBy(id => id, StringComparer.Ordinal)
             .FirstOrDefault();
@@ -223,9 +237,14 @@ public sealed class MeshRouter(
         string handle,
         string envelopeJson,
         string deviceId,
-        string? excludeConnectionId = null)
+        string? excludeConnectionId = null,
+        bool includeBackgroundSync = true)
         => (await DeliverSingleLocalDeviceWithReceiptAsync(
-            handle, envelopeJson, deviceId, excludeConnectionId)).Outcome
+            handle,
+            envelopeJson,
+            deviceId,
+            excludeConnectionId,
+            includeBackgroundSync)).Outcome
            == BackplaneDeliveryOutcome.Delivered;
 
     private string LiveLeaseOwner()

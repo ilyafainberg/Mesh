@@ -1,3 +1,4 @@
+using BackgroundTasks;
 using Foundation;
 using MetricKit;
 using Mesh.App.Platforms.iOS;
@@ -13,6 +14,9 @@ namespace Mesh.App;
 [Register("AppDelegate")]
 public class AppDelegate : MauiUIApplicationDelegate
 {
+    private const string BackgroundRefreshTaskIdentifier = "net.meshrelay.mesh.sync.refresh";
+    private static readonly NSString MeshPayloadKey = new("mesh");
+    private static readonly NSString MeshTypeKey = new("type");
     private readonly MeshNotificationCenterDelegate notificationCenterDelegate = new();
     private MeshMetricManagerSubscriber? metricSubscriber;
     private NSObject? memoryWarningObserver;
@@ -22,11 +26,13 @@ public class AppDelegate : MauiUIApplicationDelegate
 
     public override bool FinishedLaunching(UIApplication application, NSDictionary? launchOptions)
     {
+        AppLifecycleState.SetForeground(application.ApplicationState == UIApplicationState.Active);
 
         // Present relay-composed alerts even while the app is foregrounded (iOS suppresses them by default).
         // UNUserNotificationCenter holds a weak delegate, so AppDelegate keeps the managed instance alive.
         UNUserNotificationCenter.Current.Delegate = notificationCenterDelegate;
         var launched = base.FinishedLaunching(application, launchOptions);
+        RegisterBackgroundRefreshTask();
 
         var diagnostics = RuntimeDiagnostics.Current;
         diagnostics?.MarkLifecycle("launched");
@@ -42,6 +48,7 @@ public class AppDelegate : MauiUIApplicationDelegate
 
     public override void OnActivated(UIApplication application)
     {
+        AppLifecycleState.SetForeground(true);
         RuntimeDiagnostics.Current?.MarkLifecycle("active");
         base.OnActivated(application);
     }
@@ -54,7 +61,9 @@ public class AppDelegate : MauiUIApplicationDelegate
 
     public override void DidEnterBackground(UIApplication application)
     {
+        AppLifecycleState.SetForeground(false);
         RuntimeDiagnostics.Current?.MarkLifecycle("background");
+        ScheduleBackgroundRefresh();
         base.DidEnterBackground(application);
     }
 
@@ -62,6 +71,102 @@ public class AppDelegate : MauiUIApplicationDelegate
     {
         RuntimeDiagnostics.Current?.MarkLifecycle("foreground");
         base.WillEnterForeground(application);
+    }
+
+    [Export("application:didReceiveRemoteNotification:fetchCompletionHandler:")]
+    public void DidReceiveRemoteNotification(
+        UIApplication application,
+        NSDictionary userInfo,
+        Action<UIBackgroundFetchResult> completionHandler)
+    {
+        if (!IsMeshSyncNotification(userInfo))
+        {
+            completionHandler(UIBackgroundFetchResult.NoData);
+            return;
+        }
+        _ = CompleteRemoteNotificationSyncAsync(completionHandler);
+    }
+
+    private static async Task CompleteRemoteNotificationSyncAsync(
+        Action<UIBackgroundFetchResult> completionHandler)
+    {
+        try
+        {
+            var result = await BackgroundSyncBridge.SynchronizePendingAsync().ConfigureAwait(false);
+            completionHandler(result.Outcome switch
+            {
+                BackgroundSyncOutcome.NewData => UIBackgroundFetchResult.NewData,
+                BackgroundSyncOutcome.NoData => UIBackgroundFetchResult.NoData,
+                _ => UIBackgroundFetchResult.Failed
+            });
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("background-push-sync", ex);
+            completionHandler(UIBackgroundFetchResult.Failed);
+        }
+    }
+
+    private static bool IsMeshSyncNotification(NSDictionary userInfo)
+        => userInfo[MeshPayloadKey] is NSDictionary mesh
+           && string.Equals(mesh[MeshTypeKey]?.ToString(), "sync", StringComparison.Ordinal);
+
+    private static void RegisterBackgroundRefreshTask()
+    {
+        try
+        {
+            var registered = BGTaskScheduler.Shared.Register(
+                BackgroundRefreshTaskIdentifier,
+                null,
+                task => _ = RunBackgroundRefreshAsync(task));
+            if (!registered)
+                RuntimeDiagnostics.Current?.RecordEvent("background-refresh", "registration rejected");
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("background-refresh-registration", ex);
+        }
+    }
+
+    private static void ScheduleBackgroundRefresh()
+    {
+        try
+        {
+            BGTaskScheduler.Shared.Cancel(BackgroundRefreshTaskIdentifier);
+            using var request = new BGAppRefreshTaskRequest(BackgroundRefreshTaskIdentifier)
+            {
+                EarliestBeginDate = NSDate.FromTimeIntervalSinceNow(TimeSpan.FromMinutes(15).TotalSeconds)
+            };
+            if (!BGTaskScheduler.Shared.Submit(request, out var error))
+                RuntimeDiagnostics.Current?.RecordEvent(
+                    "background-refresh", error?.LocalizedDescription ?? "schedule rejected");
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("background-refresh-schedule", ex);
+        }
+    }
+
+    private static async Task RunBackgroundRefreshAsync(BGTask task)
+    {
+        using var expired = new CancellationTokenSource();
+        task.ExpirationHandler = expired.Cancel;
+        try
+        {
+            var result = await BackgroundSyncBridge.SynchronizePendingAsync(
+                TimeSpan.FromSeconds(20), expired.Token).ConfigureAwait(false);
+            task.SetTaskCompleted(result.Outcome != BackgroundSyncOutcome.Failed);
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("background-refresh-run", ex);
+            task.SetTaskCompleted(false);
+        }
+        finally
+        {
+            task.ExpirationHandler = null;
+            ScheduleBackgroundRefresh();
+        }
     }
 
     private static void RecordMemoryWarning(RuntimeDiagnostics diagnostics)

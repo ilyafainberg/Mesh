@@ -7,20 +7,7 @@ using UserNotifications;
 
 namespace Mesh.App.Platforms.iOS;
 
-/// <summary>
-/// iOS APNs (Apple Push Notification service) device-token registration scaffold.
-/// </summary>
-/// <remarks>
-/// <para>
-/// On iOS, the device token is not returned synchronously from the registration call. Instead the app asks
-/// the OS to register, then the token (or a failure) is delivered later via the AppDelegate callbacks
-/// (RegisteredForRemoteNotifications / FailedToRegisterForRemoteNotifications). To bridge that async, OS-driven
-/// callback back to an awaitable, this class exposes a static <see cref="TaskCompletionSource{TResult}"/> that
-/// the AppDelegate completes through <see cref="CompleteRegistration"/> or <see cref="FailRegistration"/>.
-/// </para>
-/// The result is shared across concurrent relay reconnects so iOS sees one authorization and token request at a
-/// time. Once issued, the token is cached for the process lifetime and registered with the Mesh relay.
-/// </remarks>
+/// <summary>Registers this iOS device with APNs independently of visible-alert permission.</summary>
 public sealed class ApplePushService : IPushService
 {
     private const int RegistrationTimeoutSeconds = 30;
@@ -33,18 +20,32 @@ public sealed class ApplePushService : IPushService
     public bool IsSupported => true;
 
     /// <summary>
-    /// Ask iOS to register with APNs and request user authorization for notifications. The actual token is
-    /// delivered asynchronously by the AppDelegate, which must call <see cref="CompleteRegistration"/>.
+    /// Registers for remote notifications even when alert authorization is denied. Alert permission is
+    /// requested separately and returned as metadata so the relay can choose an alert or a silent wake.
     /// </summary>
     [global::System.Runtime.Versioning.SupportedOSPlatform("ios")]
-    public async Task<string?> RegisterAsync(CancellationToken ct = default)
+    public async Task<PushRegistrationInfo?> RegisterAsync(CancellationToken ct = default)
     {
 #if IOS
+        var tokenTask = GetDeviceTokenAsync(ct);
+        var alertsTask = GetAlertsEnabledAsync(ct);
+        var token = await tokenTask.ConfigureAwait(false);
+        var alertsEnabled = await alertsTask.ConfigureAwait(false);
+        return PushRegistrationPolicy.Create(token, alertsEnabled);
+#else
+        return null;
+#endif
+    }
+
+#if IOS
+    private static Task<string?> GetDeviceTokenAsync(CancellationToken ct)
+    {
         TaskCompletionSource<string?> pending;
         var startRegistration = false;
         lock (gate)
         {
-            if (!string.IsNullOrWhiteSpace(cachedToken)) return cachedToken;
+            if (!string.IsNullOrWhiteSpace(cachedToken))
+                return Task.FromResult<string?>(cachedToken);
             if (registration is null || registration.Task.IsCompleted)
                 registration = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
             pending = registration;
@@ -57,20 +58,15 @@ public sealed class ApplePushService : IPushService
 
         if (startRegistration)
         {
-            BeginRegistration();
+            RequestDeviceToken();
             _ = TimeoutRegistrationAsync(pending);
         }
-        return await pending.Task.WaitAsync(ct);
-#else
-        // Harmless fallback if this file is ever compiled for a non-iOS target.
-        return null;
-#endif
+        return pending.Task.WaitAsync(ct);
     }
 
-#if IOS
-    private static void BeginRegistration()
+    private static async Task<bool> GetAlertsEnabledAsync(CancellationToken ct)
     {
-        RuntimeDiagnostics.Current?.RecordEvent("apns-registration", "starting");
+        var pending = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
             UIApplication.SharedApplication.InvokeOnMainThread(() =>
@@ -81,31 +77,80 @@ public sealed class ApplePushService : IPushService
                     {
                         try
                         {
-                            if (settings.AuthorizationStatus == UNAuthorizationStatus.Denied)
-                            {
-                                FailRegistration("Notification permission is denied.");
-                                return;
-                            }
-
                             if (settings.AuthorizationStatus == UNAuthorizationStatus.NotDetermined)
                             {
-                                RequestAuthorization();
+                                RequestAuthorization(pending);
                                 return;
                             }
-
-                            RequestDeviceToken();
+                            pending.TrySetResult(IsAlertAuthorized(settings.AuthorizationStatus));
                         }
                         catch (Exception ex)
                         {
                             RuntimeDiagnostics.Current?.RecordException("apns-settings-callback", ex);
-                            FailRegistration("Could not read notification settings.");
+                            pending.TrySetResult(false);
                         }
                     });
                 }
                 catch (Exception ex)
                 {
                     RuntimeDiagnostics.Current?.RecordException("apns-settings-request", ex);
-                    FailRegistration("Could not request notification settings.");
+                    pending.TrySetResult(false);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("apns-main-thread-dispatch", ex);
+            pending.TrySetResult(false);
+        }
+        return await pending.Task.WaitAsync(ct).ConfigureAwait(false);
+    }
+
+    private static void RequestAuthorization(TaskCompletionSource<bool> pending)
+    {
+        UNUserNotificationCenter.Current.RequestAuthorization(
+            UNAuthorizationOptions.Alert | UNAuthorizationOptions.Badge | UNAuthorizationOptions.Sound,
+            (granted, error) =>
+            {
+                try
+                {
+                    if (error is not null)
+                    {
+                        RuntimeDiagnostics.Current?.RecordEvent(
+                            "apns-authorization", error.LocalizedDescription);
+                        pending.TrySetResult(false);
+                        return;
+                    }
+                    pending.TrySetResult(granted);
+                }
+                catch (Exception ex)
+                {
+                    RuntimeDiagnostics.Current?.RecordException("apns-authorization-callback", ex);
+                    pending.TrySetResult(false);
+                }
+            });
+    }
+
+    private static bool IsAlertAuthorized(UNAuthorizationStatus status)
+        => status is UNAuthorizationStatus.Authorized
+            or UNAuthorizationStatus.Provisional
+            or UNAuthorizationStatus.Ephemeral;
+
+    private static void RequestDeviceToken()
+    {
+        RuntimeDiagnostics.Current?.RecordEvent("apns-registration", "starting");
+        try
+        {
+            UIApplication.SharedApplication.InvokeOnMainThread(() =>
+            {
+                try
+                {
+                    UIApplication.SharedApplication.RegisterForRemoteNotifications();
+                }
+                catch (Exception ex)
+                {
+                    RuntimeDiagnostics.Current?.RecordException("apns-device-token-request", ex);
+                    FailRegistration("Could not request an APNs device token.");
                 }
             });
         }
@@ -116,53 +161,9 @@ public sealed class ApplePushService : IPushService
         }
     }
 
-    private static void RequestAuthorization()
-    {
-        UNUserNotificationCenter.Current.RequestAuthorization(
-            UNAuthorizationOptions.Alert | UNAuthorizationOptions.Badge | UNAuthorizationOptions.Sound,
-            (granted, error) =>
-            {
-                try
-                {
-                    if (error is not null)
-                    {
-                        FailRegistration(error.LocalizedDescription);
-                        return;
-                    }
-                    if (!granted)
-                    {
-                        FailRegistration("Notification permission was not granted.");
-                        return;
-                    }
-                    RequestDeviceToken();
-                }
-                catch (Exception ex)
-                {
-                    RuntimeDiagnostics.Current?.RecordException("apns-authorization-callback", ex);
-                    FailRegistration("APNs authorization callback failed.");
-                }
-            });
-    }
-
-    private static void RequestDeviceToken()
-    {
-        UIApplication.SharedApplication.InvokeOnMainThread(() =>
-        {
-            try
-            {
-                UIApplication.SharedApplication.RegisterForRemoteNotifications();
-            }
-            catch (Exception ex)
-            {
-                RuntimeDiagnostics.Current?.RecordException("apns-device-token-request", ex);
-                FailRegistration("Could not request an APNs device token.");
-            }
-        });
-    }
-
     private static async Task TimeoutRegistrationAsync(TaskCompletionSource<string?> pending)
     {
-        await Task.Delay(TimeSpan.FromSeconds(RegistrationTimeoutSeconds));
+        await Task.Delay(TimeSpan.FromSeconds(RegistrationTimeoutSeconds)).ConfigureAwait(false);
         lock (gate)
         {
             if (!ReferenceEquals(registration, pending) || pending.Task.IsCompleted) return;
@@ -173,10 +174,7 @@ public sealed class ApplePushService : IPushService
     }
 #endif
 
-    /// <summary>
-    /// Called by the AppDelegate's RegisteredForRemoteNotifications callback with the APNs device token
-    /// (hex string) once iOS has issued it.
-    /// </summary>
+    /// <summary>Completes the pending APNs device-token request.</summary>
     public static void CompleteRegistration(string token)
     {
         if (string.IsNullOrWhiteSpace(token))
@@ -190,10 +188,7 @@ public sealed class ApplePushService : IPushService
         RuntimeDiagnostics.Current?.RecordEvent("apns-registration", "device token received");
     }
 
-    /// <summary>
-    /// Called by the AppDelegate's FailedToRegisterForRemoteNotifications callback (or when the user denies
-    /// authorization) to unblock any pending <see cref="RegisterAsync"/> with a null token.
-    /// </summary>
+    /// <summary>Fails only token registration; visible-alert denial does not call this path.</summary>
     public static void FailRegistration(string? reason = null)
     {
         lock (gate)

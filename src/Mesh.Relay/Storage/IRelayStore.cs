@@ -60,6 +60,10 @@ public sealed class DevicePushToken
 {
     public string Platform { get; set; } = "";
     public string Token { get; set; } = "";
+    public bool AlertsEnabled { get; set; } = true;
+    public DateTimeOffset? BackgroundPushWindowStartedAt { get; set; }
+    public int BackgroundPushCount { get; set; }
+    public DateTimeOffset? LastBackgroundPushAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -247,7 +251,19 @@ public interface IRelayStore
     /// recovery key. No-op if the handle is missing or already has a recovery key.
     /// </summary>
     /// <summary>Registers or refreshes a device's push token (APNs/FCM) under a handle. No-op if the handle is missing.</summary>
-    Task SetDevicePushTokenAsync(string handle, string deviceId, string platform, string token, CancellationToken ct = default);
+    Task SetDevicePushTokenAsync(
+        string handle, string deviceId, string platform, string token, bool alertsEnabled,
+        CancellationToken ct = default);
+
+    /// <summary>Atomically reserves one rate-limited silent background wake for a device.</summary>
+    Task<bool> TryAcquireBackgroundPushAsync(
+        string handle,
+        string deviceId,
+        DateTimeOffset now,
+        TimeSpan minimumInterval,
+        TimeSpan window,
+        int maxCount,
+        CancellationToken ct = default);
 
     /// <summary>Removes a device's push token (for example on sign-out). No-op if absent.</summary>
     Task RemoveDevicePushTokenAsync(string handle, string deviceId, CancellationToken ct = default);

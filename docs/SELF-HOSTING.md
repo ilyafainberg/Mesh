@@ -33,6 +33,10 @@ Single-device agent responses require a relay whose health capabilities report
 to legacy agent routing when that capability is absent; legacy routing does not have
 the relay-enforced at-most-one-response guarantee.
 
+iOS passive background synchronization requires both `durableDelivery: true` and
+`backgroundSync: true`; the current relay advertises them as protocol version 6.
+When either flag is absent, the client keeps queued records for foreground delivery.
+
 ## Quick start (Docker)
 
 ```bash
@@ -118,15 +122,25 @@ setup for a private relay.
 ## Push notifications (optional)
 
 The relay can wake an offline mobile device (APNs on iOS, FCM on Android) when a
-message is queued for it. The push is metadata-only: the relay composes it from what
-it already routes on and never includes message contents. Two alerts are sent:
+message or passive state update is queued for it. Push is metadata-only: the relay
+composes it from routing metadata and never includes encrypted message contents.
+Visible alerts are limited to:
 
 - "Message from @sender" for a direct message.
 - "New group message" for a group message (the relay never sees the group name; it is
   end-to-end encrypted).
+- "Your agent replied in a topic" for a successful remotely hosted topic response.
 
 Push is off until you configure at least one backend. Devices register their token
-with a signed `POST /handles/{handle}/push` and clear it with `DELETE`.
+and visible-alert authorization with a signed `POST /handles/{handle}/push`, and
+clear the token with `DELETE`.
+
+On iOS, eligible alerts include `content-available: 1`, and safe updates can use a
+pure silent wake when no visible alert is available. The app then performs a bounded
+drain, decrypt, persist, and acknowledge session. It never executes agents, services,
+or topic turns in the background. Silent delivery is opportunistic, unavailable after
+a user force-quit, and coalesced to at least 20 minutes between wakes with a maximum of
+three per hour per device. The durable inbox remains authoritative.
 
 | Env var | Config key | Purpose | Default |
 |---|---|---|---|
@@ -135,10 +149,13 @@ with a signed `POST /handles/{handle}/push` and clear it with `DELETE`.
 | `APNS_BUNDLE_ID` | `Push:Apns:BundleId` | App bundle id (sent as apns-topic). | none |
 | `APNS_PRIVATE_KEY` | `Push:Apns:PrivateKey` | The `.p8` key PEM contents, or a path to it. | none |
 | `APNS_PRODUCTION` | `Push:Apns:Production` | `true` for the production APNs host, else sandbox. | `false` |
+| `PUSH_BACKGROUND_SYNC_ENABLED` | `Push:BackgroundSyncEnabled` | Set `false` to restore alert-only APNs behavior. | `true` |
 | `FCM_SERVICE_ACCOUNT_JSON` | `Push:Fcm:ServiceAccountJson` | Google service-account JSON, or a path to it. | none |
 
 Set the APNs group (all four required) to enable iOS, and/or `FCM_SERVICE_ACCOUNT_JSON`
-to enable Android. With none set, the relay behaves exactly as before (no push).
+to enable Android. With none set, the relay behaves exactly as before (no push). See
+[PUSH-NOTIFICATIONS.md](./PUSH-NOTIFICATIONS.md) for delivery modes and limitations.
+
 ## Scaling
 
 - **Single small relay**: the defaults are fine. In-memory state, one container.

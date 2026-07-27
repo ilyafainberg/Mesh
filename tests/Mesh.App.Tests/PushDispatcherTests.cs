@@ -7,38 +7,50 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 
 namespace Mesh.App.Tests;
 
-/// <summary>
-/// Covers the relay's "wake offline siblings" push path: when a notifiable message is delivered live
-/// to one of a handle's devices, the handle's OTHER (offline) devices are still woken by push, while
-/// devices that are currently connected on any instance are skipped.
-/// </summary>
 [TestClass]
 public sealed class PushDispatcherTests
 {
-    private sealed class CapturingSender(string platform) : IPushSender
+    private sealed class CapturingSender(
+        string platform,
+        PushSendResult? result = null) : IPushSender
     {
         public string Platform { get; } = platform;
         public List<string> Sent { get; } = new();
+        public List<PushAlert> Alerts { get; } = new();
         public TaskCompletionSource<(string Token, PushAlert Alert)> FirstDelivery { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public Task SendAsync(string token, PushAlert alert, CancellationToken ct = default)
+        public Task<PushSendResult> SendAsync(
+            string token,
+            PushAlert alert,
+            CancellationToken ct = default)
         {
             Sent.Add(token);
+            Alerts.Add(alert);
             FirstDelivery.TrySetResult((token, alert));
-            return Task.CompletedTask;
+            return Task.FromResult(result ?? PushSendResult.Sent());
         }
     }
 
     private static PushDispatcher NewDispatcher(
-        IRelayStore store, IBackplane backplane, params IPushSender[] senders)
-        => new(store, backplane, senders, NullLogger<PushDispatcher>.Instance);
+        IRelayStore store,
+        IBackplane backplane,
+        bool backgroundSyncEnabled = true,
+        params IPushSender[] senders)
+        => new(
+            store,
+            backplane,
+            senders,
+            new PushDispatchOptions(backgroundSyncEnabled),
+            NullLogger<PushDispatcher>.Instance);
 
     private static async Task SeedHandleWithTwoPhonesAsync(InMemoryRelayStore store)
     {
         await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
-        await store.SetDevicePushTokenAsync("ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone");
-        await store.SetDevicePushTokenAsync("ifain", "dev-ipad", DevicePlatforms.IOS, "tok-ipad");
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-ipad", DevicePlatforms.IOS, "tok-ipad", alertsEnabled: true);
     }
 
     [TestMethod]
@@ -71,7 +83,7 @@ public sealed class PushDispatcherTests
         var backplane = new InMemoryBackplane();
         await SeedHandleWithTwoPhonesAsync(store);
         var apns = new CapturingSender(DevicePlatforms.IOS);
-        var dispatcher = NewDispatcher(store, backplane, apns);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
         var response = MeshEnvelope.Create(
             "ifain",
             "ifain",
@@ -88,6 +100,7 @@ public sealed class PushDispatcherTests
         Assert.AreEqual("Mesh", delivery.Alert.Title);
         Assert.AreEqual("Your agent replied in a topic", delivery.Alert.Body);
         Assert.AreEqual("topic", delivery.Alert.Category);
+        Assert.AreEqual(PushDeliveryMode.AlertAndBackground, delivery.Alert.Mode);
         CollectionAssert.AreEqual(new[] { "tok-iphone" }, apns.Sent);
     }
 
@@ -97,13 +110,10 @@ public sealed class PushDispatcherTests
         var store = new InMemoryRelayStore();
         var backplane = new InMemoryBackplane();
         await SeedHandleWithTwoPhonesAsync(store);
-
-        // The iPad is connected somewhere (e.g. the message was just delivered live to it); the
-        // iPhone is offline and must still be woken.
         await backplane.SetDevicePresenceAsync("ifain", "dev-ipad");
 
         var apns = new CapturingSender(DevicePlatforms.IOS);
-        var dispatcher = NewDispatcher(store, backplane, apns);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
 
         await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.Chat, "alice");
 
@@ -120,7 +130,7 @@ public sealed class PushDispatcherTests
         await backplane.SetDevicePresenceAsync("ifain", "dev-ipad");
 
         var apns = new CapturingSender(DevicePlatforms.IOS);
-        var dispatcher = NewDispatcher(store, backplane, apns);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
 
         await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.Chat, "alice");
 
@@ -128,19 +138,144 @@ public sealed class PushDispatcherTests
     }
 
     [TestMethod]
-    public async Task WakeOfflineSiblings_NonNotifiableKindProducesNoPush()
+    public async Task WakeOfflineSiblings_UnsupportedKindProducesNoPush()
     {
         var store = new InMemoryRelayStore();
         var backplane = new InMemoryBackplane();
         await SeedHandleWithTwoPhonesAsync(store);
-
         var apns = new CapturingSender(DevicePlatforms.IOS);
-        var dispatcher = NewDispatcher(store, backplane, apns);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
 
-        // A receipt is not a user-facing message, so no alert is composed and nothing is sent.
-        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.Receipt, "alice");
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.TopicRunRequest, "ifain");
 
         Assert.AreEqual(0, apns.Sent.Count);
+    }
+
+    [TestMethod]
+    public async Task WakeOfflineSiblings_ReceiptUsesRateLimitedBackgroundWake()
+    {
+        var store = new InMemoryRelayStore();
+        var backplane = new InMemoryBackplane();
+        await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: true);
+        var apns = new CapturingSender(DevicePlatforms.IOS);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
+
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.Receipt, "alice");
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.Receipt, "alice");
+
+        Assert.AreEqual(1, apns.Sent.Count);
+        Assert.AreEqual(PushDeliveryMode.Background, apns.Alerts[0].Mode);
+    }
+
+    [TestMethod]
+    public async Task NotifyOffline_AlertPermissionDeniedUsesSilentWake()
+    {
+        var store = new InMemoryRelayStore();
+        var backplane = new InMemoryBackplane();
+        await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: false);
+        var apns = new CapturingSender(DevicePlatforms.IOS);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
+        var message = MeshEnvelope.Create("alice", "ifain", MeshKinds.DirectMessage, "ciphertext");
+
+        dispatcher.NotifyOffline("ifain", "dev-iphone", message);
+
+        var delivery = await apns.FirstDelivery.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.AreEqual(PushDeliveryMode.Background, delivery.Alert.Mode);
+        Assert.AreEqual("", delivery.Alert.Title);
+    }
+
+    [TestMethod]
+    public async Task AlertPermissionDeniedDoesNotWakeForForegroundOnlyWork()
+    {
+        var store = new InMemoryRelayStore();
+        var backplane = new InMemoryBackplane();
+        await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: false);
+        var apns = new CapturingSender(DevicePlatforms.IOS);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
+
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.AgentRequest, "alice");
+
+        Assert.AreEqual(0, apns.Sent.Count);
+    }
+
+    [TestMethod]
+    public async Task ForegroundOnlyWorkUsesAlertWithoutBackgroundWake()
+    {
+        var store = new InMemoryRelayStore();
+        var backplane = new InMemoryBackplane();
+        await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: true);
+        var apns = new CapturingSender(DevicePlatforms.IOS);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
+
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.AgentRequest, "alice");
+
+        Assert.AreEqual(1, apns.Sent.Count);
+        Assert.AreEqual(PushDeliveryMode.Alert, apns.Alerts[0].Mode);
+    }
+
+    [TestMethod]
+    public async Task BackgroundWakeThrottleSurvivesAlertAuthorizationRefresh()
+    {
+        var store = new InMemoryRelayStore();
+        await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: true);
+        var now = DateTimeOffset.Parse("2026-07-08T12:00:00Z");
+
+        Assert.IsTrue(await store.TryAcquireBackgroundPushAsync(
+            "ifain", "dev-iphone", now, TimeSpan.FromMinutes(20), TimeSpan.FromHours(1), 3));
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: false);
+
+        Assert.IsFalse(await store.TryAcquireBackgroundPushAsync(
+            "ifain", "dev-iphone", now.AddMinutes(1),
+            TimeSpan.FromMinutes(20), TimeSpan.FromHours(1), 3));
+    }
+
+    [TestMethod]
+    public async Task KillSwitchRestoresAlertOnlyBehavior()
+    {
+        var store = new InMemoryRelayStore();
+        var backplane = new InMemoryBackplane();
+        await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: true);
+        var apns = new CapturingSender(DevicePlatforms.IOS);
+        var dispatcher = NewDispatcher(store, backplane, false, apns);
+
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.Receipt, "alice");
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.DirectMessage, "alice");
+
+        Assert.AreEqual(1, apns.Sent.Count);
+        Assert.AreEqual(PushDeliveryMode.Alert, apns.Alerts[0].Mode);
+    }
+
+    [TestMethod]
+    public async Task InvalidTokenIsRemovedFromHandle()
+    {
+        var store = new InMemoryRelayStore();
+        var backplane = new InMemoryBackplane();
+        await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-iphone", DevicePlatforms.IOS, "tok-iphone", alertsEnabled: true);
+        var apns = new CapturingSender(
+            DevicePlatforms.IOS,
+            PushSendResult.InvalidToken(410, "Unregistered"));
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
+
+        await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.DirectMessage, "alice");
+
+        var handle = await store.GetHandleAsync("ifain");
+        Assert.IsNotNull(handle);
+        Assert.AreEqual(0, handle.DevicePushTokens.Count);
     }
 
     [TestMethod]
@@ -149,11 +284,10 @@ public sealed class PushDispatcherTests
         var store = new InMemoryRelayStore();
         var backplane = new InMemoryBackplane();
         await store.UpsertHandleAsync("ifain", "key-desktop", "Ilya", allowNewDevice: true);
-        await store.SetDevicePushTokenAsync("ifain", "dev-droid", DevicePlatforms.Android, "tok-droid");
-
-        // Only an APNs (iOS) sender is configured; the offline Android token has no sender.
+        await store.SetDevicePushTokenAsync(
+            "ifain", "dev-droid", DevicePlatforms.Android, "tok-droid", alertsEnabled: true);
         var apns = new CapturingSender(DevicePlatforms.IOS);
-        var dispatcher = NewDispatcher(store, backplane, apns);
+        var dispatcher = NewDispatcher(store, backplane, true, apns);
 
         await dispatcher.WakeOfflineSiblingsAsync("ifain", MeshKinds.Chat, "alice");
 

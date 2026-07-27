@@ -132,12 +132,57 @@ public sealed class InMemoryRelayStore : IRelayStore
         }
     }
 
-    public Task SetDevicePushTokenAsync(string handle, string deviceId, string platform, string token, CancellationToken ct = default)
+    public Task SetDevicePushTokenAsync(
+        string handle, string deviceId, string platform, string token, bool alertsEnabled,
+        CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))
             lock (rec)
-                rec.DevicePushTokens[deviceId] = new DevicePushToken { Platform = platform, Token = token, UpdatedAt = DateTimeOffset.UtcNow };
+            {
+                rec.DevicePushTokens.TryGetValue(deviceId, out var previous);
+                var preserveWakeState = previous is not null
+                    && string.Equals(previous.Platform, platform, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(previous.Token, token, StringComparison.Ordinal);
+                rec.DevicePushTokens[deviceId] = new DevicePushToken
+                {
+                    Platform = platform,
+                    Token = token,
+                    AlertsEnabled = alertsEnabled,
+                    BackgroundPushWindowStartedAt = preserveWakeState ? previous!.BackgroundPushWindowStartedAt : null,
+                    BackgroundPushCount = preserveWakeState ? previous!.BackgroundPushCount : 0,
+                    LastBackgroundPushAt = preserveWakeState ? previous!.LastBackgroundPushAt : null,
+                    UpdatedAt = DateTimeOffset.UtcNow
+                };
+            }
         return Task.CompletedTask;
+    }
+
+    public Task<bool> TryAcquireBackgroundPushAsync(
+        string handle,
+        string deviceId,
+        DateTimeOffset now,
+        TimeSpan minimumInterval,
+        TimeSpan window,
+        int maxCount,
+        CancellationToken ct = default)
+    {
+        if (!handles.TryGetValue(handle, out var rec)) return Task.FromResult(false);
+        lock (rec)
+        {
+            if (!rec.DevicePushTokens.TryGetValue(deviceId, out var token)) return Task.FromResult(false);
+            if (token.LastBackgroundPushAt is { } last && now - last < minimumInterval)
+                return Task.FromResult(false);
+            if (token.BackgroundPushWindowStartedAt is null
+                || now - token.BackgroundPushWindowStartedAt.Value >= window)
+            {
+                token.BackgroundPushWindowStartedAt = now;
+                token.BackgroundPushCount = 0;
+            }
+            if (token.BackgroundPushCount >= maxCount) return Task.FromResult(false);
+            token.BackgroundPushCount++;
+            token.LastBackgroundPushAt = now;
+            return Task.FromResult(true);
+        }
     }
 
     public Task RemoveDevicePushTokenAsync(string handle, string deviceId, CancellationToken ct = default)
@@ -658,7 +703,16 @@ public sealed class InMemoryRelayStore : IRelayStore
                 AgentPrimaryWasSelectedAutomatically = r.AgentPrimaryWasSelectedAutomatically,
                 DevicePushTokens = r.DevicePushTokens.ToDictionary(
                     kv => kv.Key,
-                    kv => new DevicePushToken { Platform = kv.Value.Platform, Token = kv.Value.Token, UpdatedAt = kv.Value.UpdatedAt })
+                    kv => new DevicePushToken
+                    {
+                        Platform = kv.Value.Platform,
+                        Token = kv.Value.Token,
+                        AlertsEnabled = kv.Value.AlertsEnabled,
+                        BackgroundPushWindowStartedAt = kv.Value.BackgroundPushWindowStartedAt,
+                        BackgroundPushCount = kv.Value.BackgroundPushCount,
+                        LastBackgroundPushAt = kv.Value.LastBackgroundPushAt,
+                        UpdatedAt = kv.Value.UpdatedAt
+                    })
             };
     }
 
