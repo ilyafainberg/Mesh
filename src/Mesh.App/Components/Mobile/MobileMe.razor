@@ -566,6 +566,7 @@ else
     string? activeThreadValue;
     int messageRenderCount = MessageRenderWindow.InitialCount;
     bool preserveHistoryScroll;
+    bool scrollToLatestRequested;
     string? activeThread
     {
         get => activeThreadValue;
@@ -656,8 +657,8 @@ else
     {
         var queued = QueueInfo(line);
         if (queued is null) return;
-        State.SetQueuedTopicRunStage(queued.ThreadId, queued.RunId, TopicQueueStage.Cancelling);
-        if (!await TopicRouter.StopAsync(queued.ThreadId, queued.RunId, CancellationToken.None))
+        if (!await TopicRouter.CancelQueuedAsync(
+                queued.ThreadId, queued.RunId, line.Id, CancellationToken.None))
             attachError = "The queued turn could not be cancelled yet.";
     }
     IReadOnlyList<ChatLine> OrderedVisibleLines => Active is null
@@ -819,10 +820,12 @@ else
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
 
+        var scrollToLatest = scrollToLatestRequested;
+        scrollToLatestRequested = false;
         if (preserveHistoryScroll)
         {
             preserveHistoryScroll = false;
-            return;
+            if (!scrollToLatest) return;
         }
 
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
@@ -835,12 +838,12 @@ else
         {
             try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
         }
-        if (firstRender || activeChanged || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
+        if (scrollToLatest || firstRender || activeChanged || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
         {
             lastCount = count;
             lastBusy = ActiveBusy;
             lastScrolledThread = activeThread;
-            var method = firstRender || activeChanged
+            var method = scrollToLatest || firstRender || activeChanged
                 ? "meshUI.scrollToBottom"
                 : "meshUI.scrollToBottomIfPinned";
             try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
@@ -1100,16 +1103,6 @@ else
         return true;
     }
 
-    void RestoreSubmittedDraft(string threadId, string submittedText)
-    {
-        if (string.Equals(activeThread, threadId, StringComparison.Ordinal))
-        {
-            if (input.Length == 0) input = submittedText;
-            return;
-        }
-        State.SetTopicDraft(threadId, submittedText);
-    }
-
     async Task PickFile()
     {
         attachError = null;
@@ -1188,16 +1181,26 @@ else
         }
 
         var runId = Guid.NewGuid().ToString("n");
-        var lineId = Guid.NewGuid().ToString("n");
         var prompt = BuildTurnPrompt(text, chosenWidget, wasWidget);
+        var trigger = new ChatLine
+        {
+            Id = Guid.NewGuid().ToString("n"),
+            Role = "user",
+            Text = prompt,
+            Attachments = loadedAttachments.ToList(),
+            At = DateTimeOffset.UtcNow
+        };
+        scrollToLatestRequested = true;
+        State.AddOwnChatLine(thread.Id, trigger);
+
         var widgetContext = BuildWidgetContext(chosenWidget, wasWidget);
         var draft = new TopicTurnDraft(
             runId,
             thread.Id,
-            lineId,
+            trigger.Id,
             State.Profile.Handle,
             prompt,
-            DateTimeOffset.UtcNow,
+            trigger.At,
             State.Profile.PlanBeforeActing ? global::Mesh.Shared.TopicTurnMode.Autonomous : global::Mesh.Shared.TopicTurnMode.Single,
             target.DeviceId,
             chosenWidget?.Id,
@@ -1217,20 +1220,24 @@ else
             var result = await TopicRouter.SubmitAsync(draft, null, CancellationToken.None);
             if (!result.Accepted)
             {
-                RestoreSubmittedDraft(thread.Id, text);
-                attachments.AddRange(files);
-                widgetMode = wasWidget;
-                selectedWidget = chosenWidget;
                 attachError = result.Error ?? $"The topic turn was not accepted ({result.Code}).";
+                State.AddOwnChatLine(thread.Id, new ChatLine
+                {
+                    Role = "assistant",
+                    Text = $"[{attachError}]",
+                    ReplyToLineId = trigger.Id
+                });
             }
         }
         catch (Exception ex)
         {
-            RestoreSubmittedDraft(thread.Id, text);
-            attachments.AddRange(files);
-            widgetMode = wasWidget;
-            selectedWidget = chosenWidget;
             attachError = $"Could not send this topic turn: {ex.Message}";
+            State.AddOwnChatLine(thread.Id, new ChatLine
+            {
+                Role = "assistant",
+                Text = $"[{attachError}]",
+                ReplyToLineId = trigger.Id
+            });
         }
     }
 

@@ -218,6 +218,25 @@ public sealed class DeviceSyncProfileStateTests
     }
 
     [TestMethod]
+    public void TopicLineDelete_AppliesAfterLineUpsert()
+    {
+        var upsert = Operation(
+            DeviceSyncKinds.TopicLineUpsert,
+            "topic-1",
+            Version(10, "upsert"));
+        var delete = Operation(
+            DeviceSyncKinds.TopicLineDelete,
+            DeviceSyncEntityIds.TopicLine("topic-1", "line-1"),
+            Version(20, "delete"),
+            "");
+
+        var ordered = ProfileSyncState.OrderForApplication([delete, upsert]);
+
+        Assert.AreSame(upsert, ordered[0]);
+        Assert.AreSame(delete, ordered[1]);
+    }
+
+    [TestMethod]
     public void RenameUpsert_IsAppliedBeforeItsOlderDeleteToPreserveReferences()
     {
         var deleteVersion = Version(10, "delete-old");

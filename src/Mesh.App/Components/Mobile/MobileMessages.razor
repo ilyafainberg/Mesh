@@ -370,6 +370,7 @@ else
     string? activeValue;
     int messageRenderCount = MessageRenderWindow.InitialCount;
     bool preserveHistoryScroll;
+    bool scrollToLatestRequested;
     string? active
     {
         get => activeValue;
@@ -506,10 +507,12 @@ else
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
 
+        var scrollToLatest = scrollToLatestRequested;
+        scrollToLatestRequested = false;
         if (preserveHistoryScroll)
         {
             preserveHistoryScroll = false;
-            return;
+            if (!scrollToLatest) return;
         }
 
         var count = State.GetOrCreateConversation(active).Lines.Count;
@@ -519,11 +522,11 @@ else
         {
             try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
         }
-        if (count != lastCount || activeChanged)
+        if (scrollToLatest || count != lastCount || activeChanged)
         {
             lastCount = count;
             lastActive = active;
-            var method = activeChanged ? "meshUI.scrollToBottom" : "meshUI.scrollToBottomIfPinned";
+            var method = scrollToLatest || activeChanged ? "meshUI.scrollToBottom" : "meshUI.scrollToBottomIfPinned";
             try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
         }
     }
@@ -776,6 +779,7 @@ else
             SenderHandle = isGroup ? AppState.Norm(State.Profile.Handle) : null,
             WidgetPrompt = widget?.Prompt
         };
+        scrollToLatestRequested = true;
         State.AddChatLine(active, line);
 
         // A send is already running: queue this one for the next turn instead of starting a

@@ -591,6 +591,7 @@
     string? activeThreadValue;
     int messageRenderCount = MessageRenderWindow.InitialCount;
     bool preserveHistoryScroll;
+    bool scrollToLatestRequested;
     string? activeThread
     {
         get => activeThreadValue;
@@ -707,8 +708,8 @@
     {
         var queued = QueueInfo(line);
         if (queued is null) return;
-        State.SetQueuedTopicRunStage(queued.ThreadId, queued.RunId, TopicQueueStage.Cancelling);
-        if (!await TopicRouter.StopAsync(queued.ThreadId, queued.RunId, CancellationToken.None))
+        if (!await TopicRouter.CancelQueuedAsync(
+                queued.ThreadId, queued.RunId, line.Id, CancellationToken.None))
             dispatchError = "The queued turn could not be cancelled yet.";
     }
     IReadOnlyList<ChatLine> OrderedVisibleLines => Active is null
@@ -817,10 +818,12 @@
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
 
+        var scrollToLatest = scrollToLatestRequested;
+        scrollToLatestRequested = false;
         if (preserveHistoryScroll)
         {
             preserveHistoryScroll = false;
-            return;
+            if (!scrollToLatest) return;
         }
 
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
@@ -833,12 +836,12 @@
         {
             try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
         }
-        if (firstRender || activeChanged || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
+        if (scrollToLatest || firstRender || activeChanged || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
         {
             lastCount = count;
             lastBusy = ActiveBusy;
             lastScrolledThread = activeThread;
-            var method = firstRender || activeChanged
+            var method = scrollToLatest || firstRender || activeChanged
                 ? "meshUI.scrollToBottom"
                 : "meshUI.scrollToBottomIfPinned";
             try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
@@ -1212,6 +1215,7 @@
             At = DateTimeOffset.UtcNow
         };
         var runId = Guid.NewGuid().ToString("n");
+        scrollToLatestRequested = true;
         State.AddOwnChatLine(thread.Id, trigger);
 
         var clearedVisibleDraft = ClearSubmittedDraft(thread.Id, text);

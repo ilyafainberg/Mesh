@@ -80,11 +80,7 @@ a:hover { text-decoration: underline; }
 }
 .route-error > i { color: var(--danger); font-size: 2rem; }
 .route-error p { margin: 0; color: var(--fg-2); }
-.route-error a.primary {
-  display: inline-flex; align-items: center; justify-content: center; margin-top: 4px; padding: 8px 16px;
-  color: var(--fg-on-brand); background: var(--brand); border-radius: var(--radius-s); font-weight: 600;
-}
-.route-error a.primary:hover { background: var(--brand-hover); text-decoration: none; }
+.route-error button.primary { margin-top: 4px; padding: 8px 16px; }
 /* ============================================================
    App shell
    ============================================================ */

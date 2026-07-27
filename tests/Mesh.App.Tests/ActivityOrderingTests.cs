@@ -262,6 +262,17 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void QueuedTopicRunState_FindsSameLineIdWithinItsThread()
+    {
+        var state = new QueuedTopicRunState();
+        state.MarkWaiting("topic-1", "run-1", "line");
+        state.MarkWaiting("topic-2", "run-2", "line");
+
+        Assert.AreEqual("run-1", state.FindByLine("topic-1", "line")?.RunId);
+        Assert.AreEqual("run-2", state.FindByLine("topic-2", "line")?.RunId);
+    }
+
+    [TestMethod]
     public void TopicTranscriptOrdering_PairsQueuedPromptsWithTheirReplies()
     {
         var lines = new[]

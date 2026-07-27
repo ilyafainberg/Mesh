@@ -621,14 +621,20 @@ public sealed partial class AppState : IMemoryState
     /// <summary>Appends a line to a "Me" topic thread as a single row.</summary>
     public void AddOwnChatLine(string threadId, ChatLine line)
     {
-        var thread = GetOrCreateOwnThread(threadId);
-        thread.Lines.Add(line);
-        thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
-        activeDb?.AppendOwnChat(thread.Id, line);
-        if (thread.LastActivityAt.HasValue)
-            activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
-        EmitLineUpsert(DeviceSyncKinds.TopicLineUpsert, thread.Id, line);
-        EmitTopicUpsert(thread);
+        lock (profileSyncGate)
+        {
+            if (IsTopicLineDeleted(threadId, line.Id)
+                || IsTopicLineDeleted(threadId, line.ReplyToLineId))
+                return;
+            var thread = GetOrCreateOwnThread(threadId);
+            thread.Lines.Add(line);
+            thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
+            activeDb?.AppendOwnChat(thread.Id, line);
+            if (thread.LastActivityAt.HasValue)
+                activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+            EmitLineUpsert(DeviceSyncKinds.TopicLineUpsert, thread.Id, line);
+            EmitTopicUpsert(thread);
+        }
         NotifyChanged();
     }
 
@@ -1123,6 +1129,7 @@ public sealed partial class AppState : IMemoryState
         {
             DeviceSyncKinds.TopicUpsert => ApplyTopicUpsert(operation),
             DeviceSyncKinds.TopicLineUpsert => ApplyTopicLineUpsert(operation),
+            DeviceSyncKinds.TopicLineDelete => ApplyTopicLineDelete(operation),
             DeviceSyncKinds.TopicClear => ApplyTopicClear(operation),
             DeviceSyncKinds.TopicDelete => ApplyTopicDelete(operation),
             DeviceSyncKinds.ConversationUpsert => ApplyConversationUpsert(operation),
@@ -1253,6 +1260,8 @@ public sealed partial class AppState : IMemoryState
         var dto = DeserializePayload<DeviceSyncLine>(operation);
         var lineId = dto.Id;
         if (!IsValidLine(dto, lineId)
+            || IsTopicLineDeleted(threadId, lineId)
+            || IsTopicLineDeleted(threadId, dto.ReplyToLineId)
             || IsBlockedByTombstone(DeviceSyncKinds.TopicDelete, threadId, operation.Version)
             || IsBlockedByTombstone(DeviceSyncKinds.TopicClear, threadId, operation.Version)
             || !DeviceSyncVersion.IsNewer(
@@ -1267,7 +1276,8 @@ public sealed partial class AppState : IMemoryState
                 threadId,
                 incoming,
                 LineSyncKey(operation.Kind, threadId, lineId),
-                operation.Version))
+                operation.Version,
+                DeviceSyncKinds.TopicLineDelete))
             return false;
         if (thread is null)
         {
@@ -1290,6 +1300,35 @@ public sealed partial class AppState : IMemoryState
                          && !dto.Internal
                          && ReconcileRemoteRunWithAnswer(thread, dto.At);
         return changed || reconciled;
+    }
+
+    private bool ApplyTopicLineDelete(DeviceSyncOperation operation)
+    {
+        if (!DeviceSyncEntityIds.TryParseTopicLine(
+                operation.EntityId, out var threadId, out var lineId)
+            || !CanApplyTombstone(operation))
+            return false;
+
+        var thread = Profile.OwnThreads.FirstOrDefault(item =>
+            string.Equals(item.Id, threadId, StringComparison.Ordinal));
+        if (thread?.Lines.Any(line =>
+                string.Equals(line.Id, lineId, StringComparison.Ordinal)) == true
+            && !DeviceSyncVersion.IsNewer(
+                operation.Version,
+                activeDb!.GetSyncVersion(LineSyncKey(
+                    DeviceSyncKinds.TopicLineUpsert, threadId, lineId))))
+            return false;
+
+        var changed = thread is not null && thread.Lines.RemoveAll(line =>
+            string.Equals(line.Id, lineId, StringComparison.Ordinal)
+            || string.Equals(line.ReplyToLineId, lineId, StringComparison.Ordinal)) > 0;
+        var queued = queuedTopicRuns.FindByLine(threadId, lineId);
+        if (queued is not null)
+            changed |= queuedTopicRuns.Complete(queued.ThreadId, queued.RunId);
+
+        activeDb!.ApplyTopicLineDelete(
+            threadId, lineId, operation.EntityId, operation.Kind, operation.Version);
+        return changed;
     }
 
     private bool ApplyTopicClear(DeviceSyncOperation operation)
@@ -1884,6 +1923,10 @@ public sealed partial class AppState : IMemoryState
     private void EmitLineUpsert(string kind, string parentId, ChatLine line)
     {
         if (applyingDeviceSync) return;
+        if (kind == DeviceSyncKinds.TopicLineUpsert
+            && (IsTopicLineDeleted(parentId, line.Id)
+                || IsTopicLineDeleted(parentId, line.ReplyToLineId)))
+            return;
         var deviceId = LocalDeviceId();
         if (activeDb is null || deviceId is null) return;
         var deleteKind = kind == DeviceSyncKinds.TopicLineUpsert
@@ -1900,7 +1943,12 @@ public sealed partial class AppState : IMemoryState
             {
                 activeDb.GetSyncVersion(LineSyncKey(kind, parentId, line.Id)),
                 activeDb.GetSyncTombstoneVersion(deleteKind, parentId),
-                activeDb.GetSyncTombstoneVersion(clearKind, parentId)
+                activeDb.GetSyncTombstoneVersion(clearKind, parentId),
+                kind == DeviceSyncKinds.TopicLineUpsert
+                    ? activeDb.GetSyncTombstoneVersion(
+                        DeviceSyncKinds.TopicLineDelete,
+                        DeviceSyncEntityIds.TopicLine(parentId, line.Id))
+                    : null
             });
         if (!activeDb.TryAdvanceSyncVersion(
                 LineSyncKey(kind, parentId, line.Id), version))
@@ -1960,6 +2008,12 @@ public sealed partial class AppState : IMemoryState
         {
             switch (kind)
             {
+                case DeviceSyncKinds.TopicLineDelete:
+                    if (!DeviceSyncEntityIds.TryParseTopicLine(
+                            entityId, out var threadId, out var lineId))
+                        throw new InvalidOperationException("The topic line tombstone ID was invalid.");
+                    activeDb.DeleteOwnChatLine(threadId, lineId);
+                    break;
                 case DeviceSyncKinds.TopicDelete:
                     activeDb.DeleteOwnThread(entityId);
                     break;
@@ -1978,7 +2032,8 @@ public sealed partial class AppState : IMemoryState
         var operationId = NewId();
         var version = CreateNewerVersion(deviceId, operationId, priorVersions);
         var serialized = payload is null ? "" : JsonSerializer.Serialize(payload, SyncJson);
-        if (kind is DeviceSyncKinds.TopicDelete
+        if (kind is DeviceSyncKinds.TopicLineDelete
+            or DeviceSyncKinds.TopicDelete
             or DeviceSyncKinds.TopicClear
             or DeviceSyncKinds.ConversationDelete
             or DeviceSyncKinds.ConversationClear
@@ -1987,6 +2042,13 @@ public sealed partial class AppState : IMemoryState
         {
             switch (kind)
             {
+                case DeviceSyncKinds.TopicLineDelete:
+                    if (!DeviceSyncEntityIds.TryParseTopicLine(
+                            entityId, out var threadId, out var lineId))
+                        throw new InvalidOperationException("The topic line tombstone ID was invalid.");
+                    activeDb.ApplyTopicLineDelete(
+                        threadId, lineId, entityId, kind, version);
+                    break;
                 case DeviceSyncKinds.TopicDelete:
                     activeDb.ApplyTopicDelete(entityId, kind, version);
                     break;
@@ -2109,6 +2171,7 @@ public sealed partial class AppState : IMemoryState
                 or DeviceSyncKinds.TopicDelete
                 or DeviceSyncKinds.ConversationClear
                 or DeviceSyncKinds.ConversationDelete
+                or DeviceSyncKinds.TopicLineDelete
                 or DeviceSyncKinds.ContactDelete
                 or DeviceSyncKinds.CircleDelete
                 or DeviceSyncKinds.MemoryDelete
@@ -2132,6 +2195,13 @@ public sealed partial class AppState : IMemoryState
         => DeviceSyncVersion.Compare(
             activeDb!.GetSyncTombstoneVersion(kind, entityId),
             version) >= 0;
+
+    private bool IsTopicLineDeleted(string threadId, string? lineId)
+        => TopicRunProtocol.IsValidIdentifier(threadId)
+           && TopicRunProtocol.IsValidIdentifier(lineId)
+           && activeDb?.GetSyncTombstoneVersion(
+               DeviceSyncKinds.TopicLineDelete,
+               DeviceSyncEntityIds.TopicLine(threadId, lineId!)) is not null;
 
     private bool CanApplyTombstone(DeviceSyncOperation operation)
         => DeviceSyncVersion.IsNewer(
@@ -2191,6 +2261,7 @@ public sealed partial class AppState : IMemoryState
             return false;
         return operation.Kind is DeviceSyncKinds.TopicUpsert
             or DeviceSyncKinds.TopicLineUpsert
+            or DeviceSyncKinds.TopicLineDelete
             or DeviceSyncKinds.TopicClear
             or DeviceSyncKinds.TopicDelete
             or DeviceSyncKinds.ConversationUpsert
@@ -2594,19 +2665,16 @@ public sealed partial class AppState : IMemoryState
     // Live agent step trace, keyed by conversation/thread id so independent threads each show only
     // their own steps. The agent reports a step as each tool call starts and finishes; the Me chat
     // renders the steps for the thread being viewed. Cleared per thread at the start and end of its turn.
-    private readonly Dictionary<string, List<AgentStep>> agentSteps = new(StringComparer.Ordinal);
-    private static readonly IReadOnlyList<AgentStep> NoSteps = Array.Empty<AgentStep>();
+    private readonly LiveAgentRenderState liveAgentRenderState = new();
 
     /// <summary>The steps taken so far in the given thread's current turn (most recent last).</summary>
     public IReadOnlyList<AgentStep> AgentStepsFor(string key)
-        => agentSteps.TryGetValue(key, out var l) ? l : NoSteps;
+        => liveAgentRenderState.StepsFor(key);
 
     /// <summary>Clears one thread's step trace at the start of a new turn.</summary>
     public void BeginAgentSteps(string key)
     {
-        if (agentSteps.TryGetValue(key, out var l) && l.Count == 0) return;
-        agentSteps[key] = new List<AgentStep>();
-        NotifyChanged();
+        if (liveAgentRenderState.BeginSteps(key)) NotifyChanged();
     }
 
     /// <summary>
@@ -2615,72 +2683,46 @@ public sealed partial class AppState : IMemoryState
     /// </summary>
     public void ReportAgentStep(string key, AgentStep step)
     {
-        if (!agentSteps.TryGetValue(key, out var steps))
-            agentSteps[key] = steps = new List<AgentStep>();
-
-        if (step.State == AgentStepState.Started)
-        {
-            steps.Add(step);
-        }
-        else
-        {
-            var i = steps.FindLastIndex(s => s.Tool == step.Tool && s.State == AgentStepState.Started);
-            if (i >= 0) steps[i] = step;
-            else steps.Add(step);
-        }
+        liveAgentRenderState.ReportStep(key, step);
         NotifyChanged();
     }
 
     /// <summary>Clears one thread's step trace when its turn ends.</summary>
     public void EndAgentSteps(string key)
     {
-        if (agentSteps.Remove(key)) NotifyChanged();
+        if (liveAgentRenderState.EndSteps(key)) NotifyChanged();
     }
 
     // Transient streamed assistant draft (reasoning + answer) for a thread's in-flight turn. Mirrors
-    // agentSteps: never persisted and never sent to peers, cleared when the turn ends and the final
-    // ChatLine is committed. It lets the UI show the model's reasoning and answer building up live
-    // instead of appearing all at once when the turn finishes.
-    private readonly Dictionary<string, AssistantDraft> assistantDrafts = new(StringComparer.Ordinal);
+    // the step trace: never persisted or sent to peers, and exposed to Razor only as immutable snapshots.
     private readonly AssistantDraftRefreshGate assistantDraftRefreshGate = new();
 
     /// <summary>A thread's live streamed reply: reasoning and answer accumulated as chunks arrive.</summary>
-    public sealed class AssistantDraft
+    public sealed record AssistantDraft(string Reasoning, string Answer)
     {
-        private readonly StringBuilder reasoning = new();
-        private readonly StringBuilder answer = new();
-        public string Reasoning => reasoning.ToString();
-        public string Answer => answer.ToString();
-        public bool HasReasoning => reasoning.Length > 0;
-        public bool HasAnswer => answer.Length > 0;
-
-        /// <summary>Appends one fragment; returns true when it added visible text.</summary>
-        public bool Append(AgentDelta delta)
-        {
-            if (string.IsNullOrEmpty(delta.Text)) return false;
-            (delta.Kind == AgentDeltaKind.Reasoning ? reasoning : answer).Append(delta.Text);
-            return true;
-        }
+        public bool HasReasoning => Reasoning.Length > 0;
+        public bool HasAnswer => Answer.Length > 0;
     }
 
     /// <summary>The live streamed draft for the given thread's turn, or null when none is streaming.</summary>
     public AssistantDraft? AssistantDraftFor(string key)
-        => assistantDrafts.TryGetValue(key, out var draft) ? draft : null;
+    {
+        if (liveAgentRenderState.DraftFor(key) is not { } draft) return null;
+        return new AssistantDraft(draft.Reasoning, draft.Answer);
+    }
 
     /// <summary>Starts a fresh streamed draft for a thread at the start of a turn.</summary>
     public void BeginAssistantDraft(string key)
     {
         assistantDraftRefreshGate.Reset(key);
-        assistantDrafts[key] = new AssistantDraft();
+        liveAgentRenderState.BeginDraft(key);
         NotifyChanged();
     }
 
     /// <summary>Appends one streamed reasoning/answer fragment to a thread's live draft.</summary>
     public void AppendAssistantDelta(string key, AgentDelta delta)
     {
-        if (!assistantDrafts.TryGetValue(key, out var draft))
-            assistantDrafts[key] = draft = new AssistantDraft();
-        if (draft.Append(delta)
+        if (liveAgentRenderState.AppendDraft(key, delta)
             && assistantDraftRefreshGate.ShouldPublish(key, delta.Kind, Environment.TickCount64))
             NotifyChanged();
     }
@@ -2688,7 +2730,7 @@ public sealed partial class AppState : IMemoryState
     /// <summary>Clears a thread's streamed draft once its turn ends and the final line is committed.</summary>
     public void EndAssistantDraft(string key)
     {
-        var removed = assistantDrafts.Remove(key);
+        var removed = liveAgentRenderState.EndDraft(key);
         assistantDraftRefreshGate.Reset(key);
         if (removed) NotifyChanged();
     }
@@ -2869,9 +2911,8 @@ public sealed partial class AppState : IMemoryState
             var kind = update.DeltaKind == TopicRunDeltaKind.Reasoning
                 ? AgentDeltaKind.Reasoning
                 : AgentDeltaKind.Answer;
-            if (!assistantDrafts.TryGetValue(threadId, out var draft))
-                assistantDrafts[threadId] = draft = new AssistantDraft();
-            appended = draft.Append(new AgentDelta(kind, update.Delta));
+            appended = liveAgentRenderState.AppendDraft(
+                threadId, new AgentDelta(kind, update.Delta));
         }
         if (appended
             && assistantDraftRefreshGate.ShouldPublish(
@@ -2926,7 +2967,7 @@ public sealed partial class AppState : IMemoryState
                 remoteRuns.Remove(threadId);
                 terminalRemoteRuns.Add(correlationKey);
                 remoteDeltaSeq.Remove(correlationKey);
-                assistantDrafts.Remove(threadId);
+                liveAgentRenderState.EndDraft(threadId);
                 assistantDraftRefreshGate.Reset(threadId);
             }
             else
@@ -2972,7 +3013,7 @@ public sealed partial class AppState : IMemoryState
             terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
             thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
-            assistantDrafts.Remove(threadId);
+            liveAgentRenderState.EndDraft(threadId);
             assistantDraftRefreshGate.Reset(threadId);
         }
         EmitTopicUpsert(thread!);
@@ -3015,7 +3056,7 @@ public sealed partial class AppState : IMemoryState
             remoteRuns.Remove(thread.Id);
             terminalRemoteRuns.Add(thread.Id + "\0" + projection.RunId);
             remoteDeltaSeq.Remove(thread.Id + "\0" + projection.RunId);
-            assistantDrafts.Remove(thread.Id);
+            liveAgentRenderState.EndDraft(thread.Id);
             assistantDraftRefreshGate.Reset(thread.Id);
             return true;
         }
@@ -3229,6 +3270,71 @@ public sealed partial class AppState : IMemoryState
         ArgumentNullException.ThrowIfNull(line);
         lock (profileSyncGate)
             return queuedTopicRuns.FindByLine(line.Id);
+    }
+
+    public bool IsQueuedTopicRunLine(string threadId, string runId, string lineId)
+    {
+        lock (profileSyncGate)
+        {
+            var queued = queuedTopicRuns.FindByLine(threadId, lineId);
+            return queued is { Waiting: true }
+                   && string.Equals(queued.ThreadId, threadId, StringComparison.Ordinal)
+                   && string.Equals(queued.RunId, runId, StringComparison.Ordinal);
+        }
+    }
+
+    public bool RemoveCancelledQueuedTopicLine(string threadId, string runId, string lineId)
+    {
+        if (!TopicRunProtocol.IsValidIdentifier(threadId)
+            || !TopicRunProtocol.IsValidIdentifier(runId)
+            || !TopicRunProtocol.IsValidIdentifier(lineId))
+            return false;
+
+        var visibleChanged = false;
+        var deleted = false;
+        lock (profileSyncGate)
+        {
+            var queued = queuedTopicRuns.FindByLine(threadId, lineId);
+            if (queued is not null
+                && (!string.Equals(queued.ThreadId, threadId, StringComparison.Ordinal)
+                    || !string.Equals(queued.RunId, runId, StringComparison.Ordinal)))
+                return false;
+
+            var thread = Profile.OwnThreads.FirstOrDefault(item =>
+                string.Equals(item.Id, threadId, StringComparison.Ordinal));
+            if (thread is null) return false;
+
+            var trigger = thread.Lines.FirstOrDefault(line =>
+                string.Equals(line.Id, lineId, StringComparison.Ordinal));
+            if (trigger is null)
+            {
+                visibleChanged = queuedTopicRuns.Complete(threadId, runId);
+                deleted = true;
+            }
+            else
+            {
+                if (!string.Equals(trigger.Role, "user", StringComparison.Ordinal))
+                    return false;
+                var removed = thread.Lines.Where(line =>
+                        string.Equals(line.Id, lineId, StringComparison.Ordinal)
+                        || string.Equals(line.ReplyToLineId, lineId, StringComparison.Ordinal))
+                    .ToList();
+                var lineVersions = removed.Select(line => activeDb?.GetSyncVersion(LineSyncKey(
+                    DeviceSyncKinds.TopicLineUpsert, thread.Id, line.Id))).ToList();
+                thread.Lines.RemoveAll(line =>
+                    string.Equals(line.Id, lineId, StringComparison.Ordinal)
+                    || string.Equals(line.ReplyToLineId, lineId, StringComparison.Ordinal));
+                queuedTopicRuns.Complete(threadId, runId);
+                EmitTombstone(
+                    DeviceSyncKinds.TopicLineDelete,
+                    DeviceSyncEntityIds.TopicLine(threadId, lineId),
+                    lineVersions);
+                visibleChanged = true;
+                deleted = true;
+            }
+        }
+        if (visibleChanged) NotifyChanged();
+        return deleted;
     }
 
     public bool IsKnownQueuedTopicRun(string threadId, string runId)

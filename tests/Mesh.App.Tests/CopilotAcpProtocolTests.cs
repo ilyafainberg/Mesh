@@ -114,6 +114,19 @@ public class CopilotAcpProtocolTests
     }
 
     [TestMethod]
+    public void FormatThoughtChunk_PrependsParagraphBreakToEveryUpdate()
+    {
+        Assert.AreEqual("", CopilotAcpProtocol.FormatThoughtChunk(null));
+        Assert.AreEqual("", CopilotAcpProtocol.FormatThoughtChunk(""));
+
+        var streamed = string.Concat(
+            CopilotAcpProtocol.FormatThoughtChunk("First thought"),
+            CopilotAcpProtocol.FormatThoughtChunk("Second thought"));
+
+        Assert.AreEqual("\n\nFirst thought\n\nSecond thought", streamed);
+    }
+
+    [TestMethod]
     public void ParseUsage_ReadsNestedExplicitInputAndOutputVariants()
     {
         using var document = JsonDocument.Parse("""

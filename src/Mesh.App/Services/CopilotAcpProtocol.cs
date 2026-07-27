@@ -195,6 +195,13 @@ public static class CopilotAcpProtocol
         return bestScore < originalScore ? best : text;
     }
 
+    /// <summary>Prefixes a Copilot thought update with a Markdown paragraph break.</summary>
+    public static string FormatThoughtChunk(string? text)
+    {
+        var normalized = NormalizeText(text);
+        return normalized.Length == 0 ? "" : "\n\n" + normalized;
+    }
+
     public static bool TryParseUsage(JsonElement element, out CopilotAcpUsage usage)
     {
         long? prompt = null;

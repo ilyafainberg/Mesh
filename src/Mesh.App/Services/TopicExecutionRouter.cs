@@ -107,6 +107,22 @@ public sealed class TopicExecutionRouter(
         }
     }
 
+    public async Task<bool> CancelQueuedAsync(
+        string threadId,
+        string runId,
+        string lineId,
+        CancellationToken cancellationToken)
+    {
+        if (!state.IsQueuedTopicRunLine(threadId, runId, lineId))
+            return false;
+
+        state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
+        if (!await StopAsync(threadId, runId, cancellationToken))
+            return false;
+
+        return state.RemoveCancelledQueuedTopicLine(threadId, runId, lineId);
+    }
+
     public async Task<bool> StopAsync(
         string threadId,
         string runId,

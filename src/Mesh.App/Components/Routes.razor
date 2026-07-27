@@ -1,6 +1,6 @@
 ﻿<Router AppAssembly="typeof(MauiProgram).Assembly" NotFoundPage="typeof(Pages.NotFound)">
     <Found Context="routeData">
-        <ErrorBoundary MaximumErrorCount="3">
+        <ErrorBoundary @ref="routeErrorBoundary" MaximumErrorCount="3">
             <ChildContent>
                 <RouteView RouteData="routeData" DefaultLayout="typeof(Layout.MainLayout)" />
                 <FocusOnNavigate RouteData="routeData" Selector="h1" />
@@ -10,9 +10,15 @@
                     <i class="bi bi-exclamation-triangle"></i>
                     <h1>Mesh hit a display error</h1>
                     <p>The technical details were saved locally. Reload this view, then copy diagnostics from Settings if it happens again.</p>
-                    <a class="primary" href=".">Reload view</a>
+                    <button type="button" class="primary" @onclick="RecoverRoute">Reload view</button>
                 </main>
             </ErrorContent>
         </ErrorBoundary>
     </Found>
 </Router>
+
+@code {
+    Microsoft.AspNetCore.Components.Web.ErrorBoundary? routeErrorBoundary;
+
+    void RecoverRoute() => routeErrorBoundary?.Recover();
+}

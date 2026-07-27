@@ -101,6 +101,12 @@ public interface ITopicExecutionRouter
         IProgress<TopicRunUpdatePayload>? progress,
         CancellationToken cancellationToken);
 
+    Task<bool> CancelQueuedAsync(
+        string threadId,
+        string runId,
+        string lineId,
+        CancellationToken cancellationToken);
+
     Task<bool> StopAsync(
         string threadId,
         string runId,
