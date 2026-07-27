@@ -300,6 +300,7 @@ public interface IRelayStore
         TimeSpan? leaseDuration = null,
         CancellationToken ct = default);
 
+    /// <summary>Releases a confirmed not-delivered lease and rolls back its tentative attempt.</summary>
     Task ReleaseInboxLeaseAsync(
         string toHandle,
         string deliveryId,
