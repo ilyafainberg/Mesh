@@ -92,7 +92,7 @@ public static class RelayInboxPolicy
     public static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(30);
     // Cosmos acquires leases sequentially before sending the first envelope. Keep the batch small
     // enough to make progress well inside SignalR and iOS background execution timeouts.
-    public const int DeliveryWindow = 16;
+    public const int DeliveryWindow = 4;
 
     public static bool UsesClientInitiatedDrain(bool supportsDurableDelivery)
         => supportsDurableDelivery;
