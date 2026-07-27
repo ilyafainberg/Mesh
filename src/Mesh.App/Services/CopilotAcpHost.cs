@@ -24,8 +24,8 @@ internal sealed class CopilotAcpLane(
             public bool StartedReported { get; set; }
         }
 
-        public StringBuilder Answer { get; } = new();
-        public StringBuilder Thought { get; } = new();
+        public CopilotAcpTextBuffer Answer { get; } = new();
+        public CopilotAcpTextBuffer Thought { get; } = new();
         public IProgress<AgentStep>? Progress { get; init; }
         public IProgress<AgentDelta>? Delta { get; init; }
         public required TokenMeter.UsageContext UsageContext { get; init; }
@@ -37,9 +37,6 @@ internal sealed class CopilotAcpLane(
         public CopilotAcpUsageAccumulator Usage { get; } = new();
         private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
         private readonly List<string> messageOrder = new();
-        private readonly HashSet<string> paragraphBoundaryToolCallIds = new(StringComparer.Ordinal);
-        private readonly CopilotAcpParagraphStream answerParagraphs = new();
-        private readonly CopilotAcpParagraphStream thoughtParagraphs = new();
 
         public string? AppendAnswer(string? messageId, string? text)
         {
@@ -47,33 +44,29 @@ internal sealed class CopilotAcpLane(
             if (text.StartsWith("Info: Disabled tools:", StringComparison.Ordinal)
                 || text.StartsWith("Info: Unknown tool name in the tool allowlist:", StringComparison.Ordinal))
                 return null;
-            text = answerParagraphs.AppendChunk(text);
-            if (text.Length == 0) return null;
-            Answer.Append(text);
-            if (string.IsNullOrWhiteSpace(messageId)) return text;
+            if (!string.IsNullOrWhiteSpace(messageId)
+                && !messages.ContainsKey(messageId)
+                && messageOrder.Count > 0)
+                Answer.MarkParagraphBoundary();
+            var appended = Answer.Append(text);
+            if (appended.Length == 0) return null;
+            if (string.IsNullOrWhiteSpace(messageId)) return appended;
             if (!messages.TryGetValue(messageId, out var message))
             {
                 message = new StringBuilder();
                 messages[messageId] = message;
                 messageOrder.Add(messageId);
             }
-            message.Append(text);
-            return text;
-        }
-
-        public string? AppendThought(string? text)
-        {
-            var appended = thoughtParagraphs.AppendChunk(text);
-            if (appended.Length == 0) return null;
-            Thought.Append(appended);
+            message.Append(appended);
             return appended;
         }
 
-        public void MarkProgressBoundary(string toolCallId)
+        public string AppendThought(string? text) => Thought.Append(text);
+
+        public void MarkTextBoundary()
         {
-            if (!paragraphBoundaryToolCallIds.Add(toolCallId)) return;
-            answerParagraphs.MarkBoundary();
-            thoughtParagraphs.MarkBoundary();
+            Answer.MarkParagraphBoundary();
+            Thought.MarkParagraphBoundary();
         }
 
         public string FinalAnswer()
@@ -544,11 +537,12 @@ internal sealed class CopilotAcpLane(
             }
             return;
         }
+        // ACP drops assistant message boundaries, but progress messages are separated by tool activity.
+        if (kind is "tool_call" or "tool_call_update") turn.MarkTextBoundary();
         if (kind is not "tool_call" and not "tool_call_update") return;
         if (!update.TryGetProperty("toolCallId", out var toolCallIdValue)
             || toolCallIdValue.GetString() is not { } toolCallId)
             return;
-        turn.MarkProgressBoundary(toolCallId);
 
         var titleText = update.TryGetProperty("title", out var titleCandidate)
             ? titleCandidate.GetString()

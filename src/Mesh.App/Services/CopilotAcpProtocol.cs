@@ -71,29 +71,69 @@ public sealed class CopilotAcpUsageAccumulator
         => current.HasValue ? Math.Max(0, current.Value - (previous ?? 0)) : 0;
 }
 
-/// <summary>Preserves token streaming while adding one Markdown paragraph break at a thought boundary.</summary>
-public sealed class CopilotAcpParagraphStream
+/// <summary>
+/// Accumulates one ACP text stream while preserving token chunks. ACP does not expose assistant
+/// message ids, so tool activity is the reliable boundary between Copilot progress thoughts.
+/// </summary>
+internal sealed class CopilotAcpTextBuffer
 {
-    private bool hasContent;
+    private readonly StringBuilder buffer = new();
     private bool paragraphPending;
 
-    public void MarkBoundary()
+
+    /// <summary>Starts the next non-empty chunk as a new Markdown paragraph.</summary>
+    public void MarkParagraphBoundary()
     {
-        if (hasContent)
-            paragraphPending = true;
+        if (buffer.Length > 0) paragraphPending = true;
     }
 
-    public string AppendChunk(string? text)
+    /// <summary>Appends a streamed token and returns the exact text added to the buffer.</summary>
+    public string Append(string? text)
     {
         var normalized = CopilotAcpProtocol.NormalizeText(text);
         if (normalized.Length == 0) return "";
 
-        var formatted = paragraphPending
-            ? "\n\n" + normalized.TrimStart('\r', '\n')
-            : normalized;
+        var prefix = paragraphPending ? MissingParagraphBreak(normalized) : "";
         paragraphPending = false;
-        hasContent = true;
-        return formatted;
+        var appended = prefix + normalized;
+        buffer.Append(appended);
+        return appended;
+    }
+
+    public override string ToString() => buffer.ToString();
+
+    private string MissingParagraphBreak(string next)
+    {
+        var present = CountTrailingLineBreaks(buffer) + CountLeadingLineBreaks(next);
+        return present >= 2 ? "" : new string('\n', 2 - present);
+    }
+
+    private static int CountTrailingLineBreaks(StringBuilder text)
+    {
+        var count = 0;
+        for (var index = text.Length - 1; index >= 0 && count < 2; index--)
+        {
+            if (text[index] == '\n')
+            {
+                if (index > 0 && text[index - 1] == '\r') index--;
+                count++;
+            }
+            else if (text[index] == '\r') count++;
+            else break;
+        }
+        return count;
+    }
+
+    private static int CountLeadingLineBreaks(string text)
+    {
+        var count = 0;
+        for (var index = 0; index < text.Length && count < 2; index++)
+        {
+            if (text[index] == '\r' && index + 1 < text.Length && text[index + 1] == '\n') index++;
+            else if (text[index] != '\n' && text[index] != '\r') break;
+            count++;
+        }
+        return count;
     }
 }
 
