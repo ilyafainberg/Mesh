@@ -8,6 +8,8 @@
 @inject NavigationManager Nav
 @implements IDisposable
 
+<MobileOverlayScope Active="@(createMenuOpen || moveMenuOpen)" />
+
 <div class="split">
     <div class="conv-list">
         <div class="new-conv create-topic-row">

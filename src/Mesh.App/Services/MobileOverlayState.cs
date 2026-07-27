@@ -1,34 +1,37 @@
 namespace Mesh.App.Services;
 
-/// <summary>Tracks modal surfaces that must own the full mobile viewport.</summary>
+/// <summary>
+/// Tracks modal surfaces rendered inside the mobile shell's native scrolling layer.
+/// The shell uses this state to give those surfaces the full safe-area viewport.
+/// </summary>
 public sealed class MobileOverlayState
 {
-    private int activeCount;
-
-    public bool IsOpen => Volatile.Read(ref activeCount) > 0;
+    readonly object gate = new();
+    readonly HashSet<object> owners = new(ReferenceEqualityComparer.Instance);
 
     public event Action? Changed;
 
-    public IDisposable Enter()
+    public bool IsOpen
     {
-        if (Interlocked.Increment(ref activeCount) == 1)
-            Changed?.Invoke();
-        return new Lease(this);
-    }
-
-    private void Exit()
-    {
-        if (Interlocked.Decrement(ref activeCount) == 0)
-            Changed?.Invoke();
-    }
-
-    private sealed class Lease(MobileOverlayState owner) : IDisposable
-    {
-        private MobileOverlayState? current = owner;
-
-        public void Dispose()
+        get
         {
-            Interlocked.Exchange(ref current, null)?.Exit();
+            lock (gate) return owners.Count > 0;
         }
+    }
+
+    public void SetActive(object owner, bool active)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+
+        bool openChanged;
+        lock (gate)
+        {
+            var wasOpen = owners.Count > 0;
+            if (active) owners.Add(owner);
+            else owners.Remove(owner);
+            openChanged = wasOpen != (owners.Count > 0);
+        }
+        if (openChanged) Changed?.Invoke();
+    }
     }
 }

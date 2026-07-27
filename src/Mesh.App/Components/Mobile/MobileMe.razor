@@ -13,6 +13,8 @@
 @inject NavigationManager Nav
 @implements IDisposable
 
+<MobileOverlayScope Active="@(newDeviceMenuOpen || moveMenuOpen || pendingMove is not null)" />
+
 @if (Active is null)
 {
     @* A) LIST screen: shown when no thread is selected, or the selected thread no longer exists. *@
@@ -30,7 +32,7 @@
                 <span class="new-chat-device">This device</span>
             </button>
             <button class="new-chat-menu-button" @onclick="OpenNewDeviceMenu" aria-label="Choose a device for new chat"
-                    aria-haspopup="menu" aria-expanded="@newDeviceMenuOpen">
+                    aria-haspopup="dialog" aria-expanded="@newDeviceMenuOpen">
                 <i class="bi bi-chevron-down"></i>
             </button>
         </div>
@@ -105,13 +107,13 @@
     {
         <MobileOverlayScope />
         <div class="sheet-scrim" @onclick="CloseDeviceMenus">
-            <div class="device-sheet" role="menu" aria-label="Choose a device" tabindex="-1" autofocus
+            <div class="device-sheet" role="dialog" aria-modal="true" aria-label="Choose a device" tabindex="-1" autofocus
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
                 <div class="sheet-handle"></div>
                 <h3>Start a new chat</h3>
                 @foreach (var device in DeviceChoices)
                 {
-                    <button class="device-choice" role="menuitem"
+                    <button class="device-choice"
                             disabled="@(!CanRunHere(device))"
                             @onclick="() => NewThread(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
@@ -498,14 +500,14 @@ else
     {
         <MobileOverlayScope />
         <div class="sheet-scrim" @onclick="CloseDeviceMenus">
-            <div class="device-sheet" role="menu" aria-label="Move topic to device" tabindex="-1" autofocus
+            <div class="device-sheet" role="dialog" aria-modal="true" aria-label="Move topic to device" tabindex="-1" autofocus
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
                 <div class="sheet-handle"></div>
                 <h3>Move topic</h3>
                 <p class="sheet-copy">The full topic history stays with this chat.</p>
                 @foreach (var device in DeviceChoices)
                 {
-                    <button class="device-choice" role="menuitem"
+                    <button class="device-choice"
                             disabled="@(!CanRunHere(device) || IsActiveDevice(device))"
                             @onclick="() => ChooseMoveTarget(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>

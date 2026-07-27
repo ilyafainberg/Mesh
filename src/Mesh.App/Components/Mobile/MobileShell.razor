@@ -7,10 +7,10 @@
 @inject ModelSetupService Setup
 @inject UpdateService Updater
 @inject MemoryService Memories
-@inject MobileOverlayState Overlays
+@inject MobileOverlayState MobileOverlays
 @implements IDisposable
 
-<div class="m-shell @ModeClass @(Overlays.IsOpen ? "overlay-open" : "")">
+<div class="m-shell @ModeClass @(MobileOverlays.IsOpen ? "mobile-overlay-open" : "")">
     <div class="m-body">
         @if (Setup.HasBanner)
         {
@@ -182,7 +182,7 @@
         Setup.Changed += Refresh;
         Updater.Changed += Refresh;
         Memories.Changed += Refresh;
-        Overlays.Changed += Refresh;
+        MobileOverlays.Changed += Refresh;
         Nav.LocationChanged += OnLocationChanged;
     }
 
@@ -210,8 +210,8 @@
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
         Updater.Changed -= Refresh;
-        Overlays.Changed -= Refresh;
         Memories.Changed -= Refresh;
+        MobileOverlays.Changed -= Refresh;
         Nav.LocationChanged -= OnLocationChanged;
     }
 }
