@@ -13,7 +13,7 @@ public sealed class DurableRelayDeliveryTests
         Assert.IsTrue(RelayInboxPolicy.UsesClientInitiatedDrain(supportsDurableDelivery: true));
         Assert.IsFalse(RelayInboxPolicy.UsesClientInitiatedDrain(supportsDurableDelivery: false));
         Assert.IsTrue(
-            RelayInboxPolicy.DeliveryWindow <= 16,
+            RelayInboxPolicy.DeliveryWindow <= 4,
             "The initial Cosmos lease batch must stay below transport timeout budgets.");
     }
 

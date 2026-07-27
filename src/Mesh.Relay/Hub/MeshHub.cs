@@ -111,32 +111,52 @@ public sealed class MeshHub(
 
     public async Task<bool> AcknowledgeDelivery(string deliveryId, bool deviceScoped)
     {
-        var state = registry.Get(Context.ConnectionId);
-        if (state is not { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null }
+        var connection = registry.Get(Context.ConnectionId);
+        if (connection is not { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null }
             || string.IsNullOrWhiteSpace(deliveryId))
             return false;
-        var inboxKey = deviceScoped
-            ? MeshRouter.DeviceInboxKey(state.Handle, state.DeviceId)
-            : state.Handle;
-        var acknowledged = await store.AcknowledgeInboxAsync(
-            inboxKey, deliveryId, Context.ConnectionAborted);
-        if (acknowledged is not null)
+
+        await connection.DeliveryGate.WaitAsync(Context.ConnectionAborted);
+        try
         {
-            metrics.DeliveryAcknowledged(DateTimeOffset.UtcNow - acknowledged.QueuedAt);
-            await DeliverDurableInboxAsync(inboxKey, deviceScoped);
+            if (!ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return false;
+            var inboxKey = deviceScoped
+                ? MeshRouter.DeviceInboxKey(connection.Handle, connection.DeviceId)
+                : connection.Handle;
+            var acknowledged = await store.AcknowledgeInboxAsync(
+                inboxKey, deliveryId, Context.ConnectionAborted);
+            if (acknowledged is not null)
+            {
+                metrics.DeliveryAcknowledged(DateTimeOffset.UtcNow - acknowledged.QueuedAt);
+                await DeliverDurableInboxCoreAsync(connection, inboxKey, deviceScoped);
+            }
+            return acknowledged is not null;
         }
-        return acknowledged is not null;
+        finally
+        {
+            connection.DeliveryGate.Release();
+        }
     }
 
     public async Task<int> RequestPendingDeliveries()
     {
-        var state = registry.Get(Context.ConnectionId);
-        if (state is not { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null })
+        var connection = registry.Get(Context.ConnectionId);
+        if (connection is not { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null })
             return 0;
-        var deviceItems = await DeliverDurableInboxAsync(
-            MeshRouter.DeviceInboxKey(state.Handle, state.DeviceId), deviceScoped: true);
-        var handleItems = await DeliverDurableInboxAsync(state.Handle, deviceScoped: false);
-        return deviceItems + handleItems;
+
+        await connection.DeliveryGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            if (!ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return 0;
+            var deviceItems = await DeliverDurableInboxCoreAsync(
+                connection, MeshRouter.DeviceInboxKey(connection.Handle, connection.DeviceId), deviceScoped: true);
+            var handleItems = await DeliverDurableInboxCoreAsync(connection, connection.Handle, deviceScoped: false);
+            return deviceItems + handleItems;
+        }
+        finally
+        {
+            connection.DeliveryGate.Release();
+        }
     }
 
     public async Task<bool> CancelQueuedEnvelope(CancelQueuedEnvelopeRequest request)
@@ -161,59 +181,50 @@ public sealed class MeshHub(
         return cancelled;
     }
 
-    private async Task<int> DeliverDurableInboxAsync(
+    private async Task<int> DeliverDurableInboxCoreAsync(
+        ConnectionRegistry.ConnState connection,
         string inboxKey,
         bool deviceScoped,
         int maxItems = RelayInboxPolicy.DeliveryWindow)
     {
-        var connection = registry.Get(Context.ConnectionId);
-        if (connection is not { Authenticated: true, SupportsDurableDelivery: true }) return 0;
-        await connection.DeliveryGate.WaitAsync(Context.ConnectionAborted);
-        try
+        if (!ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return 0;
+        var pending = await store.LeaseInboxAsync(
+            inboxKey,
+            Context.ConnectionId,
+            Math.Clamp(maxItems, 1, RelayInboxPolicy.DeliveryWindow),
+            ct: Context.ConnectionAborted);
+        var delivered = 0;
+        foreach (var item in pending)
         {
-            if (!ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return 0;
-            var pending = await store.LeaseInboxAsync(
-                inboxKey,
-                Context.ConnectionId,
-                Math.Clamp(maxItems, 1, RelayInboxPolicy.DeliveryWindow),
-                ct: Context.ConnectionAborted);
-            var delivered = 0;
-            foreach (var item in pending)
+            MeshEnvelope? envelope;
+            try
             {
-                MeshEnvelope? envelope;
-                try
-                {
-                    envelope = JsonSerializer.Deserialize<MeshEnvelope>(item.Json, Json);
-                }
-                catch (JsonException)
-                {
-                    await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
-                    continue;
-                }
-                if (envelope is null)
-                {
-                    await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
-                    continue;
-                }
-                if (connection.IsBackgroundSync
-                    && BackgroundSyncProtocol.RequiresForeground(envelope.Kind))
-                {
-                    await store.ReleaseInboxLeaseAsync(
-                        inboxKey, item.Id, Context.ConnectionId, Context.ConnectionAborted);
-                    continue;
-                }
-                if (item.DeliveryAttempts > 1) metrics.DeliveryRedelivered();
-                var deliveryJson = JsonSerializer.Serialize(
-                    envelope with { RelayDeliveryId = item.Id, RelayDeviceScoped = deviceScoped }, Json);
-                await Clients.Caller.SendAsync(MeshHubProtocol.Receive, deliveryJson);
-                delivered++;
+                envelope = JsonSerializer.Deserialize<MeshEnvelope>(item.Json, Json);
             }
-            return delivered;
+            catch (JsonException)
+            {
+                await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
+                continue;
+            }
+            if (envelope is null)
+            {
+                await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
+                continue;
+            }
+            if (connection.IsBackgroundSync
+                && BackgroundSyncProtocol.RequiresForeground(envelope.Kind))
+            {
+                await store.ReleaseInboxLeaseAsync(
+                    inboxKey, item.Id, Context.ConnectionId, Context.ConnectionAborted);
+                continue;
+            }
+            if (item.DeliveryAttempts > 1) metrics.DeliveryRedelivered();
+            var deliveryJson = JsonSerializer.Serialize(
+                envelope with { RelayDeliveryId = item.Id, RelayDeviceScoped = deviceScoped }, Json);
+            await Clients.Caller.SendAsync(MeshHubProtocol.Receive, deliveryJson);
+            delivered++;
         }
-        finally
-        {
-            connection.DeliveryGate.Release();
-        }
+        return delivered;
     }
     /// <summary>Receives an envelope from an authenticated connection and routes it.</summary>
     public async Task<MeshSendResult> SendEnvelope(MeshEnvelope env)
@@ -462,6 +473,30 @@ public sealed class MeshHub(
         }
     }
 
+    private async Task ReleaseDeliveryLeasesAfterDisconnectAsync(ConnectionRegistry.ConnState connection)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await store.ReleaseInboxLeasesAsync(
+                MeshRouter.DeviceInboxKey(connection.Handle!, connection.DeviceId!),
+                Context.ConnectionId,
+                timeout.Token);
+            await store.ReleaseInboxLeasesAsync(
+                connection.Handle!,
+                Context.ConnectionId,
+                timeout.Token);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            logger.LogWarning("Timed out releasing inbox leases after disconnect: {Handle}", connection.Handle);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not release inbox leases after disconnect: {Handle}", connection.Handle);
+        }
+    }
+
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
         // Only count a close for a connection we counted on open (present in the registry).
@@ -469,11 +504,7 @@ public sealed class MeshHub(
         var counted = connection is not null;
         var handle = registry.Remove(Context.ConnectionId);
         if (connection is { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null })
-        {
-            await store.ReleaseInboxLeasesAsync(
-                MeshRouter.DeviceInboxKey(connection.Handle, connection.DeviceId), Context.ConnectionId);
-            await store.ReleaseInboxLeasesAsync(connection.Handle, Context.ConnectionId);
-        }
+            await ReleaseDeliveryLeasesAfterDisconnectAsync(connection);
         if (counted)
         {
             metrics.ConnectionClosed();
