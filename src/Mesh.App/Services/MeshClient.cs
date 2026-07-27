@@ -348,7 +348,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport
             wantConnected = true;
             await DetectRelayCapabilitiesAsync(p.RelayUrl);
 
-            var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}&deliveryAck=1";
+            var deliveryQuery = supportsDurableDelivery ? "&deliveryAck=1" : "";
+            var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}{deliveryQuery}";
             var connection = new HubConnectionBuilder()
                 .WithUrl(url)
                 .WithAutomaticReconnect(new ForeverRetry())
@@ -360,7 +361,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport
                 try
                 {
                     var sig = IdentityService.Sign(state.Profile.PrivateKey, nonce);
-                    await connection.InvokeAsync(MeshHubProtocol.Authenticate, state.Profile.PublicKey, sig);
+                    await connection.SendAsync(MeshHubProtocol.Authenticate, state.Profile.PublicKey, sig);
                 }
                 catch (Exception ex) { Log?.Invoke($"auth failed: {ex.Message}"); }
             });

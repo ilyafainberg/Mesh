@@ -8,6 +8,16 @@ namespace Mesh.App.Tests;
 public sealed class DurableRelayDeliveryTests
 {
     [TestMethod]
+    public void DurableHandshake_UsesPostReadyBoundedDrain()
+    {
+        Assert.IsTrue(RelayInboxPolicy.UsesClientInitiatedDrain(supportsDurableDelivery: true));
+        Assert.IsFalse(RelayInboxPolicy.UsesClientInitiatedDrain(supportsDurableDelivery: false));
+        Assert.IsTrue(
+            RelayInboxPolicy.DeliveryWindow <= 16,
+            "The initial Cosmos lease batch must stay below transport timeout budgets.");
+    }
+
+    [TestMethod]
     public async Task InboxLease_RedeliversUntilRecipientAcknowledges()
     {
         var store = new InMemoryRelayStore();
