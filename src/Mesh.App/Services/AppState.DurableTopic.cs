@@ -120,6 +120,29 @@ public sealed partial class AppState
             activeDb.PruneInboundTopicRuns(DateTimeOffset.UtcNow - TopicTransportPolicy.DedupRetention);
             foreach (var item in activeDb.ListTopicOutbox())
             {
+                var thread = Profile.OwnThreads.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Id, item.ThreadId, StringComparison.Ordinal));
+                if (thread is not null
+                    && RemoteRunReconciliation.HasCommittedAnswer(
+                        thread.Lines, item.TriggerLineId))
+                {
+                    activeDb.DeleteTopicOutbox(item.RunId);
+                    terminalRemoteRuns.Add(item.ThreadId + "\0" + item.RunId);
+                    remoteDeltaSeq.Remove(item.ThreadId + "\0" + item.RunId);
+                    if (string.Equals(
+                            thread.ExecutionRunId, item.RunId, StringComparison.Ordinal))
+                    {
+                        activeDb.SetOwnThreadExecution(
+                            thread.Id,
+                            thread.ExecutionDeviceId,
+                            thread.ExecutionAt,
+                            null,
+                            thread.ExecutionDeviceName,
+                            thread.ExecutionDevicePlatform);
+                        thread.ExecutionRunId = null;
+                    }
+                    continue;
+                }
                 var stage = item.State switch
                 {
                     TopicOutboxStates.RelayQueued => TopicQueueStage.Relay,

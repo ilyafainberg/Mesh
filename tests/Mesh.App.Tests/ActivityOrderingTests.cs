@@ -373,6 +373,59 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void RemoteRunReconciliation_ExactQueuedReplyFinalizesWithoutLiveProjection()
+    {
+        var at = new DateTimeOffset(2026, 7, 27, 19, 0, 0, TimeSpan.Zero);
+        var queued = new QueuedTopicRunInfo(
+            "topic", "queued-run", "prompt-line", TopicQueueStage.Device, Waiting: true);
+
+        Assert.AreEqual(
+            "queued-run",
+            RemoteRunReconciliation.RunIdForAnswer(
+                "topic", "prompt-line", queued, null, at));
+        Assert.AreEqual(
+            "queued-run",
+            RemoteRunReconciliation.RunIdForAnswer(
+                "topic",
+                "prompt-line",
+                queued,
+                Projection("newer-run", "topic", at.AddMinutes(1)),
+                at));
+        Assert.IsNull(RemoteRunReconciliation.RunIdForAnswer(
+            "topic", "other-line", queued, null, at));
+        Assert.IsNull(RemoteRunReconciliation.RunIdForAnswer(
+            "other-topic", "prompt-line", queued, null, at));
+    }
+
+    [TestMethod]
+    public void RemoteRunReconciliation_CommittedAnswerRequiresExactPublicReply()
+    {
+        var lines = new[]
+        {
+            new ChatLine
+            {
+                Id = "internal",
+                Role = "assistant",
+                Internal = true,
+                ReplyToLineId = "prompt-line"
+            },
+            new ChatLine
+            {
+                Id = "other",
+                Role = "assistant",
+                ReplyToLineId = "other-line"
+            }
+        };
+
+        Assert.IsFalse(RemoteRunReconciliation.HasCommittedAnswer(lines, "prompt-line"));
+
+        lines[1].ReplyToLineId = "prompt-line";
+
+        Assert.IsTrue(RemoteRunReconciliation.HasCommittedAnswer(lines, "prompt-line"));
+        Assert.IsFalse(RemoteRunReconciliation.HasCommittedAnswer(lines, "missing-line"));
+    }
+
+    [TestMethod]
     public void ClockBehindMetadataMutations_KeepFutureActivity()
     {
         var future = DateTimeOffset.UtcNow.AddDays(2);
