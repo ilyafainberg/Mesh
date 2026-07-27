@@ -1677,7 +1677,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport
         }
     }
 
-    private async Task HandleInboundDeviceSyncAsync(
+    private Task HandleInboundDeviceSyncAsync(
         MeshEnvelope env, string from, CancellationToken ct)
     {
         var currentHandle = AppState.Norm(state.Profile.Handle);
@@ -1687,18 +1687,18 @@ public sealed partial class MeshClient : IDeviceTopicTransport
             || string.IsNullOrWhiteSpace(env.FromDevice)
             || string.Equals(env.FromDevice, myDeviceId, StringComparison.Ordinal)
             || !string.Equals(env.ToDevice, myDeviceId, StringComparison.Ordinal))
-            return;
+            return Task.CompletedTask;
         if (!MessageCrypto.IsEncrypted(env.Body))
         {
             Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: body was not encrypted");
-            return;
+            return Task.CompletedTask;
         }
         var (decrypted, plaintext) = MessageCrypto.TryDecrypt(
             env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
         if (!decrypted || plaintext is null)
         {
             Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: body could not be decrypted");
-            return;
+            return Task.CompletedTask;
         }
 
         try
@@ -1711,7 +1711,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport
                 if (batch.IsSnapshot)
                     deviceSyncActivity.ObserveSnapshotActivity();
                 _ = state.ApplyDeviceSyncBatch(batch);
-                return;
+                return Task.CompletedTask;
             }
 
             var request = JsonSerializer.Deserialize<DeviceSyncSnapshotRequest>(plaintext, Json)
@@ -1721,7 +1721,9 @@ public sealed partial class MeshClient : IDeviceTopicTransport
                 throw new JsonException("Snapshot requester did not match the sending device.");
             var identity = authenticatedDeviceSyncIdentity;
             if (identity is not null)
-                await RespondToDeviceSyncSnapshotRequestAsync(identity, env.FromDevice, ct);
+                TrackBackground(Task.Run(
+                        () => RespondToDeviceSyncSnapshotRequestAsync(identity, env.FromDevice, ct),
+                        CancellationToken.None), $"device sync snapshot response {request.RequestId}");
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -1731,6 +1733,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport
         {
             Log?.Invoke($"dropped {env.Kind} from device {env.FromDevice}: invalid payload ({ex.Message})");
         }
+        return Task.CompletedTask;
     }
 
     private async Task RespondToDeviceSyncSnapshotRequestAsync(

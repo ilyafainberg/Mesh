@@ -97,6 +97,10 @@ public static class RelayInboxPolicy
     public static bool UsesClientInitiatedDrain(bool supportsDurableDelivery)
         => supportsDurableDelivery;
 
+    public static bool ShouldDiscardAfterFailedDelivery(string kind, int deliveryAttempts)
+        => deliveryAttempts > 1
+           && string.Equals(kind, DeviceSyncKinds.EnvelopeSnapshotRequest, StringComparison.Ordinal);
+
     public static bool NeverExpires(string inboxKey)
     {
         var separator = inboxKey.IndexOf('\u001f');
