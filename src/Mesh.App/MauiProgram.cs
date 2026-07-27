@@ -85,6 +85,7 @@ public static class MauiProgram
 		builder.Services.AddSingleton<IPushService, NoopPushService>();
 #endif
 		builder.Services.AddSingleton<AppState>();
+		builder.Services.AddSingleton<MobileOverlayState>();
 		builder.Services.AddSingleton<IMemoryState>(services => services.GetRequiredService<AppState>());
 		builder.Services.AddSingleton<TokenMeter>();
 		builder.Services.AddSingleton<BrowserModelService>();

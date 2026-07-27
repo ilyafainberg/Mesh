@@ -37,6 +37,9 @@ internal sealed class CopilotAcpLane(
         public CopilotAcpUsageAccumulator Usage { get; } = new();
         private readonly Dictionary<string, StringBuilder> messages = new(StringComparer.Ordinal);
         private readonly List<string> messageOrder = new();
+        private readonly HashSet<string> paragraphBoundaryToolCallIds = new(StringComparer.Ordinal);
+        private readonly CopilotAcpParagraphStream answerParagraphs = new();
+        private readonly CopilotAcpParagraphStream thoughtParagraphs = new();
 
         public string? AppendAnswer(string? messageId, string? text)
         {
@@ -44,7 +47,8 @@ internal sealed class CopilotAcpLane(
             if (text.StartsWith("Info: Disabled tools:", StringComparison.Ordinal)
                 || text.StartsWith("Info: Unknown tool name in the tool allowlist:", StringComparison.Ordinal))
                 return null;
-            text = CopilotAcpProtocol.NormalizeText(text);
+            text = answerParagraphs.AppendChunk(text);
+            if (text.Length == 0) return null;
             Answer.Append(text);
             if (string.IsNullOrWhiteSpace(messageId)) return text;
             if (!messages.TryGetValue(messageId, out var message))
@@ -55,6 +59,21 @@ internal sealed class CopilotAcpLane(
             }
             message.Append(text);
             return text;
+        }
+
+        public string? AppendThought(string? text)
+        {
+            var appended = thoughtParagraphs.AppendChunk(text);
+            if (appended.Length == 0) return null;
+            Thought.Append(appended);
+            return appended;
+        }
+
+        public void MarkProgressBoundary(string toolCallId)
+        {
+            if (!paragraphBoundaryToolCallIds.Add(toolCallId)) return;
+            answerParagraphs.MarkBoundary();
+            thoughtParagraphs.MarkBoundary();
         }
 
         public string FinalAnswer()
@@ -518,8 +537,7 @@ internal sealed class CopilotAcpLane(
                 }
                 else
                 {
-                    var thought = CopilotAcpProtocol.FormatThoughtChunk(text.GetString());
-                    turn.Thought.Append(thought);
+                    var thought = turn.AppendThought(text.GetString());
                     if (!string.IsNullOrEmpty(thought))
                         turn.Delta?.Report(new AgentDelta(AgentDeltaKind.Reasoning, thought));
                 }
@@ -530,6 +548,7 @@ internal sealed class CopilotAcpLane(
         if (!update.TryGetProperty("toolCallId", out var toolCallIdValue)
             || toolCallIdValue.GetString() is not { } toolCallId)
             return;
+        turn.MarkProgressBoundary(toolCallId);
 
         var titleText = update.TryGetProperty("title", out var titleCandidate)
             ? titleCandidate.GetString()

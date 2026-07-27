@@ -24,6 +24,7 @@
                 </button>
                 @if (createMenuOpen)
                 {
+                    <MobileOverlayScope />
                     <button class="menu-scrim" tabindex="-1" aria-hidden="true" @onclick="CloseCreateMenu"></button>
                     <div id="new-chat-device-menu" class="device-menu" role="menu" aria-label="Choose device for new chat" @onkeydown="OnCreateMenuKey">
                         <div class="device-menu-title">Start a topic</div>
@@ -177,6 +178,7 @@
                                 @ref="moveMenuButton" @onclick="ToggleMoveMenu"><i class="bi bi-device-ssd"></i> Move topic to...</button>
                         @if (moveMenuOpen)
                         {
+                            <MobileOverlayScope />
                             <button class="menu-scrim" tabindex="-1" aria-hidden="true" @onclick="CloseMoveMenu"></button>
                             <div id="move-topic-device-menu" class="device-menu header-device-menu" role="menu" aria-label="Move topic to" @onkeydown="OnMoveMenuKey">
                                 <div class="device-menu-title">Move topic to...</div>
@@ -258,9 +260,11 @@
                 }
                 @if (Active is not null)
                 {
-                    @foreach (var line in renderedLines.Where(line => !IsQueued(line)))
+                    @foreach (var line in renderedLines)
                     {
-                        <div class="bubble @(line.Role)" @key="line.Id">
+                        var queued = IsQueued(line);
+                        var bubbleClass = $"bubble {TopicTranscriptPresentation.BubbleRole(line.Role)}{(queued ? " topic-queued-line" : "")}";
+                        <div class="@bubbleClass" @key="line.Id">
                             <ModelAttribution ModelId="@line.ModelId" />
                             @if (!string.IsNullOrEmpty(line.Reasoning))
                             {
@@ -276,12 +280,24 @@
                             }
                             <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                             OnPin="html => PinWidget(html, line)" />
+                            @if (queued)
+                            {
+                                <div class="msg-tag queue-tag">
+                                    <i class="bi @QueueIcon(line)"></i>
+                                    <span>@QueueLabel(line)</span>
+                                    <button type="button" class="queue-cancel" title="Cancel queued turn"
+                                            aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
+                                            @onclick:stopPropagation="true">
+                                        <i class="bi bi-x-lg"></i>
+                                    </button>
+                                </div>
+                            }
                         </div>
                     }
                 }
                 @if (ActiveBusy)
                 {
-                    <div class="bubble assistant">
+                    <div class="bubble assistant topic-live-run" @key="Active">
                         @{
                             var remote = Active is null ? null : RemoteRunPresentation.VisibleProjection(
                                 State.GetRemoteRunProjection(Active.Id),
@@ -414,22 +430,6 @@
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
-                    </div>
-                }
-                @foreach (var line in renderedLines.Where(IsQueued))
-                {
-                    <div class="bubble @(line.Role)" @key="line.Id">
-                        <MessageContent Text="@line.Text" Attachments="@line.Attachments"
-                                        OnPin="html => PinWidget(html, line)" />
-                        <div class="msg-tag queue-tag">
-                            <i class="bi @QueueIcon(line)"></i>
-                            <span>@QueueLabel(line)</span>
-                            <button type="button" class="queue-cancel" title="Cancel queued turn"
-                                    aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
-                                    @onclick:stopPropagation="true">
-                                <i class="bi bi-x-lg"></i>
-                            </button>
-                        </div>
                     </div>
                 }
                 </div>
@@ -1238,6 +1238,9 @@
             chosenWidget?.Id,
             widgetContext,
             turnAttachments);
+
+        // Let the persisted prompt paint before dispatch can reclassify it as queued.
+        await Task.Yield();
         try
         {
             var result = await TopicRouter.SubmitAsync(draft, null, CancellationToken.None);

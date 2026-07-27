@@ -114,16 +114,22 @@ public class CopilotAcpProtocolTests
     }
 
     [TestMethod]
-    public void FormatThoughtChunk_PrependsParagraphBreakToEveryUpdate()
+    public void ParagraphStream_SeparatesToolDelimitedThoughtsWithoutSplittingTokens()
     {
-        Assert.AreEqual("", CopilotAcpProtocol.FormatThoughtChunk(null));
-        Assert.AreEqual("", CopilotAcpProtocol.FormatThoughtChunk(""));
+        var stream = new CopilotAcpParagraphStream();
+        var first = string.Concat(
+            stream.AppendChunk("First "),
+            stream.AppendChunk("thought"));
 
-        var streamed = string.Concat(
-            CopilotAcpProtocol.FormatThoughtChunk("First thought"),
-            CopilotAcpProtocol.FormatThoughtChunk("Second thought"));
+        stream.MarkBoundary();
+        stream.MarkBoundary();
+        Assert.AreEqual("", stream.AppendChunk(null));
+        var second = string.Concat(
+            stream.AppendChunk("\nSecond "),
+            stream.AppendChunk("thought"));
 
-        Assert.AreEqual("\n\nFirst thought\n\nSecond thought", streamed);
+        Assert.AreEqual("First thought", first);
+        Assert.AreEqual("\n\nSecond thought", second);
     }
 
     [TestMethod]

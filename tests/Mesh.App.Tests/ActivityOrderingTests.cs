@@ -320,6 +320,16 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void TopicTranscriptPresentation_AlwaysUsesStyledBubbleRoles()
+    {
+        Assert.AreEqual("user", TopicTranscriptPresentation.BubbleRole("user"));
+        Assert.AreEqual("user", TopicTranscriptPresentation.BubbleRole("USER"));
+        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole("assistant"));
+        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole("system"));
+        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole(null));
+    }
+
+    [TestMethod]
     public void TopicTranscriptOrdering_PreservesLegacyAndOrphanReplies()
     {
         var lines = new[]
