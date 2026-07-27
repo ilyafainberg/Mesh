@@ -546,7 +546,7 @@ The relay exposes plain HTTP endpoints for status and observability.
 - deliveries redelivered
 - queued envelopes cancelled
 
-Normal and fan-out hub sends return explicit accepted or rejected results. Ordinary envelopes are enqueued before live delivery. Protocol-5 clients acknowledge after processing; until then, the inbox item remains leased and can be redelivered after a disconnect or dropped acknowledgement. An accepted fan-out still has no atomic simultaneous physical-delivery guarantee.
+Normal and fan-out hub sends return explicit accepted or rejected results. Ordinary envelopes are enqueued before live delivery. Protocol-5 authentication returns before Cosmos inbox leasing; the client requests a bounded batch after `Ready` and acknowledges each item after processing. Until then, the inbox item remains leased and can be redelivered after a disconnect or dropped acknowledgement. An accepted fan-out still has no atomic simultaneous physical-delivery guarantee.
 
 Atomic agent sends are different: `agent_dispatch_accepted` means the request reached
 its assigned device fence, while `agent_dispatch_queued` means the relay accepted

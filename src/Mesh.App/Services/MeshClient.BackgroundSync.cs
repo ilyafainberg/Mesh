@@ -103,7 +103,7 @@ public sealed partial class MeshClient
             try
             {
                 var signature = IdentityService.Sign(profile.PrivateKey, nonce);
-                await connection.InvokeAsync(
+                await connection.SendAsync(
                     MeshHubProtocol.Authenticate, profile.PublicKey, signature, ct).ConfigureAwait(false);
             }
             catch (Exception ex)

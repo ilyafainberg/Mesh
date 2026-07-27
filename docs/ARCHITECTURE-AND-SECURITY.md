@@ -454,7 +454,7 @@ For cross-replica delivery, protocol-4 relay instances advertise acknowledged si
 ### 5.5 Durable Inbox, Acknowledgement, and TTL
 
 - Ordinary envelopes are **idempotently enqueued before live delivery**. The delivery ID is derived from the normalized sender handle and stable envelope ID, so an exact retry does not create another inbox item.
-- Protocol-5 clients connect with `deliveryAck=1`. On authentication, the relay leases queued items instead of deleting them, adds `RelayDeliveryId` metadata, and waits for `AcknowledgeDelivery` after the client has verified, decrypted, and persisted the inbound work.
+- Protocol-5 clients connect with `deliveryAck=1`. Authentication completes before inbox work begins; after handling `Ready`, the client requests a bounded batch. The relay leases queued items instead of deleting them, adds `RelayDeliveryId` metadata, and waits for `AcknowledgeDelivery` after the client has verified, decrypted, and persisted the inbound work.
 - A dropped acknowledgement leaves the item queued. Its lease is released on disconnect or expires, so the next authenticated connection receives it again. Clients therefore process durable envelopes at least once and must deduplicate stable IDs.
 - `ToDevice` envelopes use a device-specific inbox and cannot be consumed by an online sibling. A sender can call `CancelQueuedEnvelope` with the stable envelope ID and target device to remove work that has not completed delivery; an encrypted cancellation envelope covers live-delivery races.
 - Older clients keep the legacy destructive drain path. A confirmed live handoff to a legacy client removes the enqueue-first copy for compatibility.

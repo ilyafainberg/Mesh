@@ -87,24 +87,26 @@ public sealed class MeshHub(
             await backplane.SetDevicePresenceAsync(state.Handle, deviceId);
         }
         await Clients.Caller.SendAsync(MeshHubProtocol.Ready);
+        logger.LogInformation(
+            "hub authenticated: {Handle}; device={DeviceId}; background={Background}; durable={Durable}",
+            state.Handle,
+            deviceId,
+            state.IsBackgroundSync,
+            state.SupportsDurableDelivery);
         if (!state.IsBackgroundSync)
-            await agentDispatch.DispatchAvailableAsync(state.Handle, Context.ConnectionAborted);
+            _ = DispatchAvailableAfterAuthenticationAsync(state.Handle);
 
         // Device-targeted fan-out must drain only on the intended device. Legacy handle-wide
         // messages are delivered afterward for backward compatibility.
-        if (state.SupportsDurableDelivery)
-        {
-            await DeliverDurableInboxAsync(
-                MeshRouter.DeviceInboxKey(state.Handle, deviceId), deviceScoped: true);
-            await DeliverDurableInboxAsync(state.Handle, deviceScoped: false);
-        }
-        else
-        {
-            foreach (var pending in await store.DrainInboxAsync(MeshRouter.DeviceInboxKey(state.Handle, deviceId)))
-                await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
-            foreach (var pending in await store.DrainInboxAsync(state.Handle))
-                await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
-        }
+        // Acknowledged clients request their first bounded batch after handling Ready. Leasing a
+        // large Cosmos backlog here keeps Authenticate open and can strand the client in a retry loop.
+        if (RelayInboxPolicy.UsesClientInitiatedDrain(state.SupportsDurableDelivery))
+            return;
+
+        foreach (var pending in await store.DrainInboxAsync(MeshRouter.DeviceInboxKey(state.Handle, deviceId)))
+            await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
+        foreach (var pending in await store.DrainInboxAsync(state.Handle))
+            await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
     }
 
     public async Task<bool> AcknowledgeDelivery(string deliveryId, bool deviceScoped)
@@ -446,6 +448,18 @@ public sealed class MeshHub(
         metrics.QueueEnqueued(routes.Count(route => route.NewlyQueued));
         metrics.MessageRouted(targets.Count);
         return MeshSendResult.Ok(recipients.Count);
+    }
+
+    private async Task DispatchAvailableAfterAuthenticationAsync(string handle)
+    {
+        try
+        {
+            await agentDispatch.DispatchAvailableAsync(handle);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Agent dispatch after authentication failed: {Handle}", handle);
+        }
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
