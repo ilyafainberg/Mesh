@@ -29,6 +29,7 @@ public sealed class ConnectionRegistry
         public string Nonce { get; set; } = "";
         public bool Authenticated { get; set; }
         public bool SupportsDurableDelivery { get; init; }
+        public bool IsBackgroundSync { get; init; }
         public SemaphoreSlim DeliveryGate { get; } = new(1, 1);
     }
 
@@ -37,12 +38,15 @@ public sealed class ConnectionRegistry
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Registers a freshly connected (not yet authenticated) connection with its nonce.</summary>
-    public void Add(string connectionId, string handle, string nonce, bool supportsDurableDelivery = false)
+    public void Add(
+        string connectionId, string handle, string nonce,
+        bool supportsDurableDelivery = false, bool isBackgroundSync = false)
         => byConnection[connectionId] = new ConnState
         {
             Handle = handle,
             Nonce = nonce,
-            SupportsDurableDelivery = supportsDurableDelivery
+            SupportsDurableDelivery = supportsDurableDelivery,
+            IsBackgroundSync = isBackgroundSync
         };
 
     public ConnState? Get(string connectionId)
@@ -60,7 +64,7 @@ public sealed class ConnectionRegistry
 
     /// <summary>
     /// Removes a connection on disconnect. Returns the handle to clear from presence only when
-    /// this was its last local connection (so another device on this node keeps it present).
+    /// this was its last foreground connection (so background drains never hold presence open).
     /// </summary>
     public string? Remove(string connectionId)
     {
@@ -70,22 +74,35 @@ public sealed class ConnectionRegistry
             set.TryRemove(connectionId, out _);
             if (set.IsEmpty) byHandle.TryRemove(s.Handle, out _);
         }
-        return s.Authenticated && !HandleHasLocalConnections(s.Handle) ? s.Handle : null;
+        return s.Authenticated
+            && !s.IsBackgroundSync
+            && !HandleHasLocalConnections(s.Handle, includeBackgroundSync: false)
+                ? s.Handle
+                : null;
     }
 
     /// <summary>All local connection ids currently authenticated for a handle.</summary>
-    public IReadOnlyCollection<string> ConnectionsFor(string handle)
-        => byHandle.TryGetValue(handle, out var set) ? set.Keys.ToArray() : Array.Empty<string>();
+    public IReadOnlyCollection<string> ConnectionsFor(string handle, bool includeBackgroundSync = true)
+    {
+        if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
+        return set.Keys
+            .Where(id => includeBackgroundSync
+                || byConnection.TryGetValue(id, out var state) && !state.IsBackgroundSync)
+            .ToArray();
+    }
 
     /// <summary>
     /// The local connection ids for a handle whose authenticated device id matches
     /// <paramref name="deviceId"/>. Used to route an envelope to ONE specific device of a handle.
     /// </summary>
-    public IReadOnlyCollection<string> ConnectionsForDevice(string handle, string deviceId)
+    public IReadOnlyCollection<string> ConnectionsForDevice(
+        string handle, string deviceId, bool includeBackgroundSync = true)
     {
         if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
         return set.Keys
-            .Where(c => byConnection.TryGetValue(c, out var s) && s.DeviceId == deviceId)
+            .Where(c => byConnection.TryGetValue(c, out var s)
+                && s.DeviceId == deviceId
+                && (includeBackgroundSync || !s.IsBackgroundSync))
             .ToArray();
     }
 
@@ -107,16 +124,34 @@ public sealed class ConnectionRegistry
     }
 
     /// <summary>Every handle with at least one authenticated connection on this instance.</summary>
-    public IReadOnlyCollection<string> LocalHandles() => byHandle.Keys.ToArray();
+    public IReadOnlyCollection<string> LocalHandles(bool includeBackgroundSync = true)
+    {
+        if (includeBackgroundSync) return byHandle.Keys.ToArray();
+        return byHandle
+            .Where(pair => pair.Value.Keys.Any(id =>
+                byConnection.TryGetValue(id, out var state) && !state.IsBackgroundSync))
+            .Select(pair => pair.Key)
+            .ToArray();
+    }
 
     /// <summary>Every distinct authenticated (handle, device) pair connected to this instance.</summary>
-    public IReadOnlyCollection<(string Handle, string DeviceId)> LocalDevices()
+    public IReadOnlyCollection<(string Handle, string DeviceId)> LocalDevices(
+        bool includeBackgroundSync = true)
         => byConnection.Values
-            .Where(s => s.Authenticated && s.Handle is not null && s.DeviceId is not null)
+            .Where(s => s.Authenticated
+                && s.Handle is not null
+                && s.DeviceId is not null
+                && (includeBackgroundSync || !s.IsBackgroundSync))
             .Select(s => (s.Handle!, s.DeviceId!))
             .Distinct()
             .ToArray();
 
-    private bool HandleHasLocalConnections(string handle)
-        => byHandle.TryGetValue(handle, out var set) && !set.IsEmpty;
+    private bool HandleHasLocalConnections(string handle, bool includeBackgroundSync = true)
+    {
+        if (!byHandle.TryGetValue(handle, out var set)) return false;
+        return includeBackgroundSync
+            ? !set.IsEmpty
+            : set.Keys.Any(id =>
+                byConnection.TryGetValue(id, out var state) && !state.IsBackgroundSync);
+    }
 }

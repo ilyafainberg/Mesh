@@ -3,10 +3,9 @@ using Mesh.Relay.Backplane;
 namespace Mesh.Relay.Hub;
 
 /// <summary>
-/// Periodically re-asserts backplane presence for every handle connected to this instance, so
-/// the presence TTL never lapses for an idle but still-connected client. Without this, an idle
-/// connection's presence key would expire and its messages would wrongly fall through to the
-/// offline inbox.
+/// Periodically re-asserts backplane presence for every foreground handle connected to this
+/// instance, so an idle foreground client's messages do not wrongly fall through to the inbox.
+/// Short-lived background drains are deliberately excluded from ordinary online presence.
 /// </summary>
 public sealed class PresenceRenewer(ConnectionRegistry registry, IBackplane backplane) : BackgroundService
 {
@@ -17,9 +16,9 @@ public sealed class PresenceRenewer(ConnectionRegistry registry, IBackplane back
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken);
-                foreach (var handle in registry.LocalHandles())
+                foreach (var handle in registry.LocalHandles(includeBackgroundSync: false))
                     await backplane.SetPresenceAsync(handle, stoppingToken);
-                foreach (var (handle, deviceId) in registry.LocalDevices())
+                foreach (var (handle, deviceId) in registry.LocalDevices(includeBackgroundSync: false))
                     await backplane.SetDevicePresenceAsync(handle, deviceId, stoppingToken);
             }
             catch (OperationCanceledException) { break; }

@@ -36,6 +36,9 @@ public static class StoragePaths
         TryCreate(Root);
         TryCreate(DataDir);
         TryCreate(KeysDir);
+        StorageProtection.TryEnsureBackgroundReadable(Root);
+        StorageProtection.TryEnsureBackgroundReadable(DataDir);
+        StorageProtection.TryEnsureBackgroundReadable(KeysDir);
     }
 
     private static string ResolveRoot()

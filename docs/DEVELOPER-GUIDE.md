@@ -481,7 +481,7 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 
 ### 5.3 SignalR hub: connect, auth handshake, and routing
 
-The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, `SendFanout`, `AcknowledgeDelivery`, `RequestPendingDeliveries`, and `CancelQueuedEnvelope`; the server emits `Challenge`, `Ready`, and `Receive`. Protocol-5 clients append `deliveryAck=1` to the hub query.
+The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, `SendFanout`, `AcknowledgeDelivery`, `RequestPendingDeliveries`, and `CancelQueuedEnvelope`; the server emits `Challenge`, `Ready`, and `Receive`. Protocol-5 clients append `deliveryAck=1` to the hub query. Protocol-6 background clients append both `deliveryAck=1` and `backgroundSync=1`.
 
 #### 5.3.1 Connect and auth handshake
 
@@ -509,6 +509,14 @@ Per-device routing honors `ToDevice`: if set, the message targets only that devi
 Atomic agent requests are an explicit exception to broadcast fallback and the ordinary offline inbox. `AgentDispatchCoordinator` persists and assigns them, and `MeshRouter.RouteAtomicAgentRequestAsync` delivers to exactly one connection of the selected device. Atomic responses are routed only after the coordinator completes the durable fence.
 
 Delivery to clients uses the **`Receive`** method. A protocol-5 client acknowledges only after signature verification, decryption, validation, and durable client-side persistence have succeeded. If the acknowledgement is lost, the relay releases or expires the lease and redelivers the same stable envelope ID. `CancelQueuedEnvelope` is authenticated and sender-scoped; it removes only a device-targeted inbox record created by that handle.
+
+#### 5.3.3 Passive background synchronization
+
+Protocol version 6 relays advertise both `durableDelivery: true` and `backgroundSync: true` in the `capabilities` object returned by `GET /` and `GET /health`. A client must require both flags before opening a background session; the numeric protocol version by itself is not a sufficient safety check.
+
+A background client connects with `deliveryAck=1&backgroundSync=1`, completes the normal device-key challenge, and drains the same authoritative durable inbox. The connection may receive and acknowledge passive updates only after successful decryption, validation, and local persistence. Foreground-only kinds remain queued, including agent and service requests, topic execution or cancellation, attachments, and snapshot requests.
+
+The relay excludes background sessions from ordinary handle and device presence, foreground-only live routing, and atomic agent dispatch. This prevents a short inbox drain from suppressing sibling alerts or being selected to execute work. Push payloads remain metadata-only wake signals and never carry ciphertext, plaintext, or keys.
 
 ### 5.4 Storage and backplane abstractions
 

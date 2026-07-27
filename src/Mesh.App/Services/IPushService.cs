@@ -1,5 +1,14 @@
 namespace Mesh.App.Services;
 
+/// <summary>An OS push token plus the current visible-notification authorization state.</summary>
+public sealed record PushRegistrationInfo(string Token, bool AlertsEnabled);
+
+public static class PushRegistrationPolicy
+{
+    public static PushRegistrationInfo? Create(string? token, bool alertsEnabled)
+        => string.IsNullOrWhiteSpace(token) ? null : new PushRegistrationInfo(token, alertsEnabled);
+}
+
 /// <summary>
 /// Cross-platform push notification registration. Unlike <see cref="INotifier"/> (which shows a local
 /// toast on the current device), push is about letting a remote server wake a backgrounded phone.
@@ -24,10 +33,10 @@ namespace Mesh.App.Services;
 public interface IPushService
 {
     /// <summary>
-    /// Ask the OS for a push token (registers with APNs/FCM). Returns the device token, or null if unavailable
-    /// (unsupported platform, user denied permission, or credentials/config not yet wired up).
+    /// Ask the OS for a push token (registers with APNs/FCM). Visible-notification permission is reported
+    /// separately because APNs silent pushes remain available when alert permission is denied.
     /// </summary>
-    Task<string?> RegisterAsync(CancellationToken ct = default);
+    Task<PushRegistrationInfo?> RegisterAsync(CancellationToken ct = default);
 
     /// <summary>The platform's push capability, for feature checks.</summary>
     bool IsSupported { get; }

@@ -4,58 +4,61 @@ using Mesh.Shared;
 
 namespace Mesh.Relay.Push;
 
-/// <summary>The user-facing category a push alert falls into.</summary>
 public enum PushCategory { None, Message, Group, TopicResponse }
 
-/// <summary>
-/// A ready-to-send, metadata-only push alert. Title/Body are composed by the relay from metadata it already
-/// routes on (the sender handle and group-vs-direct). No message plaintext is ever included.
-/// </summary>
-public sealed record PushAlert(string Title, string Body, string Category);
+public enum PushDeliveryMode { Alert, AlertAndBackground, Background }
 
-/// <summary>Sends a composed alert to one device token on a specific push platform (APNs / FCM).</summary>
+public sealed record PushAlert(
+    string Title,
+    string Body,
+    string Category,
+    PushDeliveryMode Mode = PushDeliveryMode.Alert);
+
+public enum PushSendStatus { Sent, Rejected, InvalidToken }
+
+public sealed record PushSendResult(PushSendStatus Status, int StatusCode = 0, string? Reason = null)
+{
+    public static PushSendResult Sent() => new(PushSendStatus.Sent);
+    public static PushSendResult Rejected(int statusCode, string? reason = null)
+        => new(PushSendStatus.Rejected, statusCode, reason);
+    public static PushSendResult InvalidToken(int statusCode, string? reason = null)
+        => new(PushSendStatus.InvalidToken, statusCode, reason);
+}
+
+public sealed record PushDispatchOptions(bool BackgroundSyncEnabled);
+
 public interface IPushSender
 {
-    /// <summary>The device platform this sender handles: <c>ios</c> or <c>android</c> (see <see cref="DevicePlatforms"/>).</summary>
     string Platform { get; }
-
-    /// <summary>Delivers <paramref name="alert"/> to <paramref name="token"/>. Should not throw for a single bad token.</summary>
-    Task SendAsync(string token, PushAlert alert, CancellationToken ct = default);
+    Task<PushSendResult> SendAsync(string token, PushAlert alert, CancellationToken ct = default);
 }
 
 /// <summary>
-/// Composes and dispatches "Option 1" push alerts when a message is queued for an offline recipient.
-///
-/// Privacy: the relay only sees cleartext routing metadata (Kind, From/To, and an optional PushHint), never message
-/// bodies (they are end-to-end encrypted). The relay can compose three metadata-only alerts:
-///   - direct message -> "Message from @sender"
-///   - group message -> "New group message" (the relay never sees the group name; it is E2EE)
-///   - completed topic turn -> "Your agent replied in a topic" (explicit metadata-only PushHint)
-/// Everything else (sync, receipts, topic progress, control) produces no push.
-///
-/// The alert is dispatched fire-and-forget from the routing path via <see cref="NotifyOffline"/>, so it never
-/// adds latency to (or throws on) message delivery. When no push backend is configured, every call is a no-op.
+/// Sends metadata-only alert and background wakes. APNs is only a wake signal; the durable relay inbox
+/// remains authoritative and the client acknowledges each encrypted envelope after local persistence.
 /// </summary>
 public sealed class PushDispatcher(
     IRelayStore store,
     IBackplane backplane,
     IEnumerable<IPushSender> senders,
+    PushDispatchOptions options,
     ILogger<PushDispatcher> logger)
 {
+    private static readonly TimeSpan BackgroundPushMinimumInterval = TimeSpan.FromMinutes(20);
+    private static readonly TimeSpan BackgroundPushWindow = TimeSpan.FromHours(1);
+    private const int MaxBackgroundPushesPerWindow = 3;
+
     private readonly Dictionary<string, IPushSender> byPlatform =
         senders.ToDictionary(s => s.Platform, StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>True when at least one push backend (APNs/FCM) is configured; otherwise every call is a no-op.</summary>
     public bool Enabled => byPlatform.Count > 0;
 
-    /// <summary>Maps cleartext routing metadata to a user-facing push category.</summary>
     public static PushCategory Classify(MeshEnvelope env)
     {
         ArgumentNullException.ThrowIfNull(env);
         return PushHintProtocol.IsTopicResponse(env) ? PushCategory.TopicResponse : Classify(env.Kind);
     }
 
-    /// <summary>Maps a cleartext envelope Kind to a user-facing push category (or None to suppress the push).</summary>
     public static PushCategory Classify(string kind) => kind switch
     {
         MeshKinds.Fanout or MeshKinds.GroupMessage => PushCategory.Group,
@@ -66,54 +69,58 @@ public sealed class PushDispatcher(
         _ => PushCategory.None,
     };
 
-    /// <summary>
-    /// Fire-and-forget wake for an offline recipient. Safe to call on the hot routing path: it returns
-    /// immediately and never throws. Does nothing when push is unconfigured or the Kind is not notifiable.
-    /// </summary>
-    /// <param name="toHandle">Recipient handle (normalized or not).</param>
-    /// <param name="deviceId">When non-null, push only this device (device-targeted route, e.g. group fan-out).</param>
-    /// <param name="env">The envelope being queued; only routing metadata is read.</param>
+    public static bool SupportsBackgroundSync(string kind) => kind is
+        MeshKinds.Receipt
+        or MeshKinds.GroupControl
+        or MeshKinds.GroupMessage
+        or MeshKinds.Fanout
+        or MeshKinds.DirectMessage
+        or MeshKinds.AgentResponse
+        or MeshKinds.AtomicAgentResponse
+        or MeshKinds.ServiceResponse
+        or MeshKinds.Report
+        or MeshKinds.TopicRunUpdate
+        or DeviceSyncKinds.EnvelopeOperation;
+
     public void NotifyOffline(string toHandle, string? deviceId, MeshEnvelope env)
     {
         if (!Enabled) return;
         var category = Classify(env);
-        if (category == PushCategory.None) return;
-        _ = SafeSendAsync(toHandle, deviceId, category, env.From);
+        var backgroundEligible = SupportsBackgroundSync(env.Kind);
+        if (category == PushCategory.None && (!options.BackgroundSyncEnabled || !backgroundEligible)) return;
+        _ = SafeSendAsync(toHandle, deviceId, category, backgroundEligible, env.From);
     }
 
-    /// <summary>
-    /// Fire-and-forget wake for the recipient's OFFLINE devices after a notifiable message was
-    /// delivered live to at least one of their other (online) devices. Registered push tokens whose
-    /// device is currently connected on any instance are skipped; the rest are woken, so a phone is
-    /// notified even while a desktop is open. Safe on the hot routing path: returns immediately and
-    /// never throws. Never enqueues; offline siblings receive the content via device sync on reconnect.
-    /// </summary>
     public void NotifyOfflineSiblings(string toHandle, MeshEnvelope env)
     {
         if (!Enabled) return;
         var category = Classify(env);
-        if (category == PushCategory.None) return;
-        _ = WakeOfflineSiblingsAsync(toHandle, category, env.From);
+        var backgroundEligible = SupportsBackgroundSync(env.Kind);
+        if (category == PushCategory.None && (!options.BackgroundSyncEnabled || !backgroundEligible)) return;
+        _ = WakeOfflineSiblingsAsync(toHandle, category, backgroundEligible, env.From);
     }
 
     private async Task SafeSendAsync(
-        string toHandle, string? deviceId, PushCategory category, string from)
+        string toHandle,
+        string? deviceId,
+        PushCategory category,
+        bool backgroundEligible,
+        string from)
     {
         try
         {
-            var alert = Compose(category, from);
-            if (alert is null) return;
-
             var handle = Normalize(toHandle);
             var rec = await store.GetHandleAsync(handle).ConfigureAwait(false);
             if (rec is null || rec.DevicePushTokens.Count == 0) return;
 
-            var targets = deviceId is null
-                ? rec.DevicePushTokens
-                : rec.DevicePushTokens.Where(kv => string.Equals(kv.Key, deviceId, StringComparison.Ordinal));
+            var targets = (deviceId is null
+                    ? rec.DevicePushTokens
+                    : rec.DevicePushTokens.Where(kv => string.Equals(kv.Key, deviceId, StringComparison.Ordinal)))
+                .ToArray();
 
-            foreach (var (_, tok) in targets)
-                await TrySendAsync(handle, tok, alert).ConfigureAwait(false);
+            foreach (var (targetDeviceId, token) in targets)
+                await TrySendAsync(handle, targetDeviceId, token, category, backgroundEligible, from)
+                    .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -121,33 +128,27 @@ public sealed class PushDispatcher(
         }
     }
 
-    /// <summary>
-    /// Pushes the recipient's registered tokens whose device is NOT currently connected on any
-    /// instance (offline = registered push-token devices minus live device presence). Presence is
-    /// read from the backplane, so this is correct for both a single node and multiple replicas.
-    /// Exposed (and self-guarded so it never throws) so the router can fire it, and so the offline-set
-    /// computation is unit testable.
-    /// </summary>
     public Task WakeOfflineSiblingsAsync(string toHandle, string kind, string from)
-        => WakeOfflineSiblingsAsync(toHandle, Classify(kind), from);
+        => WakeOfflineSiblingsAsync(toHandle, Classify(kind), SupportsBackgroundSync(kind), from);
 
     private async Task WakeOfflineSiblingsAsync(
-        string toHandle, PushCategory category, string from)
+        string toHandle,
+        PushCategory category,
+        bool backgroundEligible,
+        string from)
     {
         try
         {
-            var alert = Compose(category, from);
-            if (alert is null) return;
-
             var handle = Normalize(toHandle);
             var rec = await store.GetHandleAsync(handle).ConfigureAwait(false);
             if (rec is null || rec.DevicePushTokens.Count == 0) return;
 
-            foreach (var (deviceId, tok) in rec.DevicePushTokens)
+            foreach (var (deviceId, token) in rec.DevicePushTokens.ToArray())
             {
                 var owner = await backplane.GetInstanceForDeviceAsync(handle, deviceId).ConfigureAwait(false);
-                if (owner is not null) continue; // device is connected somewhere; no wake needed
-                await TrySendAsync(handle, tok, alert).ConfigureAwait(false);
+                if (owner is not null) continue;
+                await TrySendAsync(handle, deviceId, token, category, backgroundEligible, from)
+                    .ConfigureAwait(false);
             }
         }
         catch (Exception ex)
@@ -156,25 +157,87 @@ public sealed class PushDispatcher(
         }
     }
 
-    // Sends one composed alert to one device token. Logs a delivered wake at info (so success is
-    // observable in the relay logs) and swallows a single bad token as a warning so one failure
-    // cannot abort the rest of the batch.
-    private async Task TrySendAsync(string handle, DevicePushToken tok, PushAlert alert)
+    private async Task TrySendAsync(
+        string handle,
+        string deviceId,
+        DevicePushToken token,
+        PushCategory category,
+        bool backgroundEligible,
+        string from)
     {
-        if (string.IsNullOrWhiteSpace(tok.Token)) return;
-        if (!byPlatform.TryGetValue(tok.Platform, out var sender)) return;
+        if (string.IsNullOrWhiteSpace(token.Token)
+            || !byPlatform.TryGetValue(token.Platform, out var sender))
+            return;
+
+        var push = Compose(category, backgroundEligible, from, token);
+        if (push is null) return;
+        if (push.Mode == PushDeliveryMode.Background)
+        {
+            var acquired = await store.TryAcquireBackgroundPushAsync(
+                handle,
+                deviceId,
+                DateTimeOffset.UtcNow,
+                BackgroundPushMinimumInterval,
+                BackgroundPushWindow,
+                MaxBackgroundPushesPerWindow).ConfigureAwait(false);
+            if (!acquired)
+            {
+                logger.LogDebug("background push coalesced for {Handle} device {DeviceId}", handle, deviceId);
+                return;
+            }
+        }
+
         try
         {
-            await sender.SendAsync(tok.Token, alert).ConfigureAwait(false);
-            logger.LogInformation("push sent to {Handle} (platform {Platform})", handle, tok.Platform);
+            var result = await sender.SendAsync(token.Token, push).ConfigureAwait(false);
+            if (result.Status == PushSendStatus.Sent)
+            {
+                logger.LogInformation(
+                    "push sent to {Handle} (platform {Platform}, mode {Mode})",
+                    handle, token.Platform, push.Mode);
+                return;
+            }
+
+            if (result.Status == PushSendStatus.InvalidToken)
+            {
+                await store.RemoveDevicePushTokenAsync(handle, deviceId).ConfigureAwait(false);
+                logger.LogWarning(
+                    "removed invalid push token for {Handle} device {DeviceId}: {Reason}",
+                    handle, deviceId, result.Reason ?? result.StatusCode.ToString());
+                return;
+            }
+
+            logger.LogWarning(
+                "push rejected for {Handle} (platform {Platform}, status {Status}): {Reason}",
+                handle, token.Platform, result.StatusCode, result.Reason ?? "unknown");
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "push send failed (platform {Platform})", tok.Platform);
+            logger.LogWarning(ex, "push send failed (platform {Platform})", token.Platform);
         }
     }
 
-    private static PushAlert? Compose(PushCategory category, string fromHandle) => category switch
+    private PushAlert? Compose(
+        PushCategory category,
+        bool backgroundEligible,
+        string fromHandle,
+        DevicePushToken token)
+    {
+        var visible = ComposeVisible(category, fromHandle);
+        if (!string.Equals(token.Platform, DevicePlatforms.IOS, StringComparison.OrdinalIgnoreCase)
+            || !options.BackgroundSyncEnabled)
+            return visible;
+
+        if (visible is not null && token.AlertsEnabled)
+            return backgroundEligible
+                ? visible with { Mode = PushDeliveryMode.AlertAndBackground }
+                : visible;
+        if (backgroundEligible)
+            return new PushAlert("", "", "sync", PushDeliveryMode.Background);
+        return null;
+    }
+
+    private static PushAlert? ComposeVisible(PushCategory category, string fromHandle) => category switch
     {
         PushCategory.Message => new PushAlert("Mesh", $"Message from @{Normalize(fromHandle)}", "message"),
         PushCategory.Group => new PushAlert("Mesh", "New group message", "group"),

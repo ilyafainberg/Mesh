@@ -418,7 +418,9 @@ public sealed class CosmosRelayStore : IRelayStore
     }
 
     /// <inheritdoc />
-    public async Task SetDevicePushTokenAsync(string handle, string deviceId, string platform, string token, CancellationToken ct = default)
+    public async Task SetDevicePushTokenAsync(
+        string handle, string deviceId, string platform, string token, bool alertsEnabled,
+        CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
 
@@ -441,7 +443,20 @@ public sealed class CosmosRelayStore : IRelayStore
             }
 
             doc.DevicePushTokens ??= new Dictionary<string, DevicePushToken>();
-            doc.DevicePushTokens[deviceId] = new DevicePushToken { Platform = platform, Token = token, UpdatedAt = DateTimeOffset.UtcNow };
+            doc.DevicePushTokens.TryGetValue(deviceId, out var previous);
+            var preserveWakeState = previous is not null
+                && string.Equals(previous.Platform, platform, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(previous.Token, token, StringComparison.Ordinal);
+            doc.DevicePushTokens[deviceId] = new DevicePushToken
+            {
+                Platform = platform,
+                Token = token,
+                AlertsEnabled = alertsEnabled,
+                BackgroundPushWindowStartedAt = preserveWakeState ? previous!.BackgroundPushWindowStartedAt : null,
+                BackgroundPushCount = preserveWakeState ? previous!.BackgroundPushCount : 0,
+                LastBackgroundPushAt = preserveWakeState ? previous!.LastBackgroundPushAt : null,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
 
             try
             {
@@ -449,6 +464,64 @@ public sealed class CosmosRelayStore : IRelayStore
                     .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
                     .ConfigureAwait(false);
                 return;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
+            {
+                continue;
+            }
+        }
+    }
+
+    public async Task<bool> TryAcquireBackgroundPushAsync(
+        string handle,
+        string deviceId,
+        DateTimeOffset now,
+        TimeSpan minimumInterval,
+        TimeSpan window,
+        int maxCount,
+        CancellationToken ct = default)
+    {
+        await EnsureInitAsync(ct).ConfigureAwait(false);
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; ; attempt++)
+        {
+            HandleDoc doc;
+            string etag;
+            try
+            {
+                var read = await handlesContainer
+                    .ReadItemAsync<HandleDoc>(handle, new PartitionKey(handle), cancellationToken: ct)
+                    .ConfigureAwait(false);
+                doc = read.Resource;
+                etag = read.ETag;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return false;
+            }
+
+            if (doc.DevicePushTokens is null
+                || !doc.DevicePushTokens.TryGetValue(deviceId, out var token))
+                return false;
+            if (token.LastBackgroundPushAt is { } last && now - last < minimumInterval)
+                return false;
+            if (token.BackgroundPushWindowStartedAt is null
+                || now - token.BackgroundPushWindowStartedAt.Value >= window)
+            {
+                token.BackgroundPushWindowStartedAt = now;
+                token.BackgroundPushCount = 0;
+            }
+            if (token.BackgroundPushCount >= maxCount) return false;
+            token.BackgroundPushCount++;
+            token.LastBackgroundPushAt = now;
+
+            try
+            {
+                await handlesContainer
+                    .UpsertItemAsync(doc, new PartitionKey(handle), new ItemRequestOptions { IfMatchEtag = etag }, ct)
+                    .ConfigureAwait(false);
+                return true;
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed && attempt < maxAttempts)
             {
