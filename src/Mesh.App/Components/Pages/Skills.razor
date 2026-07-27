@@ -99,6 +99,7 @@
 
                         @if (openMarketId == m.Id)
                         {
+                            <MobileOverlayScope />
                             <div class="sk-modal-backdrop" @onclick="CloseBrowse">
                             <div class="sk-modal" @onclick:stopPropagation="true">
                             <div class="sk-modal-head">

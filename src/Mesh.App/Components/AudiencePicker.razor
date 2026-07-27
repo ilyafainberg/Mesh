@@ -13,6 +13,7 @@
 
     @if (open)
     {
+        <MobileOverlayScope />
         <button type="button" class="audience-backdrop" tabindex="-1" @onclick="Close" aria-label="Close audience picker"></button>
         <section class="audience-panel" role="dialog" aria-modal="true" aria-label="@AriaLabel" @onclick:stopPropagation="true">
             <header class="audience-head">

@@ -4,6 +4,7 @@
    metadata that will be sent, and gates submission behind an explicit consent checkbox. Call Show(...). *@
 @if (open)
 {
+    <MobileOverlayScope />
     <div class="report-scrim" @onclick="Cancel">
         <div class="report-modal" @onclick:stopPropagation="true" role="dialog" aria-modal="true" aria-label="Report AI content">
             <h3><i class="bi bi-flag"></i> Report AI content</h3>

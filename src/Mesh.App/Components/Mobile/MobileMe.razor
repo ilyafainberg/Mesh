@@ -103,6 +103,7 @@
 
     @if (newDeviceMenuOpen)
     {
+        <MobileOverlayScope />
         <div class="sheet-scrim" @onclick="CloseDeviceMenus">
             <div class="device-sheet" role="menu" aria-label="Choose a device" tabindex="-1" autofocus
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
@@ -206,9 +207,11 @@ else
                         and helps you manage what your public agent shares with others. Ask it anything.
                     </div>
                 }
-                @foreach (var line in renderedLines.Where(line => !IsQueued(line)))
+                @foreach (var line in renderedLines)
                 {
-                    <div class="bubble @(line.Role)" @key="line.Id">
+                    var queued = IsQueued(line);
+                    var bubbleClass = $"bubble {TopicTranscriptPresentation.BubbleRole(line.Role)}{(queued ? " topic-queued-line" : "")}";
+                    <div class="@bubbleClass" @key="line.Id">
                         <ModelAttribution ModelId="@line.ModelId" />
                         @if (!string.IsNullOrEmpty(line.Reasoning))
                         {
@@ -224,11 +227,23 @@ else
                         }
                         <MessageContent Text="@line.Text" Attachments="@line.Attachments"
                                         OnPin="html => PinWidget(html, line)" />
+                        @if (queued)
+                        {
+                            <div class="msg-tag queue-tag">
+                                <i class="bi @QueueIcon(line)"></i>
+                                <span>@QueueLabel(line)</span>
+                                <button type="button" class="queue-cancel" title="Cancel queued turn"
+                                        aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
+                                        @onclick:stopPropagation="true">
+                                    <i class="bi bi-x-lg"></i>
+                                </button>
+                            </div>
+                        }
                     </div>
                 }
                 @if (ActiveBusy)
                 {
-                    <div class="bubble assistant">
+                    <div class="bubble assistant topic-live-run" @key="Active">
                         @{ var run = Active is null ? null : State.AgentRunFor(Active.Id); }
                         @if (run is not null)
                         {
@@ -346,22 +361,6 @@ else
                         {
                             <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
                         }
-                    </div>
-                }
-                @foreach (var line in renderedLines.Where(IsQueued))
-                {
-                    <div class="bubble @(line.Role)" @key="line.Id">
-                        <MessageContent Text="@line.Text" Attachments="@line.Attachments"
-                                        OnPin="html => PinWidget(html, line)" />
-                        <div class="msg-tag queue-tag">
-                            <i class="bi @QueueIcon(line)"></i>
-                            <span>@QueueLabel(line)</span>
-                            <button type="button" class="queue-cancel" title="Cancel queued turn"
-                                    aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
-                                    @onclick:stopPropagation="true">
-                                <i class="bi bi-x-lg"></i>
-                            </button>
-                        </div>
                     </div>
                 }
                 </div>
@@ -497,6 +496,7 @@ else
 
     @if (moveMenuOpen)
     {
+        <MobileOverlayScope />
         <div class="sheet-scrim" @onclick="CloseDeviceMenus">
             <div class="device-sheet" role="menu" aria-label="Move topic to device" tabindex="-1" autofocus
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
@@ -520,6 +520,7 @@ else
     }
     @if (pendingMove is not null)
     {
+        <MobileOverlayScope />
         <div class="sheet-scrim">
             <div class="confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="move-confirm-title" tabindex="-1" autofocus
                  @onkeydown="OnDeviceMenuKey">
@@ -1214,6 +1215,9 @@ else
         selectedWidget = null;
         attachError = null;
         if (clearedVisibleDraft) _ = ResetComposer();
+
+        // Let the persisted prompt paint before dispatch can reclassify it as queued.
+        await Task.Yield();
 
         try
         {

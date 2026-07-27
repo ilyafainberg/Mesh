@@ -71,6 +71,32 @@ public sealed class CopilotAcpUsageAccumulator
         => current.HasValue ? Math.Max(0, current.Value - (previous ?? 0)) : 0;
 }
 
+/// <summary>Preserves token streaming while adding one Markdown paragraph break at a thought boundary.</summary>
+public sealed class CopilotAcpParagraphStream
+{
+    private bool hasContent;
+    private bool paragraphPending;
+
+    public void MarkBoundary()
+    {
+        if (hasContent)
+            paragraphPending = true;
+    }
+
+    public string AppendChunk(string? text)
+    {
+        var normalized = CopilotAcpProtocol.NormalizeText(text);
+        if (normalized.Length == 0) return "";
+
+        var formatted = paragraphPending
+            ? "\n\n" + normalized.TrimStart('\r', '\n')
+            : normalized;
+        paragraphPending = false;
+        hasContent = true;
+        return formatted;
+    }
+}
+
 public static class CopilotAcpProtocol
 {
     private static readonly string[] MojibakeMarkers =
@@ -194,14 +220,6 @@ public static class CopilotAcpProtocol
         TryRepairSegments(Encoding.Latin1, text, ref best, ref bestScore);
         return bestScore < originalScore ? best : text;
     }
-
-    /// <summary>Prefixes a Copilot thought update with a Markdown paragraph break.</summary>
-    public static string FormatThoughtChunk(string? text)
-    {
-        var normalized = NormalizeText(text);
-        return normalized.Length == 0 ? "" : "\n\n" + normalized;
-    }
-
     public static bool TryParseUsage(JsonElement element, out CopilotAcpUsage usage)
     {
         long? prompt = null;

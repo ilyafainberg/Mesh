@@ -11,18 +11,28 @@
     max-width: 100%;
 }
 
-/* Scrollable body region. Its stacking context stays above the in-flow tab bar so
-   fixed dialogs from routed content are not occluded by the bar on iOS. */
+/* Routed content scrolls inside this native layer until a modal owns the viewport. */
 .m-body {
     flex: 1 1 auto;
     position: relative;
-    z-index: 2;
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
     padding-bottom: 8px;
     overflow-x: hidden;
+}
+
+/* iOS clips fixed descendants inside a momentum-scrolling layer. Remove the sibling
+   tab bar and suspend that layer while any routed modal is mounted. */
+.m-shell.overlay-open .m-tabbar {
+    display: none;
+}
+
+.m-shell.overlay-open .m-body {
+    overflow: hidden;
+    -webkit-overflow-scrolling: auto;
+    padding-bottom: 0;
 }
 
 .memory-notice {

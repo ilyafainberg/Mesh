@@ -1,0 +1,17 @@
+@inject MobileOverlayState Overlays
+@implements IDisposable
+
+@code {
+    IDisposable? lease;
+
+    protected override void OnInitialized()
+    {
+        lease = Overlays.Enter();
+    }
+
+    public void Dispose()
+    {
+        lease?.Dispose();
+        lease = null;
+    }
+}
