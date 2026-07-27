@@ -35,6 +35,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\RuntimeDiagnostics.cs" Link="RuntimeDiagnostics.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MessageRenderWindow.cs" Link="MessageRenderWindow.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AssistantDraftRefreshGate.cs" Link="AssistantDraftRefreshGate.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\LiveAgentRenderState.cs" Link="LiveAgentRenderState.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\PasteFiles.cs" Link="PasteFiles.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\PickedFileStager.cs" Link="PickedFileStager.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MemoryPolicy.cs" Link="MemoryPolicy.cs" />
