@@ -367,6 +367,39 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void TopicTranscriptPresentation_KeepsPromptBubbleStableWhenItBecomesQueued()
+    {
+        var first = new ChatLine { Id = "prompt-1", Role = "user" };
+        var second = new ChatLine { Id = "prompt-2", Role = "user" };
+        var queued = new HashSet<string>(StringComparer.Ordinal);
+
+        var before = TopicTranscriptPresentation.Compose(
+            new[] { first, second }, line => queued.Contains(line.Id), "topic");
+        queued.Add(second.Id);
+        var after = TopicTranscriptPresentation.Compose(
+            new[] { first, second }, line => queued.Contains(line.Id), "topic");
+
+        CollectionAssert.AreEqual(
+            new[] { "line:prompt-1", "line:prompt-2", "run:topic" },
+            before.Select(item => item.Key).ToArray());
+        CollectionAssert.AreEqual(
+            new[] { "line:prompt-1", "run:topic", "line:prompt-2" },
+            after.Select(item => item.Key).ToArray());
+        Assert.AreEqual(1, before.Count(item => ReferenceEquals(item.Line, second)));
+        Assert.AreEqual(1, after.Count(item => ReferenceEquals(item.Line, second)));
+    }
+
+    [TestMethod]
+    public void TopicTranscriptPresentation_AlwaysUsesAStyledBubbleRole()
+    {
+        Assert.AreEqual("user", TopicTranscriptPresentation.BubbleRole(new ChatLine { Role = "user" }));
+        Assert.AreEqual("user", TopicTranscriptPresentation.BubbleRole(new ChatLine { Role = "USER" }));
+        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole(new ChatLine { Role = "assistant" }));
+        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole(new ChatLine { Role = "system" }));
+        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole(new ChatLine { Role = "" }));
+    }
+
+    [TestMethod]
     public void TopicTranscriptOrdering_PreservesLegacyAndOrphanReplies()
     {
         var lines = new[]
