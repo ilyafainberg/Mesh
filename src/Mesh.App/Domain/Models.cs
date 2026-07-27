@@ -1083,13 +1083,23 @@ public sealed class QueuedTopicRunState
     public bool IsKnownRun(string threadId, string runId)
         => runsByThread.TryGetValue(threadId, out var runs) && runs.ContainsKey(runId);
 
+    public QueuedTopicRunInfo? FindByLine(string threadId, string lineId)
+    {
+        if (!runsByThread.TryGetValue(threadId, out var runs)) return null;
+        foreach (var (runId, entry) in runs)
+            if (string.Equals(entry.LineId, lineId, StringComparison.Ordinal))
+                return new QueuedTopicRunInfo(
+                    threadId, runId, entry.LineId, entry.Stage, entry.Waiting);
+        return null;
+    }
+
     public QueuedTopicRunInfo? FindByLine(string lineId)
     {
-        foreach (var (threadId, runs) in runsByThread)
-            foreach (var (runId, entry) in runs)
-                if (string.Equals(entry.LineId, lineId, StringComparison.Ordinal))
-                    return new QueuedTopicRunInfo(
-                        threadId, runId, entry.LineId, entry.Stage, entry.Waiting);
+        foreach (var threadId in runsByThread.Keys)
+        {
+            var match = FindByLine(threadId, lineId);
+            if (match is not null) return match;
+        }
         return null;
     }
 

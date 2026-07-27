@@ -18,6 +18,24 @@ public sealed class DeviceSyncProfileProtocolTests
         Assert.AreEqual("circle.delete", DeviceSyncKinds.CircleDelete);
         Assert.AreEqual("memory.upsert", DeviceSyncKinds.MemoryUpsert);
         Assert.AreEqual("memory.delete", DeviceSyncKinds.MemoryDelete);
+        Assert.AreEqual("topic.line.upsert", DeviceSyncKinds.TopicLineUpsert);
+        Assert.AreEqual("topic.line.delete", DeviceSyncKinds.TopicLineDelete);
+    }
+
+    [TestMethod]
+    public void TopicLineEntityId_RoundTripsThreadAndLineIds()
+    {
+        var entityId = DeviceSyncEntityIds.TopicLine("topic:1", "line:2");
+
+        Assert.AreEqual("7:topic:1line:2", entityId);
+        Assert.IsTrue(DeviceSyncEntityIds.TryParseTopicLine(
+            entityId, out var threadId, out var lineId));
+        Assert.AreEqual("topic:1", threadId);
+        Assert.AreEqual("line:2", lineId);
+        Assert.IsFalse(DeviceSyncEntityIds.TryParseTopicLine(
+            "100:short", out _, out _));
+        Assert.IsFalse(DeviceSyncEntityIds.TryParseTopicLine(
+            "07:topic:1line:2", out _, out _));
     }
 
     [TestMethod]

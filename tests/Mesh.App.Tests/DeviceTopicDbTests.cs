@@ -506,6 +506,77 @@ public sealed class DeviceTopicDbTests
     }
 
     [TestMethod]
+    public void TopicLineDelete_RemovesPromptAndRepliesAndBlocksResurrection()
+    {
+        const string threadId = "topic-delete-parent";
+        const string otherThreadId = "topic-delete-other";
+        const string lineId = "cancelled-line";
+        const string versionKey = "topic.line.upsert\u001ftopic-delete-parent\u001fcancelled-line";
+        var at = new DateTimeOffset(2026, 7, 27, 12, 0, 0, TimeSpan.Zero);
+        var upsertVersion = DeviceSyncVersion.Create(at, "mobile", "upsert");
+        var deleteVersion = DeviceSyncVersion.Create(at.AddMinutes(1), "mobile", "delete");
+        var deleteEntityId = DeviceSyncEntityIds.TopicLine(threadId, lineId);
+
+        using var db = MeshDb.Open(databasePath, key);
+        SaveProfile(db);
+        db.UpsertOwnThread(threadId, "Topic", at.AddDays(-1), 0, at, false);
+        db.UpsertOwnThread(otherThreadId, "Other", at.AddDays(-1), 1, at, false);
+        var prompt = new ChatLine
+        {
+            Id = lineId,
+            Role = "user",
+            Text = "Do not run this",
+            At = at
+        };
+        Assert.IsTrue(db.TryApplyOwnSyncLine(
+            threadId, prompt, versionKey, upsertVersion, DeviceSyncKinds.TopicLineDelete));
+        db.AppendOwnChat(threadId, new ChatLine
+        {
+            Id = "reply",
+            Role = "assistant",
+            Text = "late answer",
+            ReplyToLineId = lineId,
+            At = at.AddSeconds(1)
+        });
+        db.AppendOwnChat(threadId, new ChatLine
+        {
+            Id = "keep",
+            Role = "user",
+            Text = "keep me",
+            At = at.AddSeconds(2)
+        });
+        db.AppendOwnChat(otherThreadId, new ChatLine
+        {
+            Id = lineId,
+            Role = "user",
+            Text = "same id, other topic",
+            At = at.AddSeconds(3)
+        });
+
+        db.ApplyTopicLineDelete(
+            threadId, lineId, deleteEntityId, DeviceSyncKinds.TopicLineDelete, deleteVersion);
+
+        var profile = db.LoadProfile()!;
+        var remaining = profile.OwnThreads.Single(thread => thread.Id == threadId).Lines;
+        Assert.HasCount(1, remaining);
+        Assert.AreEqual("keep", remaining[0].Id);
+        Assert.HasCount(
+            1,
+            profile.OwnThreads.Single(thread => thread.Id == otherThreadId).Lines);
+        Assert.AreEqual(
+            deleteVersion,
+            db.GetSyncTombstoneVersion(DeviceSyncKinds.TopicLineDelete, deleteEntityId));
+
+        prompt.Text = "resurrected";
+        Assert.IsFalse(db.TryApplyOwnSyncLine(
+            threadId,
+            prompt,
+            versionKey,
+            DeviceSyncVersion.Create(at.AddMinutes(2), "desktop", "resurrect"),
+            DeviceSyncKinds.TopicLineDelete));
+    }
+
+    [TestMethod]
     public void ComposerDrafts_PersistIndependentlyAndClear()
     {
         using (var db = MeshDb.Open(databasePath, key))

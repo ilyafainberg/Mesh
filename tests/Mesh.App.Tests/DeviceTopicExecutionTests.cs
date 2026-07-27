@@ -66,6 +66,21 @@ namespace Mesh.App.Services
             => QueuedRuns.IsKnownRun(threadId, runId);
         public int QueuedCountForThread(string threadId) => QueuedRuns.WaitingCount(threadId);
         public bool IsLineQueued(string lineId) => QueuedRuns.IsLineWaiting(lineId);
+        public bool IsQueuedTopicRunLine(string threadId, string runId, string lineId)
+        {
+            var queued = QueuedRuns.FindByLine(threadId, lineId);
+            return queued is { Waiting: true }
+                   && queued.ThreadId == threadId
+                   && queued.RunId == runId;
+        }
+        public bool RemoveCancelledQueuedTopicLine(string threadId, string runId, string lineId)
+        {
+            var thread = Profile.OwnThreads.Single(item => item.Id == threadId);
+            var removed = thread.Lines.RemoveAll(line =>
+                line.Id == lineId || line.ReplyToLineId == lineId) > 0;
+            QueuedRuns.Complete(threadId, runId);
+            return removed;
+        }
 
         public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
         {
@@ -279,6 +294,32 @@ namespace Mesh.App.Tests
             Assert.IsTrue(state.IsLineQueued(draft.TriggerLineId));
             Assert.AreEqual(TopicQueueStage.Sending, state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
         }
+        [TestMethod]
+        public async Task CancellingQueuedSubmission_RemovesItsTriggerLine()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.ExecutionDeviceId = "offline";
+            thread.ExecutionDeviceName = "Laptop";
+            thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
+            var transport = new RecordingTransport
+            {
+                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                ResultCode = DurableDeliveryCodes.LocalQueued
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "offline" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+
+            var cancelled = await router.CancelQueuedAsync(
+                draft.ThreadId, draft.RunId, draft.TriggerLineId, CancellationToken.None);
+
+            Assert.IsTrue(cancelled);
+            Assert.AreEqual(1, transport.Cancellations);
+            Assert.AreEqual(0, thread.Lines.Count);
+            Assert.IsFalse(state.IsLineQueued(draft.TriggerLineId));
+        }
+
         [TestMethod]
         public async Task EligibleDeviceRefreshes_AreSerializedSoThePickerGetsTheNewestResult()
         {
@@ -520,8 +561,10 @@ namespace Mesh.App.Tests
         {
             public IReadOnlyList<DeviceInfo> Devices { get; set; } = [];
             public int Dispatches { get; private set; }
+            public int Cancellations { get; private set; }
             public TopicRunRequestPayload? Request { get; private set; }
             public string ResultCode { get; set; } = "accepted";
+            public bool CancellationAccepted { get; set; } = true;
 
             public Task<TopicDispatchResult> DispatchAsync(
                 string targetDeviceId,
@@ -538,7 +581,10 @@ namespace Mesh.App.Tests
                 string targetDeviceId,
                 TopicRunCancelPayload cancel,
                 CancellationToken cancellationToken)
-                => Task.FromResult(true);
+            {
+                Cancellations++;
+                return Task.FromResult(CancellationAccepted);
+            }
 
             public Task<IReadOnlyList<DeviceInfo>> ListEligibleDevicesAsync(
                 CancellationToken cancellationToken)

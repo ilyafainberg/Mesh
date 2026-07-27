@@ -180,6 +180,7 @@ public sealed partial class MeshDb : IDisposable
         AddColumnIfMissing("chat_lines", "status", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("own_chat", "line_id", "TEXT");
         AddColumnIfMissing("own_chat", "status", "TEXT NOT NULL DEFAULT ''");
+        Exec("CREATE INDEX IF NOT EXISTS ix_own_chat_lineid ON own_chat(line_id);");
         Exec("""
             UPDATE chat_lines
             SET line_id = 'legacy-conversation-' || printf('%016x', id)
@@ -969,6 +970,41 @@ public sealed partial class MeshDb : IDisposable
         return true;
     }
 
+    public void DeleteOwnChatLine(string threadId, string lineId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM own_chat
+            WHERE thread_id = $thread AND (line_id = $line OR reply_to_line_id = $line);
+            """;
+        cmd.Parameters.AddWithValue("$thread", threadId);
+        cmd.Parameters.AddWithValue("$line", lineId);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void ApplyTopicLineDelete(
+        string threadId,
+        string lineId,
+        string entityId,
+        string kind,
+        string version)
+    {
+        using var tx = conn.BeginTransaction();
+        using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = tx;
+            delete.CommandText = """
+                DELETE FROM own_chat
+                WHERE thread_id = $thread AND (line_id = $line OR reply_to_line_id = $line);
+                """;
+            delete.Parameters.AddWithValue("$thread", threadId);
+            delete.Parameters.AddWithValue("$line", lineId);
+            delete.ExecuteNonQuery();
+        }
+        UpsertSyncTombstone(tx, kind, entityId, version);
+        tx.Commit();
+    }
+
     public void ApplyTopicClear(string id, string kind, string version)
     {
         using var tx = conn.BeginTransaction();
@@ -1476,11 +1512,23 @@ public sealed partial class MeshDb : IDisposable
         string threadId,
         ChatLine line,
         string versionKey,
-        string version)
+        string version,
+        string? lineDeleteKind = null)
     {
         if (line.At == default) return false;
         using var tx = conn.BeginTransaction();
         if (!DeviceSyncVersion.IsNewer(version, GetSyncVersion(tx, versionKey)))
+            return false;
+        if (lineDeleteKind is not null
+            && (GetSyncTombstoneVersion(
+                    tx,
+                    lineDeleteKind,
+                    DeviceSyncEntityIds.TopicLine(threadId, line.Id)) is not null
+                || line.ReplyToLineId is not null
+                && GetSyncTombstoneVersion(
+                    tx,
+                    lineDeleteKind,
+                    DeviceSyncEntityIds.TopicLine(threadId, line.ReplyToLineId)) is not null))
             return false;
 
         using (var parent = conn.CreateCommand())

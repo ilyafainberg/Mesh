@@ -222,6 +222,7 @@ internal static class ProfileSyncState
             DeviceSyncKinds.ContactDelete => 2,
             DeviceSyncKinds.TopicLineUpsert => 2,
             DeviceSyncKinds.ConversationLineUpsert => 2,
+            DeviceSyncKinds.TopicLineDelete => 3,
             DeviceSyncKinds.TopicClear => 3,
             DeviceSyncKinds.ConversationClear => 3,
             DeviceSyncKinds.TopicDelete => 4,

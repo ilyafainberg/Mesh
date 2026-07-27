@@ -621,14 +621,20 @@ public sealed partial class AppState : IMemoryState
     /// <summary>Appends a line to a "Me" topic thread as a single row.</summary>
     public void AddOwnChatLine(string threadId, ChatLine line)
     {
-        var thread = GetOrCreateOwnThread(threadId);
-        thread.Lines.Add(line);
-        thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
-        activeDb?.AppendOwnChat(thread.Id, line);
-        if (thread.LastActivityAt.HasValue)
-            activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
-        EmitLineUpsert(DeviceSyncKinds.TopicLineUpsert, thread.Id, line);
-        EmitTopicUpsert(thread);
+        lock (profileSyncGate)
+        {
+            if (IsTopicLineDeleted(threadId, line.Id)
+                || IsTopicLineDeleted(threadId, line.ReplyToLineId))
+                return;
+            var thread = GetOrCreateOwnThread(threadId);
+            thread.Lines.Add(line);
+            thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
+            activeDb?.AppendOwnChat(thread.Id, line);
+            if (thread.LastActivityAt.HasValue)
+                activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+            EmitLineUpsert(DeviceSyncKinds.TopicLineUpsert, thread.Id, line);
+            EmitTopicUpsert(thread);
+        }
         NotifyChanged();
     }
 
@@ -1123,6 +1129,7 @@ public sealed partial class AppState : IMemoryState
         {
             DeviceSyncKinds.TopicUpsert => ApplyTopicUpsert(operation),
             DeviceSyncKinds.TopicLineUpsert => ApplyTopicLineUpsert(operation),
+            DeviceSyncKinds.TopicLineDelete => ApplyTopicLineDelete(operation),
             DeviceSyncKinds.TopicClear => ApplyTopicClear(operation),
             DeviceSyncKinds.TopicDelete => ApplyTopicDelete(operation),
             DeviceSyncKinds.ConversationUpsert => ApplyConversationUpsert(operation),
@@ -1253,6 +1260,8 @@ public sealed partial class AppState : IMemoryState
         var dto = DeserializePayload<DeviceSyncLine>(operation);
         var lineId = dto.Id;
         if (!IsValidLine(dto, lineId)
+            || IsTopicLineDeleted(threadId, lineId)
+            || IsTopicLineDeleted(threadId, dto.ReplyToLineId)
             || IsBlockedByTombstone(DeviceSyncKinds.TopicDelete, threadId, operation.Version)
             || IsBlockedByTombstone(DeviceSyncKinds.TopicClear, threadId, operation.Version)
             || !DeviceSyncVersion.IsNewer(
@@ -1267,7 +1276,8 @@ public sealed partial class AppState : IMemoryState
                 threadId,
                 incoming,
                 LineSyncKey(operation.Kind, threadId, lineId),
-                operation.Version))
+                operation.Version,
+                DeviceSyncKinds.TopicLineDelete))
             return false;
         if (thread is null)
         {
@@ -1290,6 +1300,35 @@ public sealed partial class AppState : IMemoryState
                          && !dto.Internal
                          && ReconcileRemoteRunWithAnswer(thread, dto.At);
         return changed || reconciled;
+    }
+
+    private bool ApplyTopicLineDelete(DeviceSyncOperation operation)
+    {
+        if (!DeviceSyncEntityIds.TryParseTopicLine(
+                operation.EntityId, out var threadId, out var lineId)
+            || !CanApplyTombstone(operation))
+            return false;
+
+        var thread = Profile.OwnThreads.FirstOrDefault(item =>
+            string.Equals(item.Id, threadId, StringComparison.Ordinal));
+        if (thread?.Lines.Any(line =>
+                string.Equals(line.Id, lineId, StringComparison.Ordinal)) == true
+            && !DeviceSyncVersion.IsNewer(
+                operation.Version,
+                activeDb!.GetSyncVersion(LineSyncKey(
+                    DeviceSyncKinds.TopicLineUpsert, threadId, lineId))))
+            return false;
+
+        var changed = thread is not null && thread.Lines.RemoveAll(line =>
+            string.Equals(line.Id, lineId, StringComparison.Ordinal)
+            || string.Equals(line.ReplyToLineId, lineId, StringComparison.Ordinal)) > 0;
+        var queued = queuedTopicRuns.FindByLine(threadId, lineId);
+        if (queued is not null)
+            changed |= queuedTopicRuns.Complete(queued.ThreadId, queued.RunId);
+
+        activeDb!.ApplyTopicLineDelete(
+            threadId, lineId, operation.EntityId, operation.Kind, operation.Version);
+        return changed;
     }
 
     private bool ApplyTopicClear(DeviceSyncOperation operation)
@@ -1884,6 +1923,10 @@ public sealed partial class AppState : IMemoryState
     private void EmitLineUpsert(string kind, string parentId, ChatLine line)
     {
         if (applyingDeviceSync) return;
+        if (kind == DeviceSyncKinds.TopicLineUpsert
+            && (IsTopicLineDeleted(parentId, line.Id)
+                || IsTopicLineDeleted(parentId, line.ReplyToLineId)))
+            return;
         var deviceId = LocalDeviceId();
         if (activeDb is null || deviceId is null) return;
         var deleteKind = kind == DeviceSyncKinds.TopicLineUpsert
@@ -1900,7 +1943,12 @@ public sealed partial class AppState : IMemoryState
             {
                 activeDb.GetSyncVersion(LineSyncKey(kind, parentId, line.Id)),
                 activeDb.GetSyncTombstoneVersion(deleteKind, parentId),
-                activeDb.GetSyncTombstoneVersion(clearKind, parentId)
+                activeDb.GetSyncTombstoneVersion(clearKind, parentId),
+                kind == DeviceSyncKinds.TopicLineUpsert
+                    ? activeDb.GetSyncTombstoneVersion(
+                        DeviceSyncKinds.TopicLineDelete,
+                        DeviceSyncEntityIds.TopicLine(parentId, line.Id))
+                    : null
             });
         if (!activeDb.TryAdvanceSyncVersion(
                 LineSyncKey(kind, parentId, line.Id), version))
@@ -1960,6 +2008,12 @@ public sealed partial class AppState : IMemoryState
         {
             switch (kind)
             {
+                case DeviceSyncKinds.TopicLineDelete:
+                    if (!DeviceSyncEntityIds.TryParseTopicLine(
+                            entityId, out var threadId, out var lineId))
+                        throw new InvalidOperationException("The topic line tombstone ID was invalid.");
+                    activeDb.DeleteOwnChatLine(threadId, lineId);
+                    break;
                 case DeviceSyncKinds.TopicDelete:
                     activeDb.DeleteOwnThread(entityId);
                     break;
@@ -1978,7 +2032,8 @@ public sealed partial class AppState : IMemoryState
         var operationId = NewId();
         var version = CreateNewerVersion(deviceId, operationId, priorVersions);
         var serialized = payload is null ? "" : JsonSerializer.Serialize(payload, SyncJson);
-        if (kind is DeviceSyncKinds.TopicDelete
+        if (kind is DeviceSyncKinds.TopicLineDelete
+            or DeviceSyncKinds.TopicDelete
             or DeviceSyncKinds.TopicClear
             or DeviceSyncKinds.ConversationDelete
             or DeviceSyncKinds.ConversationClear
@@ -1987,6 +2042,13 @@ public sealed partial class AppState : IMemoryState
         {
             switch (kind)
             {
+                case DeviceSyncKinds.TopicLineDelete:
+                    if (!DeviceSyncEntityIds.TryParseTopicLine(
+                            entityId, out var threadId, out var lineId))
+                        throw new InvalidOperationException("The topic line tombstone ID was invalid.");
+                    activeDb.ApplyTopicLineDelete(
+                        threadId, lineId, entityId, kind, version);
+                    break;
                 case DeviceSyncKinds.TopicDelete:
                     activeDb.ApplyTopicDelete(entityId, kind, version);
                     break;
@@ -2109,6 +2171,7 @@ public sealed partial class AppState : IMemoryState
                 or DeviceSyncKinds.TopicDelete
                 or DeviceSyncKinds.ConversationClear
                 or DeviceSyncKinds.ConversationDelete
+                or DeviceSyncKinds.TopicLineDelete
                 or DeviceSyncKinds.ContactDelete
                 or DeviceSyncKinds.CircleDelete
                 or DeviceSyncKinds.MemoryDelete
@@ -2132,6 +2195,13 @@ public sealed partial class AppState : IMemoryState
         => DeviceSyncVersion.Compare(
             activeDb!.GetSyncTombstoneVersion(kind, entityId),
             version) >= 0;
+
+    private bool IsTopicLineDeleted(string threadId, string? lineId)
+        => TopicRunProtocol.IsValidIdentifier(threadId)
+           && TopicRunProtocol.IsValidIdentifier(lineId)
+           && activeDb?.GetSyncTombstoneVersion(
+               DeviceSyncKinds.TopicLineDelete,
+               DeviceSyncEntityIds.TopicLine(threadId, lineId!)) is not null;
 
     private bool CanApplyTombstone(DeviceSyncOperation operation)
         => DeviceSyncVersion.IsNewer(
@@ -2191,6 +2261,7 @@ public sealed partial class AppState : IMemoryState
             return false;
         return operation.Kind is DeviceSyncKinds.TopicUpsert
             or DeviceSyncKinds.TopicLineUpsert
+            or DeviceSyncKinds.TopicLineDelete
             or DeviceSyncKinds.TopicClear
             or DeviceSyncKinds.TopicDelete
             or DeviceSyncKinds.ConversationUpsert
@@ -3229,6 +3300,71 @@ public sealed partial class AppState : IMemoryState
         ArgumentNullException.ThrowIfNull(line);
         lock (profileSyncGate)
             return queuedTopicRuns.FindByLine(line.Id);
+    }
+
+    public bool IsQueuedTopicRunLine(string threadId, string runId, string lineId)
+    {
+        lock (profileSyncGate)
+        {
+            var queued = queuedTopicRuns.FindByLine(threadId, lineId);
+            return queued is { Waiting: true }
+                   && string.Equals(queued.ThreadId, threadId, StringComparison.Ordinal)
+                   && string.Equals(queued.RunId, runId, StringComparison.Ordinal);
+        }
+    }
+
+    public bool RemoveCancelledQueuedTopicLine(string threadId, string runId, string lineId)
+    {
+        if (!TopicRunProtocol.IsValidIdentifier(threadId)
+            || !TopicRunProtocol.IsValidIdentifier(runId)
+            || !TopicRunProtocol.IsValidIdentifier(lineId))
+            return false;
+
+        var visibleChanged = false;
+        var deleted = false;
+        lock (profileSyncGate)
+        {
+            var queued = queuedTopicRuns.FindByLine(threadId, lineId);
+            if (queued is not null
+                && (!string.Equals(queued.ThreadId, threadId, StringComparison.Ordinal)
+                    || !string.Equals(queued.RunId, runId, StringComparison.Ordinal)))
+                return false;
+
+            var thread = Profile.OwnThreads.FirstOrDefault(item =>
+                string.Equals(item.Id, threadId, StringComparison.Ordinal));
+            if (thread is null) return false;
+
+            var trigger = thread.Lines.FirstOrDefault(line =>
+                string.Equals(line.Id, lineId, StringComparison.Ordinal));
+            if (trigger is null)
+            {
+                visibleChanged = queuedTopicRuns.Complete(threadId, runId);
+                deleted = true;
+            }
+            else
+            {
+                if (!string.Equals(trigger.Role, "user", StringComparison.Ordinal))
+                    return false;
+                var removed = thread.Lines.Where(line =>
+                        string.Equals(line.Id, lineId, StringComparison.Ordinal)
+                        || string.Equals(line.ReplyToLineId, lineId, StringComparison.Ordinal))
+                    .ToList();
+                var lineVersions = removed.Select(line => activeDb?.GetSyncVersion(LineSyncKey(
+                    DeviceSyncKinds.TopicLineUpsert, thread.Id, line.Id))).ToList();
+                thread.Lines.RemoveAll(line =>
+                    string.Equals(line.Id, lineId, StringComparison.Ordinal)
+                    || string.Equals(line.ReplyToLineId, lineId, StringComparison.Ordinal));
+                queuedTopicRuns.Complete(threadId, runId);
+                EmitTombstone(
+                    DeviceSyncKinds.TopicLineDelete,
+                    DeviceSyncEntityIds.TopicLine(threadId, lineId),
+                    lineVersions);
+                visibleChanged = true;
+                deleted = true;
+            }
+        }
+        if (visibleChanged) NotifyChanged();
+        return deleted;
     }
 
     public bool IsKnownQueuedTopicRun(string threadId, string runId)

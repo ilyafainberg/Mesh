@@ -380,14 +380,15 @@ Compatibility is capability-gated. A new client must use legacy kinds when the r
 
 `DeviceSyncOperation` is the versioned unit used by interoperable clients to synchronize private profile state between authorized devices of the same handle. These operations are serialized inside end-to-end-encrypted device-targeted envelopes; the relay routes ciphertext and does not interpret the operation payload.
 
-`DeviceSyncKinds` defines both the envelope-level sync kinds and the operation kinds. Memory synchronization uses:
+`DeviceSyncKinds` defines both the envelope-level sync kinds and the operation kinds. Selected tombstone-bearing operations include:
 
 | Operation kind | Payload |
 |------|------|
 | `memory.upsert` | `DeviceSyncMemory` with the owner-visible content, category, origin, salience metadata, source correlation, and timestamps. |
 | `memory.delete` | Empty payload plus the memory entity id and operation version. |
+| `topic.line.delete` | Empty payload with `DeviceSyncEntityIds.TopicLine(threadId, lineId)` as the entity id. The tombstone removes the cancelled trigger and correlated replies without affecting a same-id line in another topic. |
 
-`DeviceSyncMemory` deliberately omits local recall counters and last-recalled time. Those values describe use on one device and must not overwrite newer shared content. Clients should compare operation versions atomically, retain deletion tombstones, reject stale upserts, and allow recreation only with a version newer than both the prior upsert and delete.
+`DeviceSyncMemory` deliberately omits local recall counters and last-recalled time. Those values describe use on one device and must not overwrite newer shared content. Memory clients should compare operation versions atomically and allow recreation only with a version newer than both the prior upsert and delete. Topic line ids are immutable, so a `topic.line.delete` tombstone permanently rejects later upserts for that trigger and its correlated replies.
 
 #### 4.2.9 Capability directory (services)
 
