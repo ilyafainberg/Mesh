@@ -1,5 +1,6 @@
 using Mesh.Relay.Hub;
 using Mesh.Relay.Storage;
+using Mesh.Shared;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
 namespace Mesh.App.Tests;
@@ -15,6 +16,17 @@ public sealed class DurableRelayDeliveryTests
         Assert.IsTrue(
             RelayInboxPolicy.DeliveryWindow <= 4,
             "The initial Cosmos lease batch must stay below transport timeout budgets.");
+    }
+
+    [TestMethod]
+    public void SnapshotRequest_IsDiscardedOnlyAfterFailedDelivery()
+    {
+        Assert.IsFalse(RelayInboxPolicy.ShouldDiscardAfterFailedDelivery(
+            DeviceSyncKinds.EnvelopeSnapshotRequest, deliveryAttempts: 1));
+        Assert.IsTrue(RelayInboxPolicy.ShouldDiscardAfterFailedDelivery(
+            DeviceSyncKinds.EnvelopeSnapshotRequest, deliveryAttempts: 2));
+        Assert.IsFalse(RelayInboxPolicy.ShouldDiscardAfterFailedDelivery(
+            DeviceSyncKinds.EnvelopeOperation, deliveryAttempts: 50));
     }
 
     [TestMethod]
@@ -90,7 +102,9 @@ public sealed class DurableRelayDeliveryTests
         Assert.HasCount(0, await store.LeaseInboxAsync(inbox, "connection"));
 
         await store.ReleaseInboxLeaseAsync(inbox, queued.DeliveryId, "live-attempt");
-        Assert.HasCount(1, await store.LeaseInboxAsync(inbox, "connection"));
+        var delivered = await store.LeaseInboxAsync(inbox, "connection");
+        Assert.HasCount(1, delivered);
+        Assert.AreEqual(1, delivered[0].DeliveryAttempts);
     }
     [TestMethod]
     public async Task LiveDeliveryLease_BecomesAvailableAfterExpiry()

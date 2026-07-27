@@ -345,6 +345,7 @@ public sealed class InMemoryRelayStore : IRelayStore
             {
                 item.LeaseOwner = null;
                 item.LeaseUntil = null;
+                item.DeliveryAttempts = Math.Max(0, item.DeliveryAttempts - 1);
             }
         }
         return Task.CompletedTask;

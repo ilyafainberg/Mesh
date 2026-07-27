@@ -884,6 +884,7 @@ public sealed class CosmosRelayStore : IRelayStore
             }
             doc.LeaseOwner = null;
             doc.LeaseUntil = null;
+            doc.DeliveryAttempts = Math.Max(0, doc.DeliveryAttempts - 1);
             await inboxContainer.ReplaceItemAsync(
                 doc,
                 deliveryId,

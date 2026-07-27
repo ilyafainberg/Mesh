@@ -218,6 +218,14 @@ public sealed class MeshHub(
                     inboxKey, item.Id, Context.ConnectionId, Context.ConnectionAborted);
                 continue;
             }
+            if (RelayInboxPolicy.ShouldDiscardAfterFailedDelivery(envelope.Kind, item.DeliveryAttempts))
+            {
+                await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
+                logger.LogWarning(
+                    "Discarded repeatedly failing snapshot request {DeliveryId} after {Attempts} attempts",
+                    item.Id, item.DeliveryAttempts);
+                continue;
+            }
             if (item.DeliveryAttempts > 1) metrics.DeliveryRedelivered();
             var deliveryJson = JsonSerializer.Serialize(
                 envelope with { RelayDeliveryId = item.Id, RelayDeviceScoped = deviceScoped }, Json);

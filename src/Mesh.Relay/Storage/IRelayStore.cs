@@ -101,6 +101,10 @@ public static class RelayInboxPolicy
     public static bool UsesClientInitiatedDrain(bool supportsDurableDelivery)
         => supportsDurableDelivery;
 
+    public static bool ShouldDiscardAfterFailedDelivery(string kind, int deliveryAttempts)
+        => deliveryAttempts > 1
+           && string.Equals(kind, DeviceSyncKinds.EnvelopeSnapshotRequest, StringComparison.Ordinal);
+
     public static bool NeverExpires(string inboxKey)
     {
         var separator = inboxKey.IndexOf('\u001f');
@@ -312,6 +316,7 @@ public interface IRelayStore
         TimeSpan? leaseDuration = null,
         CancellationToken ct = default);
 
+    /// <summary>Releases a confirmed not-delivered lease and rolls back its tentative attempt.</summary>
     Task ReleaseInboxLeaseAsync(
         string toHandle,
         string deliveryId,

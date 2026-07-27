@@ -447,6 +447,9 @@ recipient is disconnected; atomic agent questions are queued while neither confi
 response device is eligible. Queued records use the default 14-day TTL; reserved
 system inbox records never expire.
 
+Device-sync snapshot requests are idempotent control records. If one is delivered but
+not acknowledged, the relay removes it on the next lease instead of redelivering it indefinitely.
+
 Cosmos containers used (created and managed for you, no pre-creation needed):
 
 - handle directory
