@@ -184,6 +184,36 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task RemoteSubmission_ReusesOptimisticTriggerLine()
+        {
+            var state = StateWithThread();
+            var runner = new RecordingRunner();
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                ]
+            };
+            var router = new TopicExecutionRouter(state, runner, transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+            state.AddOwnChatLine(draft.ThreadId, new ChatLine
+            {
+                Id = draft.TriggerLineId,
+                Role = "user",
+                Text = draft.Prompt,
+                At = draft.TriggerAt
+            });
+
+            var result = await router.SubmitAsync(draft, null, CancellationToken.None);
+
+            Assert.IsTrue(result.Accepted);
+            Assert.AreEqual(1, transport.Dispatches);
+            Assert.AreEqual(1, state.Profile.OwnThreads[0].Lines.Count);
+            Assert.AreEqual(draft.TriggerLineId, state.Profile.OwnThreads[0].Lines[0].Id);
+        }
+
+        [TestMethod]
         public async Task RemoteSubmission_BindsBuildsManifestAndRegistersProjection()
         {
             var state = StateWithThread();
