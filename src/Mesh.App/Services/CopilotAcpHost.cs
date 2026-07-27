@@ -518,7 +518,7 @@ internal sealed class CopilotAcpLane(
                 }
                 else
                 {
-                    var thought = CopilotAcpProtocol.NormalizeText(text.GetString());
+                    var thought = CopilotAcpProtocol.FormatThoughtChunk(text.GetString());
                     turn.Thought.Append(thought);
                     if (!string.IsNullOrEmpty(thought))
                         turn.Delta?.Report(new AgentDelta(AgentDeltaKind.Reasoning, thought));
