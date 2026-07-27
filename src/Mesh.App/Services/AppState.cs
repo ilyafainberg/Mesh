@@ -1295,10 +1295,10 @@ public sealed partial class AppState : IMemoryState
         thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, dto.At);
         // A committed assistant answer syncing in from the executing device is the terminal truth for a
         // remote run. The terminal update travels independently and can arrive later, so reconcile any
-        // lingering projection here to clear the phantom "thinking" bubble on this viewing device.
+        // lingering projection and durable queue entry here to clear phantom execution state.
         var reconciled = string.Equals(dto.Role, "assistant", StringComparison.Ordinal)
                          && !dto.Internal
-                         && ReconcileRemoteRunWithAnswer(thread, dto.At);
+                         && ReconcileTopicRunWithAnswer(thread, dto.ReplyToLineId, dto.At);
         return changed || reconciled;
     }
 
@@ -3021,23 +3021,33 @@ public sealed partial class AppState : IMemoryState
     }
 
     /// <summary>
-    /// Finalizes a lingering LIVE remote-run projection when the executing device's committed assistant
-    /// answer arrives via device sync. The terminal update and committed line travel independently, so the
-    /// line can arrive first or the update can be unavailable on a legacy relay. The durable answer is the
-    /// terminal truth: drop the projection, null the persisted run id, and
-    /// mark the run terminal so a late replay of a non-terminal update for the same run cannot resurrect
-    /// it. Runs while applying a device-sync batch (under profileSyncGate, which is reentrant) so it must
-    /// not re-broadcast: it mutates local state only and returns true so the caller refreshes the UI.
+    /// Finalizes durable queue state and any matching live remote-run projection when the executing
+    /// device's committed assistant answer arrives via device sync. The answer and terminal update travel
+    /// independently, so the answer is terminal truth for its exact trigger line even after an app restart.
+    /// Runs while applying a device-sync batch (under profileSyncGate, which is reentrant), so it mutates
+    /// local state only and returns true so the caller refreshes the UI.
     /// </summary>
-    private bool ReconcileRemoteRunWithAnswer(OwnThread thread, DateTimeOffset answerAt)
+    private bool ReconcileTopicRunWithAnswer(
+        OwnThread thread,
+        string? replyToLineId,
+        DateTimeOffset answerAt)
     {
         lock (profileSyncGate)
         {
-            if (!remoteRuns.TryGetValue(thread.Id, out var projection)
-                || !RemoteRunReconciliation.ShouldFinalizeOnAnswer(projection, answerAt))
+            remoteRuns.TryGetValue(thread.Id, out var projection);
+            var queuedRun = TopicRunProtocol.IsValidIdentifier(replyToLineId)
+                ? queuedTopicRuns.FindByLine(thread.Id, replyToLineId!)
+                : null;
+            var runId = RemoteRunReconciliation.RunIdForAnswer(
+                thread.Id, replyToLineId, queuedRun, projection, answerAt);
+            if (runId is null)
                 return false;
 
-            if (RemoteRunCorrelation.IsExpected(thread, thread.Id, projection.RunId))
+            var correlationKey = thread.Id + "\0" + runId;
+            var projectionMatches = projection is not null
+                                    && string.Equals(
+                                        projection.RunId, runId, StringComparison.Ordinal);
+            if (string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
             {
                 var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, answerAt);
                 if (activeDb is not null
@@ -3053,11 +3063,17 @@ public sealed partial class AppState : IMemoryState
                 thread.LastActivityAt = activityAt;
                 thread.ExecutionRunId = null;
             }
-            remoteRuns.Remove(thread.Id);
-            terminalRemoteRuns.Add(thread.Id + "\0" + projection.RunId);
-            remoteDeltaSeq.Remove(thread.Id + "\0" + projection.RunId);
-            liveAgentRenderState.EndDraft(thread.Id);
-            assistantDraftRefreshGate.Reset(thread.Id);
+
+            queuedTopicRuns.Complete(thread.Id, runId);
+            activeDb?.DeleteTopicOutbox(runId);
+            terminalRemoteRuns.Add(correlationKey);
+            remoteDeltaSeq.Remove(correlationKey);
+            if (projectionMatches)
+            {
+                remoteRuns.Remove(thread.Id);
+                liveAgentRenderState.EndDraft(thread.Id);
+                assistantDraftRefreshGate.Reset(thread.Id);
+            }
             return true;
         }
     }
@@ -3223,15 +3239,20 @@ public sealed partial class AppState : IMemoryState
     {
         lock (profileSyncGate)
         {
+            if (terminalRemoteRuns.Contains(update.ThreadId + "\0" + update.RunId))
+                return false;
             if (queuedTopicRuns.IsKnownRun(update.ThreadId, update.RunId)) return true;
             if (update.Phase != TopicRunPhase.Queued
                 || !TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
                 return false;
             var thread = Profile.OwnThreads.FirstOrDefault(item =>
                 string.Equals(item.Id, update.ThreadId, StringComparison.Ordinal));
-            return thread?.Lines.Any(line =>
-                string.Equals(line.Id, update.TriggerLineId, StringComparison.Ordinal)
-                && string.Equals(line.Role, "user", StringComparison.Ordinal)) == true;
+            return thread is not null
+                   && thread.Lines.Any(line =>
+                       string.Equals(line.Id, update.TriggerLineId, StringComparison.Ordinal)
+                       && string.Equals(line.Role, "user", StringComparison.Ordinal))
+                   && !RemoteRunReconciliation.HasCommittedAnswer(
+                       thread.Lines, update.TriggerLineId);
         }
     }
 

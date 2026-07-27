@@ -1138,6 +1138,39 @@ public static class RemoteRunReconciliation
         => projection is not null
            && answerAt != default
            && answerAt >= projection.Timestamp;
+
+    /// <summary>
+    /// Resolves the run completed by a committed assistant answer. An exact reply-to match against a
+    /// durable queued run is authoritative even when the live projection was missed or lost on restart.
+    /// Legacy uncorrelated answers retain the timestamp-based projection fallback.
+    /// </summary>
+    public static string? RunIdForAnswer(
+        string threadId,
+        string? replyToLineId,
+        QueuedTopicRunInfo? queuedRun,
+        RemoteRunProjection? projection,
+        DateTimeOffset answerAt)
+    {
+        if (TopicRunProtocol.IsValidIdentifier(replyToLineId)
+            && queuedRun is not null
+            && string.Equals(queuedRun.ThreadId, threadId, StringComparison.Ordinal)
+            && string.Equals(queuedRun.LineId, replyToLineId, StringComparison.Ordinal))
+            return queuedRun.RunId;
+
+        return projection is not null
+               && string.Equals(projection.ThreadId, threadId, StringComparison.Ordinal)
+               && ShouldFinalizeOnAnswer(projection, answerAt)
+            ? projection.RunId
+            : null;
+    }
+
+    /// <summary>True once a trigger line has a durable, user-visible assistant answer.</summary>
+    public static bool HasCommittedAnswer(IEnumerable<ChatLine> lines, string? triggerLineId)
+        => TopicRunProtocol.IsValidIdentifier(triggerLineId)
+           && lines.Any(line =>
+               !line.Internal
+               && string.Equals(line.Role, "assistant", StringComparison.Ordinal)
+               && string.Equals(line.ReplyToLineId, triggerLineId, StringComparison.Ordinal));
 }
 
 /// <summary>
