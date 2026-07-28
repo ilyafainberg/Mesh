@@ -43,7 +43,7 @@ public sealed class MeshRouter(
             return await RouteToDeviceAsync(clean, excludeConnectionId);
 
         var originalJson = JsonSerializer.Serialize(clean, Json);
-        var enqueued = await store.EnqueueAsync(to, clean.Id, clean.From, originalJson);
+        var enqueued = await store.EnqueueAsync(to, clean.Id, clean.From, originalJson, RelayInboxPriority.ForKind(clean.Kind));
         var deliveryId = enqueued.DeliveryId;
         var leaseOwner = LiveLeaseOwner();
         if (!await store.TryLeaseInboxItemAsync(to, deliveryId, leaseOwner))
@@ -92,7 +92,7 @@ public sealed class MeshRouter(
         var to = Normalize(clean.To);
         var inboxKey = DeviceInboxKey(to, clean.ToDevice!);
         var originalJson = JsonSerializer.Serialize(clean, Json);
-        var enqueued = await store.EnqueueAsync(inboxKey, clean.Id, clean.From, originalJson);
+        var enqueued = await store.EnqueueAsync(inboxKey, clean.Id, clean.From, originalJson, RelayInboxPriority.ForKind(clean.Kind));
         var deliveryId = enqueued.DeliveryId;
         var leaseOwner = LiveLeaseOwner();
         if (!await store.TryLeaseInboxItemAsync(inboxKey, deliveryId, leaseOwner))
@@ -193,6 +193,7 @@ public sealed class MeshRouter(
         bool includeBackgroundSync = true)
     {
         var normalized = Normalize(handle);
+        await PruneUnauthorizedConnectionsAsync(normalized);
         var conns = toDevice is not null
             ? registry.ConnectionsForDevice(normalized, toDevice, includeBackgroundSync)
             : registry.ConnectionsFor(normalized, includeBackgroundSync);
@@ -222,6 +223,7 @@ public sealed class MeshRouter(
         string? excludeConnectionId = null,
         bool includeBackgroundSync = true)
     {
+        await PruneUnauthorizedConnectionsAsync(Normalize(handle));
         var connection = registry.ConnectionsForDevice(Normalize(handle), deviceId, includeBackgroundSync)
             .Where(id => !string.Equals(id, excludeConnectionId, StringComparison.Ordinal))
             .OrderBy(id => id, StringComparer.Ordinal)
@@ -247,11 +249,25 @@ public sealed class MeshRouter(
             includeBackgroundSync)).Outcome
            == BackplaneDeliveryOutcome.Delivered;
 
+    private async Task PruneUnauthorizedConnectionsAsync(string handle)
+    {
+        if (registry.ConnectionsFor(handle).Count == 0) return;
+        var registration = await store.GetHandleAsync(handle);
+        var authorizedPublicKeys = registration?.DevicePublicKeys.ToHashSet(StringComparer.Ordinal)
+                                   ?? new HashSet<string>(StringComparer.Ordinal);
+        var revokedDeviceIds = registry.RevokeUnauthorizedDevices(handle, authorizedPublicKeys);
+        foreach (var deviceId in revokedDeviceIds)
+            await backplane.ClearDevicePresenceAsync(handle, deviceId);
+        if (revokedDeviceIds.Count > 0
+            && registry.ConnectionsFor(handle, includeBackgroundSync: false).Count == 0)
+            await backplane.ClearPresenceAsync(handle);
+    }
+
     private string LiveLeaseOwner()
         => $"live:{backplane.InstanceId}:{Guid.NewGuid():n}";
 
     private static string Normalize(string handle) => handle.Trim().TrimStart('@').ToLowerInvariant();
 
     public static string DeviceInboxKey(string handle, string deviceId)
-        => $"{Normalize(handle)}\u001f{deviceId}";
+        => RelayInboxKey.Device(handle, deviceId);
 }

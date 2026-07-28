@@ -958,18 +958,50 @@ public static class RemoteRunActivity
         return projection.Timestamp != default && now - projection.Timestamp < StaleAfter;
     }
 
+    public static bool UsesAuthoritativeState(
+        bool relaySupportsAuthoritativeState,
+        string? executionDeviceId,
+        string currentDeviceId,
+        IEnumerable<Mesh.Shared.DeviceInfo> devices)
+    {
+        if (!relaySupportsAuthoritativeState) return false;
+        if (string.IsNullOrWhiteSpace(executionDeviceId)
+            || string.Equals(executionDeviceId, currentDeviceId, StringComparison.Ordinal))
+            return true;
+        return devices.Any(device =>
+            string.Equals(device.DeviceId, executionDeviceId, StringComparison.Ordinal)
+            && device.ProtocolVersion >= 7);
+    }
+
+    public static bool IsProjectionActive(
+        RemoteRunProjection projection,
+        DateTimeOffset now,
+        bool authoritativeState)
+        => authoritativeState
+            ? projection.Timestamp != default
+            : IsProjectionFresh(projection, now);
+
+    public static bool IsPersistedRunActive(
+        OwnThread thread,
+        DateTimeOffset now,
+        bool authoritativeState)
+        => authoritativeState
+            ? !string.IsNullOrWhiteSpace(thread.ExecutionRunId)
+            : IsPersistedRunFresh(thread, now);
+
     /// <summary>True while a topic is actively running on this device or a remote execution device.</summary>
     public static bool IsBusy(
         OwnThread thread,
         bool localTurnActive,
         RemoteRunProjection? projection,
         bool remoteBound,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        bool authoritativeState = false)
     {
         ArgumentNullException.ThrowIfNull(thread);
         return localTurnActive
-            || projection is not null && IsProjectionFresh(projection, now)
-            || remoteBound && IsPersistedRunFresh(thread, now);
+            || projection is not null && IsProjectionActive(projection, now, authoritativeState)
+            || remoteBound && IsPersistedRunActive(thread, now, authoritativeState);
     }
 }
 

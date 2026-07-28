@@ -142,10 +142,49 @@ public sealed class BackgroundSyncTests
         Assert.IsNull(registry.Remove("background"));
     }
 
+    [TestMethod]
+    public void RevokedDeviceConnectionsAreRemovedFromEveryDeliveryIndex()
+    {
+        var registry = new ConnectionRegistry();
+        registry.Add("current", "ifain", "nonce-1", supportsDurableDelivery: true);
+        registry.Add("revoked", "ifain", "nonce-2", supportsDurableDelivery: true);
+        registry.MarkAuthenticated("current", "current-device-key");
+        registry.MarkAuthenticated("revoked", "revoked-device-key");
+        var revokedDeviceId = DeviceProtocol.DeviceId("revoked-device-key");
+
+        var revoked = registry.RevokeUnauthorizedDevices(
+            "ifain",
+            new HashSet<string>(["current-device-key"], StringComparer.Ordinal));
+
+        CollectionAssert.AreEqual(new[] { revokedDeviceId }, revoked.ToArray());
+        CollectionAssert.AreEqual(new[] { "current" }, registry.ConnectionsFor("ifain").ToArray());
+        Assert.HasCount(0, registry.ConnectionsForDevice("ifain", revokedDeviceId));
+        Assert.IsFalse(registry.Get("revoked")!.Authenticated);
+    }
+
+    [DataTestMethod]
+    [DataRow("attachment inbox is disposed", true)]
+    [DataRow("attachment inbox is full", true)]
+    [DataRow("attachment storage is unavailable", true)]
+    [DataRow("duplicate or conflicting attachment storage", true)]
+    [DataRow("duplicate attachment chunk", false)]
+    [DataRow("conflicting attachment metadata", false)]
+    public void AttachmentPersistenceFailuresRemainRetryable(string error, bool expected)
+        => Assert.AreEqual(expected, InboundAttachmentFailurePolicy.ShouldRetry(error));
+
     [DataTestMethod]
     [DataRow("user", true)]
     [DataRow("assistant", false)]
     [DataRow("tool", false)]
     public void OnlyInboundConversationLinesBecomeUnread(string role, bool expected)
         => Assert.AreEqual(expected, DeviceSyncUnreadPolicy.ShouldMarkConversationUnread(role));
+
+    [TestMethod]
+    public void InboundAcknowledgementRequiresTerminalProcessingOutcome()
+    {
+        Assert.IsTrue(InboundAcknowledgementPolicy.ShouldAcknowledge(InboundDisposition.Processed));
+        Assert.IsTrue(InboundAcknowledgementPolicy.ShouldAcknowledge(InboundDisposition.PermanentReject));
+        Assert.IsFalse(InboundAcknowledgementPolicy.ShouldAcknowledge(InboundDisposition.Retry));
+        Assert.IsFalse(InboundAcknowledgementPolicy.ShouldAcknowledge(InboundDisposition.Defer));
+    }
 }

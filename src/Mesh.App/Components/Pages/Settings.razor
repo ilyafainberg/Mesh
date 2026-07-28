@@ -54,6 +54,76 @@
                 </div>
                 <button class="ghost" @onclick="ClearInvite">Done</button>
             }
+            <h3>Linked devices</h3>
+            <div class="field-hint" style="margin-bottom:12px;">
+                Revoke a device you no longer control. Its relay queue is purged and it cannot reconnect with its old key.
+            </div>
+            <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+                <button class="ghost icon-btn" title="Refresh linked devices" aria-label="Refresh linked devices"
+                        disabled="@loadingLinkedDevices" @onclick="LoadLinkedDevicesAsync">
+                    <i class="bi bi-arrow-clockwise"></i>
+                </button>
+            </div>
+            @if (loadingLinkedDevices)
+            {
+                <div class="field-hint">Loading linked devices...</div>
+            }
+            else if (linkedDeviceError is not null)
+            {
+                <p class="err">@linkedDeviceError</p>
+            }
+            else if (linkedDevices.Count == 0)
+            {
+                <div class="field-hint">No linked devices were returned by the relay.</div>
+            }
+            else
+            {
+                <div class="account-list">
+                    @foreach (var device in linkedDevices.OrderBy(DeviceDisplayName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var isCurrentDevice = device.DeviceId == Mesh.MyDeviceId;
+                        <div class="account-row @(isCurrentDevice ? "active" : "")">
+                            <div class="account-info">
+                                <i class="bi @DeviceIcon(device.Platform)"></i>
+                                <div class="account-text">
+                                    <b>@DeviceDisplayName(device)</b>
+                                    <small class="muted">@DevicePlatform(device.Platform) - @(device.Online ? "online" : "offline") - protocol @device.ProtocolVersion</small>
+                                    @if (revokeDeviceId == device.DeviceId)
+                                    {
+                                        <small class="muted">Device ID: <code>@device.DeviceId</code></small>
+                                        <label class="field-hint">Enter <b>@RevokeSuffix(device.DeviceId)</b> to confirm this exact device.</label>
+                                        <input value="@revokeConfirmation" @oninput="OnRevokeConfirmationChanged" autocomplete="off" />
+                                        @if (revokeError is not null) { <small class="err">@revokeError</small> }
+                                    }
+                                </div>
+                            </div>
+                            <div class="account-actions">
+                                @if (isCurrentDevice)
+                                {
+                                    <span class="vis shared">this device</span>
+                                }
+                                else if (revokeDeviceId == device.DeviceId)
+                                {
+                                    <button class="danger" disabled="@(!CanConfirmRevoke(device) || revokingDevice)"
+                                            @onclick="() => ConfirmRevokeDeviceAsync(device)">
+                                        @(revokingDevice ? "Revoking..." : "Revoke device")
+                                    </button>
+                                    <button class="ghost" disabled="@revokingDevice" @onclick="CancelRevokeDevice">Cancel</button>
+                                }
+                                else
+                                {
+                                    <button class="danger" disabled="@(!Mesh.SupportsDeviceRevocation || revokingDevice)"
+                                            @onclick="() => BeginRevokeDevice(device)">Revoke</button>
+                                }
+                            </div>
+                        </div>
+                    }
+                </div>
+                @if (!Mesh.SupportsDeviceRevocation)
+                {
+                    <div class="field-hint">This relay does not support linked-device revocation yet.</div>
+                }
+            }
             <h3>Identities on this device</h3>
             <div class="field-hint" style="margin-bottom:12px;">
                 Keep several handles on this device and switch between them without signing out of any.
@@ -764,6 +834,14 @@
     bool allowApps = true;
     int replyBudget = 100;
     List<Mesh.Shared.DeviceInfo> agentDevices = new();
+    List<Mesh.Shared.DeviceInfo> linkedDevices = new();
+    bool loadingLinkedDevices;
+    bool linkedDevicesAttempted;
+    bool revokingDevice;
+    string? linkedDeviceError;
+    string? revokeDeviceId;
+    string? revokeError;
+    string revokeConfirmation = "";
     string primaryAgentDeviceId = "";
     string failoverAgentDeviceId = "";
     bool loadingAgentRouting;
@@ -826,6 +904,8 @@
                 SyncFields();
                 await Mesh.RegisterAsync();
                 await Mesh.ConnectAsync();
+                linkedDevicesAttempted = false;
+                await LoadLinkedDevicesAsync();
                 await LoadAgentRoutingAsync();
             }
         }
@@ -1055,6 +1135,7 @@
     {
         if (provider == "GitHubCopilot")
             await LoadCopilotModelsAsync();
+        await LoadLinkedDevicesAsync();
         await LoadAgentRoutingAsync();
     }
 
@@ -1072,7 +1153,10 @@
             if (!await Mesh.RegisterAsync())
                 registrationError = "Could not update this device on the relay. Check your connection and try again.";
             else
+            {
+                await LoadLinkedDevicesAsync();
                 await LoadAgentRoutingAsync();
+            }
         }
         catch { registrationError = "Could not update this device on the relay. Check your connection and try again."; }
     }
@@ -1086,6 +1170,8 @@
     }
     void Refresh()
     {
+        if (Mesh.Connected && !linkedDevicesAttempted && !loadingLinkedDevices)
+            _ = LoadLinkedDevicesAsync();
         if (Mesh.SupportsAtomicAgentDispatch && !agentRoutingAttempted && !loadingAgentRouting)
             _ = LoadAgentRoutingAsync();
         // Keep the dropdown in sync if the startup preload finishes while Settings is open.
@@ -1289,6 +1375,103 @@
         await LoadAgentRoutingAsync();
     }
 
+    async Task LoadLinkedDevicesAsync()
+    {
+        if (loadingLinkedDevices) return;
+        linkedDevicesAttempted = true;
+        loadingLinkedDevices = true;
+        linkedDeviceError = null;
+        try
+        {
+            linkedDevices = (await Mesh.ListMyDevicesAsync()).ToList();
+        }
+        catch (Exception ex)
+        {
+            linkedDeviceError = "Could not load linked devices: " + ex.Message;
+        }
+        finally
+        {
+            loadingLinkedDevices = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    void BeginRevokeDevice(Mesh.Shared.DeviceInfo device)
+    {
+        revokeDeviceId = device.DeviceId;
+        revokeConfirmation = "";
+        revokeError = null;
+    }
+
+    void CancelRevokeDevice()
+    {
+        revokeDeviceId = null;
+        revokeConfirmation = "";
+        revokeError = null;
+    }
+
+    void OnRevokeConfirmationChanged(ChangeEventArgs e)
+        => revokeConfirmation = e.Value?.ToString()?.Trim() ?? "";
+
+    bool CanConfirmRevoke(Mesh.Shared.DeviceInfo device)
+        => string.Equals(
+            revokeConfirmation,
+            RevokeSuffix(device.DeviceId),
+            StringComparison.OrdinalIgnoreCase);
+
+    async Task ConfirmRevokeDeviceAsync(Mesh.Shared.DeviceInfo device)
+    {
+        if (!CanConfirmRevoke(device) || revokingDevice) return;
+        revokingDevice = true;
+        revokeError = null;
+        try
+        {
+            var result = await Mesh.RevokeDeviceAsync(device.DeviceId);
+            if (result?.Revoked != true)
+            {
+                revokeError = "The relay did not revoke this device.";
+                return;
+            }
+            linkedDevices.RemoveAll(item => item.DeviceId == device.DeviceId);
+            agentDevices.RemoveAll(item => item.DeviceId == device.DeviceId);
+            if (primaryAgentDeviceId == device.DeviceId) primaryAgentDeviceId = "";
+            if (failoverAgentDeviceId == device.DeviceId) failoverAgentDeviceId = "";
+            CancelRevokeDevice();
+        }
+        catch (Exception ex)
+        {
+            revokeError = "Could not revoke this device: " + ex.Message;
+        }
+        finally
+        {
+            revokingDevice = false;
+        }
+    }
+
+    static string RevokeSuffix(string deviceId)
+        => deviceId.Length <= 6 ? deviceId : deviceId[^6..];
+
+    static string DeviceDisplayName(global::Mesh.Shared.DeviceInfo device)
+        => string.IsNullOrWhiteSpace(device.Name) ? "Linked device" : device.Name;
+
+    static string DevicePlatform(string? platform) => platform?.ToLowerInvariant() switch
+    {
+        global::Mesh.Shared.DevicePlatforms.Windows => "Windows",
+        global::Mesh.Shared.DevicePlatforms.MacOS => "Mac",
+        global::Mesh.Shared.DevicePlatforms.Android => "Android",
+        global::Mesh.Shared.DevicePlatforms.IOS => "iPhone or iPad",
+        _ => "Device"
+    };
+
+    static string DeviceIcon(string? platform) => platform?.ToLowerInvariant() switch
+    {
+        global::Mesh.Shared.DevicePlatforms.Windows => "bi-windows",
+        global::Mesh.Shared.DevicePlatforms.MacOS => "bi-apple",
+        global::Mesh.Shared.DevicePlatforms.Android => "bi-android2",
+        global::Mesh.Shared.DevicePlatforms.IOS => "bi-phone",
+        _ => "bi-device-ssd"
+    };
+
     async Task LoadAgentRoutingAsync()
     {
         if (!Mesh.SupportsAtomicAgentDispatch || loadingAgentRouting) return;
@@ -1301,6 +1484,8 @@
             var routingTask = Mesh.GetAgentRoutingAsync();
             await Task.WhenAll(devicesTask, routingTask);
             agentDevices = (await devicesTask).ToList();
+            linkedDevices = agentDevices.ToList();
+            linkedDevicesAttempted = true;
             var routing = await routingTask;
             if (routing is null)
             {
@@ -1309,6 +1494,12 @@
             }
             primaryAgentDeviceId = routing.PrimaryDeviceId ?? "";
             failoverAgentDeviceId = routing.FailoverDeviceId ?? "";
+        }
+        catch (Exception ex)
+        {
+            linkedDevicesAttempted = true;
+            linkedDeviceError = "Could not load linked devices: " + ex.Message;
+            agentRoutingError = "Could not load agent response devices: " + ex.Message;
         }
         finally
         {

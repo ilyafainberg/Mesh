@@ -86,13 +86,48 @@ public sealed partial class MeshDb
         return reader.Read() ? ReadInboundTopicRun(reader) : null;
     }
 
+    public InboundTopicCancellationItem? GetInboundTopicCancellation(string runId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM inbound_topic_cancellations WHERE run_id = $run;";
+        cmd.Parameters.AddWithValue("$run", runId);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read()
+            ? new InboundTopicCancellationItem(
+                reader.GetString(reader.GetOrdinal("run_id")),
+                reader.GetString(reader.GetOrdinal("source_device_id")),
+                reader.GetString(reader.GetOrdinal("thread_id")),
+                reader.GetString(reader.GetOrdinal("terminal_update_json")),
+                DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at"))))
+            : null;
+    }
+
+    public bool TryAddInboundTopicCancellation(InboundTopicCancellationItem item)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT OR IGNORE INTO inbound_topic_cancellations(
+                run_id, source_device_id, thread_id, terminal_update_json, created_at)
+            VALUES($run, $source, $thread, $terminal, $created);
+            """;
+        cmd.Parameters.AddWithValue("$run", item.RunId);
+        cmd.Parameters.AddWithValue("$source", item.SourceDeviceId);
+        cmd.Parameters.AddWithValue("$thread", item.ThreadId);
+        cmd.Parameters.AddWithValue("$terminal", item.TerminalUpdateJson);
+        cmd.Parameters.AddWithValue("$created", item.CreatedAt.ToString("O"));
+        return cmd.ExecuteNonQuery() == 1;
+    }
+
     public bool TryAddInboundTopicRun(InboundTopicRunItem item)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT OR IGNORE INTO inbound_topic_runs(
-                run_id, source_device_id, request_json, state, accepted_at, updated_at, terminal_update_json)
-            VALUES($run, $source, $request, $state, $accepted, $updated, $terminal);
+                run_id, source_device_id, request_json, state, accepted_at, updated_at,
+                terminal_update_json, queue_sequence)
+            SELECT $run, $source, $request, $state, $accepted, $updated, $terminal,
+                   COALESCE(MAX(queue_sequence), 0) + 1
+            FROM inbound_topic_runs;
             """;
         cmd.Parameters.AddWithValue("$run", item.RunId);
         cmd.Parameters.AddWithValue("$source", item.SourceDeviceId);
@@ -109,7 +144,7 @@ public sealed partial class MeshDb
         using var cmd = conn.CreateCommand();
         if (states.Length == 0)
         {
-            cmd.CommandText = "SELECT * FROM inbound_topic_runs ORDER BY accepted_at, run_id;";
+            cmd.CommandText = "SELECT * FROM inbound_topic_runs ORDER BY queue_sequence, run_id;";
         }
         else
         {
@@ -120,7 +155,7 @@ public sealed partial class MeshDb
                 names.Add(name);
                 cmd.Parameters.AddWithValue(name, states[i]);
             }
-            cmd.CommandText = $"SELECT * FROM inbound_topic_runs WHERE state IN ({string.Join(",", names)}) ORDER BY accepted_at, run_id;";
+            cmd.CommandText = $"SELECT * FROM inbound_topic_runs WHERE state IN ({string.Join(",", names)}) ORDER BY queue_sequence, run_id;";
         }
         using var reader = cmd.ExecuteReader();
         var result = new List<InboundTopicRunItem>();
@@ -170,6 +205,57 @@ public sealed partial class MeshDb
         return Convert.ToInt64(check.ExecuteScalar()) == 1;
     }
 
+    public bool SetInboundTopicRunTerminalAndQueue(
+        string runId,
+        string state,
+        TopicRunUpdatePayload terminalUpdate,
+        DeviceEnvelopeOutboxItem outbox)
+    {
+        using var transaction = conn.BeginTransaction();
+        using var update = conn.CreateCommand();
+        update.Transaction = transaction;
+        update.CommandText = """
+            UPDATE inbound_topic_runs
+            SET state = $state,
+                updated_at = $updated,
+                terminal_update_json = $terminal
+            WHERE run_id = $run
+              AND terminal_update_json IS NULL;
+            """;
+        update.Parameters.AddWithValue("$run", runId);
+        update.Parameters.AddWithValue("$state", state);
+        update.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O"));
+        update.Parameters.AddWithValue("$terminal", TopicRunProtocol.UpdateBody(terminalUpdate));
+        var wonTerminal = update.ExecuteNonQuery() == 1;
+        if (wonTerminal)
+        {
+            using var queue = conn.CreateCommand();
+            queue.Transaction = transaction;
+            queue.CommandText = """
+                INSERT OR IGNORE INTO device_envelope_outbox(
+                    envelope_id, target_device_id, kind, plaintext, push_hint, created_at)
+                VALUES($id, $device, $kind, $plaintext, $push, $created);
+                """;
+            queue.Parameters.AddWithValue("$id", outbox.EnvelopeId);
+            queue.Parameters.AddWithValue("$device", outbox.TargetDeviceId);
+            queue.Parameters.AddWithValue("$kind", outbox.Kind);
+            queue.Parameters.AddWithValue("$plaintext", outbox.Plaintext);
+            queue.Parameters.AddWithValue("$push", (object?)outbox.PushHint ?? DBNull.Value);
+            queue.Parameters.AddWithValue("$created", outbox.CreatedAt.ToString("O"));
+            queue.ExecuteNonQuery();
+        }
+        transaction.Commit();
+        if (wonTerminal) return true;
+
+        using var check = conn.CreateCommand();
+        check.CommandText = """
+            SELECT EXISTS(
+                SELECT 1 FROM inbound_topic_runs
+                WHERE run_id = $run AND terminal_update_json IS NOT NULL);
+            """;
+        check.Parameters.AddWithValue("$run", runId);
+        return Convert.ToInt64(check.ExecuteScalar()) == 1;
+    }
     public int PruneInboundTopicRuns(DateTimeOffset updatedBefore)
     {
         using var cmd = conn.CreateCommand();
@@ -186,6 +272,69 @@ public sealed partial class MeshDb
         return cmd.ExecuteNonQuery();
     }
 
+    public int PruneInboundTopicCancellations(DateTimeOffset createdBefore)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM inbound_topic_cancellations WHERE created_at < $before;";
+        cmd.Parameters.AddWithValue("$before", createdBefore.ToString("O"));
+        return cmd.ExecuteNonQuery();
+    }
+
+    public void UpsertInboundRejection(InboundRejectionItem item)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO inbound_rejections(
+                rejection_id, envelope_id, relay_delivery_id, kind, from_handle,
+                from_device_id, reason, rejected_at)
+            VALUES($id, $envelope, $delivery, $kind, $from, $device, $reason, $rejected)
+            ON CONFLICT(rejection_id) DO UPDATE SET
+                reason = excluded.reason,
+                rejected_at = excluded.rejected_at;
+            """;
+        cmd.Parameters.AddWithValue("$id", item.RejectionId);
+        cmd.Parameters.AddWithValue("$envelope", item.EnvelopeId);
+        cmd.Parameters.AddWithValue("$delivery", (object?)item.RelayDeliveryId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$kind", item.Kind);
+        cmd.Parameters.AddWithValue("$from", item.FromHandle);
+        cmd.Parameters.AddWithValue("$device", (object?)item.FromDeviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$reason", item.Reason);
+        cmd.Parameters.AddWithValue("$rejected", item.RejectedAt.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    public IReadOnlyList<InboundRejectionItem> ListInboundRejections()
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM inbound_rejections ORDER BY rejected_at, rejection_id;";
+        using var reader = cmd.ExecuteReader();
+        var result = new List<InboundRejectionItem>();
+        while (reader.Read())
+        {
+            result.Add(new InboundRejectionItem(
+                reader.GetString(reader.GetOrdinal("rejection_id")),
+                reader.GetString(reader.GetOrdinal("envelope_id")),
+                reader.IsDBNull(reader.GetOrdinal("relay_delivery_id"))
+                    ? null
+                    : reader.GetString(reader.GetOrdinal("relay_delivery_id")),
+                reader.GetString(reader.GetOrdinal("kind")),
+                reader.GetString(reader.GetOrdinal("from_handle")),
+                reader.IsDBNull(reader.GetOrdinal("from_device_id"))
+                    ? null
+                    : reader.GetString(reader.GetOrdinal("from_device_id")),
+                reader.GetString(reader.GetOrdinal("reason")),
+                DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("rejected_at")))));
+        }
+        return result;
+    }
+
+    public int PruneInboundRejections(DateTimeOffset rejectedBefore)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM inbound_rejections WHERE rejected_at < $before;";
+        cmd.Parameters.AddWithValue("$before", rejectedBefore.ToString("O"));
+        return cmd.ExecuteNonQuery();
+    }
     public void UpsertDeviceEnvelopeOutbox(DeviceEnvelopeOutboxItem item)
     {
         using var cmd = conn.CreateCommand();
@@ -243,7 +392,8 @@ public sealed partial class MeshDb
             DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("updated_at"))),
             reader.IsDBNull(reader.GetOrdinal("terminal_update_json"))
                 ? null
-                : reader.GetString(reader.GetOrdinal("terminal_update_json")));
+                : reader.GetString(reader.GetOrdinal("terminal_update_json")),
+            reader.GetInt64(reader.GetOrdinal("queue_sequence")));
     private static TopicOutboxItem ReadTopicOutbox(SqliteDataReader reader)
         => new(
             reader.GetString(reader.GetOrdinal("run_id")),

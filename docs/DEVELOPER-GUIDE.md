@@ -460,6 +460,7 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 | POST | `/handles/{handle}/recover` | Recover a handle using the recovery key. | Signed (recovery) |
 | GET | `/handles/{handle}` | Public handle info. | Public |
 | GET | `/handles/{handle}/devices` | Device directory for a handle. | Public |
+| DELETE | `/handles/{handle}/devices/{deviceId}` | Revoke one linked device and purge only its device inbox. | Signed by a different linked device |
 | POST | `/handles/{handle}/agent-routing/query` | Read relay-authoritative primary/failover policy. | Signed device key |
 | PUT | `/handles/{handle}/agent-routing` | Compare-and-swap update of primary/failover policy. | Signed device key |
 | POST | `/handles/resolve` | Batch-resolve device public keys. Body: `HandleKeysBatchRequest`; missing handles are omitted. Limited to 10 requests/minute per IP in addition to the global REST limit. | Public |
@@ -482,7 +483,7 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 
 ### 5.3 SignalR hub: connect, auth handshake, and routing
 
-The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, `SendFanout`, `AcknowledgeDelivery`, `RequestPendingDeliveries`, and `CancelQueuedEnvelope`; the server emits `Challenge`, `Ready`, and `Receive`. Protocol-5 clients append `deliveryAck=1` to the hub query. Protocol-6 background clients append both `deliveryAck=1` and `backgroundSync=1`.
+The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, `SendEphemeralEnvelope`, `SendFanout`, `AcknowledgeDelivery`, `RequestPendingDeliveries`, and `CancelQueuedEnvelope`; the server emits `Challenge`, `Ready`, and `Receive`. Protocol-5 clients append `deliveryAck=1` to the hub query. Protocol-6 background clients append both `deliveryAck=1` and `backgroundSync=1`.
 
 #### 5.3.1 Connect and auth handshake
 
@@ -513,11 +514,22 @@ Delivery to clients uses the **`Receive`** method. A protocol-5 client acknowled
 
 #### 5.3.3 Passive background synchronization
 
-Protocol version 6 relays advertise both `durableDelivery: true` and `backgroundSync: true` in the `capabilities` object returned by `GET /` and `GET /health`. A client must require both flags before opening a background session; the numeric protocol version by itself is not a sufficient safety check.
+Protocol version 6 introduced `durableDelivery: true` and `backgroundSync: true`; Protocol 7 relays continue to advertise both in the `capabilities` object returned by `GET /` and `GET /health`. A client must require both flags before opening a background session; the numeric protocol version by itself is not a sufficient safety check.
 
 A background client connects with `deliveryAck=1&backgroundSync=1`, completes the normal device-key challenge, and drains the same authoritative durable inbox. The connection may receive and acknowledge passive updates only after successful decryption, validation, and local persistence. Foreground-only kinds remain queued, including agent and service requests, topic execution or cancellation, attachments, and snapshot requests.
 
 The relay excludes background sessions from ordinary handle and device presence, foreground-only live routing, and atomic agent dispatch. This prevents a short inbox drain from suppressing sibling alerts or being selected to execute work. Push payloads remain metadata-only wake signals and never carry ciphertext, plaintext, or keys.
+
+#### 5.3.4 Protocol 7 reliability
+
+Protocol 7 relays advertise `ephemeralDelivery`, `snapshotTransferV2`, `deviceRevocation`, `processingOutcomes`, and `authoritativeTopicState`. Clients still gate each behavior on its capability flag and retain Protocol 6 behavior when a flag is absent.
+
+- Durable inboxes drain Critical, Control, Normal, Sync, then Bulk traffic while preserving FIFO order inside each class and advancing one aged lower-priority item per bounded drain. Cancellations and snapshot completions are Critical; topic requests, durable phases, and snapshot requests are Control; ordinary messages are Normal; incremental operations and snapshot manifests are Sync; snapshot chunks are Bulk.
+- Inbound processing has four client outcomes: `Processed`, `PermanentReject`, `Retry`, and `Defer`. Only the first two acknowledge the relay delivery. Retry and defer leave the stable envelope queued for redelivery.
+- Snapshot v2 uses Brotli-compressed deterministic content, a manifest, chunks no larger than 512 KB, and a durable completion receipt. A reconnecting receiver reports its known snapshot ID and missing indexes so the sender transmits only missing chunks. Complete transfers are hash-checked before atomic application.
+- `SendEphemeralEnvelope` accepts only signed, encrypted, device-targeted `topic.run.update` traffic for a currently online sibling device. It never creates an inbox record. Durable phase changes and terminal results continue through `SendEnvelope`.
+- Device registration records the client's protocol version. A linked device can be revoked only by a different authorized device using `DeviceRevocationProtocol.Message`. Revocation removes its public key and metadata, clears live authorization/presence, purges that device's inbox, and rejects later device-scoped sends to the removed ID.
+- Topic requests are persisted as accepted before work starts, receive a durable queued update, and transition to running only when their per-topic queue actually dequeues them. Cancellation remains pending until a terminal update arrives unless `CancelQueuedEnvelope` proves the request was removed before delivery.
 
 ### 5.4 Storage and backplane abstractions
 

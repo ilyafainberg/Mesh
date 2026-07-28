@@ -116,11 +116,10 @@ public sealed class TopicExecutionRouter(
         if (!state.IsQueuedTopicRunLine(threadId, runId, lineId))
             return false;
 
-        state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
         if (!await StopAsync(threadId, runId, cancellationToken))
             return false;
-
-        return state.RemoveCancelledQueuedTopicLine(threadId, runId, lineId);
+        state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
+        return true;
     }
 
     public async Task<bool> StopAsync(
@@ -145,8 +144,6 @@ public sealed class TopicExecutionRouter(
                 thread.ExecutionDeviceId,
                 new TopicRunCancelPayload(runId, threadId),
                 cancellationToken);
-            if (queuedCancelled)
-                state.ClearRemoteRunProjection(threadId, runId);
             return queuedCancelled;
         }
 
@@ -177,8 +174,6 @@ public sealed class TopicExecutionRouter(
             entry.RemoteDeviceId,
             new TopicRunCancelPayload(runId, threadId),
             cancellationToken);
-        if (cancelled)
-            state.ClearRemoteRunProjection(threadId, runId);
         return cancelled;
     }
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
@@ -318,13 +313,15 @@ public sealed class TopicExecutionRouter(
                     draft.RunId,
                     new ExecutionDevice(target.DeviceId, target.Name, target.Platform),
                     draft.TriggerAt);
-                state.ApplyRemoteRunUpdate(queuedUpdate);
+                if (!state.TryApplyRemoteRunUpdate(queuedUpdate))
+                    throw new InvalidOperationException("The queued run state could not be persisted.");
             }
             var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             entry.LocalCancellation = linked;
             var projectedProgress = new InlineProgress<TopicRunUpdatePayload>(update =>
             {
-                state.ApplyRemoteRunUpdate(update);
+                if (!state.TryApplyRemoteRunUpdate(update))
+                    throw new InvalidOperationException("The local run state could not be persisted.");
                 progress?.Report(update);
             });
             _ = RunLocalAsync(
@@ -347,7 +344,8 @@ public sealed class TopicExecutionRouter(
                 new ExecutionDevice(
                     remoteTarget.DeviceId, remoteTarget.Name, remoteTarget.Platform),
                 draft.TriggerAt);
-            state.ApplyRemoteRunUpdate(queuedUpdate);
+            if (!state.TryApplyRemoteRunUpdate(queuedUpdate))
+                throw new InvalidOperationException("The queued run state could not be persisted.");
         }
 
         var attachments = draft.Attachments?.ToList() ?? [];

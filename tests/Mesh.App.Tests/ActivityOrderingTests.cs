@@ -205,6 +205,43 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
+    public void RemoteRunActivity_AuthoritativeStateDoesNotUseFreshnessHeuristic()
+    {
+        var now = new DateTimeOffset(2026, 7, 24, 3, 0, 0, TimeSpan.Zero);
+        var thread = Thread("topic", now.AddDays(-2));
+        thread.ExecutionRunId = "run-1";
+        var staleProjection = Projection("run-1", "topic", now.AddDays(-1));
+
+        Assert.IsTrue(RemoteRunActivity.IsBusy(
+            thread, false, staleProjection, false, now, authoritativeState: true));
+        Assert.IsTrue(RemoteRunActivity.IsBusy(
+            thread, false, null, true, now, authoritativeState: true));
+        Assert.IsFalse(RemoteRunActivity.IsBusy(
+            thread, false, null, false, now, authoritativeState: true));
+    }
+
+    [TestMethod]
+    public void RemoteRunActivity_AuthoritativeStateRequiresProtocol7ExecutionDevice()
+    {
+        Mesh.Shared.DeviceInfo[] devices =
+        [
+            new("legacy", "Legacy", true, Mesh.Shared.DevicePlatforms.Windows, true,
+                ProtocolVersion: 6),
+            new("modern", "Modern", true, Mesh.Shared.DevicePlatforms.Windows, true,
+                ProtocolVersion: 7)
+        ];
+
+        Assert.IsFalse(RemoteRunActivity.UsesAuthoritativeState(
+            false, "modern", "current", devices));
+        Assert.IsTrue(RemoteRunActivity.UsesAuthoritativeState(
+            true, "current", "current", devices));
+        Assert.IsFalse(RemoteRunActivity.UsesAuthoritativeState(
+            true, "legacy", "current", devices));
+        Assert.IsTrue(RemoteRunActivity.UsesAuthoritativeState(
+            true, "modern", "current", devices));
+    }
+
+    [TestMethod]
     public void RemoteRunPresentation_PrefersLocalStateAndDoesNotRepeatToolLabel()
     {
         var projection = Projection("run-1", "topic", DateTimeOffset.UtcNow);

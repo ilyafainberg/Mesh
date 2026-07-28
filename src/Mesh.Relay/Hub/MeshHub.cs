@@ -111,15 +111,17 @@ public sealed class MeshHub(
 
     public async Task<bool> AcknowledgeDelivery(string deliveryId, bool deviceScoped)
     {
-        var connection = registry.Get(Context.ConnectionId);
-        if (connection is not { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null }
+        var authorization = await GetAuthorizedConnectionAsync();
+        var connection = authorization.Connection;
+        if (connection is not { SupportsDurableDelivery: true, Handle: not null, DeviceId: not null }
             || string.IsNullOrWhiteSpace(deliveryId))
             return false;
 
         await connection.DeliveryGate.WaitAsync(Context.ConnectionAborted);
         try
         {
-            if (!ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return false;
+            if (!connection.Authenticated
+                || !ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return false;
             var inboxKey = deviceScoped
                 ? MeshRouter.DeviceInboxKey(connection.Handle, connection.DeviceId)
                 : connection.Handle;
@@ -140,14 +142,16 @@ public sealed class MeshHub(
 
     public async Task<int> RequestPendingDeliveries()
     {
-        var connection = registry.Get(Context.ConnectionId);
-        if (connection is not { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null })
+        var authorization = await GetAuthorizedConnectionAsync();
+        var connection = authorization.Connection;
+        if (connection is not { SupportsDurableDelivery: true, Handle: not null, DeviceId: not null })
             return 0;
 
         await connection.DeliveryGate.WaitAsync(Context.ConnectionAborted);
         try
         {
-            if (!ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return 0;
+            if (!connection.Authenticated
+                || !ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return 0;
             var deviceItems = await DeliverDurableInboxCoreAsync(
                 connection, MeshRouter.DeviceInboxKey(connection.Handle, connection.DeviceId), deviceScoped: true);
             var handleItems = await DeliverDurableInboxCoreAsync(connection, connection.Handle, deviceScoped: false);
@@ -161,8 +165,9 @@ public sealed class MeshHub(
 
     public async Task<bool> CancelQueuedEnvelope(CancelQueuedEnvelopeRequest request)
     {
-        var state = registry.Get(Context.ConnectionId);
-        if (state is not { Authenticated: true, Handle: not null }
+        var authorization = await GetAuthorizedConnectionAsync();
+        var state = authorization.Connection;
+        if (state is not { Handle: not null }
             || request is null
             || string.IsNullOrWhiteSpace(request.EnvelopeId)
             || string.IsNullOrWhiteSpace(request.TargetDeviceId))
@@ -187,7 +192,8 @@ public sealed class MeshHub(
         bool deviceScoped,
         int maxItems = RelayInboxPolicy.DeliveryWindow)
     {
-        if (!ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return 0;
+        if (!connection.Authenticated
+            || !ReferenceEquals(connection, registry.Get(Context.ConnectionId))) return 0;
         var pending = await store.LeaseInboxAsync(
             inboxKey,
             Context.ConnectionId,
@@ -196,6 +202,12 @@ public sealed class MeshHub(
         var delivered = 0;
         foreach (var item in pending)
         {
+            if (!connection.Authenticated)
+            {
+                await store.ReleaseInboxLeasesAsync(
+                    inboxKey, Context.ConnectionId, Context.ConnectionAborted);
+                break;
+            }
             MeshEnvelope? envelope;
             try
             {
@@ -218,14 +230,7 @@ public sealed class MeshHub(
                     inboxKey, item.Id, Context.ConnectionId, Context.ConnectionAborted);
                 continue;
             }
-            if (RelayInboxPolicy.ShouldDiscardAfterFailedDelivery(envelope.Kind, item.DeliveryAttempts))
-            {
-                await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
-                logger.LogWarning(
-                    "Discarded repeatedly failing snapshot request {DeliveryId} after {Attempts} attempts",
-                    item.Id, item.DeliveryAttempts);
-                continue;
-            }
+
             if (item.DeliveryAttempts > 1) metrics.DeliveryRedelivered();
             var deliveryJson = JsonSerializer.Serialize(
                 envelope with { RelayDeliveryId = item.Id, RelayDeviceScoped = deviceScoped }, Json);
@@ -237,12 +242,16 @@ public sealed class MeshHub(
     /// <summary>Receives an envelope from an authenticated connection and routes it.</summary>
     public async Task<MeshSendResult> SendEnvelope(MeshEnvelope env)
     {
-        var state = registry.Get(Context.ConnectionId);
-        if (state is null || !state.Authenticated || state.Handle is null || state.PublicKey is null)
-            return MeshSendResult.Reject("unauthenticated");
+        var authorization = await GetAuthorizedConnectionAsync();
+        var state = authorization.Connection;
+        if (state is null)
+            return MeshSendResult.Reject(authorization.Revoked ? "device_revoked" : "unauthenticated");
+        var currentRegistration = authorization.Registration!;
+        var handle = state.Handle!;
+        var publicKey = state.PublicKey!;
 
         // Verify the message signature against the connection's authenticated key.
-        if (!MeshCrypto.Verify(state.PublicKey, env.Body, env.Signature ?? ""))
+        if (!MeshCrypto.Verify(publicKey, env.Body, env.Signature ?? ""))
             return MeshSendResult.Reject("invalid_signature");
 
         // Reject oversized envelopes before routing: the relay persists each one as a single Cosmos
@@ -251,7 +260,7 @@ public sealed class MeshHub(
         if (System.Text.Encoding.UTF8.GetByteCount(env.Body ?? string.Empty) > MessageLimits.MaxEnvelopeBodyBytes)
             return MeshSendResult.Reject("message_too_large");
 
-        var stamped = env with { From = state.Handle, FromDevice = state.DeviceId };
+        var stamped = env with { From = handle, FromDevice = state.DeviceId };
         if (stamped.PushHint is not null && !PushHintProtocol.IsTopicResponse(stamped))
             return MeshSendResult.Reject("invalid_push_hint");
 
@@ -259,10 +268,24 @@ public sealed class MeshHub(
         if (!isDeviceSync
             && env.Kind?.StartsWith("device.sync.", StringComparison.OrdinalIgnoreCase) == true)
             return MeshSendResult.Reject("sync_kind_unknown");
+        if (!string.IsNullOrWhiteSpace(stamped.ToDevice))
+        {
+            var targetHandle = Normalize(stamped.To);
+            var targetRegistration = string.Equals(targetHandle, handle, StringComparison.Ordinal)
+                ? currentRegistration
+                : await store.GetHandleAsync(targetHandle, Context.ConnectionAborted);
+            var targetKnown = targetRegistration?.DevicePublicKeys.Any(publicKey =>
+                string.Equals(
+                    DeviceProtocol.DeviceId(publicKey),
+                    stamped.ToDevice,
+                    StringComparison.Ordinal)) == true;
+            if (!targetKnown)
+                return MeshSendResult.Reject(isDeviceSync ? "sync_target_unknown" : "target_device_unknown");
+        }
 
         if (isDeviceSync)
         {
-            if (Normalize(env.To) != state.Handle)
+            if (Normalize(env.To) != handle)
                 return MeshSendResult.Reject("sync_same_handle_required");
             if (string.IsNullOrWhiteSpace(state.DeviceId))
                 return MeshSendResult.Reject("unauthenticated");
@@ -270,15 +293,6 @@ public sealed class MeshHub(
                 return MeshSendResult.Reject("sync_target_required");
             if (string.Equals(env.ToDevice, state.DeviceId, StringComparison.Ordinal))
                 return MeshSendResult.Reject("sync_self_target");
-
-            var registration = await store.GetHandleAsync(state.Handle, Context.ConnectionAborted);
-            var targetKnown = registration?.DevicePublicKeys.Any(publicKey =>
-                string.Equals(
-                    DeviceProtocol.DeviceId(publicKey),
-                    env.ToDevice,
-                    StringComparison.Ordinal)) == true;
-            if (!targetKnown)
-                return MeshSendResult.Reject("sync_target_unknown");
 
             var syncEnvelope = stamped;
             var syncRoute = await router.RouteToDeviceAsync(syncEnvelope);
@@ -290,17 +304,17 @@ public sealed class MeshHub(
         }
 
         var (decision, policy) = await rateLimiter.TryAcquireAsync(
-            state.Handle, MessageRateBucket.Direct, Context.ConnectionAborted);
+            handle, MessageRateBucket.Direct, Context.ConnectionAborted);
         if (!policy.Enabled)
         {
             metrics.RateLimitRejected();
-            logger.LogWarning("message disabled by policy: {Handle}", state.Handle);
+            logger.LogWarning("message disabled by policy: {Handle}", handle);
             return MeshSendResult.Reject("disabled");
         }
         if (!decision.Allowed)
         {
             metrics.RateLimitRejected();
-            logger.LogWarning("message rate limited: {Handle}", state.Handle);
+            logger.LogWarning("message rate limited: {Handle}", handle);
             return MeshSendResult.Reject("rate_limited", decision.RetryAfterMs);
         }
 
@@ -328,20 +342,19 @@ public sealed class MeshHub(
 
         if (stamped.Kind == MeshKinds.RemoteAgentRequest)
         {
-            if (Normalize(stamped.To) != state.Handle)
+            if (Normalize(stamped.To) != handle)
                 return MeshSendResult.Reject("remote_agent_same_handle_required");
             if (string.IsNullOrWhiteSpace(stamped.ToDevice))
                 return MeshSendResult.Reject("home_device_required");
 
-            var registration = await store.GetHandleAsync(state.Handle, Context.ConnectionAborted);
-            var platform = registration?.DevicePlatforms.GetValueOrDefault(stamped.ToDevice);
+            var platform = currentRegistration.DevicePlatforms.GetValueOrDefault(stamped.ToDevice);
             var remoteAgentEnabled =
-                registration?.DeviceRemoteAgentEnabled.GetValueOrDefault(stamped.ToDevice) == true;
+                currentRegistration.DeviceRemoteAgentEnabled.GetValueOrDefault(stamped.ToDevice);
             if (!DevicePlatforms.IsDesktop(platform) || !remoteAgentEnabled)
                 return MeshSendResult.Reject("home_device_not_eligible");
 
             var owner = await backplane.GetInstanceForDeviceAsync(
-                state.Handle, stamped.ToDevice, Context.ConnectionAborted);
+                handle, stamped.ToDevice, Context.ConnectionAborted);
             if (owner is null)
                 return MeshSendResult.Reject("home_device_offline");
 
@@ -363,7 +376,7 @@ public sealed class MeshHub(
 
         // When a device sends to its own handle (remote-to-desktop), exclude the sender's own
         // connection so the message reaches the owner's OTHER devices rather than echoing back.
-        var exclude = Normalize(stamped.To) == state.Handle ? Context.ConnectionId : null;
+        var exclude = Normalize(stamped.To) == handle ? Context.ConnectionId : null;
         var route = await router.RouteAsync(stamped, exclude);
         if (route.NewlyQueued) metrics.QueueEnqueued();
         metrics.MessageRouted();
@@ -372,15 +385,55 @@ public sealed class MeshHub(
             : MeshSendResult.Delivered(route.DeliveryId);
     }
 
+    public async Task<MeshSendResult> SendEphemeralEnvelope(MeshEnvelope env)
+    {
+        var authorization = await GetAuthorizedConnectionAsync();
+        var state = authorization.Connection;
+        if (state is null)
+            return MeshSendResult.Reject(authorization.Revoked ? "device_revoked" : "unauthenticated");
+        var registration = authorization.Registration!;
+        var handle = state.Handle!;
+        var publicKey = state.PublicKey!;
+        if (!MeshCrypto.Verify(publicKey, env.Body, env.Signature ?? ""))
+            return MeshSendResult.Reject("invalid_signature");
+        if (System.Text.Encoding.UTF8.GetByteCount(env.Body ?? string.Empty) > MessageLimits.MaxEnvelopeBodyBytes)
+            return MeshSendResult.Reject("message_too_large");
+        if (!string.Equals(env.Kind, MeshKinds.TopicRunUpdate, StringComparison.Ordinal)
+            || Normalize(env.To) != handle
+            || string.IsNullOrWhiteSpace(state.DeviceId)
+            || string.IsNullOrWhiteSpace(env.ToDevice)
+            || string.Equals(env.ToDevice, state.DeviceId, StringComparison.Ordinal)
+            || env.PushHint is not null)
+            return MeshSendResult.Reject("ephemeral_route_invalid");
+        var targetKnown = registration.DevicePublicKeys.Any(publicKey =>
+            string.Equals(DeviceProtocol.DeviceId(publicKey), env.ToDevice, StringComparison.Ordinal));
+        if (!targetKnown) return MeshSendResult.Reject("sync_target_unknown");
+
+        var stamped = env with
+        {
+            From = handle,
+            FromDevice = state.DeviceId,
+            RelayDeliveryId = null,
+            RelayDeviceScoped = false
+        };
+        var delivered = await router.RouteToOnlineDeviceAsync(
+            stamped, Context.ConnectionId, Context.ConnectionAborted);
+        if (!delivered) return MeshSendResult.Reject("ephemeral_not_delivered");
+        metrics.MessageRouted();
+        return MeshSendResult.Ok();
+    }
     /// <summary>
     /// Routes one opaque ciphertext to a transient recipient list. The relay never inspects the
     /// encrypted dispatch metadata and never creates a durable group or membership record.
     /// </summary>
     public async Task<MeshSendResult> SendFanout(MeshFanoutRequest request)
     {
-        var state = registry.Get(Context.ConnectionId);
-        if (state is null || !state.Authenticated || state.Handle is null || state.PublicKey is null)
-            return MeshSendResult.Reject("unauthenticated");
+        var authorization = await GetAuthorizedConnectionAsync();
+        var state = authorization.Connection;
+        if (state is null)
+            return MeshSendResult.Reject(authorization.Revoked ? "device_revoked" : "unauthenticated");
+        var handle = state.Handle!;
+        var publicKey = state.PublicKey!;
         if (request is null
             || string.IsNullOrWhiteSpace(request.Id)
             || string.IsNullOrWhiteSpace(request.Body)
@@ -389,7 +442,7 @@ public sealed class MeshHub(
             return MeshSendResult.Reject("invalid_fanout");
         if (request.Recipients.Count > FanoutProtocol.MaxRecipients)
             return MeshSendResult.Reject("too_many_recipients");
-        if (!MeshCrypto.Verify(state.PublicKey, request.Body, request.Signature))
+        if (!MeshCrypto.Verify(publicKey, request.Body, request.Signature))
             return MeshSendResult.Reject("invalid_signature");
 
         // Same 2 MB envelope ceiling applies to the fan-out body stored per recipient inbox.
@@ -410,7 +463,7 @@ public sealed class MeshHub(
         if (recipients.Count == 0)
             return MeshSendResult.Reject("invalid_fanout");
 
-        var policy = await ratePolicies.GetPolicyAsync(state.Handle, Context.ConnectionAborted);
+        var policy = await ratePolicies.GetPolicyAsync(handle, Context.ConnectionAborted);
         if (!policy.Enabled)
         {
             metrics.RateLimitRejected();
@@ -422,7 +475,7 @@ public sealed class MeshHub(
 
         // One accepted fan-out is one logical group message, regardless of recipient count.
         var (decision, effectivePolicy) = await rateLimiter.TryAcquireAsync(
-            state.Handle, MessageRateBucket.Group, Context.ConnectionAborted);
+            handle, MessageRateBucket.Group, Context.ConnectionAborted);
         if (!effectivePolicy.Enabled)
         {
             metrics.RateLimitRejected();
@@ -431,7 +484,7 @@ public sealed class MeshHub(
         if (!decision.Allowed)
         {
             metrics.RateLimitRejected();
-            logger.LogWarning("fan-out rate limited: {Handle}", state.Handle);
+            logger.LogWarning("fan-out rate limited: {Handle}", handle);
             return MeshSendResult.Reject("rate_limited", decision.RetryAfterMs);
         }
 
@@ -443,7 +496,7 @@ public sealed class MeshHub(
         var targets = registrations
             .SelectMany(record => record!.DevicePublicKeys
                 .Select(publicKey => (record.Handle, DeviceId: DeviceProtocol.DeviceId(publicKey))))
-            .Where(target => !(target.Handle == state.Handle && target.DeviceId == state.DeviceId))
+            .Where(target => !(target.Handle == handle && target.DeviceId == state.DeviceId))
             .Distinct()
             .ToList();
 
@@ -452,7 +505,7 @@ public sealed class MeshHub(
         {
             var envelope = new MeshEnvelope(
                 request.Id,
-                state.Handle,
+                handle,
                 target.Handle,
                 MeshKinds.Fanout,
                 request.Body,
@@ -467,6 +520,37 @@ public sealed class MeshHub(
         metrics.QueueEnqueued(routes.Count(route => route.NewlyQueued));
         metrics.MessageRouted(targets.Count);
         return MeshSendResult.Ok(recipients.Count);
+    }
+
+    private async Task<(
+        ConnectionRegistry.ConnState? Connection,
+        StoredHandle? Registration,
+        bool Revoked)> GetAuthorizedConnectionAsync()
+    {
+        var connection = registry.Get(Context.ConnectionId);
+        if (connection is null
+            || !connection.Authenticated
+            || connection.Handle is null
+            || connection.PublicKey is null)
+            return (null, null, false);
+
+        var registration = await store.GetHandleAsync(
+            connection.Handle, Context.ConnectionAborted);
+        if (registration?.DevicePublicKeys.Contains(connection.PublicKey) == true)
+            return (connection, registration, false);
+
+        if (!string.IsNullOrWhiteSpace(connection.DeviceId))
+        {
+            registry.RevokeDevice(connection.Handle, connection.DeviceId);
+            await backplane.ClearDevicePresenceAsync(connection.Handle, connection.DeviceId);
+        }
+        else
+        {
+            connection.Authenticated = false;
+        }
+        if (registry.ConnectionsFor(connection.Handle, includeBackgroundSync: false).Count == 0)
+            await backplane.ClearPresenceAsync(connection.Handle);
+        return (null, null, true);
     }
 
     private async Task DispatchAvailableAfterAuthenticationAsync(string handle)

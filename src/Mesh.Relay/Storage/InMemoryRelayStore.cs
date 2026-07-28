@@ -90,6 +90,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         string platform,
         bool remoteAgentEnabled,
         bool atomicAgentDispatchEnabled,
+        int protocolVersion = 6,
         CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))
@@ -100,6 +101,7 @@ public sealed class InMemoryRelayStore : IRelayStore
                 rec.DevicePlatforms[deviceId] = platform;
                 rec.DeviceRemoteAgentEnabled[deviceId] = remoteAgentEnabled;
                 rec.DeviceAtomicAgentDispatchEnabled[deviceId] = atomicAgentDispatchEnabled;
+                rec.DeviceProtocolVersions[deviceId] = protocolVersion;
                 if (string.IsNullOrWhiteSpace(rec.AgentPrimaryDeviceId)
                     && DevicePlatforms.IsDesktop(platform)
                     && atomicAgentDispatchEnabled)
@@ -110,6 +112,51 @@ public sealed class InMemoryRelayStore : IRelayStore
                 }
             }
         return Task.CompletedTask;
+    }
+
+    public Task<DeviceRevocationResult> RevokeDeviceAsync(
+        string handle,
+        string targetDeviceId,
+        string? authorizingPublicKey = null,
+        CancellationToken ct = default)
+    {
+        var revoked = false;
+        if (handles.TryGetValue(handle, out var rec))
+        {
+            lock (rec)
+            {
+                if (authorizingPublicKey is not null
+                    && !rec.DevicePublicKeys.Contains(authorizingPublicKey, StringComparer.Ordinal))
+                    return Task.FromResult(new DeviceRevocationResult(false, 0));
+                var publicKey = rec.DevicePublicKeys.FirstOrDefault(key =>
+                    string.Equals(DeviceProtocol.DeviceId(key), targetDeviceId, StringComparison.Ordinal));
+                if (publicKey is not null && rec.DevicePublicKeys.Count > 1)
+                {
+                    rec.DevicePublicKeys.Remove(publicKey);
+                    rec.DeviceNames.Remove(targetDeviceId);
+                    rec.DevicePlatforms.Remove(targetDeviceId);
+                    rec.DeviceRemoteAgentEnabled.Remove(targetDeviceId);
+                    rec.DeviceAtomicAgentDispatchEnabled.Remove(targetDeviceId);
+                    rec.DeviceProtocolVersions.Remove(targetDeviceId);
+                    rec.DevicePushTokens.Remove(targetDeviceId);
+                    if (string.Equals(rec.AgentPrimaryDeviceId, targetDeviceId, StringComparison.Ordinal))
+                        rec.AgentPrimaryDeviceId = null;
+                    if (string.Equals(rec.AgentFailoverDeviceId, targetDeviceId, StringComparison.Ordinal))
+                        rec.AgentFailoverDeviceId = null;
+                    rec.AgentRoutingVersion = Guid.NewGuid().ToString("n");
+                    rec.AgentPrimaryWasSelectedAutomatically = false;
+                    revoked = true;
+                }
+            }
+        }
+
+        var inboxKey = RelayInboxKey.Device(handle, targetDeviceId);
+        var purged = 0;
+        if (inboxes.TryRemove(inboxKey, out var inbox))
+        {
+            lock (inbox) purged = inbox.Count;
+        }
+        return Task.FromResult(new DeviceRevocationResult(revoked, purged));
     }
 
     public Task<bool> SetAgentRoutingAsync(
@@ -222,6 +269,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         string envelopeId,
         string fromHandle,
         string envelopeJson,
+        int priority = RelayInboxPriority.Normal,
         CancellationToken ct = default)
     {
         var deliveryId = InboxDeliveryId.Create(fromHandle, envelopeId);
@@ -243,7 +291,8 @@ public sealed class InMemoryRelayStore : IRelayStore
                     QueuedAt = now,
                     ExpiresAt = RelayInboxPolicy.NeverExpires(toHandle)
                         ? null
-                        : now + RelayInboxPolicy.Retention
+                        : now + RelayInboxPolicy.Retention,
+                    Priority = priority
                 });
                 created = true;
             }
@@ -270,10 +319,7 @@ public sealed class InMemoryRelayStore : IRelayStore
                 string.Equals(item.LeaseOwner, leaseOwner, StringComparison.Ordinal)
                 && item.LeaseUntil > now);
             var capacity = Math.Max(0, maxItems - outstanding);
-            var result = inbox
-                .Where(item => item.LeaseUntil is null || item.LeaseUntil <= now)
-                .OrderBy(item => item.QueuedAt)
-                .ThenBy(item => item.Id, StringComparer.Ordinal)
+            var result = OrderInboxCandidates(inbox, now)
                 .Take(capacity)
                 .ToList();
             foreach (var item in result)
@@ -318,9 +364,9 @@ public sealed class InMemoryRelayStore : IRelayStore
         lock (inbox)
         {
             PurgeExpiredInbox(inbox, now);
-            var item = inbox.FirstOrDefault(candidate =>
-                string.Equals(candidate.Id, deliveryId, StringComparison.Ordinal));
-            if (item is null || item.LeaseUntil > now) return Task.FromResult(false);
+            var item = OrderInboxCandidates(inbox, now).FirstOrDefault();
+            if (item is null || !string.Equals(item.Id, deliveryId, StringComparison.Ordinal))
+                return Task.FromResult(false);
             item.LeaseOwner = leaseOwner;
             item.LeaseUntil = now + (leaseDuration ?? RelayInboxPolicy.LeaseDuration);
             item.DeliveryAttempts++;
@@ -361,10 +407,12 @@ public sealed class InMemoryRelayStore : IRelayStore
         lock (inbox)
         {
             PurgeExpiredInbox(inbox, UtcNow);
-            var removed = inbox.RemoveAll(item =>
+            var item = inbox.FirstOrDefault(item =>
                 string.Equals(item.Id, deliveryId, StringComparison.Ordinal)
-                && string.Equals(item.From, normalizedFrom, StringComparison.Ordinal)) > 0;
-            return Task.FromResult(removed);
+                && string.Equals(item.From, normalizedFrom, StringComparison.Ordinal));
+            if (item is null || item.DeliveryAttempts != 0 || item.LeaseUntil is not null)
+                return Task.FromResult(false);
+            return Task.FromResult(inbox.Remove(item));
         }
     }
 
@@ -698,6 +746,7 @@ public sealed class InMemoryRelayStore : IRelayStore
                 DevicePlatforms = new Dictionary<string, string>(r.DevicePlatforms),
                 DeviceRemoteAgentEnabled = new Dictionary<string, bool>(r.DeviceRemoteAgentEnabled),
                 DeviceAtomicAgentDispatchEnabled = new Dictionary<string, bool>(r.DeviceAtomicAgentDispatchEnabled),
+                DeviceProtocolVersions = new Dictionary<string, int>(r.DeviceProtocolVersions),
                 AgentPrimaryDeviceId = r.AgentPrimaryDeviceId,
                 AgentFailoverDeviceId = r.AgentFailoverDeviceId,
                 AgentRoutingVersion = r.AgentRoutingVersion,
@@ -717,6 +766,28 @@ public sealed class InMemoryRelayStore : IRelayStore
             };
     }
 
+    private static IReadOnlyList<StoredEnvelope> OrderInboxCandidates(
+        IEnumerable<StoredEnvelope> inbox,
+        DateTimeOffset now)
+    {
+        var available = inbox
+            .Where(item => item.LeaseUntil is null || item.LeaseUntil <= now)
+            .ToList();
+        var aged = available
+            .Where(item => item.QueuedAt <= now - RelayInboxPolicy.PriorityAgingThreshold)
+            .OrderBy(item => item.Priority)
+            .ThenBy(item => item.QueuedAt)
+            .ThenBy(item => item.Id, StringComparer.Ordinal)
+            .FirstOrDefault();
+        var prioritized = available
+            .Where(item => !ReferenceEquals(item, aged))
+            .OrderByDescending(item => item.Priority)
+            .ThenBy(item => item.QueuedAt)
+            .ThenBy(item => item.Id, StringComparer.Ordinal);
+        return aged is null
+            ? prioritized.ToArray()
+            : new[] { aged }.Concat(prioritized).ToArray();
+    }
     private static void PurgeExpiredInbox(List<StoredEnvelope> inbox, DateTimeOffset now)
         => inbox.RemoveAll(item => item.ExpiresAt is { } expiresAt && expiresAt <= now);
 
@@ -731,7 +802,8 @@ public sealed class InMemoryRelayStore : IRelayStore
         ExpiresAt = envelope.ExpiresAt,
         LeaseOwner = envelope.LeaseOwner,
         LeaseUntil = envelope.LeaseUntil,
-        DeliveryAttempts = envelope.DeliveryAttempts
+        DeliveryAttempts = envelope.DeliveryAttempts,
+        Priority = envelope.Priority
     };
 
     private static StoredAgentDispatch CloneDispatch(StoredAgentDispatch dispatch) => new()

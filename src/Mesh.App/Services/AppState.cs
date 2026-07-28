@@ -1065,6 +1065,14 @@ public sealed partial class AppState : IMemoryState
         return operations;
     }
 
+    public bool DeviceSyncPersistenceAvailable
+    {
+        get
+        {
+            lock (profileSyncGate)
+                return activeDb is not null && LocalDeviceId() is not null;
+        }
+    }
     public bool ApplyDeviceSyncBatch(DeviceSyncBatch batch)
     {
         (bool accepted, bool visibleChanged) result;
@@ -1084,7 +1092,7 @@ public sealed partial class AppState : IMemoryState
             || batch.Operations is null)
             return (false, false);
 
-        var accepted = false;
+        var processed = true;
         var visibleChanged = false;
         applyingDeviceSync = true;
         try
@@ -1092,26 +1100,26 @@ public sealed partial class AppState : IMemoryState
             foreach (var operation in ProfileSyncState.OrderForApplication(
                          batch.Operations.Where(operation => operation is not null)))
             {
-                if (!IsValidOperation(operation, batch.SourceDeviceId, deviceId)) continue;
+                if (!IsValidOperation(operation, batch.SourceDeviceId, deviceId))
+                {
+                    processed = false;
+                    continue;
+                }
                 try
                 {
-                    var previousAcceptedVersion = AcceptedVersion(operation);
                     visibleChanged |= ApplyDeviceSyncOperation(operation);
-                    accepted |= DeviceSyncVersion.IsNewer(
-                                    operation.Version, previousAcceptedVersion)
-                                && string.Equals(
-                                    AcceptedVersion(operation),
-                                    operation.Version,
-                                    StringComparison.Ordinal);
                 }
                 catch (JsonException)
                 {
+                    processed = false;
                 }
                 catch (ArgumentException)
                 {
+                    processed = false;
                 }
                 catch (FormatException)
                 {
+                    processed = false;
                 }
             }
         }
@@ -1120,7 +1128,7 @@ public sealed partial class AppState : IMemoryState
             applyingDeviceSync = false;
         }
 
-        return (accepted, visibleChanged);
+        return (processed, visibleChanged);
     }
 
     private bool ApplyDeviceSyncOperation(DeviceSyncOperation operation)
@@ -2856,17 +2864,26 @@ public sealed partial class AppState : IMemoryState
         NotifyChanged();
     }
 
-    public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
+    private enum RemoteRunApplyResult
     {
-        ApplyQueuedTopicRunUpdate(update);
-        // A streamed reply fragment rides the same channel as run-state updates but is applied to the
-        // live draft, not the run projection, so it never disturbs the phase/steps the viewer is showing.
+        Applied,
+        Ignored,
+        PersistenceFailed
+    }
+
+    public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
+        => _ = TryApplyRemoteRunUpdate(update);
+
+    public bool TryApplyRemoteRunUpdate(TopicRunUpdatePayload update)
+    {
         if (update.Delta is { Length: > 0 })
         {
+            if (!ApplyQueuedTopicRunUpdate(update)) return false;
             ApplyRemoteAssistantDelta(update);
-            return;
+            return true;
         }
-        ApplyRemoteRunProjection(update.ThreadId, new RemoteRunProjection
+
+        var result = ApplyRemoteRunProjectionCore(update.ThreadId, new RemoteRunProjection
         {
             RunId = update.RunId,
             ThreadId = update.ThreadId,
@@ -2880,6 +2897,11 @@ public sealed partial class AppState : IMemoryState
             FailureCode = update.FailureCode,
             Timestamp = update.Timestamp
         });
+        if (result == RemoteRunApplyResult.PersistenceFailed) return false;
+        if (result == RemoteRunApplyResult.Applied
+            && !ApplyQueuedTopicRunUpdate(update))
+            return false;
+        return true;
     }
 
     // Applies one reply fragment forwarded by the executing device into this device's live draft so the
@@ -2923,23 +2945,28 @@ public sealed partial class AppState : IMemoryState
 
     /// <summary>Applies a remote run update projection for a thread and refreshes the UI.</summary>
     public void ApplyRemoteRunProjection(string threadId, RemoteRunProjection projection)
+        => _ = ApplyRemoteRunProjectionCore(threadId, projection);
+
+    private RemoteRunApplyResult ApplyRemoteRunProjectionCore(
+        string threadId,
+        RemoteRunProjection projection)
     {
         var correlationKey = threadId + "\0" + projection.RunId;
         if (!string.Equals(threadId, projection.ThreadId, StringComparison.Ordinal)
             || string.IsNullOrWhiteSpace(projection.RunId)
             || projection.Timestamp == default)
-            return;
+            return RemoteRunApplyResult.Ignored;
 
         OwnThread? thread;
         lock (profileSyncGate)
         {
             if (terminalRemoteRuns.Contains(correlationKey))
-                return;
+                return RemoteRunApplyResult.Ignored;
             thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
             if (!RemoteRunCorrelation.IsExpected(thread, threadId, projection.RunId)
                 || remoteRuns.TryGetValue(threadId, out var current)
                    && projection.Timestamp < current.Timestamp)
-                return;
+                return RemoteRunApplyResult.Ignored;
 
             var activityAt = ActivityTimestamp.Advance(
                 thread!.LastActivityAt, projection.Timestamp);
@@ -2948,16 +2975,27 @@ public sealed partial class AppState : IMemoryState
                 or TopicRunPhase.Cancelled;
             var nextRunId = terminal ? null : projection.RunId;
             var executionAt = thread.ExecutionAt ?? projection.Timestamp;
-            if (activeDb is not null
-                && !activeDb.SetOwnThreadExecutionAndActivity(
+            if (activeDb is null)
+                return RemoteRunApplyResult.PersistenceFailed;
+            var persisted = terminal
+                ? activeDb.CompleteOwnThreadRunAndDeleteTopicOutbox(
+                    thread.Id,
+                    projection.RunId,
+                    thread.ExecutionDeviceId,
+                    thread.ExecutionDeviceName,
+                    thread.ExecutionDevicePlatform,
+                    executionAt,
+                    activityAt)
+                : activeDb.SetOwnThreadExecutionAndActivity(
                     thread.Id,
                     thread.ExecutionDeviceId,
                     thread.ExecutionDeviceName,
                     thread.ExecutionDevicePlatform,
                     executionAt,
                     nextRunId,
-                    activityAt))
-                return;
+                    activityAt);
+            if (!persisted)
+                return RemoteRunApplyResult.PersistenceFailed;
 
             thread.LastActivityAt = activityAt;
             thread.ExecutionAt = executionAt;
@@ -2977,6 +3015,7 @@ public sealed partial class AppState : IMemoryState
         }
         EmitTopicUpsert(thread!);
         NotifyChanged();
+        return RemoteRunApplyResult.Applied;
     }
 
     /// <summary>Clears the remote run projection for a thread (run completed or cancelled).</summary>
@@ -3047,25 +3086,27 @@ public sealed partial class AppState : IMemoryState
             var projectionMatches = projection is not null
                                     && string.Equals(
                                         projection.RunId, runId, StringComparison.Ordinal);
+            var outboxDeletedAtomically = false;
             if (string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
             {
                 var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, answerAt);
                 if (activeDb is not null
-                    && !activeDb.SetOwnThreadExecutionAndActivity(
+                    && !activeDb.CompleteOwnThreadRunAndDeleteTopicOutbox(
                         thread.Id,
+                        runId,
                         thread.ExecutionDeviceId,
                         thread.ExecutionDeviceName,
                         thread.ExecutionDevicePlatform,
                         thread.ExecutionAt ?? answerAt,
-                        null,
                         activityAt))
                     return false;
+                outboxDeletedAtomically = activeDb is not null;
                 thread.LastActivityAt = activityAt;
                 thread.ExecutionRunId = null;
             }
 
             queuedTopicRuns.Complete(thread.Id, runId);
-            activeDb?.DeleteTopicOutbox(runId);
+            if (!outboxDeletedAtomically) activeDb?.DeleteTopicOutbox(runId);
             terminalRemoteRuns.Add(correlationKey);
             remoteDeltaSeq.Remove(correlationKey);
             if (projectionMatches)
@@ -3256,26 +3297,27 @@ public sealed partial class AppState : IMemoryState
         }
     }
 
-    private void ApplyQueuedTopicRunUpdate(TopicRunUpdatePayload update)
+    private bool ApplyQueuedTopicRunUpdate(TopicRunUpdatePayload update)
     {
         if (update.Phase == TopicRunPhase.Queued)
         {
+            if (!SetTopicOutboxState(update.RunId, TopicOutboxStates.DeviceQueued))
+                return false;
             if (TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
                 TrackQueuedTopicRun(
                     update.ThreadId, update.RunId, update.TriggerLineId!, TopicQueueStage.Device);
-            SetTopicOutboxState(update.RunId, TopicOutboxStates.DeviceQueued);
-            return;
+            return true;
         }
         if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
         {
+            if (!DeleteTopicOutbox(update.RunId)) return false;
             CompleteQueuedTopicRun(update.ThreadId, update.RunId);
-            DeleteTopicOutbox(update.RunId);
+            return true;
         }
-        else
-        {
-            StartQueuedTopicRun(update.ThreadId, update.RunId);
-            SetTopicOutboxState(update.RunId, TopicOutboxStates.Running);
-        }
+        if (!SetTopicOutboxState(update.RunId, TopicOutboxStates.Running))
+            return false;
+        StartQueuedTopicRun(update.ThreadId, update.RunId);
+        return true;
     }
 
     /// <summary>True when a specific line is still waiting in some thread's queue (drives the "queued" tag).</summary>
