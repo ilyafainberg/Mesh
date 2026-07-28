@@ -363,7 +363,7 @@ public sealed class ActivityOrderingTests
         Assert.AreEqual("user", TopicTranscriptPresentation.BubbleRole("USER"));
         Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole("assistant"));
         Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole("system"));
-        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole(null));
+        Assert.AreEqual("assistant", TopicTranscriptPresentation.BubbleRole((string?)null));
     }
 
     [TestMethod]

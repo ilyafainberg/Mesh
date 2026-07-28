@@ -33,5 +33,4 @@ public sealed class MobileOverlayState
         }
         if (openChanged) Changed?.Invoke();
     }
-    }
 }

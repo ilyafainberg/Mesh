@@ -15,7 +15,6 @@
          without a MAUI build dependency. The file compiles cleanly against net10.0 and
          Microsoft.Extensions.Logging.Abstractions. -->
     <Compile Include="..\..\src\Mesh.App\Services\UiModeService.cs" Link="UiModeService.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\MobileOverlayState.cs" Link="MobileOverlayState.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\BackgroundSync.cs" Link="BackgroundSync.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\IPushService.cs" Link="IPushService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\StorageProtection.cs" Link="StorageProtection.cs" />
