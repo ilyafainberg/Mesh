@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Security.Cryptography;
 using Microsoft.Data.Sqlite;
 using Mesh.App.Domain;
 using Mesh.Shared;
@@ -68,22 +69,48 @@ public sealed partial class MeshDb : IDisposable
     private const string LastDesktopConversationMetaKey = "ui.desktop.last_conversation";
     private static bool nativeInit;
 
-    private readonly SqliteConnection conn;
+    private readonly string connectionString;
+    private readonly byte[] key;
+    private readonly ThreadLocal<SqliteConnection> connections;
+    private int disposed;
 
-    private MeshDb(SqliteConnection conn) => this.conn = conn;
+    private SqliteConnection conn
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+            return connections.Value!;
+        }
+    }
+
+    private MeshDb(string path, byte[] key)
+    {
+        connectionString = new SqliteConnectionStringBuilder { DataSource = path }.ToString();
+        this.key = key.ToArray();
+        connections = new ThreadLocal<SqliteConnection>(CreateConnection, trackAllValues: true);
+    }
 
     /// <summary>Opens (creating if needed) an encrypted database at <paramref name="path"/> with the given key.</summary>
     public static MeshDb Open(string path, byte[] key)
     {
         EnsureNativeInit();
         StorageProtection.TryEnsureBackgroundReadable(Path.GetDirectoryName(path) ?? path);
-        var conn = new SqliteConnection($"Data Source={path}");
-        conn.Open();
+        var db = new MeshDb(path, key);
+        _ = db.conn;
         StorageProtection.TryEnsureBackgroundReadable(path);
-        ApplyKey(conn, key);
-        var db = new MeshDb(conn);
         db.CreateSchema();
         return db;
+    }
+
+    private SqliteConnection CreateConnection()
+    {
+        var connection = new SqliteConnection(connectionString);
+        connection.Open();
+        ApplyKey(connection, key);
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "PRAGMA busy_timeout = 10000;";
+        cmd.ExecuteNonQuery();
+        return connection;
     }
 
     private static void EnsureNativeInit()
@@ -2249,7 +2276,13 @@ public sealed partial class MeshDb : IDisposable
 
     public void Dispose()
     {
-        try { conn.Close(); } catch { }
-        conn.Dispose();
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        foreach (var connection in connections.Values)
+        {
+            try { connection.Close(); } catch { }
+            connection.Dispose();
+        }
+        connections.Dispose();
+        CryptographicOperations.ZeroMemory(key);
     }
 }
