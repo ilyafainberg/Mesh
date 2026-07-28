@@ -68,6 +68,7 @@ $SignTool   = Join-Path $Deploy "signing\sdk\bin\10.0.28000.0\x64\signtool.exe"
 $SignDlib   = Join-Path $Deploy "signing\tsc\bin\x64\Azure.CodeSigning.Dlib.dll"
 $SignMeta   = Join-Path $Deploy "signing\metadata.json"
 $TimeStamp  = "http://timestamp.acs.microsoft.com"
+$ExpectedWindowsPublisher = "Feincraft"
 
 # Android keystore.
 $Keystore   = Join-Path $Deploy "android-signing\mesh-upload.keystore"
@@ -94,6 +95,20 @@ function Die($m)  { Write-Host "  [fail] $m" -ForegroundColor Red; exit 1 }
 function Invoke-Native([string]$exe, [string[]]$argv, [string]$what) {
   & $exe @argv
   if ($LASTEXITCODE -ne 0) { Die "$what failed (exit $LASTEXITCODE)." }
+}
+
+function Assert-MeshInstallerSignature([string]$path, [string]$context) {
+  $sig = Get-AuthenticodeSignature $path
+  if ($sig.Status -ne "Valid") {
+    Die "$context signature is not valid (status: $($sig.Status))."
+  }
+
+  $publisher = $sig.SignerCertificate.GetNameInfo(
+    [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+  $organizationPattern = "(^|,\s*)O=$([regex]::Escape($ExpectedWindowsPublisher))(,|$)"
+  if ($publisher -ne $ExpectedWindowsPublisher -or $sig.SignerCertificate.Subject -notmatch $organizationPattern) {
+    Die "$context signer '$($sig.SignerCertificate.Subject)' is not the expected Mesh publisher."
+  }
 }
 
 function Get-KeystorePassword {
@@ -212,6 +227,7 @@ function Build-Windows {
   if ($foreignPlaywrightDrivers.Count -gt 0) {
     Die "Windows publish contains non-Windows Playwright drivers: $($foreignPlaywrightDrivers.Name -join ', ')"
   }
+  if (-not (Test-Path (Join-Path $PubDir "Mesh.Updater.exe"))) { Die "publish produced no Mesh.Updater.exe" }
   Ok "published"
 
   Note "staging license/notices/icon"
@@ -236,8 +252,7 @@ function Build-Windows {
     "sign", "/q", "/fd", "SHA256", "/tr", $TimeStamp, "/td", "SHA256",
     "/dlib", $SignDlib, "/dmdf", $SignMeta, $exe
   ) "signtool sign"
-  $sig = Get-AuthenticodeSignature $exe
-  if ($sig.Status -ne "Valid") { Die "signature not valid (status: $($sig.Status))." }
+  Assert-MeshInstallerSignature $exe "installer"
   Ok "installer signature valid"
 
   # Use script scope (not a return value): external tool stdout from Invoke-Native would otherwise
@@ -397,10 +412,7 @@ if (-not $SkipAndroid) { Build-Android } else { Warn "skipping Android build" }
 if (-not $SkipPush)   { Invoke-GitCommitPush }
 if ($script:WinExe -and -not $SkipBlob)   { Publish-Blob   $script:WinExe }
 if ($script:WinExe -and -not $SkipGitHub) {
-  $sig = Get-AuthenticodeSignature $script:WinExe
-  if ($sig.Status -ne "Valid") {
-    Die "refusing GitHub upload: installer signature is not valid."
-  }
+  Assert-MeshInstallerSignature $script:WinExe "GitHub upload installer"
   Publish-GitHubRelease $script:WinExe
   & $RelayPublisher -Version $Version -RepoRoot $RepoRoot -DryRun:$DryRun
 }

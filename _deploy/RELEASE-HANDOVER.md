@@ -254,7 +254,7 @@ pwsh -NoProfile -File .\_deploy\release-win.ps1 `
 
 This builds:
 
-- Self-contained Windows client
+- Self-contained Windows client with `Mesh.Updater.exe`
 - Inno Setup installer
 - Azure Trusted Signing signature
 - ZIP containing exactly `Mesh-Setup-vX.Y.Z.exe`
@@ -272,12 +272,15 @@ path uploads the raw EXE, which violates the ZIP-only policy.
 $exe = "_deploy\artifacts\Mesh-Setup-vX.Y.Z.exe"
 $zip = "_deploy\artifacts\Mesh-Setup-vX.Y.Z.zip"
 
-(Get-AuthenticodeSignature $exe).Status
+$signature = Get-AuthenticodeSignature $exe
+$signature.Status
+$signature.SignerCertificate.Subject
 Get-FileHash $exe -Algorithm SHA256
 Get-FileHash $zip -Algorithm SHA256
 ```
 
-The signature status must be `Valid`.
+The signature status must be `Valid`, and the signer subject must contain both `CN=Feincraft`
+and `O=Feincraft`. The in-app updater pins this publisher identity.
 
 Verify public release:
 

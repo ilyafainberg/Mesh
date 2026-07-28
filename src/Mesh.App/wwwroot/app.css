@@ -814,6 +814,8 @@ input[type=checkbox]:not(.switch input):checked::after {
 .global-banner.ok { background: #EEF6EC; color: #0E700E; }
 .global-banner.err { background: var(--warn-bg); color: #9A2A2A; }
 .global-banner .gb-link { color: inherit; font-weight: 600; text-decoration: underline; flex: 0 0 auto; }
+.global-banner button.gb-link { background: transparent; border: 0; padding: 2px 4px; font: inherit; cursor: pointer; }
+.global-banner button.gb-link:disabled { opacity: .65; cursor: default; }
 .global-banner.memory { background: var(--brand-tint); color: var(--fg-1); }
 .global-banner.memory > .bi { color: var(--brand); }
 .global-banner .gb-action { background: transparent; border: none; color: inherit; padding: 2px 4px; font: inherit; font-weight: 600; text-decoration: underline; flex: 0 0 auto; }

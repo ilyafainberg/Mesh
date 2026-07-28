@@ -90,6 +90,9 @@
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionContracts.cs" Link="TopicExecutionContracts.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionRouter.cs" Link="TopicExecutionRouter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicTurnRunner.cs" Link="TopicTurnRunner.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\UpdatePackageCache.cs" Link="UpdatePackageCache.cs" />
+    <Compile Include="..\..\src\Mesh.Updater\AuthenticodeVerifier.cs" Link="Updater\AuthenticodeVerifier.cs" />
+    <Compile Include="..\..\src\Mesh.Updater\UpdateOptions.cs" Link="Updater\UpdateOptions.cs" />
     <Compile Include="..\..\src\Mesh.App\Domain\Models.cs" Link="Domain\Models.cs" />
     <Compile Include="..\..\src\Mesh.App\Domain\TopicTranscriptPresentation.cs" Link="Domain\TopicTranscriptPresentation.cs" />
   </ItemGroup>

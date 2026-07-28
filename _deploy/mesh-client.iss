@@ -45,10 +45,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
 PrivilegesRequired=lowest
 LicenseFile={#SourceDir}\LICENSE.txt
-; During an in-app update the running Mesh is closed via the Windows Restart Manager so its files
-; can be replaced, then relaunched by the [Run] entry below. AppMutex lets Setup detect the running
-; instance (the app creates this named mutex on Windows).
+; The bundled updater closes Mesh before running Setup silently, then relaunches Mesh itself.
+; Restart Manager remains enabled as a fallback for manual installs and any residual child process.
+; AppMutex lets Setup detect the running instance (the app creates this named mutex on Windows).
 CloseApplications=yes
+RestartApplications=no
 CloseApplicationsFilter=*.exe,*.dll
 AppMutex=MeshApp.SingleInstance
 

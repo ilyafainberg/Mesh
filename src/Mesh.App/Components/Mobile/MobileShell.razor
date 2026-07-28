@@ -38,8 +38,8 @@
         {
             <div class="global-banner update">
                 <i class="bi bi-arrow-up-circle-fill"></i>
-                <span class="gb-text">Mesh @Updater.Available.Version.ToString(3) is available.</span>
-                <a class="gb-link" href="settings">Update</a>
+                <span class="gb-text">@Updater.BannerText</span>
+                <button type="button" class="gb-link" @onclick="StartUpdate" disabled="@Updater.IsLaunchRequested">@Updater.ActionText</button>
                 <button class="gb-close" @onclick="Updater.DismissBanner" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
             </div>
         }
@@ -164,6 +164,8 @@
     }
 
     void ToggleMore() => moreOpen = !moreOpen;
+
+    async Task StartUpdate() => await Updater.StartUpdateAsync();
 
     void CloseMore() => moreOpen = false;
 
