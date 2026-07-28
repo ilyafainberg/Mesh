@@ -137,6 +137,7 @@ app.UseRateLimiter();
 
 // When another instance forwards a message to this one, deliver it to the local hub connections.
 var router = app.Services.GetRequiredService<MeshRouter>();
+var registry = app.Services.GetRequiredService<ConnectionRegistry>();
 var agentDispatch = app.Services.GetRequiredService<AgentDispatchCoordinator>();
 var connectorCatalog = app.Services.GetRequiredService<Mesh.Relay.RelayConnectorCatalog>();
 await backplane.StartAsync(async (toHandle, envelopeJson) =>
@@ -176,10 +177,15 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
 // ---- Health ---------------------------------------------------------------
 var transportCapabilities = new
 {
-    protocolVersion = 6,
+    protocolVersion = 7,
     sendResults = true,
+    ephemeralDelivery = true,
     fanout = true,
     deviceSync = true,
+    snapshotTransferV2 = true,
+    deviceRevocation = true,
+    processingOutcomes = true,
+    authoritativeTopicState = true,
     atomicAgentDispatch = true,
     durableDelivery = true,
     backgroundSync = true,
@@ -360,23 +366,18 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         if (!string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
         var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
-        if (string.IsNullOrWhiteSpace(req.DevicePlatform))
-        {
-            if (!string.IsNullOrWhiteSpace(req.DeviceName))
-                await store.SetDeviceNameAsync(handle, deviceId, req.DeviceName);
-        }
-        else
-        {
-            await store.SetDeviceMetadataAsync(
-                handle,
-                deviceId,
-                req.DeviceName,
-                req.DevicePlatform.Trim().ToLowerInvariant(),
-                // Directory honesty: never let a device (an old client, or one on the wrong platform) advertise
-                // mobile remote hosting. The stored flag is clamped to desktop-only regardless of what was sent.
-                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()),
-                req.AtomicAgentDispatchEnabled);
-        }
+        var platform = string.IsNullOrWhiteSpace(req.DevicePlatform)
+            ? DevicePlatforms.Unknown
+            : req.DevicePlatform.Trim().ToLowerInvariant();
+        await store.SetDeviceMetadataAsync(
+            handle,
+            deviceId,
+            req.DeviceName,
+            platform,
+            // Directory honesty: mobile devices never advertise remote hosting.
+            DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, platform),
+            req.AtomicAgentDispatchEnabled,
+            Math.Clamp(req.ProtocolVersion, 6, 7));
         await agentDispatch.DispatchAvailableAsync(handle);
         metrics.HandleRegistered();
         app.Logger.LogInformation("handle registered: {Handle}", handle);
@@ -391,23 +392,22 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         if (existing.RecoveryPublicKey is null && !string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
         var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
-        if (string.IsNullOrWhiteSpace(req.DevicePlatform))
-        {
-            if (!string.IsNullOrWhiteSpace(req.DeviceName))
-                await store.SetDeviceNameAsync(handle, deviceId, req.DeviceName);
-        }
-        else
-        {
-            await store.SetDeviceMetadataAsync(
-                handle,
-                deviceId,
-                req.DeviceName,
-                req.DevicePlatform.Trim().ToLowerInvariant(),
-                // Directory honesty: never let a device (an old client, or one on the wrong platform) advertise
-                // mobile remote hosting. The stored flag is clamped to desktop-only regardless of what was sent.
-                DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, req.DevicePlatform.Trim().ToLowerInvariant()),
-                req.AtomicAgentDispatchEnabled);
-        }
+        var hasPlatform = !string.IsNullOrWhiteSpace(req.DevicePlatform);
+        var platform = hasPlatform
+            ? req.DevicePlatform!.Trim().ToLowerInvariant()
+            : existing.DevicePlatforms.GetValueOrDefault(deviceId, DevicePlatforms.Unknown);
+        await store.SetDeviceMetadataAsync(
+            handle,
+            deviceId,
+            req.DeviceName,
+            platform,
+            hasPlatform
+                ? DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, platform)
+                : existing.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId),
+            hasPlatform
+                ? req.AtomicAgentDispatchEnabled
+                : existing.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId),
+            Math.Clamp(req.ProtocolVersion, 6, 7));
         await agentDispatch.DispatchAvailableAsync(handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), existing.RegisteredAt));
     }
@@ -685,12 +685,67 @@ app.MapGet("/handles/{handle}/devices", async (string handle) =>
             owners[index] is not null,
             rec.DevicePlatforms.GetValueOrDefault(deviceId, DevicePlatforms.Unknown),
             rec.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId),
-            rec.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId)))
+            rec.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId),
+            rec.DeviceProtocolVersions.GetValueOrDefault(deviceId, 6)))
         .ToArray();
 
     return Results.Ok(devices);
 });
 
+app.MapDelete("/handles/{handle}/devices/{deviceId}", async (
+    string handle,
+    string deviceId,
+    [Microsoft.AspNetCore.Mvc.FromBody] RevokeDeviceRequest req) =>
+{
+    var key = Normalize(handle);
+    var rec = await store.GetHandleAsync(key);
+    if (rec is null) return Results.NotFound();
+    if (string.IsNullOrWhiteSpace(req.DevicePublicKey)
+        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
+        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var callerDeviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
+    if (!DeviceProtocol.IsValidDeviceId(deviceId)
+        || !string.Equals(req.TargetDeviceId, deviceId, StringComparison.Ordinal)
+        || string.Equals(callerDeviceId, deviceId, StringComparison.Ordinal))
+        return Results.BadRequest(new { error = "a device can revoke only a different linked device" });
+    var targetWasAuthorized = rec.DevicePublicKeys.Any(publicKey =>
+        string.Equals(DeviceProtocol.DeviceId(publicKey), deviceId, StringComparison.Ordinal));
+    if (targetWasAuthorized && rec.DevicePublicKeys.Count <= 1)
+        return Results.BadRequest(new { error = "the last authorized device cannot be revoked" });
+    if (!MeshCrypto.Verify(
+            req.DevicePublicKey,
+            DeviceRevocationProtocol.Message(key, deviceId),
+            req.Signature ?? ""))
+        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
+
+    var result = await store.RevokeDeviceAsync(key, deviceId, req.DevicePublicKey);
+    var current = await store.GetHandleAsync(key);
+    var callerStillAuthorized = current?.DevicePublicKeys.Contains(
+        req.DevicePublicKey, StringComparer.Ordinal) == true;
+    if (!callerStillAuthorized)
+        return Results.Json(new { error = "device is no longer authorized" }, statusCode: StatusCodes.Status401Unauthorized);
+    var targetStillAuthorized = current?.DevicePublicKeys.Any(publicKey =>
+        string.Equals(DeviceProtocol.DeviceId(publicKey), deviceId, StringComparison.Ordinal)) == true;
+    if (targetStillAuthorized)
+    {
+        return Results.Conflict(new { error = "device revocation did not complete" });
+    }
+
+    registry.RevokeDevice(key, deviceId);
+    await backplane.ClearDevicePresenceAsync(key, deviceId);
+    if (registry.ConnectionsFor(key, includeBackgroundSync: false).Count == 0)
+        await backplane.ClearPresenceAsync(key);
+    app.Logger.LogInformation(
+        "device revoked: {Handle}/{DeviceId}; purged={Purged}",
+        key,
+        deviceId,
+        result.PurgedEnvelopes);
+    return Results.Ok(new RevokeDeviceResponse(
+        Revoked: true,
+        result.PurgedEnvelopes,
+        deviceId));
+});
 app.MapPost("/handles/{handle}/agent-routing/query", async (string handle, AgentRoutingQueryRequest req) =>
 {
     var key = Normalize(handle);

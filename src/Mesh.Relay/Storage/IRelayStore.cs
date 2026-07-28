@@ -39,6 +39,9 @@ public sealed class StoredHandle
     /// <summary>Atomic agent-dispatch protocol support keyed by stable device id.</summary>
     public Dictionary<string, bool> DeviceAtomicAgentDispatchEnabled { get; set; } = new();
 
+    /// <summary>Mesh protocol version keyed by stable device id.</summary>
+    public Dictionary<string, int> DeviceProtocolVersions { get; set; } = new();
+
     /// <summary>The owner's selected device for answering agent-addressed Messages.</summary>
     public string? AgentPrimaryDeviceId { get; set; }
 
@@ -88,12 +91,36 @@ public sealed class StoredEnvelope
     public string? LeaseOwner { get; set; }
     public DateTimeOffset? LeaseUntil { get; set; }
     public int DeliveryAttempts { get; set; }
+    public int Priority { get; set; } = RelayInboxPriority.Normal;
 }
+
+public static class RelayInboxPriority
+{
+    public const int Critical = 400;
+    public const int Bulk = 0;
+    public const int Sync = 100;
+    public const int Normal = 200;
+    public const int Control = 300;
+
+    public static int ForKind(string? kind) => kind switch
+    {
+        MeshKinds.TopicRunCancel or DeviceSyncKinds.EnvelopeSnapshotComplete => Critical,
+        MeshKinds.TopicRunRequest or MeshKinds.TopicRunUpdate => Control,
+        DeviceSyncKinds.EnvelopeSnapshotRequest => Control,
+        DeviceSyncKinds.EnvelopeSnapshotManifest => Sync,
+        DeviceSyncKinds.EnvelopeSnapshotChunk => Bulk,
+        DeviceSyncKinds.EnvelopeOperation => Sync,
+        _ => Normal
+    };
+}
+
+public sealed record DeviceRevocationResult(bool Revoked, int PurgedEnvelopes);
 
 public static class RelayInboxPolicy
 {
     public static readonly TimeSpan Retention = TimeSpan.FromDays(14);
     public static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan PriorityAgingThreshold = TimeSpan.FromMinutes(2);
     // Cosmos acquires leases sequentially before sending the first envelope. Keep the batch small
     // enough to make progress well inside SignalR and iOS background execution timeouts.
     public const int DeliveryWindow = 4;
@@ -101,9 +128,6 @@ public static class RelayInboxPolicy
     public static bool UsesClientInitiatedDrain(bool supportsDurableDelivery)
         => supportsDurableDelivery;
 
-    public static bool ShouldDiscardAfterFailedDelivery(string kind, int deliveryAttempts)
-        => deliveryAttempts > 1
-           && string.Equals(kind, DeviceSyncKinds.EnvelopeSnapshotRequest, StringComparison.Ordinal);
 
     public static bool NeverExpires(string inboxKey)
     {
@@ -116,6 +140,12 @@ public static class RelayInboxPolicy
 public sealed record InboxEnqueueResult(string DeliveryId, bool Created);
 
 public sealed record RelayInboxStats(long QueuedItems, DateTimeOffset? OldestQueuedAt);
+
+public static class RelayInboxKey
+{
+    public static string Device(string handle, string deviceId)
+        => LinkProtocol.Normalize(handle) + "\u001f" + deviceId.Trim();
+}
 
 public static class InboxDeliveryId
 {
@@ -245,6 +275,13 @@ public interface IRelayStore
         string platform,
         bool remoteAgentEnabled,
         bool atomicAgentDispatchEnabled,
+        int protocolVersion = 6,
+        CancellationToken ct = default);
+
+    Task<DeviceRevocationResult> RevokeDeviceAsync(
+        string handle,
+        string targetDeviceId,
+        string? authorizingPublicKey = null,
         CancellationToken ct = default);
 
     Task<bool> SetAgentRoutingAsync(
@@ -294,6 +331,7 @@ public interface IRelayStore
         string envelopeId,
         string fromHandle,
         string envelopeJson,
+        int priority = RelayInboxPriority.Normal,
         CancellationToken ct = default);
 
     /// <summary>Leases queued envelopes without removing them. The receiver must acknowledge each item.</summary>

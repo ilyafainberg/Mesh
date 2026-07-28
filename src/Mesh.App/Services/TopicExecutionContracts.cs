@@ -72,7 +72,8 @@ public interface ITopicTurnRunner
     Task<TopicRunCompletion> ExecuteAsync(
         TopicTurnDraft draft,
         IProgress<TopicRunUpdatePayload> progress,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        Func<CancellationToken, Task>? onStarted = null);
 }
 
 /// <summary>Sends targeted topic requests and cancellation to remote agent-ready devices.</summary>

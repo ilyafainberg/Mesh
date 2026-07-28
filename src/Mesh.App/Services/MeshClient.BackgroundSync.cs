@@ -11,11 +11,10 @@ public sealed partial class MeshClient
     private static readonly TimeSpan BackgroundIdlePeriod = TimeSpan.FromMilliseconds(750);
     private readonly SemaphoreSlim backgroundSyncGate = new(1, 1);
 
-    private enum InboundDisposition
-    {
-        Acknowledge,
-        Defer
-    }
+
+    private sealed class InboundRetryException(string reason) : Exception(reason);
+    private sealed class InboundPermanentRejectException(string reason, Exception? inner = null)
+        : Exception(reason, inner);
 
     private async Task<InboundDisposition> ProcessInboundAsync(
         MeshEnvelope envelope,
@@ -28,8 +27,41 @@ public sealed partial class MeshClient
             && BackgroundInboundPolicy.RequiresForeground(envelope.Kind))
             return InboundDisposition.Defer;
 
-        await HandleInboundAsync(envelope, mode, identity, sessionSupportsDeviceSync, ct);
-        return InboundDisposition.Acknowledge;
+        try
+        {
+            await HandleInboundAsync(envelope, mode, identity, sessionSupportsDeviceSync, ct);
+            return InboundDisposition.Processed;
+        }
+        catch (InboundRetryException ex)
+        {
+            TraceTransport("receive-retry", ex.Message);
+            return InboundDisposition.Retry;
+        }
+        catch (InboundPermanentRejectException ex)
+        {
+            var reason = ex.Message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+            if (reason.Length > 200) reason = reason[..200];
+            var rejectionId = string.IsNullOrWhiteSpace(envelope.RelayDeliveryId)
+                ? "envelope:" + StableEnvelopeId(
+                    "inbound.reject",
+                    $"{AppState.Norm(envelope.From)}\0{envelope.FromDevice}\0{envelope.Id}\0{envelope.Kind}")
+                : "relay:" + envelope.RelayDeliveryId;
+            if (!state.SaveInboundRejection(new MeshDb.InboundRejectionItem(
+                    rejectionId,
+                    envelope.Id,
+                    envelope.RelayDeliveryId,
+                    envelope.Kind,
+                    AppState.Norm(envelope.From),
+                    envelope.FromDevice,
+                    reason,
+                    DateTimeOffset.UtcNow)))
+            {
+                TraceTransport("receive-rejection-persistence-failed", reason);
+                return InboundDisposition.Retry;
+            }
+            TraceTransport("receive-permanent-reject", reason);
+            return InboundDisposition.PermanentReject;
+        }
     }
 
     public async Task<BackgroundSyncResult> SynchronizePendingAsync(CancellationToken ct = default)
@@ -94,6 +126,7 @@ public sealed partial class MeshClient
         var activeHandlers = 0;
         var processed = 0;
         var deferred = 0;
+        var retry = 0;
         Exception? processingFailure = null;
 
         void Touch() => Interlocked.Exchange(ref lastActivity, Stopwatch.GetTimestamp());
@@ -138,8 +171,18 @@ public sealed partial class MeshClient
                         Interlocked.Increment(ref deferred);
                         return;
                     }
+                    if (disposition == InboundDisposition.Retry)
+                    {
+                        Interlocked.Increment(ref retry);
+                        Interlocked.CompareExchange(
+                            ref processingFailure,
+                            new InvalidOperationException("inbound_retry_required"),
+                            null);
+                        return;
+                    }
 
-                    if (!string.IsNullOrWhiteSpace(envelope.RelayDeliveryId))
+                    if (InboundAcknowledgementPolicy.ShouldAcknowledge(disposition)
+                        && !string.IsNullOrWhiteSpace(envelope.RelayDeliveryId))
                         await AcknowledgeDeliveryAsync(connection, envelope, ct).ConfigureAwait(false);
                     Interlocked.Increment(ref processed);
                 }
@@ -193,7 +236,7 @@ public sealed partial class MeshClient
                 : BackgroundSyncResult.NoData(deferred);
             RuntimeDiagnostics.Current?.RecordEvent(
                 "background-sync",
-                $"outcome={result.Outcome}; processed={processed}; deferred={deferred}; "
+                $"outcome={result.Outcome}; processed={processed}; deferred={deferred}; retry={retry}; "
                 + $"elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F0}");
             return result;
         }

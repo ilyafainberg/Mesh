@@ -127,6 +127,29 @@ public enum InboundProcessingMode
     Background
 }
 
+internal enum InboundDisposition
+{
+    Processed,
+    Retry,
+    PermanentReject,
+    Defer
+}
+
+internal static class InboundAcknowledgementPolicy
+{
+    public static bool ShouldAcknowledge(InboundDisposition disposition)
+        => disposition is InboundDisposition.Processed or InboundDisposition.PermanentReject;
+}
+
+internal static class InboundAttachmentFailurePolicy
+{
+    public static bool ShouldRetry(string error)
+        => error is "attachment inbox is disposed"
+            or "attachment inbox is full"
+            or "attachment storage is unavailable"
+            or "duplicate or conflicting attachment storage";
+}
+
 public static class BackgroundInboundPolicy
 {
     public static bool RequiresForeground(string kind)

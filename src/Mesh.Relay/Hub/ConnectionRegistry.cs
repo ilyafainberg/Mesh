@@ -62,6 +62,49 @@ public sealed class ConnectionRegistry
         byHandle.GetOrAdd(s.Handle, _ => new()).TryAdd(connectionId, 0);
     }
 
+    public IReadOnlyList<string> RevokeDevice(string handle, string deviceId)
+    {
+        if (!byHandle.TryGetValue(handle, out var set)) return [];
+        var revoked = new List<string>();
+        foreach (var connectionId in set.Keys)
+        {
+            if (!byConnection.TryGetValue(connectionId, out var state)
+                || !string.Equals(state.DeviceId, deviceId, StringComparison.Ordinal))
+                continue;
+            state.Authenticated = false;
+            set.TryRemove(connectionId, out _);
+            revoked.Add(connectionId);
+        }
+        if (set.IsEmpty) byHandle.TryRemove(handle, out _);
+        return revoked;
+    }
+
+    public IReadOnlyList<string> RevokeUnauthorizedDevices(
+        string handle,
+        IReadOnlySet<string> authorizedPublicKeys)
+    {
+        if (!byHandle.TryGetValue(handle, out var set)) return [];
+        var revokedDeviceIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var connectionId in set.Keys)
+        {
+            if (!byConnection.TryGetValue(connectionId, out var state))
+            {
+                set.TryRemove(connectionId, out _);
+                continue;
+            }
+            if (state.Authenticated
+                && state.PublicKey is not null
+                && authorizedPublicKeys.Contains(state.PublicKey))
+                continue;
+
+            state.Authenticated = false;
+            set.TryRemove(connectionId, out _);
+            if (!string.IsNullOrWhiteSpace(state.DeviceId))
+                revokedDeviceIds.Add(state.DeviceId);
+        }
+        if (set.IsEmpty) byHandle.TryRemove(handle, out _);
+        return revokedDeviceIds.ToArray();
+    }
     /// <summary>
     /// Removes a connection on disconnect. Returns the handle to clear from presence only when
     /// this was its last foreground connection (so background drains never hold presence open).
@@ -86,8 +129,9 @@ public sealed class ConnectionRegistry
     {
         if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
         return set.Keys
-            .Where(id => includeBackgroundSync
-                || byConnection.TryGetValue(id, out var state) && !state.IsBackgroundSync)
+            .Where(id => byConnection.TryGetValue(id, out var state)
+                && state.Authenticated
+                && (includeBackgroundSync || !state.IsBackgroundSync))
             .ToArray();
     }
 
@@ -101,6 +145,7 @@ public sealed class ConnectionRegistry
         if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
         return set.Keys
             .Where(c => byConnection.TryGetValue(c, out var s)
+                && s.Authenticated
                 && s.DeviceId == deviceId
                 && (includeBackgroundSync || !s.IsBackgroundSync))
             .ToArray();
@@ -116,7 +161,7 @@ public sealed class ConnectionRegistry
     {
         if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
         return set.Keys
-            .Select(c => byConnection.TryGetValue(c, out var s) ? s.DeviceId : null)
+            .Select(c => byConnection.TryGetValue(c, out var s) && s.Authenticated ? s.DeviceId : null)
             .Where(d => d is not null)
             .Select(d => d!)
             .Distinct()

@@ -31,8 +31,32 @@ public sealed partial class MeshDb : IDisposable
     public sealed record InboundTopicRunItem(
         string RunId, string SourceDeviceId, TopicRunRequestPayload Request,
         string State, DateTimeOffset AcceptedAt, DateTimeOffset UpdatedAt,
-        string? TerminalUpdateJson = null);
+        string? TerminalUpdateJson = null, long QueueSequence = 0);
 
+    public sealed record InboundTopicCancellationItem(
+        string RunId,
+        string SourceDeviceId,
+        string ThreadId,
+        string TerminalUpdateJson,
+        DateTimeOffset CreatedAt);
+
+    public sealed record DeviceSyncSnapshotResumeState(
+        string? SnapshotId,
+        IReadOnlyList<int> MissingChunkIndexes);
+
+    public sealed record DeviceSyncSnapshotTransferState(
+        DeviceSyncSnapshotManifest Manifest,
+        IReadOnlyList<DeviceSyncSnapshotChunk> Chunks);
+
+    public sealed record InboundRejectionItem(
+        string RejectionId,
+        string EnvelopeId,
+        string? RelayDeliveryId,
+        string Kind,
+        string FromHandle,
+        string? FromDeviceId,
+        string Reason,
+        DateTimeOffset RejectedAt);
     public sealed record DeviceEnvelopeOutboxItem(
         string EnvelopeId, string TargetDeviceId, string Kind, string Plaintext,
         string? PushHint, DateTimeOffset CreatedAt);
@@ -129,6 +153,25 @@ public sealed partial class MeshDb : IDisposable
                 updated_at TEXT NOT NULL,
                 terminal_update_json TEXT);
             CREATE INDEX IF NOT EXISTS ix_inbound_topic_runs_state ON inbound_topic_runs(state, accepted_at);
+            CREATE TABLE IF NOT EXISTS inbound_topic_cancellations(
+                run_id TEXT PRIMARY KEY,
+                source_device_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                terminal_update_json TEXT NOT NULL,
+                created_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_inbound_topic_cancellations_created
+                ON inbound_topic_cancellations(created_at);
+            CREATE TABLE IF NOT EXISTS inbound_rejections(
+                rejection_id TEXT PRIMARY KEY,
+                envelope_id TEXT NOT NULL,
+                relay_delivery_id TEXT,
+                kind TEXT NOT NULL,
+                from_handle TEXT NOT NULL,
+                from_device_id TEXT,
+                reason TEXT NOT NULL,
+                rejected_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_inbound_rejections_rejected
+                ON inbound_rejections(rejected_at);
             CREATE TABLE IF NOT EXISTS device_envelope_outbox(
                 envelope_id TEXT PRIMARY KEY,
                 target_device_id TEXT NOT NULL,
@@ -136,6 +179,26 @@ public sealed partial class MeshDb : IDisposable
                 plaintext TEXT NOT NULL,
                 push_hint TEXT,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS device_sync_snapshot_manifests(
+                snapshot_id TEXT PRIMARY KEY,
+                source_device_id TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                created_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_device_sync_snapshot_source
+                ON device_sync_snapshot_manifests(source_device_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS device_sync_snapshot_chunks(
+                snapshot_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_json TEXT NOT NULL,
+                PRIMARY KEY(snapshot_id, chunk_index));
+            CREATE TABLE IF NOT EXISTS device_sync_snapshot_receipts(
+                snapshot_id TEXT NOT NULL,
+                source_device_id TEXT NOT NULL,
+                target_device_id TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY(snapshot_id, target_device_id));
+            CREATE INDEX IF NOT EXISTS ix_device_sync_snapshot_receipt_source
+                ON device_sync_snapshot_receipts(source_device_id, target_device_id, completed_at DESC);
             CREATE TABLE IF NOT EXISTS composer_drafts(
                 kind TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
@@ -224,6 +287,18 @@ public sealed partial class MeshDb : IDisposable
         AddColumnIfMissing("own_threads", "execution_at", "TEXT");
         AddColumnIfMissing("own_threads", "execution_run_id", "TEXT");
         AddColumnIfMissing("inbound_topic_runs", "terminal_update_json", "TEXT");
+        AddColumnIfMissing("inbound_topic_runs", "queue_sequence", "INTEGER NOT NULL DEFAULT 0");
+        Exec("""
+            UPDATE inbound_topic_runs AS current
+            SET queue_sequence = (
+                SELECT COUNT(*)
+                FROM inbound_topic_runs AS prior
+                WHERE prior.accepted_at < current.accepted_at
+                   OR (prior.accepted_at = current.accepted_at AND prior.run_id <= current.run_id))
+            WHERE queue_sequence = 0;
+            CREATE INDEX IF NOT EXISTS ix_inbound_topic_runs_queue
+                ON inbound_topic_runs(queue_sequence, run_id);
+            """);
         MigrateOwnThreadActivity();
         AddColumnIfMissing("conversations", "last_activity_at", "TEXT");
         AddColumnIfMissing("conversations", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
@@ -1943,6 +2018,51 @@ public sealed partial class MeshDb : IDisposable
         return cmd.ExecuteNonQuery() == 1;
     }
 
+    public bool CompleteOwnThreadRunAndDeleteTopicOutbox(
+        string id,
+        string runId,
+        string? deviceId,
+        string? deviceName,
+        string? devicePlatform,
+        DateTimeOffset? executionAt,
+        DateTimeOffset activityAt)
+    {
+        using var transaction = conn.BeginTransaction();
+        using var update = conn.CreateCommand();
+        update.Transaction = transaction;
+        update.CommandText = """
+            UPDATE own_threads
+            SET execution_device_id = $did,
+                execution_device_name = $dname,
+                execution_device_platform = $dplatform,
+                execution_at = $at,
+                execution_run_id = NULL,
+                last_activity_at = CASE
+                    WHEN last_activity_at IS NULL
+                         OR julianday($activity) > julianday(last_activity_at)
+                    THEN $activity ELSE last_activity_at
+                END
+            WHERE id = $id AND execution_run_id = $run;
+            """;
+        update.Parameters.AddWithValue("$did", (object?)deviceId ?? DBNull.Value);
+        update.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
+        update.Parameters.AddWithValue("$dplatform", (object?)devicePlatform ?? DBNull.Value);
+        update.Parameters.AddWithValue(
+            "$at",
+            executionAt.HasValue ? executionAt.Value.UtcDateTime.ToString("O") : DBNull.Value);
+        update.Parameters.AddWithValue("$activity", activityAt.UtcDateTime.ToString("O"));
+        update.Parameters.AddWithValue("$id", id);
+        update.Parameters.AddWithValue("$run", runId);
+        if (update.ExecuteNonQuery() != 1) return false;
+
+        using var delete = conn.CreateCommand();
+        delete.Transaction = transaction;
+        delete.CommandText = "DELETE FROM topic_outbox WHERE run_id = $run;";
+        delete.Parameters.AddWithValue("$run", runId);
+        delete.ExecuteNonQuery();
+        transaction.Commit();
+        return true;
+    }
     public bool SetOwnThreadExecutionAndActivity(
         string id,
         string? deviceId,

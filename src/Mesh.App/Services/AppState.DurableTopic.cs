@@ -59,6 +59,26 @@ public sealed partial class AppState
             return activeDb?.GetInboundTopicRun(runId);
     }
 
+    public MeshDb.InboundTopicCancellationItem? GetInboundTopicCancellation(string runId)
+    {
+        lock (profileSyncGate)
+            return activeDb?.GetInboundTopicCancellation(runId);
+    }
+
+    public bool SaveInboundTopicCancellation(MeshDb.InboundTopicCancellationItem item)
+    {
+        lock (profileSyncGate)
+        {
+            if (activeDb is null) return false;
+            if (activeDb.TryAddInboundTopicCancellation(item)) return true;
+            var existing = activeDb.GetInboundTopicCancellation(item.RunId);
+            return existing is not null
+                   && string.Equals(existing.SourceDeviceId, item.SourceDeviceId, StringComparison.Ordinal)
+                   && string.Equals(existing.ThreadId, item.ThreadId, StringComparison.Ordinal)
+                   && string.Equals(existing.TerminalUpdateJson, item.TerminalUpdateJson, StringComparison.Ordinal);
+        }
+    }
+
     public IReadOnlyList<MeshDb.InboundTopicRunItem> ListInboundTopicRuns(params string[] states)
     {
         lock (profileSyncGate)
@@ -83,6 +103,28 @@ public sealed partial class AppState
         {
             if (activeDb is null) return false;
             return activeDb.SetInboundTopicRunTerminal(runId, runState, terminalUpdate);
+        }
+    }
+    public bool SetInboundTopicRunTerminalAndQueue(
+        string runId,
+        string runState,
+        TopicRunUpdatePayload terminalUpdate,
+        MeshDb.DeviceEnvelopeOutboxItem outbox)
+    {
+        lock (profileSyncGate)
+        {
+            if (activeDb is null) return false;
+            return activeDb.SetInboundTopicRunTerminalAndQueue(
+                runId, runState, terminalUpdate, outbox);
+        }
+    }
+    public bool SaveInboundRejection(MeshDb.InboundRejectionItem item)
+    {
+        lock (profileSyncGate)
+        {
+            if (activeDb is null) return false;
+            activeDb.UpsertInboundRejection(item);
+            return true;
         }
     }
     public bool SaveDeviceEnvelopeOutbox(MeshDb.DeviceEnvelopeOutboxItem item)
@@ -117,7 +159,10 @@ public sealed partial class AppState
         {
             queuedTopicRuns.Clear();
             if (activeDb is null) return;
-            activeDb.PruneInboundTopicRuns(DateTimeOffset.UtcNow - TopicTransportPolicy.DedupRetention);
+            var dedupCutoff = DateTimeOffset.UtcNow - TopicTransportPolicy.DedupRetention;
+            activeDb.PruneInboundTopicRuns(dedupCutoff);
+            activeDb.PruneInboundTopicCancellations(dedupCutoff);
+            activeDb.PruneInboundRejections(dedupCutoff);
             foreach (var item in activeDb.ListTopicOutbox())
             {
                 var thread = Profile.OwnThreads.FirstOrDefault(candidate =>
@@ -126,21 +171,26 @@ public sealed partial class AppState
                     && RemoteRunReconciliation.HasCommittedAnswer(
                         thread.Lines, item.TriggerLineId))
                 {
-                    activeDb.DeleteTopicOutbox(item.RunId);
-                    terminalRemoteRuns.Add(item.ThreadId + "\0" + item.RunId);
-                    remoteDeltaSeq.Remove(item.ThreadId + "\0" + item.RunId);
                     if (string.Equals(
                             thread.ExecutionRunId, item.RunId, StringComparison.Ordinal))
                     {
-                        activeDb.SetOwnThreadExecution(
-                            thread.Id,
-                            thread.ExecutionDeviceId,
-                            thread.ExecutionAt,
-                            null,
-                            thread.ExecutionDeviceName,
-                            thread.ExecutionDevicePlatform);
+                        if (!activeDb.CompleteOwnThreadRunAndDeleteTopicOutbox(
+                                thread.Id,
+                                item.RunId,
+                                thread.ExecutionDeviceId,
+                                thread.ExecutionDeviceName,
+                                thread.ExecutionDevicePlatform,
+                                thread.ExecutionAt,
+                                thread.LastActivityAt ?? item.UpdatedAt))
+                            continue;
                         thread.ExecutionRunId = null;
                     }
+                    else
+                    {
+                        activeDb.DeleteTopicOutbox(item.RunId);
+                    }
+                    terminalRemoteRuns.Add(item.ThreadId + "\0" + item.RunId);
+                    remoteDeltaSeq.Remove(item.ThreadId + "\0" + item.RunId);
                     continue;
                 }
                 var stage = item.State switch

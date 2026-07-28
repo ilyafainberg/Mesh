@@ -631,8 +631,10 @@
     bool ActiveBusy => Active is not null
         && (State.IsThreadBusy(Active.Id)
             || State.GetRemoteRunProjection(Active.Id) is { } activeRemoteRun
-               && RemoteRunActivity.IsProjectionFresh(activeRemoteRun, DateTimeOffset.UtcNow)
-            || IsRemoteBound(Active) && RemoteRunActivity.IsPersistedRunFresh(Active, DateTimeOffset.UtcNow));
+               && RemoteRunActivity.IsProjectionActive(
+                   activeRemoteRun, DateTimeOffset.UtcNow, UsesAuthoritativeState(Active))
+            || IsRemoteBound(Active) && RemoteRunActivity.IsPersistedRunActive(
+                Active, DateTimeOffset.UtcNow, UsesAuthoritativeState(Active)));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
     string ComposerPlaceholder => widgetMode
         ? "Describe the widget you want…"
@@ -1017,7 +1019,14 @@
         State.IsThreadBusy(thread.Id),
         State.GetRemoteRunProjection(thread.Id),
         IsRemoteBound(thread),
-        DateTimeOffset.UtcNow);
+        DateTimeOffset.UtcNow,
+        UsesAuthoritativeState(thread));
+
+    bool UsesAuthoritativeState(OwnThread thread) => RemoteRunActivity.UsesAuthoritativeState(
+        Mesh.SupportsAuthoritativeTopicState,
+        thread.ExecutionDeviceId,
+        Mesh.MyDeviceId,
+        eligibleDevices);
 
     bool IsRemoteBound(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
         && thread.ExecutionDeviceId != Mesh.MyDeviceId;

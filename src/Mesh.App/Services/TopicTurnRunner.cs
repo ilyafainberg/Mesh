@@ -20,6 +20,7 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         public required TopicTurnDraft Draft { get; init; }
         public required IProgress<TopicRunUpdatePayload> Progress { get; init; }
         public required CancellationToken CancellationToken { get; init; }
+        public Func<CancellationToken, Task>? OnStarted { get; init; }
         public TaskCompletionSource<TopicRunCompletion> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Started { get; set; }
@@ -43,7 +44,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
     public async Task<TopicRunCompletion> ExecuteAsync(
         TopicTurnDraft draft,
         IProgress<TopicRunUpdatePayload> progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<CancellationToken, Task>? onStarted = null)
     {
         ArgumentNullException.ThrowIfNull(draft);
         ArgumentNullException.ThrowIfNull(progress);
@@ -53,7 +55,8 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         {
             Draft = draft,
             Progress = progress,
-            CancellationToken = cancellationToken
+            CancellationToken = cancellationToken,
+            OnStarted = onStarted
         };
         var startDrain = false;
         var queued = 0;
@@ -108,15 +111,14 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
                 while (item.Completion.Task.IsCompleted);
                 item.Started = true;
             }
-            if (item.WasQueued)
-            {
-                state.StartQueuedTopicRun(item.Draft.ThreadId, item.Draft.RunId);
-                Report(item.Progress, item.Draft, TopicRunPhase.Executing, "Starting");
-            }
-
             TopicRunCompletion completion;
             try
             {
+                if (item.OnStarted is not null)
+                    await item.OnStarted(item.CancellationToken);
+                if (item.WasQueued)
+                    state.StartQueuedTopicRun(item.Draft.ThreadId, item.Draft.RunId);
+                Report(item.Progress, item.Draft, TopicRunPhase.Executing, "Running");
                 completion = await ExecuteCoreAsync(
                     item.Draft, item.Progress, item.CancellationToken);
             }

@@ -551,6 +551,8 @@ The relay exposes plain HTTP endpoints for status and observability.
 
 Normal and fan-out hub sends return explicit accepted or rejected results. Ordinary envelopes are enqueued before live delivery. Protocol-5 authentication returns before Cosmos inbox leasing; the client requests a bounded batch after `Ready` and acknowledges each item after processing. Until then, the inbox item remains leased and can be redelivered after a disconnect or dropped acknowledgement. An accepted fan-out still has no atomic simultaneous physical-delivery guarantee.
 
+Protocol 7 adds priority-separated inbox leasing, resumable snapshot manifests/chunks, online-only ephemeral topic progress, explicit client processing outcomes, authoritative queued/running topic state, and signed exact-device revocation. Snapshot chunks are Bulk priority and cannot starve Control traffic. Revoking a device removes its registration, purges only its device-specific partition, and rejects later sends to the removed device ID; it does not touch sibling device inboxes.
+
 Atomic agent sends are different: `agent_dispatch_accepted` means the request reached
 its assigned device fence, while `agent_dispatch_queued` means the relay accepted
 it into its configured store but neither response device is currently eligible. Both
@@ -612,6 +614,7 @@ floor:
 
 | Relay capability | Client behavior | Result |
 | --- | --- | --- |
+| Protocol 7+, `ephemeralDelivery`, `snapshotTransferV2`, `deviceRevocation`, `processingOutcomes`, `authoritativeTopicState` | Protocol-7 client | Priority-separated durable traffic, resumable compressed snapshots, confirmed cancellation state, online-only transient progress, exact-device revocation, and restart-safe topic ordering |
 | Protocol 6+, `durableDelivery: true`, `backgroundSync: true` | Current iOS client with `deliveryAck=1&backgroundSync=1` | Bounded passive inbox drain without foreground presence or agent/topic execution |
 | Protocol 5+, `durableDelivery: true` | Current client with `deliveryAck=1` | Enqueue-before-deliver, lease/ack redelivery, strict device inboxes, and queued-envelope cancellation |
 | Protocol 4+, `atomicAgentDispatch: true` | Atomic-capable client | Primary/failover assignment, queueing (durable with Cosmos), relay-enforced at-most-one accepted response |
@@ -619,7 +622,7 @@ floor:
 | `atomicAgentDispatch` absent | Current client | Falls back to legacy agent kinds; no single-device guarantee |
 | Capability present | Legacy client | Legacy kinds continue to route; no single-device guarantee |
 
-Protocol version alone is not sufficient: background clients require both capability flags. In a mixed relay cluster, protocol-4 coordinators queue atomic work rather than forward it to replicas that do not advertise single-connection atomic delivery.
+Protocol version alone is not sufficient: clients require the individual capability flags for every Protocol 7 behavior, and background clients still require both durable-delivery flags. In a mixed relay cluster, protocol-4 coordinators queue atomic work rather than forward it to replicas that do not advertise single-connection atomic delivery.
 
 ---
 

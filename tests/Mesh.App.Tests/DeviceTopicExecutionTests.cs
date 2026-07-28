@@ -14,6 +14,7 @@ namespace Mesh.App.Services
         public int RegisteredRemoteRuns { get; private set; }
         public int ClearedRemoteRuns { get; private set; }
         public bool Busy { get; private set; }
+        public bool RemoteRunUpdatePersistenceSucceeds { get; set; } = true;
         public QueuedTopicRunState QueuedRuns { get; } = new();
 
         public static string Norm(string value) => value.Trim().TrimStart('@').ToLowerInvariant();
@@ -83,7 +84,11 @@ namespace Mesh.App.Services
         }
 
         public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
+            => _ = TryApplyRemoteRunUpdate(update);
+
+        public bool TryApplyRemoteRunUpdate(TopicRunUpdatePayload update)
         {
+            if (!RemoteRunUpdatePersistenceSucceeds) return false;
             if (update.Phase == TopicRunPhase.Queued)
             {
                 if (update.Queued > 0 && update.TriggerLineId is not null)
@@ -93,6 +98,7 @@ namespace Mesh.App.Services
                 CompleteQueuedTopicRun(update.ThreadId, update.RunId);
             else
                 StartQueuedTopicRun(update.ThreadId, update.RunId);
+            return true;
         }
         public void SetAgentRun(AgentRunState run)
             => Profile.OwnThreads.Single(item => item.Id == run.ThreadId).ExecutionRunId = run.RunId;
@@ -229,6 +235,28 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task RemoteSubmission_DoesNotDispatchWhenQueuedStateCannotPersist()
+        {
+            var state = StateWithThread();
+            state.RemoteRunUpdatePersistenceSucceeds = false;
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                ]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+
+            var result = await router.SubmitAsync(draft, null, CancellationToken.None);
+
+            Assert.IsFalse(result.Accepted);
+            Assert.AreEqual("dispatch_failed", result.Code);
+            Assert.AreEqual(0, transport.Dispatches);
+        }
+
+        [TestMethod]
         public async Task RemoteSubmission_BindsBuildsManifestAndRegistersProjection()
         {
             var state = StateWithThread();
@@ -295,7 +323,7 @@ namespace Mesh.App.Tests
             Assert.AreEqual(TopicQueueStage.Sending, state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
         }
         [TestMethod]
-        public async Task CancellingQueuedSubmission_RemovesItsTriggerLine()
+        public async Task CancellingQueuedSubmission_KeepsPromptUntilTerminalUpdate()
         {
             var state = StateWithThread();
             var thread = state.Profile.OwnThreads[0];
@@ -316,10 +344,40 @@ namespace Mesh.App.Tests
 
             Assert.IsTrue(cancelled);
             Assert.AreEqual(1, transport.Cancellations);
-            Assert.AreEqual(0, thread.Lines.Count);
-            Assert.IsFalse(state.IsLineQueued(draft.TriggerLineId));
+            Assert.AreEqual(1, thread.Lines.Count);
+            Assert.IsTrue(state.IsLineQueued(draft.TriggerLineId));
+            Assert.AreEqual(
+                TopicQueueStage.Cancelling,
+                state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
         }
 
+        [TestMethod]
+        public async Task RejectedQueuedCancellation_DoesNotClaimCancellationIsPending()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.ExecutionDeviceId = "offline";
+            thread.ExecutionDeviceName = "Laptop";
+            thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
+            var transport = new RecordingTransport
+            {
+                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                ResultCode = DurableDeliveryCodes.LocalQueued,
+                CancellationAccepted = false
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "offline" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+
+            var cancelled = await router.CancelQueuedAsync(
+                draft.ThreadId, draft.RunId, draft.TriggerLineId, CancellationToken.None);
+
+            Assert.IsFalse(cancelled);
+            Assert.AreEqual(1, transport.Cancellations);
+            Assert.AreEqual(
+                TopicQueueStage.Sending,
+                state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
+        }
         [TestMethod]
         public async Task EligibleDeviceRefreshes_AreSerializedSoThePickerGetsTheNewestResult()
         {
@@ -415,6 +473,7 @@ namespace Mesh.App.Tests
             var releaseFirst = new TaskCompletionSource(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             var order = new List<string>();
+            var dequeued = new List<string>();
             var agent = new AgentService
             {
                 Continue = async (_, runId, cancellationToken) =>
@@ -441,18 +500,36 @@ namespace Mesh.App.Tests
                 TopicTurnMode.Single,
                 Attachments: [new ChatAttachment("two.txt", "text/plain", [2])]);
 
-            var firstTask = runner.ExecuteAsync(first, firstProgress, CancellationToken.None);
+            var firstTask = runner.ExecuteAsync(
+                first,
+                firstProgress,
+                CancellationToken.None,
+                _ =>
+                {
+                    dequeued.Add(first.RunId);
+                    return Task.CompletedTask;
+                });
             await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            var secondTask = runner.ExecuteAsync(second, secondProgress, CancellationToken.None);
+            var secondTask = runner.ExecuteAsync(
+                second,
+                secondProgress,
+                CancellationToken.None,
+                _ =>
+                {
+                    dequeued.Add(second.RunId);
+                    return Task.CompletedTask;
+                });
             await secondProgress.Queued.Task.WaitAsync(TimeSpan.FromSeconds(2));
             Assert.IsTrue(state.IsLineQueued("line-2"));
             Assert.AreEqual("line-2", secondProgress.Updates[0].TriggerLineId);
 
             CollectionAssert.AreEqual(new[] { "run-1" }, order);
+            CollectionAssert.AreEqual(new[] { "run-1" }, dequeued);
             releaseFirst.TrySetResult();
             await Task.WhenAll(firstTask, secondTask);
 
             CollectionAssert.AreEqual(new[] { "run-1", "run-2" }, order);
+            CollectionAssert.AreEqual(new[] { "run-1", "run-2" }, dequeued);
             Assert.AreEqual(0, thread.Lines[0].Attachments.Count);
             Assert.AreEqual(0, thread.Lines[1].Attachments.Count);
             Assert.IsTrue(firstProgress.Updates.All(update =>
@@ -461,7 +538,7 @@ namespace Mesh.App.Tests
                 update.RunId == "run-2" && update.ThreadId == "thread-1"));
             Assert.IsFalse(state.IsLineQueued("line-2"));
             Assert.IsTrue(secondProgress.Updates.Any(update =>
-                update.Phase == TopicRunPhase.Executing && update.Status == "Starting"));
+                update.Phase == TopicRunPhase.Executing && update.Status == "Running"));
         }
 
         [TestMethod]
@@ -545,7 +622,8 @@ namespace Mesh.App.Tests
             public Task<TopicRunCompletion> ExecuteAsync(
                 TopicTurnDraft draft,
                 IProgress<TopicRunUpdatePayload> progress,
-                CancellationToken cancellationToken)
+                CancellationToken cancellationToken,
+                Func<CancellationToken, Task>? onStarted = null)
             {
                 Calls++;
                 Called.TrySetResult();
