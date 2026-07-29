@@ -64,8 +64,11 @@
                 <iframe @ref="frameRefs[id]"
                         sandbox="allow-scripts"
                         referrerpolicy="no-referrer"
+                        scrolling="yes"
+                        title="Interactive widget"
+                        aria-label="Interactive widget"
                         style="min-width:0;max-width:100%;"></iframe>
-                <div class="widget-render-status" hidden aria-live="polite"></div>
+                <div class="widget-render-status" role="status" aria-live="polite">Loading secure widget...</div>
                 <div class="app-toolbar">
                     @if (OnPin.HasDelegate)
                     {
