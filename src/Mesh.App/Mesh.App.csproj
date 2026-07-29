@@ -76,7 +76,7 @@
                   Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'" />
         <MauiIcon Include="Resources\AppIcon\MacCatalyst\meshicon.png" BaseSize="1024,1024" Color="#131316"
                   Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'" />
-        <MauiIcon Include="Resources\AppIcon\Windows\meshicon.png" BaseSize="1024,1024" Color="#131316"
+        <MauiIcon Include="Resources\AppIcon\Windows\meshicon.png" BaseSize="512,512" Color="#131316"
                   Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'" />
 
         <!-- Splash Screen -->
