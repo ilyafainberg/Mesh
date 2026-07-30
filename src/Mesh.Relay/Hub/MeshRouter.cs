@@ -43,11 +43,24 @@ public sealed class MeshRouter(
             return await RouteToDeviceAsync(clean, excludeConnectionId);
 
         var originalJson = JsonSerializer.Serialize(clean, Json);
-        var enqueued = await store.EnqueueAsync(to, clean.Id, clean.From, originalJson, RelayInboxPriority.ForKind(clean.Kind));
+        var enqueued = await store.EnqueueAsync(
+            to,
+            clean.Id,
+            clean.From,
+            originalJson,
+            RelayInboxPriority.ForKind(clean.Kind),
+            BackgroundSyncProtocol.RequiresForeground(clean.Kind));
+        return await RouteEnqueuedAsync(clean, enqueued, excludeConnectionId);
+    }
+
+    internal async Task<MeshRouteResult> RouteEnqueuedAsync(
+        MeshEnvelope env,
+        InboxEnqueueResult enqueued,
+        string? excludeConnectionId = null)
+    {
+        var clean = env with { RelayDeliveryId = null, RelayDeviceScoped = false };
+        var to = Normalize(clean.To);
         var deliveryId = enqueued.DeliveryId;
-        var leaseOwner = LiveLeaseOwner();
-        if (!await store.TryLeaseInboxItemAsync(to, deliveryId, leaseOwner))
-            return new MeshRouteResult(false, true, deliveryId, enqueued.Created);
         var envelopeJson = JsonSerializer.Serialize(
             clean with { RelayDeliveryId = deliveryId, RelayDeviceScoped = false }, Json);
         // A thrown or uncertain send may have reached the owning socket. In that case the live lease
@@ -64,8 +77,6 @@ public sealed class MeshRouter(
 
         if (receipt.Outcome == BackplaneDeliveryOutcome.Delivered)
         {
-            if (!receipt.DurableAckExpected)
-                await store.AcknowledgeInboxAsync(to, deliveryId);
             if (Normalize(clean.From) != to)
                 push.NotifyOfflineSiblings(to, clean);
             return new MeshRouteResult(true, false, deliveryId, enqueued.Created);
@@ -73,7 +84,6 @@ public sealed class MeshRouter(
 
         if (receipt.Outcome == BackplaneDeliveryOutcome.NotDelivered)
         {
-            await store.ReleaseInboxLeaseAsync(to, deliveryId, leaseOwner);
             push.NotifyOffline(to, null, clean);
         }
         return new MeshRouteResult(false, true, deliveryId, enqueued.Created);
@@ -92,11 +102,28 @@ public sealed class MeshRouter(
         var to = Normalize(clean.To);
         var inboxKey = DeviceInboxKey(to, clean.ToDevice!);
         var originalJson = JsonSerializer.Serialize(clean, Json);
-        var enqueued = await store.EnqueueAsync(inboxKey, clean.Id, clean.From, originalJson, RelayInboxPriority.ForKind(clean.Kind));
+        var enqueued = await store.EnqueueAsync(
+            inboxKey,
+            clean.Id,
+            clean.From,
+            originalJson,
+            RelayInboxPriority.ForKind(clean.Kind),
+            BackgroundSyncProtocol.RequiresForeground(clean.Kind));
+        return await RouteEnqueuedToDeviceAsync(clean, enqueued, excludeConnectionId);
+    }
+
+    internal async Task<MeshRouteResult> RouteEnqueuedToDeviceAsync(
+        MeshEnvelope env,
+        InboxEnqueueResult enqueued,
+        string? excludeConnectionId = null)
+    {
+        if (string.IsNullOrWhiteSpace(env.ToDevice))
+            throw new ArgumentException("A strict device route requires ToDevice.", nameof(env));
+
+        var clean = env with { RelayDeliveryId = null, RelayDeviceScoped = false };
+        var to = Normalize(clean.To);
+        var inboxKey = DeviceInboxKey(to, clean.ToDevice!);
         var deliveryId = enqueued.DeliveryId;
-        var leaseOwner = LiveLeaseOwner();
-        if (!await store.TryLeaseInboxItemAsync(inboxKey, deliveryId, leaseOwner))
-            return new MeshRouteResult(false, true, deliveryId, enqueued.Created);
         var envelopeJson = JsonSerializer.Serialize(
             clean with { RelayDeliveryId = deliveryId, RelayDeviceScoped = true }, Json);
         var receipt = await DeliverLocalWithReceiptAsync(
@@ -110,15 +137,10 @@ public sealed class MeshRouter(
         }
 
         if (receipt.Outcome == BackplaneDeliveryOutcome.Delivered)
-        {
-            if (!receipt.DurableAckExpected)
-                await store.AcknowledgeInboxAsync(inboxKey, deliveryId);
             return new MeshRouteResult(true, false, deliveryId, enqueued.Created);
-        }
 
         if (receipt.Outcome == BackplaneDeliveryOutcome.NotDelivered)
         {
-            await store.ReleaseInboxLeaseAsync(inboxKey, deliveryId, leaseOwner);
             push.NotifyOffline(to, clean.ToDevice, clean);
         }
         return new MeshRouteResult(false, true, deliveryId, enqueued.Created);
@@ -200,10 +222,49 @@ public sealed class MeshRouter(
         if (excludeConnectionId is not null)
             conns = conns.Where(c => c != excludeConnectionId).ToList();
         if (conns.Count == 0) return BackplaneDeliveryReceipt.NotDelivered;
-        await hub.Clients.Clients(conns).SendAsync(MeshHubProtocol.Receive, envelopeJson);
+
+        var durableConnection = conns
+            .Where(registry.SupportsDurableDelivery)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .FirstOrDefault();
+        var deliveryConnections = durableConnection is null ? conns : [durableConnection];
+        string? liveLeaseOwner = null;
+        MeshEnvelope? envelope = null;
+        try
+        {
+            envelope = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, Json);
+        }
+        catch (JsonException)
+        {
+        }
+        if (envelope is { RelayDeliveryId: not null })
+        {
+            var inboxKey = envelope.RelayDeviceScoped
+                && !string.IsNullOrWhiteSpace(envelope.ToDevice)
+                    ? DeviceInboxKey(normalized, envelope.ToDevice)
+                    : normalized;
+            liveLeaseOwner = durableConnection ?? LiveLeaseOwner();
+            if (!await store.TryLeaseInboxItemAsync(
+                    inboxKey, envelope.RelayDeliveryId, liveLeaseOwner))
+                return BackplaneDeliveryReceipt.NotDelivered;
+        }
+
+        await hub.Clients.Clients(deliveryConnections).SendAsync(
+            MeshHubProtocol.Receive, envelopeJson);
+        if (envelope is { RelayDeliveryId: not null }
+            && durableConnection is null
+            && liveLeaseOwner is not null)
+        {
+            var inboxKey = envelope.RelayDeviceScoped
+                && !string.IsNullOrWhiteSpace(envelope.ToDevice)
+                    ? DeviceInboxKey(normalized, envelope.ToDevice)
+                    : normalized;
+            await store.AcknowledgeInboxAsync(
+                inboxKey, envelope.RelayDeliveryId, liveLeaseOwner);
+        }
         return new BackplaneDeliveryReceipt(
             BackplaneDeliveryOutcome.Delivered,
-            conns.Any(registry.SupportsDurableDelivery));
+            durableConnection is not null);
     }
 
     public async Task<bool> DeliverLocalAsync(
@@ -257,7 +318,10 @@ public sealed class MeshRouter(
                                    ?? new HashSet<string>(StringComparer.Ordinal);
         var revokedDeviceIds = registry.RevokeUnauthorizedDevices(handle, authorizedPublicKeys);
         foreach (var deviceId in revokedDeviceIds)
+        {
             await backplane.ClearDevicePresenceAsync(handle, deviceId);
+            await backplane.ClearTransientDeviceRouteAsync(handle, deviceId);
+        }
         if (revokedDeviceIds.Count > 0
             && registry.ConnectionsFor(handle, includeBackgroundSync: false).Count == 0)
             await backplane.ClearPresenceAsync(handle);

@@ -106,11 +106,13 @@ public sealed partial class MeshClient
             RuntimeDiagnostics.Current?.RecordException("background-sync-capabilities", ex);
             return BackgroundSyncResult.Failed("transport_unavailable");
         }
+        if (capabilities.ProtocolVersion != MeshProtocol.Version)
+            return BackgroundSyncResult.Failed("protocol_mismatch");
         if (!capabilities.DurableDelivery || !capabilities.BackgroundSync)
             return BackgroundSyncResult.Failed("background_sync_unsupported");
 
         var url = $"{profile.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}"
-                  + $"?handle={Uri.EscapeDataString(normalizedHandle)}&deliveryAck=1&backgroundSync=1";
+                  + $"?handle={Uri.EscapeDataString(normalizedHandle)}&deliveryAck=1&backgroundSync=1&protocolVersion={MeshProtocol.Version}";
         var connection = new HubConnectionBuilder().WithUrl(url).Build();
         var identity = new DeviceSyncIdentity(
             connection,
@@ -128,9 +130,18 @@ public sealed partial class MeshClient
         var deferred = 0;
         var retry = 0;
         Exception? processingFailure = null;
+        string? queueDrainFailure = null;
 
         void Touch() => Interlocked.Exchange(ref lastActivity, Stopwatch.GetTimestamp());
 
+        connection.On<HandshakeResponse>(MeshHubProtocol.Handshake, response =>
+        {
+            if (response.Result == HandshakeResult.Accepted
+                && response.ServerVersion == MeshProtocol.Version)
+                return;
+            ready.TrySetException(new InvalidOperationException(
+                response.Error ?? $"relay protocol mismatch: expected {MeshProtocol.Version}, got {response.ServerVersion}"));
+        });
         connection.On<string>(MeshHubProtocol.Challenge, async nonce =>
         {
             try
@@ -144,10 +155,44 @@ public sealed partial class MeshClient
                 ready.TrySetException(ex);
             }
         });
-        connection.On(MeshHubProtocol.Ready, () =>
+        connection.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, _ =>
         {
             Touch();
             ready.TrySetResult();
+        });
+        connection.On(MeshHubProtocol.DeviceQueueAvailable, async () =>
+        {
+            Interlocked.Increment(ref activeHandlers);
+            Touch();
+            try
+            {
+                var drain = await CoalescedDrainDeviceSyncQueueAsync(
+                    identity,
+                    InboundProcessingMode.Background,
+                    ct).ConfigureAwait(false);
+                Interlocked.Add(ref processed, drain.ProcessedEnvelopes);
+                if (!drain.Succeeded)
+                    Interlocked.CompareExchange(
+                        ref queueDrainFailure,
+                        drain.Error ?? "queue_drain_failed",
+                        null);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Current?.RecordException("background-sync-device-queue", ex);
+                Interlocked.CompareExchange(
+                    ref queueDrainFailure,
+                    "queue_drain_failed",
+                    null);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref activeHandlers);
+                Touch();
+            }
         });
         connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
         {
@@ -218,8 +263,32 @@ public sealed partial class MeshClient
             await WaitForBackgroundIdleAsync(
                 () => Volatile.Read(ref lastActivity),
                 () => Volatile.Read(ref activeHandlers),
-                () => Volatile.Read(ref processingFailure),
+                () => Volatile.Read(ref processingFailure)
+                      ?? (Volatile.Read(ref queueDrainFailure) is { } error
+                          ? new InvalidOperationException(error)
+                          : null),
                 ct).ConfigureAwait(false);
+            var initialQueueDrainFailure = Volatile.Read(ref queueDrainFailure);
+            if (initialQueueDrainFailure is not null)
+                return BackgroundSyncResult.Failed(
+                    initialQueueDrainFailure,
+                    processed,
+                    deferred);
+            var initialDrain = await CoalescedDrainDeviceSyncQueueAsync(
+                identity,
+                InboundProcessingMode.Background,
+                ct).ConfigureAwait(false);
+            processed += initialDrain.ProcessedEnvelopes;
+            if (!initialDrain.Succeeded)
+            {
+                RuntimeDiagnostics.Current?.RecordEvent(
+                    "background-sync",
+                    $"initial-drain-failed={initialDrain.Error}");
+                return BackgroundSyncResult.Failed(
+                    initialDrain.Error ?? "queue_drain_failed",
+                    processed,
+                    deferred);
+            }
             _ = await connection.InvokeAsync<int>(
                 MeshHubProtocol.RequestPendingDeliveries, ct).ConfigureAwait(false);
             Touch();

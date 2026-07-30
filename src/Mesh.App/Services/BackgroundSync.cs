@@ -38,6 +38,11 @@ internal static class BackgroundSyncCapabilityPolicy
         if (capabilities.ValueKind != JsonValueKind.Object)
             return false;
 
+        if (!capabilities.TryGetProperty("protocolVersion", out var protocolVersion)
+            || !protocolVersion.TryGetInt32(out var version)
+            || version != MeshProtocol.Version)
+            return false;
+
         return IsEnabled(capabilities, "durableDelivery")
             && IsEnabled(capabilities, "backgroundSync");
     }
@@ -45,6 +50,90 @@ internal static class BackgroundSyncCapabilityPolicy
     private static bool IsEnabled(JsonElement capabilities, string name)
         => capabilities.TryGetProperty(name, out var value)
            && value.ValueKind == JsonValueKind.True;
+}
+
+internal static class DeviceSyncHandshakeCoordinator
+{
+    public static async Task<DeviceSyncHandshakeResult> RunAsync(
+        Func<Task<DeviceSyncQueueDrainResult>> drain,
+        Func<Task> discoverSnapshots,
+        Func<bool> shouldContinue,
+        Action<Exception> reportFailure,
+        int discoveryAttempts = 3,
+        Func<int, Task>? retryDelay = null)
+    {
+        DeviceSyncQueueDrainResult drainResult;
+        try
+        {
+            drainResult = await drain().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            reportFailure(ex);
+            return DeviceSyncHandshakeResult.Failed("queue_drain_exception", ex);
+        }
+
+        if (!drainResult.Succeeded)
+        {
+            var failure = new InvalidOperationException(
+                drainResult.Error ?? "queue_drain_rejected");
+            reportFailure(failure);
+            return DeviceSyncHandshakeResult.Failed(
+                drainResult.Error ?? "queue_drain_rejected",
+                failure);
+        }
+
+        for (var attempt = 0; attempt < discoveryAttempts && shouldContinue(); attempt++)
+        {
+            try
+            {
+                await discoverSnapshots().ConfigureAwait(false);
+                return DeviceSyncHandshakeResult.Completed();
+            }
+            catch (Exception ex)
+            {
+                reportFailure(ex);
+                if (attempt + 1 >= discoveryAttempts || !shouldContinue())
+                    return DeviceSyncHandshakeResult.Failed("snapshot_discovery_failed", ex);
+                if (retryDelay is not null)
+                    await retryDelay(attempt + 1).ConfigureAwait(false);
+                else
+                    await Task.Delay(TimeSpan.FromSeconds(1 << attempt)).ConfigureAwait(false);
+            }
+        }
+        return DeviceSyncHandshakeResult.Completed();
+    }
+}
+
+internal sealed record DeviceSyncQueueDrainResult(
+    bool Succeeded,
+    int ProcessedEnvelopes,
+    string? Error = null)
+{
+    public static DeviceSyncQueueDrainResult Completed(int processed)
+        => new(true, processed);
+
+    public static DeviceSyncQueueDrainResult Failed(string error, int processed = 0)
+        => new(false, processed, error);
+}
+
+internal sealed record DeviceSyncHandshakeResult(
+    bool Succeeded,
+    string? Error = null,
+    Exception? Exception = null)
+{
+    public static DeviceSyncHandshakeResult Completed() => new(true);
+
+    public static DeviceSyncHandshakeResult Failed(string error, Exception exception)
+        => new(false, error, exception);
+}
+
+internal static class DeviceSyncTransportPolicy
+{
+    public static string MethodFor(string kind)
+        => kind.StartsWith("device.sync.", StringComparison.Ordinal)
+            ? MeshHubProtocol.QueueEnqueue
+            : MeshHubProtocol.SendEnvelope;
 }
 
 /// <summary>Coalesces native wake sources onto one bounded relay synchronization session.</summary>
@@ -139,6 +228,21 @@ internal static class InboundAcknowledgementPolicy
 {
     public static bool ShouldAcknowledge(InboundDisposition disposition)
         => disposition is InboundDisposition.Processed or InboundDisposition.PermanentReject;
+}
+
+internal static class DeviceSyncQueueDrainPolicy
+{
+    public static DeviceSyncQueueDrainResult StopResult(
+        InboundDisposition disposition,
+        int processed)
+        => disposition switch
+        {
+            InboundDisposition.Retry => DeviceSyncQueueDrainResult.Failed(
+                "queue_processing_retry",
+                processed),
+            InboundDisposition.Defer => DeviceSyncQueueDrainResult.Completed(processed),
+            _ => throw new ArgumentOutOfRangeException(nameof(disposition))
+        };
 }
 
 internal static class InboundAttachmentFailurePolicy

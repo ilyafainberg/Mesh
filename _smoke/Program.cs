@@ -43,7 +43,7 @@ async Task<System.Net.Http.HttpResponseMessage> Register(
     string priv,
     string? display,
     string? recoveryPub = null,
-    int protocolVersion = 6)
+    int protocolVersion = MeshProtocol.Version)
 {
     var sig = Sign(priv, ClaimProtocol.Message(handle, pub));
     return await http.PostAsJsonAsync($"{relay}/handles",
@@ -226,17 +226,23 @@ async Task<(HubConnection conn, ConcurrentQueue<MeshEnvelope> inbox, Task ready)
 {
     var deliveryQuery = deliveryAck ? "&deliveryAck=1" : "";
     var conn = new HubConnectionBuilder()
-        .WithUrl($"{relay}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(handle)}{deliveryQuery}")
+        .WithUrl($"{relay}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(handle)}{deliveryQuery}&protocolVersion={MeshProtocol.Version}")
         .Build();
     connections.Add(conn);
     var inbox = new ConcurrentQueue<MeshEnvelope>();
     var readyTcs = new TaskCompletionSource();
+    conn.On<HandshakeResponse>(MeshHubProtocol.Handshake, response =>
+    {
+        if (response.Result != HandshakeResult.Accepted || response.ServerVersion != MeshProtocol.Version)
+            readyTcs.TrySetException(new InvalidOperationException(
+                response.Error ?? $"relay protocol mismatch: expected {MeshProtocol.Version}, got {response.ServerVersion}"));
+    });
     conn.On<string>(MeshHubProtocol.Challenge, async nonce =>
     {
         var sig = Sign(priv, nonce);
         await conn.InvokeAsync(MeshHubProtocol.Authenticate, pub, sig);
     });
-    conn.On(MeshHubProtocol.Ready, () => readyTcs.TrySetResult());
+    conn.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, _ => readyTcs.TrySetResult());
     conn.On<string>(MeshHubProtocol.Receive, json =>
     {
         var e = JsonSerializer.Deserialize<MeshEnvelope>(json, web);

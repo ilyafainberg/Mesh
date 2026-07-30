@@ -11,6 +11,7 @@ public sealed class InMemoryBackplane : IBackplane
 {
     private readonly ConcurrentDictionary<string, byte> present = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> presentDevices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> transientDeviceRoutes = new(StringComparer.OrdinalIgnoreCase);
 
     public string InstanceId { get; } = Guid.NewGuid().ToString("n")[..8];
 
@@ -29,6 +30,12 @@ public sealed class InMemoryBackplane : IBackplane
         return Task.CompletedTask;
     }
 
+    public Task SetTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default)
+    {
+        transientDeviceRoutes[DeviceKey(handle, deviceId)] = 0;
+        return Task.CompletedTask;
+    }
+
     public Task ClearPresenceAsync(string handle, CancellationToken ct = default)
     {
         present.TryRemove(handle, out _);
@@ -41,11 +48,22 @@ public sealed class InMemoryBackplane : IBackplane
         return Task.CompletedTask;
     }
 
+    public Task ClearTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default)
+    {
+        transientDeviceRoutes.TryRemove(DeviceKey(handle, deviceId), out _);
+        return Task.CompletedTask;
+    }
+
     public Task<string?> GetInstanceForAsync(string handle, CancellationToken ct = default)
         => Task.FromResult<string?>(present.ContainsKey(handle) ? InstanceId : null);
 
     public Task<string?> GetInstanceForDeviceAsync(string handle, string deviceId, CancellationToken ct = default)
         => Task.FromResult<string?>(presentDevices.ContainsKey(DeviceKey(handle, deviceId)) ? InstanceId : null);
+
+    public Task<string?> GetTransientInstanceForDeviceAsync(
+        string handle, string deviceId, CancellationToken ct = default)
+        => Task.FromResult<string?>(
+            transientDeviceRoutes.ContainsKey(DeviceKey(handle, deviceId)) ? InstanceId : null);
 
     public Task<BackplaneDeliveryReceipt> PublishToOwnerAsync(string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default)
         => Task.FromResult(BackplaneDeliveryReceipt.NotDelivered); // caller already tried the local socket

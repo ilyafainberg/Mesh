@@ -12,12 +12,14 @@ namespace Mesh.Relay.Backplane;
 ///
 /// Key/channel naming scheme:
 ///   presence key : mesh:presence:{handle}  (value = owning InstanceId, TTL ~30s)
+///   transient route: mesh:route-device:{handle}:{deviceId} (background sync only, TTL ~30s)
 ///   routing chan : mesh:inst:{InstanceId}   (per-instance pub/sub channel)
 /// </summary>
 public sealed class RedisBackplane : IBackplane
 {
     private const string PresenceKeyPrefix = "mesh:presence:";
     private const string DevicePresenceKeyPrefix = "mesh:presence-device:";
+    private const string TransientDeviceRouteKeyPrefix = "mesh:route-device:";
     private const string InstanceChannelPrefix = "mesh:inst:";
     private const string AckChannelPrefix = "mesh:ack:";
     private const string InstanceCapabilityKeyPrefix = "mesh:inst-cap:";
@@ -25,6 +27,7 @@ public sealed class RedisBackplane : IBackplane
     private const string AtomicAgentDeliveryCapability = "atomic-agent-single-connection-v1";
     private const string InstanceCapabilities = DeliveryAckCapability + "," + AtomicAgentDeliveryCapability;
     private static readonly TimeSpan PresenceTtl = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan TransientDeviceRouteTtl = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan DeliveryAckTimeout = TimeSpan.FromSeconds(5);
 
     // Lua: delete the presence key only if it still points at this instance, avoiding
@@ -86,6 +89,15 @@ public sealed class RedisBackplane : IBackplane
             .ConfigureAwait(false);
     }
 
+    public async Task SetTransientDeviceRouteAsync(
+        string handle, string deviceId, CancellationToken ct = default)
+    {
+        var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+        await mux.GetDatabase()
+            .StringSetAsync(TransientDeviceRouteKey(handle, deviceId), InstanceId, TransientDeviceRouteTtl)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Clears presence for a handle, but only if this instance still owns it.</summary>
     public async Task ClearPresenceAsync(string handle, CancellationToken ct = default)
     {
@@ -109,6 +121,18 @@ public sealed class RedisBackplane : IBackplane
             .ConfigureAwait(false);
     }
 
+    public async Task ClearTransientDeviceRouteAsync(
+        string handle, string deviceId, CancellationToken ct = default)
+    {
+        var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+        await mux.GetDatabase()
+            .ScriptEvaluateAsync(
+                ClearIfOwnerScript,
+                new RedisKey[] { TransientDeviceRouteKey(handle, deviceId) },
+                new RedisValue[] { InstanceId })
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Returns the instance id currently holding the handle's socket, or null if absent/expired.</summary>
     public async Task<string?> GetInstanceForAsync(string handle, CancellationToken ct = default)
     {
@@ -125,6 +149,16 @@ public sealed class RedisBackplane : IBackplane
         var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
         var value = await mux.GetDatabase()
             .StringGetAsync(DevicePresenceKey(handle, deviceId))
+            .ConfigureAwait(false);
+        return value.IsNullOrEmpty ? null : value.ToString();
+    }
+
+    public async Task<string?> GetTransientInstanceForDeviceAsync(
+        string handle, string deviceId, CancellationToken ct = default)
+    {
+        var mux = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+        var value = await mux.GetDatabase()
+            .StringGetAsync(TransientDeviceRouteKey(handle, deviceId))
             .ConfigureAwait(false);
         return value.IsNullOrEmpty ? null : value.ToString();
     }
@@ -327,6 +361,9 @@ public sealed class RedisBackplane : IBackplane
 
     private static string DevicePresenceKey(string handle, string deviceId)
         => $"{DevicePresenceKeyPrefix}{handle}:{deviceId}";
+
+    private static string TransientDeviceRouteKey(string handle, string deviceId)
+        => $"{TransientDeviceRouteKeyPrefix}{handle}:{deviceId}";
 
     /// <summary>Tiny wire payload carried over the per-instance routing channel.</summary>
     private sealed record RoutedMessage(

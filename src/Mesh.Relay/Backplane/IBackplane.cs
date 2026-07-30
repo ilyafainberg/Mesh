@@ -43,17 +43,31 @@ public interface IBackplane
     /// <summary>Records that one specific device is connected on this instance.</summary>
     Task SetDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default);
 
+    /// <summary>
+    /// Records a transient route to a background-sync socket without advertising the device as online.
+    /// </summary>
+    Task SetTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default);
+
     /// <summary>Clears presence for a handle when its socket closes on this instance.</summary>
     Task ClearPresenceAsync(string handle, CancellationToken ct = default);
 
     /// <summary>Clears one device's presence when its last socket closes on this instance.</summary>
     Task ClearDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default);
 
+    /// <summary>Clears a transient background-sync route owned by this instance.</summary>
+    Task ClearTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default);
+
     /// <summary>Returns the instance id currently holding the handle's socket, or null if none.</summary>
     Task<string?> GetInstanceForAsync(string handle, CancellationToken ct = default);
 
     /// <summary>Returns the instance id currently holding one device's socket, or null if offline.</summary>
     Task<string?> GetInstanceForDeviceAsync(string handle, string deviceId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the instance holding a transient background-sync socket, without affecting online presence.
+    /// </summary>
+    Task<string?> GetTransientInstanceForDeviceAsync(
+        string handle, string deviceId, CancellationToken ct = default);
 
     /// <summary>
     /// Publishes a message to the instance that owns the handle so it can deliver it to the

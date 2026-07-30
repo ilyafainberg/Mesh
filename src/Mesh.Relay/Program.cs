@@ -12,6 +12,7 @@ using Mesh.Relay.Quota;
 using Mesh.Relay.RateLimiting;
 using Mesh.Relay.Storage;
 using Mesh.Shared;
+using Microsoft.AspNetCore.SignalR;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
@@ -87,6 +88,7 @@ builder.Services.AddSingleton<IMessageRateLimiter>(messageRateLimiter);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
 builder.Services.AddSingleton<AgentDispatchCoordinator>();
+builder.Services.AddHostedService<AgentDispatchCoordinator.AgentResponseOutboxWorker>();
 builder.Services.AddMeshPush(builder.Configuration);
 builder.Services.AddSingleton<Mesh.Relay.RelayConnectorCatalog>();
 builder.Services.AddHostedService<PresenceRenewer>();
@@ -154,6 +156,21 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
         return BackplaneDeliveryReceipt.NotDelivered;
     }
     if (envelope is null) return BackplaneDeliveryReceipt.NotDelivered;
+    if (string.Equals(envelope.Kind, MeshHubProtocol.DeviceQueueAvailable, StringComparison.Ordinal))
+    {
+        if (string.IsNullOrWhiteSpace(envelope.ToDevice))
+            return BackplaneDeliveryReceipt.NotDelivered;
+        var connections = registry.ConnectionsForDevice(
+            toHandle, envelope.ToDevice, includeBackgroundSync: false);
+        if (connections.Count == 0)
+            connections = registry.ConnectionsForDevice(
+                toHandle, envelope.ToDevice, includeBackgroundSync: true);
+        if (connections.Count == 0)
+            return BackplaneDeliveryReceipt.NotDelivered;
+        var hubContext = app.Services.GetRequiredService<Microsoft.AspNetCore.SignalR.IHubContext<MeshHub>>();
+        await hubContext.Clients.Clients(connections).SendAsync(MeshHubProtocol.DeviceQueueAvailable);
+        return new BackplaneDeliveryReceipt(BackplaneDeliveryOutcome.Delivered, false);
+    }
     if (AgentDispatchProtocol.IsAtomicRequest(envelope.Kind))
     {
         var delivered = !string.IsNullOrWhiteSpace(envelope.ToDevice)
@@ -177,7 +194,7 @@ await backplane.StartAsync(async (toHandle, envelopeJson) =>
 // ---- Health ---------------------------------------------------------------
 var transportCapabilities = new
 {
-    protocolVersion = 7,
+    protocolVersion = MeshProtocol.Version,
     sendResults = true,
     ephemeralDelivery = true,
     fanout = true,
@@ -340,6 +357,20 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
     var handle = Normalize(req.Handle);
     if (string.IsNullOrWhiteSpace(handle) || string.IsNullOrWhiteSpace(req.DevicePublicKey))
         return Results.BadRequest(new { error = "handle and devicePublicKey are required" });
+    if (req.ProtocolVersion != MeshProtocol.Version)
+    {
+        app.Logger.LogWarning(
+            "register rejected for protocol {Actual} (required {Expected}): {Handle}",
+            req.ProtocolVersion,
+            MeshProtocol.Version,
+            handle);
+        return Results.BadRequest(new
+        {
+            error = $"protocol version {MeshProtocol.Version} is required",
+            required = MeshProtocol.Version,
+            actual = req.ProtocolVersion
+        });
+    }
 
     // Collision avoidance / proof of possession: the registrant must sign the claim with the
     // device PRIVATE key. This stops anyone claiming or re-asserting a handle with a key they do
@@ -377,7 +408,7 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
             // Directory honesty: mobile devices never advertise remote hosting.
             DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, platform),
             req.AtomicAgentDispatchEnabled,
-            Math.Clamp(req.ProtocolVersion, 6, 7));
+            MeshProtocol.Version);
         await agentDispatch.DispatchAvailableAsync(handle);
         metrics.HandleRegistered();
         app.Logger.LogInformation("handle registered: {Handle}", handle);
@@ -407,7 +438,7 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
             hasPlatform
                 ? req.AtomicAgentDispatchEnabled
                 : existing.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId),
-            Math.Clamp(req.ProtocolVersion, 6, 7));
+            MeshProtocol.Version);
         await agentDispatch.DispatchAvailableAsync(handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), existing.RegisteredAt));
     }
@@ -686,7 +717,7 @@ app.MapGet("/handles/{handle}/devices", async (string handle) =>
             rec.DevicePlatforms.GetValueOrDefault(deviceId, DevicePlatforms.Unknown),
             rec.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId),
             rec.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId),
-            rec.DeviceProtocolVersions.GetValueOrDefault(deviceId, 6)))
+            rec.DeviceProtocolVersions.GetValueOrDefault(deviceId)))
         .ToArray();
 
     return Results.Ok(devices);
@@ -734,6 +765,7 @@ app.MapDelete("/handles/{handle}/devices/{deviceId}", async (
 
     registry.RevokeDevice(key, deviceId);
     await backplane.ClearDevicePresenceAsync(key, deviceId);
+    await backplane.ClearTransientDeviceRouteAsync(key, deviceId);
     if (registry.ConnectionsFor(key, includeBackgroundSync: false).Count == 0)
         await backplane.ClearPresenceAsync(key);
     app.Logger.LogInformation(
@@ -905,7 +937,7 @@ app.MapPost("/handles/{handle}/attachments/{blobId}", async (string handle, stri
 app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.Mvc.FromBody] DeleteHandleRequest req) =>
 {
     var key = Normalize(handle);
-    var rec = await store.GetHandleAsync(key);
+    var rec = await store.GetHandleForDeletionAsync(key);
     if (rec is null) return Results.NotFound();
 
     // Only a device currently authorized under the handle can release it. Verify the presented key
