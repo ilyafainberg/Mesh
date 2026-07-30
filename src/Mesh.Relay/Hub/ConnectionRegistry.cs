@@ -191,6 +191,25 @@ public sealed class ConnectionRegistry
             .Distinct()
             .ToArray();
 
+    /// <summary>Every distinct device with an authenticated background-sync socket on this instance.</summary>
+    public IReadOnlyCollection<(string Handle, string DeviceId)> LocalBackgroundDevices()
+        => byConnection.Values
+            .Where(s => s.Authenticated
+                && s.IsBackgroundSync
+                && s.Handle is not null
+                && s.DeviceId is not null)
+            .Select(s => (s.Handle!, s.DeviceId!))
+            .Distinct()
+            .ToArray();
+
+    public bool HasBackgroundConnectionForDevice(string handle, string deviceId)
+        => byHandle.TryGetValue(handle, out var set)
+           && set.Keys.Any(id =>
+               byConnection.TryGetValue(id, out var state)
+               && state.Authenticated
+               && state.IsBackgroundSync
+               && string.Equals(state.DeviceId, deviceId, StringComparison.Ordinal));
+
     private bool HandleHasLocalConnections(string handle, bool includeBackgroundSync = true)
     {
         if (!byHandle.TryGetValue(handle, out var set)) return false;

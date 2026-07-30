@@ -70,6 +70,12 @@ public sealed class AgentDispatchCoordinator(
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
+    public sealed record ResponseCompletionResult(
+        bool Accepted,
+        bool Created,
+        MeshEnvelope? Response,
+        string? Error = null);
+
     public async Task<MeshSendResult> RouteRequestAsync(MeshEnvelope envelope, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(envelope);
@@ -154,7 +160,7 @@ public sealed class AgentDispatchCoordinator(
                 normalized, targets[index], targets.Skip(index + 1).ToArray(), ct).ConfigureAwait(false);
     }
 
-    public Task<bool> CompleteResponseAsync(
+    public async Task<ResponseCompletionResult> CompleteResponseAsync(
         MeshEnvelope response,
         string respondingDeviceId,
         CancellationToken ct = default)
@@ -164,18 +170,103 @@ public sealed class AgentDispatchCoordinator(
             || string.IsNullOrWhiteSpace(response.AgentRequestId)
             || string.IsNullOrWhiteSpace(response.AgentDispatchToken)
             || string.IsNullOrWhiteSpace(respondingDeviceId))
-            return Task.FromResult(false);
+            return new ResponseCompletionResult(false, false, null, "invalid_agent_dispatch_response");
 
         var ownerHandle = Normalize(response.From);
         var originalSender = Normalize(response.To);
         var dispatchId = AgentDispatchKey.Create(originalSender, response.AgentRequestId);
-        return store.CompleteAgentDispatchAsync(
+        var cleanResponse = response with { AgentDispatchToken = null };
+        var responseJson = JsonSerializer.Serialize(cleanResponse, Json);
+        var responseHash = Convert.ToHexString(SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(responseJson))).ToLowerInvariant();
+        var staged = await store.StageAgentDispatchResponseAsync(
             ownerHandle,
             dispatchId,
             originalSender,
             response.AgentDispatchToken,
             respondingDeviceId,
-            ct);
+            cleanResponse.Id,
+            responseJson,
+            responseHash,
+            ct).ConfigureAwait(false);
+        if (!staged.Accepted || string.IsNullOrWhiteSpace(staged.ResponseJson))
+            return new ResponseCompletionResult(false, false, null, "invalid_agent_dispatch_response");
+
+        MeshEnvelope? persistedResponse;
+        try
+        {
+            persistedResponse = JsonSerializer.Deserialize<MeshEnvelope>(staged.ResponseJson, Json);
+        }
+        catch (JsonException)
+        {
+            return new ResponseCompletionResult(false, false, null, "invalid_agent_dispatch_response");
+        }
+        if (persistedResponse is null)
+            return new ResponseCompletionResult(false, false, null, "invalid_agent_dispatch_response");
+
+        if (!staged.Completed)
+        {
+            var admission = await store.EnqueueAsync(
+                originalSender,
+                persistedResponse.Id,
+                ownerHandle,
+                staged.ResponseJson,
+                RelayInboxPriority.ForKind(persistedResponse.Kind),
+                BackgroundSyncProtocol.RequiresForeground(persistedResponse.Kind),
+                ct).ConfigureAwait(false);
+            if (!admission.Accepted)
+                return new ResponseCompletionResult(
+                    false, false, persistedResponse, "response_admission_rejected");
+
+            if (!await store.CompleteAgentDispatchResponseAsync(
+                    ownerHandle,
+                    dispatchId,
+                    persistedResponse.Id,
+                    ct).ConfigureAwait(false))
+                return new ResponseCompletionResult(
+                    false, admission.Created, persistedResponse, "response_completion_retry");
+            return new ResponseCompletionResult(true, admission.Created, persistedResponse);
+        }
+
+        return new ResponseCompletionResult(true, false, persistedResponse);
+    }
+
+    public async Task<int> ReplayResponseOutboxAsync(CancellationToken ct = default)
+    {
+        var completed = 0;
+        var pending = await store.GetPendingAgentResponsesAsync(ct: ct).ConfigureAwait(false);
+        foreach (var dispatch in pending)
+        {
+            if (string.IsNullOrWhiteSpace(dispatch.ResponseId)
+                || string.IsNullOrWhiteSpace(dispatch.ResponseJson))
+                continue;
+            MeshEnvelope? response;
+            try
+            {
+                response = JsonSerializer.Deserialize<MeshEnvelope>(dispatch.ResponseJson, Json);
+            }
+            catch (JsonException)
+            {
+                logger.LogError("Staged response for agent dispatch {DispatchId} is invalid", dispatch.Id);
+                continue;
+            }
+            if (response is null
+                || !string.Equals(response.Id, dispatch.ResponseId, StringComparison.Ordinal))
+                continue;
+            var admission = await store.EnqueueAsync(
+                dispatch.From,
+                response.Id,
+                dispatch.To,
+                dispatch.ResponseJson,
+                RelayInboxPriority.ForKind(response.Kind),
+                BackgroundSyncProtocol.RequiresForeground(response.Kind),
+                ct).ConfigureAwait(false);
+            if (!admission.Accepted) continue;
+            if (await store.CompleteAgentDispatchResponseAsync(
+                    dispatch.To, dispatch.Id, response.Id, ct).ConfigureAwait(false))
+                completed++;
+        }
+        return completed;
     }
 
     private async Task<IReadOnlyList<string>> SelectOnlineDevicesAsync(
@@ -198,6 +289,32 @@ public sealed class AgentDispatchCoordinator(
         return result;
     }
 
+    public sealed class AgentResponseOutboxWorker(
+        AgentDispatchCoordinator coordinator,
+        ILogger<AgentResponseOutboxWorker> logger) : BackgroundService
+    {
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+            do
+            {
+                try
+                {
+                    await coordinator.ReplayResponseOutboxAsync(stoppingToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Agent response outbox replay failed");
+                }
+            }
+            while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false));
+        }
+    }
+
     private async Task DeliverAssignedAsync(
         string handle,
         string deviceId,
@@ -206,8 +323,10 @@ public sealed class AgentDispatchCoordinator(
     {
         while (true)
         {
+            var leaseOwner = Guid.NewGuid().ToString("N");
             var deliveries = await store
-                .TakeAssignedAgentDispatchesAsync(handle, deviceId, ct)
+                .TakeAssignedAgentDispatchesAsync(
+                    handle, deviceId, leaseOwner, ct: ct)
                 .ConfigureAwait(false);
             if (deliveries.Count == 0) return;
             foreach (var dispatch in deliveries)
@@ -237,7 +356,7 @@ public sealed class AgentDispatchCoordinator(
                     var fallback = AgentDispatchRecipientPolicy.ChooseDevice(
                         encryptedDeviceIds, fallbackDeviceIds);
                     await store.ReleaseAgentDispatchAsync(
-                        handle, dispatch.Id, deviceId, fallback, ct).ConfigureAwait(false);
+                        handle, dispatch.Id, deviceId, leaseOwner, fallback, ct).ConfigureAwait(false);
                     logger.LogWarning(
                         "Atomic agent dispatch {DispatchId} has no key slot for device {DeviceId}",
                         dispatch.Id,
@@ -257,25 +376,37 @@ public sealed class AgentDispatchCoordinator(
                         .RouteAtomicAgentRequestAsync(routed, ct)
                         .ConfigureAwait(false);
                     if (outcome == BackplaneDeliveryOutcome.Delivered)
+                    {
+                        if (!await store.MarkAgentDispatchDeliveredAsync(
+                                handle, dispatch.Id, deviceId, leaseOwner, ct).ConfigureAwait(false))
+                            logger.LogWarning(
+                                "Atomic agent dispatch {DispatchId} was delivered after its claim expired; "
+                                + "stable envelope-id deduplication makes lease redelivery safe",
+                                dispatch.Id);
                         continue;
+                    }
                     if (outcome == BackplaneDeliveryOutcome.NotDelivered)
                     {
                         var fallback = AgentDispatchRecipientPolicy.ChooseDevice(
                             encryptedDeviceIds, fallbackDeviceIds);
                         await store.ReleaseAgentDispatchAsync(
-                            handle, dispatch.Id, deviceId, fallback, ct).ConfigureAwait(false);
+                            handle, dispatch.Id, deviceId, leaseOwner, fallback, ct).ConfigureAwait(false);
                         continue;
                     }
 
                     logger.LogWarning(
-                        "Atomic agent dispatch {DispatchId} had an uncertain cross-instance delivery",
+                        "Atomic agent dispatch {DispatchId} had an uncertain cross-instance delivery; "
+                        + "the claim will expire for safe envelope-id-deduplicated redelivery",
                         dispatch.Id);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    // Delivery outcome is uncertain after a transport exception. Keep the request fenced as
-                    // delivered rather than risk running it on a second device.
-                    logger.LogError(ex, "Atomic agent dispatch {DispatchId} had an uncertain delivery", dispatch.Id);
+                    // The lease remains until expiry. A retry can duplicate transport delivery, but the
+                    // persisted client chat line uses the stable envelope id to suppress re-execution.
+                    logger.LogError(
+                        ex,
+                        "Atomic agent dispatch {DispatchId} had an uncertain delivery; its claim will expire",
+                        dispatch.Id);
                 }
             }
         }

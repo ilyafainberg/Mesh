@@ -11,7 +11,8 @@
     max-width: 100%;
 }
 
-/* Routed content scrolls inside this native layer until a modal owns the viewport. */
+/* Scrollable body region. Modal descendants temporarily disable this native iOS
+   scrolling layer through mobile-overlay-open below. */
 .m-body {
     flex: 1 1 auto;
     position: relative;
@@ -25,11 +26,11 @@
 
 /* iOS clips fixed descendants inside a momentum-scrolling layer. Remove the sibling
    tab bar and suspend that layer while any routed modal is mounted. */
-.m-shell.overlay-open .m-tabbar {
+.m-shell.mobile-overlay-open .m-tabbar {
     display: none;
 }
 
-.m-shell.overlay-open .m-body {
+.m-shell.mobile-overlay-open .m-body {
     overflow: hidden;
     -webkit-overflow-scrolling: auto;
     padding-bottom: 0;
@@ -109,6 +110,20 @@
     background: var(--bg-1);
     border-top: 1px solid var(--stroke-1);
     box-shadow: 0 -2px 10px rgba(0, 0, 0, .06);
+}
+
+/* iOS composites -webkit-overflow-scrolling as a separate native layer. Fixed
+   descendants cannot reliably cover the sibling tab bar while that layer is active.
+   Removing the bar expands m-body to the full safe-area viewport; suspending scrolling
+   lets every registered modal render and scroll above it without per-dialog offsets. */
+.m-shell.mobile-overlay-open .m-tabbar {
+    display: none;
+}
+
+.m-shell.mobile-overlay-open .m-body {
+    overflow: hidden;
+    -webkit-overflow-scrolling: auto;
+    padding-bottom: 0;
 }
 
 .m-tab {

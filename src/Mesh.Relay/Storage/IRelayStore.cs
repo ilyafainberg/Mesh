@@ -16,6 +16,18 @@ public sealed class StoredHandle
     public List<string> DevicePublicKeys { get; set; } = new();
 
     /// <summary>
+    /// Opaque epoch for ordinary inbox admission. A reclaimed handle receives a fresh epoch, so an
+    /// enqueue admitted by the previous owner cannot be delivered to the new owner.
+    /// </summary>
+    public string InboxGeneration { get; set; } = "";
+
+    /// <summary>
+    /// Opaque per-device epochs used by the durable queue admission fence. A relink receives a
+    /// fresh epoch, so work authorized by an earlier registration cannot enter the new queue.
+    /// </summary>
+    public Dictionary<string, string> DeviceQueueGenerations { get; set; } = new();
+
+    /// <summary>
     /// The handle's recovery public key, captured at registration. Used to authorize a brand-new
     /// device via <c>POST /handles/{handle}/recover</c> when no existing device can issue a link
     /// invite. Null when the handle was registered without recovery support. First writer wins:
@@ -92,6 +104,7 @@ public sealed class StoredEnvelope
     public DateTimeOffset? LeaseUntil { get; set; }
     public int DeliveryAttempts { get; set; }
     public int Priority { get; set; } = RelayInboxPriority.Normal;
+    public bool RequiresForeground { get; set; }
 }
 
 public static class RelayInboxPriority
@@ -137,9 +150,34 @@ public static class RelayInboxPolicy
     }
 }
 
-public sealed record InboxEnqueueResult(string DeliveryId, bool Created);
+public sealed record InboxEnqueueResult(
+    string DeliveryId,
+    bool Accepted,
+    bool Created,
+    string? Error = null);
 
 public sealed record RelayInboxStats(long QueuedItems, DateTimeOffset? OldestQueuedAt);
+
+public sealed class StoredDeviceQueueItem
+{
+    public string EntryId { get; set; } = "";
+    public string Handle { get; set; } = "";
+    public string SourceDeviceId { get; set; } = "";
+    public string SourceGeneration { get; set; } = "";
+    public string TargetDeviceId { get; set; } = "";
+    public string OperationId { get; set; } = "";
+    public string Payload { get; set; } = "";
+    public DateTimeOffset EnqueuedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset ExpiresAt { get; set; }
+    public string? LeaseOwner { get; set; }
+    public DateTimeOffset? LeaseUntil { get; set; }
+}
+
+public static class RelayDeviceQueueKey
+{
+    public static string Create(string handle, string deviceId)
+        => LinkProtocol.Normalize(handle) + "\u001fqueue\u001f" + deviceId.Trim();
+}
 
 public static class RelayInboxKey
 {
@@ -161,7 +199,9 @@ public static class AgentDispatchStates
 {
     public const string Pending = "pending";
     public const string Assigned = "assigned";
+    public const string Delivering = "delivering";
     public const string Delivered = "delivered";
+    public const string ResponsePending = "response-pending";
     public const string Completed = "completed";
 }
 
@@ -181,9 +221,15 @@ public sealed class StoredAgentDispatch
     public string DispatchToken { get; set; } = "";
     public string State { get; set; } = AgentDispatchStates.Pending;
     public string? AssignedDeviceId { get; set; }
+    public string? DeliveryLeaseOwner { get; set; }
+    public DateTimeOffset? DeliveryLeaseUntil { get; set; }
     public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? AssignedAt { get; set; }
     public DateTimeOffset? DeliveredAt { get; set; }
+    public string? ResponseId { get; set; }
+    public string? ResponseJson { get; set; }
+    public string? ResponseHash { get; set; }
+    public DateTimeOffset? ResponseStagedAt { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
 }
 
@@ -198,6 +244,12 @@ public sealed record AgentDispatchCreateResult(
     AgentDispatchCreateStatus Status,
     string State,
     string? AssignedDeviceId);
+
+public sealed record AgentDispatchResponseStageResult(
+    bool Accepted,
+    bool Created,
+    bool Completed,
+    string? ResponseJson);
 
 public static class AgentDispatchKey
 {
@@ -243,6 +295,12 @@ public interface IRelayStore
     Task<StoredHandle?> GetHandleAsync(string handle, CancellationToken ct = default);
 
     /// <summary>
+    /// Loads a handle for authorization of an idempotent deletion retry, including a registration
+    /// whose deletion tombstone is already present. Must not be used by registration or routing.
+    /// </summary>
+    Task<StoredHandle?> GetHandleForDeletionAsync(string handle, CancellationToken ct = default);
+
+    /// <summary>
     /// Atomically creates the handle if unclaimed, or adds the device key to an existing
     /// registration only when the key is already authorized (idempotent re-assert) or the
     /// caller passes <paramref name="allowNewDevice"/> (device-link redemption).
@@ -275,7 +333,7 @@ public interface IRelayStore
         string platform,
         bool remoteAgentEnabled,
         bool atomicAgentDispatchEnabled,
-        int protocolVersion = 6,
+        int protocolVersion = MeshProtocol.Version,
         CancellationToken ct = default);
 
     Task<DeviceRevocationResult> RevokeDeviceAsync(
@@ -332,6 +390,7 @@ public interface IRelayStore
         string fromHandle,
         string envelopeJson,
         int priority = RelayInboxPriority.Normal,
+        bool requiresForeground = false,
         CancellationToken ct = default);
 
     /// <summary>Leases queued envelopes without removing them. The receiver must acknowledge each item.</summary>
@@ -340,11 +399,13 @@ public interface IRelayStore
         string leaseOwner,
         int maxItems = RelayInboxPolicy.DeliveryWindow,
         TimeSpan? leaseDuration = null,
+        bool includeForeground = true,
         CancellationToken ct = default);
 
     Task<StoredEnvelope?> AcknowledgeInboxAsync(
         string toHandle,
         string deliveryId,
+        string leaseOwner,
         CancellationToken ct = default);
 
     Task<bool> TryLeaseInboxItemAsync(
@@ -376,6 +437,36 @@ public interface IRelayStore
     Task<IReadOnlyList<string>> DrainInboxAsync(string toHandle, CancellationToken ct = default);
     Task<RelayInboxStats> GetInboxStatsAsync(CancellationToken ct = default);
 
+    Task<QueueEnqueueResult> EnqueueDeviceQueueAsync(
+        string handle,
+        QueueEnqueue request,
+        CancellationToken ct = default);
+
+    Task<QueueDrainResponse> DrainDeviceQueueAsync(
+        string handle,
+        string deviceId,
+        string leaseOwner,
+        int maxEntries = 64,
+        CancellationToken ct = default);
+
+    Task<bool> AcknowledgeDeviceQueueAsync(
+        string handle,
+        string deviceId,
+        string entryId,
+        string leaseOwner,
+        CancellationToken ct = default);
+
+    Task ReleaseDeviceQueueLeasesAsync(
+        string handle,
+        string deviceId,
+        string leaseOwner,
+        CancellationToken ct = default);
+
+    Task<int> GetDeviceQueueSizeAsync(
+        string handle,
+        string deviceId,
+        CancellationToken ct = default);
+
     Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
         StoredAgentDispatch dispatch,
         CancellationToken ct = default);
@@ -395,21 +486,44 @@ public interface IRelayStore
     Task<IReadOnlyList<StoredAgentDispatch>> TakeAssignedAgentDispatchesAsync(
         string toHandle,
         string deviceId,
+        string leaseOwner,
+        TimeSpan? leaseDuration = null,
+        CancellationToken ct = default);
+
+    Task<bool> MarkAgentDispatchDeliveredAsync(
+        string toHandle,
+        string dispatchId,
+        string deviceId,
+        string leaseOwner,
         CancellationToken ct = default);
 
     Task<bool> ReleaseAgentDispatchAsync(
         string toHandle,
         string dispatchId,
         string deviceId,
+        string leaseOwner,
         string? nextDeviceId = null,
         CancellationToken ct = default);
 
-    Task<bool> CompleteAgentDispatchAsync(
+    Task<AgentDispatchResponseStageResult> StageAgentDispatchResponseAsync(
         string toHandle,
         string dispatchId,
         string fromHandle,
         string dispatchToken,
         string respondingDeviceId,
+        string responseId,
+        string responseJson,
+        string responseHash,
+        CancellationToken ct = default);
+
+    Task<bool> CompleteAgentDispatchResponseAsync(
+        string toHandle,
+        string dispatchId,
+        string responseId,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<StoredAgentDispatch>> GetPendingAgentResponsesAsync(
+        int maxItems = 100,
         CancellationToken ct = default);
 
     /// <summary>Loads an administrative per-handle rate-policy override, or null for defaults.</summary>

@@ -1,17 +1,23 @@
-@inject MobileOverlayState Overlays
+@inject MobileOverlayState MobileOverlays
 @implements IDisposable
 
 @code {
-    IDisposable? lease;
+    [Parameter] public bool Active { get; set; } = true;
 
-    protected override void OnInitialized()
+    readonly object owner = new();
+    bool registered;
+
+    protected override void OnParametersSet()
     {
-        lease = Overlays.Enter();
+        if (registered == Active) return;
+        MobileOverlays.SetActive(owner, Active);
+        registered = Active;
     }
 
     public void Dispose()
     {
-        lease?.Dispose();
-        lease = null;
+        if (!registered) return;
+        MobileOverlays.SetActive(owner, false);
+        registered = false;
     }
 }

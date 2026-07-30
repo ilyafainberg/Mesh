@@ -15,6 +15,7 @@
          without a MAUI build dependency. The file compiles cleanly against net10.0 and
          Microsoft.Extensions.Logging.Abstractions. -->
     <Compile Include="..\..\src\Mesh.App\Services\UiModeService.cs" Link="UiModeService.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\UpdateService.cs" Link="UpdateService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\BackgroundSync.cs" Link="BackgroundSync.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\IPushService.cs" Link="IPushService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\StorageProtection.cs" Link="StorageProtection.cs" />
@@ -62,6 +63,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Mesh.Shared\Mesh.Shared.csproj" />
     <ProjectReference Include="..\..\src\Mesh.Relay\Mesh.Relay.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UpdaterFocusedTests)' == 'true'">
+    <Compile Remove="DurableRelayDeliveryTests.cs" />
   </ItemGroup>
 
 </Project>

@@ -130,9 +130,10 @@
                     <iframe @ref="draftFrameRef"
                             sandbox="allow-scripts"
                             referrerpolicy="no-referrer"
+                            scrolling="yes"
                             title="Widget preview"
                             aria-label="Widget preview"></iframe>
-                    <div class="widget-render-status" hidden aria-live="polite"></div>
+                    <div class="widget-render-status" role="status" aria-live="polite">Loading secure widget...</div>
                 </div>
 
                 @if (error is not null && phase != PagePhase.Failed)
@@ -283,9 +284,10 @@
                                 <iframe @ref="widgetFrameRefs[w.Id]"
                                         sandbox="allow-scripts"
                                         referrerpolicy="no-referrer"
+                                        scrolling="yes"
                                         title="@($"{w.Name} preview")"
                                         aria-label="@($"{w.Name} preview")"></iframe>
-                                <div class="widget-render-status" hidden aria-live="polite"></div>
+                                <div class="widget-render-status" role="status" aria-live="polite">Loading secure widget...</div>
                             </div>
 
                             @if (isEditing)

@@ -359,7 +359,7 @@ sequenceDiagram
     C->>C: Sign nonce with device private key (ECDSA P-256)
     C->>R: Signature over nonce
     R->>R: Verify signature against handle's authorized keys
-    R-->>C: Ready (connection marked authenticated)
+    R-->>C: PresenceConfirmed (authenticated and routable)
 ```
 
 After the handshake, the relay knows the authenticated handle (and device) behind the connection, and uses that to stamp outbound envelopes.
@@ -406,13 +406,12 @@ flowchart TD
     Check -->|"Unavailable"| Keep["Keep queued until reconnect or TTL"]
     Local --> Ack{"Client supports delivery acknowledgement?"}
     Fwd --> Ack
-    Ack -->|"Yes"| Wait["Keep queued until client acknowledges processing"]
-    Ack -->|"Legacy client"| Remove["Remove after confirmed live handoff"]
+    Ack --> Wait["Keep queued until client acknowledges processing"]
 ```
 
 #### 5.3.1 Atomic Single-Device Agent Dispatch
 
-Agent-addressed Messages use the atomic path only when the relay advertises protocol version 4 with `atomicAgentDispatch: true`. Older clients and relays continue to use the legacy agent kinds, which retain handle-wide routing and do not have an at-most-one-answer guarantee.
+Agent-addressed Messages use the protocol-8 atomic path when the relay advertises `atomicAgentDispatch: true`. The client fails closed when the exact protocol or required capability is absent.
 
 Each handle has a relay-authoritative primary response device and an optional failover. A selectable device must be a registered desktop that advertised atomic protocol support. It is execution-ready only while it is online and advertises a configured model. The first selectable desktop becomes a sticky automatic primary until the owner saves another choice. The relay never elects an unrelated third device.
 
@@ -444,7 +443,7 @@ A confirmed failure to find the selected connection moves the record directly to
 
 Atomic request and response bodies are required to be E2E encrypted. The relay still sees that the traffic is an atomic agent exchange, the sender and recipient, encrypted key-slot device ids, selected device id, queue/assignment/completion timestamps, ciphertext size, and the opaque dispatch token. It clears the retained request ciphertext and key-slot ids on completion. The relay cannot read the question or answer. The single-device guarantee is a relay/storage integrity property, not a consequence of E2EE: a maliciously modified relay could violate assignment or availability, but still could not decrypt correctly encrypted bodies.
 
-For cross-replica delivery, protocol-4 relay instances advertise acknowledged single-connection atomic forwarding through Redis. A new coordinator does not send atomic work to an older replica without that capability, so a rolling upgrade may temporarily queue requests but does not fall back to legacy multi-connection delivery.
+For cross-replica delivery, protocol-8 relay instances use acknowledged single-connection atomic forwarding through Redis. Mixed-version relay replicas are unsupported.
 
 ### 5.4 Backplane and Presence
 
@@ -454,18 +453,18 @@ For cross-replica delivery, protocol-4 relay instances advertise acknowledged si
 ### 5.5 Durable Inbox, Acknowledgement, and TTL
 
 - Ordinary envelopes are **idempotently enqueued before live delivery**. The delivery ID is derived from the normalized sender handle and stable envelope ID, so an exact retry does not create another inbox item.
-- Protocol-5 clients connect with `deliveryAck=1`. Authentication completes before inbox work begins; after handling `Ready`, the client requests a bounded batch. The relay leases queued items instead of deleting them, adds `RelayDeliveryId` metadata, and waits for `AcknowledgeDelivery` after the client has verified, decrypted, and persisted the inbound work.
-- A dropped acknowledgement leaves the item queued. Its lease is released on disconnect or expires, so the next authenticated connection receives it again. Clients therefore process durable envelopes at least once and must deduplicate stable IDs.
+- Protocol-8 clients connect with `protocolVersion=8`. The relay rejects any other version, authenticates the socket, registers presence, and emits `PresenceConfirmed` before inbox or device-queue work begins. The client can then emit its ready signal immediately, drain a bounded backlog, and acknowledge each durable or per-device item after it has verified, decrypted, and persisted the inbound work.
+- A dropped acknowledgement leaves the item queued. Its lease is released on disconnect or expires, so the next authenticated connection receives it again. Per-device acknowledgements are fenced to the active connection lease owner, and repeated acknowledgements return false. Clients therefore process durable envelopes at least once and must deduplicate stable IDs.
 - Snapshot requests follow the same durable rule as other envelopes: the receiver acknowledges only after validation and durable response production. Transient response failures leave the stable request queued for retry.
 - `ToDevice` envelopes use a device-specific inbox and cannot be consumed by an online sibling. A sender can call `CancelQueuedEnvelope` with the stable envelope ID and target device to remove work that has not completed delivery; an encrypted cancellation envelope covers live-delivery races.
-- Protocol-7 inbox leasing prioritizes Critical, Control, Normal, Sync, then Bulk traffic, preserving queue order inside each class and advancing one aged lower-priority item per bounded drain. Cancellations and snapshot completions are Critical, so snapshot chunks cannot starve terminal control traffic.
-- Protocol-7 clients acknowledge only `Processed` and `PermanentReject` outcomes. `Retry` and `Defer` intentionally leave the stable envelope unacknowledged so restart or reconnect can try again.
-- Snapshot v2 is deterministic, Brotli-compressed, chunked at no more than 512 KB, hash-verified, restart-persistent, and resumable by missing chunk index. A completion receipt suppresses retransmission of an already applied snapshot; corrupt complete transfers are reset rather than pinned forever.
+- Protocol-8 inbox leasing prioritizes Critical, Control, Normal, Sync, then Bulk traffic, preserving queue order inside each class and advancing one aged lower-priority item per bounded drain. Cancellations and snapshot completions are Critical, so snapshot chunks cannot starve terminal control traffic.
+- Protocol-8 clients acknowledge only `Processed` and `PermanentReject` outcomes. `Retry` and `Defer` intentionally leave the stable envelope unacknowledged so restart or reconnect can try again.
+- The protocol-8 snapshot format is deterministic, Brotli-compressed, chunked at no more than 512 KB, hash-verified, restart-persistent, and resumable by missing chunk index. A completion receipt suppresses retransmission of an already applied snapshot; corrupt complete transfers are reset rather than pinned forever.
 - Transient topic progress can use signed and E2E-encrypted online-only ephemeral delivery. Durable queued/running phase changes and terminal results still use the inbox, so progress floods cannot bury control traffic and reconnects recover authoritative state.
-- A different authorized sibling can revoke a linked device with a signed exact-device request. Revocation removes its registration metadata, invalidates live authorization and presence, purges only that device's inbox, and rejects later device-scoped sends to the removed ID. Self-revocation and revoking the final device are rejected.
-- Older clients keep the legacy destructive drain path. A confirmed live handoff to a legacy client removes the enqueue-first copy for compatibility.
+- A different authorized sibling can revoke a linked device with a signed exact-device request. Revocation removes its registration metadata, invalidates live authorization and presence, purges only that device's inbox and per-device queue, and rejects later device-scoped sends to the removed ID. Self-revocation and revoking the final device are rejected.
+- Protocol 8 is a coordinated breaking change: older Cosmos inbox/device-sync data should be discarded before deployment because the schema and routing paths are incompatible. Deploy relay and clients together; there are no active users on older protocols.
 - Atomic agent questions use a separate dispatch store rather than either inbox. Pending work is claimed in queue-time order only by the configured primary or failover; completed records clear request ciphertext but retain the hash and fence metadata until expiry.
-- Default retention is a **14-day TTL**. **Reserved handles** (for example `meshreport`) get **no expiry** (per-item TTL of -1).
+- Ordinary inbox retention is **14 days**. Per-device synchronization queue retention is **7 days** with a hard 500-entry limit per target device. **Reserved handles** (for example `meshreport`) get no ordinary-inbox expiry.
 
 ### 5.6 Rate Limiting
 
@@ -684,7 +683,7 @@ For fan-out, the relay necessarily observes the sender, transient recipient coho
 | **TOFU dependence** | TOFU pinning is only as strong as the user's **out-of-band verification** when keys change. A user who blindly accepts key changes loses the protection. |
 | **Hosted model proxy** | Content sent through the optional hosted model proxy is, by design, visible on that request path. It is opt-in convenience, not an E2EE channel. Users can configure their own provider in the client. |
 | **Memory policy classification** | Automatic capture uses conservative evidence, secret, and sensitive-data checks, but no classifier is perfect. Users can inspect, edit, delete, or undo memories, and should use an on-device model for the strongest model-path privacy. |
-| **Atomic agent guarantee** | The at-most-one accepted response guarantee applies only to capability-negotiated atomic kinds on an honest protocol-4 relay. Legacy kinds may reach multiple devices. An ambiguous handoff stays fenced and may require operator recovery rather than automatic failover. |
+| **Atomic agent guarantee** | The at-most-one accepted response guarantee applies to atomic kinds on an honest protocol-8 relay. An ambiguous handoff stays fenced and may require operator recovery rather than automatic failover. |
 | **Availability** | The relay is trusted for availability and honest routing. A relay can drop or delay messages (denial of service); it cannot read them. |
 
 ### 10.3 Sandboxed Public-Service Agent (Client Property)

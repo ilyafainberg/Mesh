@@ -114,22 +114,42 @@ public class CopilotAcpProtocolTests
     }
 
     [TestMethod]
-    public void ParagraphStream_SeparatesToolDelimitedThoughtsWithoutSplittingTokens()
+    public void TextBuffer_PreservesTokenChunksWithinOneThought()
     {
-        var stream = new CopilotAcpParagraphStream();
-        var first = string.Concat(
-            stream.AppendChunk("First "),
-            stream.AppendChunk("thought"));
+        var buffer = new CopilotAcpTextBuffer();
 
-        stream.MarkBoundary();
-        stream.MarkBoundary();
-        Assert.AreEqual("", stream.AppendChunk(null));
-        var second = string.Concat(
-            stream.AppendChunk("\nSecond "),
-            stream.AppendChunk("thought"));
+        Assert.AreEqual("First", buffer.Append("First"));
+        Assert.AreEqual(" thought", buffer.Append(" thought"));
+        Assert.AreEqual("", buffer.Append(null));
 
-        Assert.AreEqual("First thought", first);
-        Assert.AreEqual("\n\nSecond thought", second);
+        Assert.AreEqual("First thought", buffer.ToString());
+    }
+
+    [TestMethod]
+    public void TextBuffer_StartsNewParagraphAfterToolBoundary()
+    {
+        var buffer = new CopilotAcpTextBuffer();
+        buffer.Append("First thought");
+
+        buffer.MarkParagraphBoundary();
+        var appended = buffer.Append("Second thought");
+
+        Assert.AreEqual("\n\nSecond thought", appended);
+        Assert.AreEqual("First thought\n\nSecond thought", buffer.ToString());
+    }
+
+    [TestMethod]
+    public void TextBuffer_CoalescesBoundariesAndExistingLineBreaks()
+    {
+        var buffer = new CopilotAcpTextBuffer();
+        buffer.Append("First thought\n");
+
+        buffer.MarkParagraphBoundary();
+        buffer.MarkParagraphBoundary();
+        var appended = buffer.Append("\nSecond thought");
+
+        Assert.AreEqual("\nSecond thought", appended);
+        Assert.AreEqual("First thought\n\nSecond thought", buffer.ToString());
     }
 
     [TestMethod]

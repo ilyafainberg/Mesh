@@ -338,7 +338,7 @@ The relay must remain group-agnostic. Do not add group IDs, membership, roles, g
 
 #### 4.2.6 Atomic agent dispatch
 
-Protocol version 4 relays advertise `atomicAgentDispatch: true` in the `capabilities` object returned by both `GET /` and `GET /health`. A supporting device sets `AtomicAgentDispatchEnabled = true` when it registers. It must refresh registration when its model readiness changes because `RemoteAgentEnabled` is part of execution eligibility.
+Protocol-8 relays advertise `atomicAgentDispatch: true` in the `capabilities` object returned by both `GET /` and `GET /health`. A supporting device sets `AtomicAgentDispatchEnabled = true` when it registers. It must refresh registration when its model readiness changes because `RemoteAgentEnabled` is part of execution eligibility.
 
 A device is **selectable** when it is registered, desktop-class, and atomic-protocol capable. It is **execution-ready** when it is also currently online and advertises `RemoteAgentEnabled = true`. Mobile devices are never selectable. The relay uses the explicit primary first, then the optional failover, and never chooses an unrelated third device. If no primary was saved, the first selectable desktop becomes a sticky automatic primary.
 
@@ -365,7 +365,7 @@ A confirmed failure to find the selected connection reassigns directly to an onl
 
 The dispatch key is derived from sender handle plus request id. An exact retry with the same retained envelope hash is idempotent, including after completion; reuse of that id for different envelope bytes is rejected as `agent_dispatch_id_conflict`. Cosmos keeps dispatch records in the `agent-dispatches` container with the same 14-day TTL as the offline inbox.
 
-Compatibility is capability-gated. A new client must use legacy kinds when the relay does not advertise atomic dispatch, and a new relay continues to route legacy kinds for older clients. Legacy traffic has no atomic guarantee. Across Redis, a replica also advertises an internal single-connection delivery capability; a protocol-4 coordinator does not forward atomic work to an older replica that lacks it, so rolling upgrades degrade to queueing rather than duplicate execution. An atomic request for a handle with no compatible desktop queues rather than broadcasting to incompatible devices.
+Protocol 8 has no atomic-dispatch downgrade. A client requires the exact protocol and advertised atomic capability before submitting atomic work. Across Redis, every replica must run the same protocol; a request with no eligible desktop remains queued instead of broadcasting.
 
 #### 4.2.7 Connectors and hosted model
 
@@ -409,7 +409,7 @@ Compatibility is capability-gated. A new client must use legacy kinds when the r
 | `ReservedHandles` | System handles (for example the report handle `meshreport`) with `IsReserved` and `Coerce` helpers. |
 | `DeepLink` | Parser/builders for `mesh://service` and `mesh://user` deep links. |
 | `UniversalLink` | Builders/parsers for HTTPS universal links: `/s/{handle}/{serviceId}` (service) and `/u/{handle}` (user). |
-| `MeshHubProtocol` | SignalR hub contract: `Route`; client calls `Authenticate`, `SendEnvelope`, and `SendFanout`; server events `Challenge`, `Ready`, and `Receive`. |
+| `MeshHubProtocol` | SignalR hub contract: `Route`; client calls `Authenticate`, `SendEnvelope`, `SendFanout`, `QueueEnqueue`, `QueueDrain`, and `QueueAck`; server events `Handshake`, `Challenge`, `PresenceConfirmed`, `DeviceQueueAvailable`, and `Receive`. |
 
 ---
 
@@ -428,7 +428,7 @@ Mesh.Relay is AGPL-3.0. It is a minimal-API ASP.NET Core application (`Program.c
                 |   - endpoint mapping                      |
                 +----------------+--------------------------+
                                  |
-   SignalR ---> |  MeshHub (Challenge/Ready/Receive)        |
+   SignalR ---> |  MeshHub (Handshake/Challenge/PresenceConfirmed/Receive) |
                 |   - device-key challenge auth on connect  |
                 |   - verify signature on every message     |
                 |   - stamp authenticated From/FromDevice   |
@@ -483,7 +483,7 @@ All signed endpoints verify an ECDSA/P-256 signature against the relevant device
 
 ### 5.3 SignalR hub: connect, auth handshake, and routing
 
-The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, `SendEphemeralEnvelope`, `SendFanout`, `AcknowledgeDelivery`, `RequestPendingDeliveries`, and `CancelQueuedEnvelope`; the server emits `Challenge`, `Ready`, and `Receive`. Protocol-5 clients append `deliveryAck=1` to the hub query. Protocol-6 background clients append both `deliveryAck=1` and `backgroundSync=1`.
+The hub is mapped at `MeshHubProtocol.Route`. Method names come from `MeshHubProtocol`: clients call `Authenticate`, `SendEnvelope`, `SendEphemeralEnvelope`, `SendFanout`, `AcknowledgeDelivery`, `RequestPendingDeliveries`, `CancelQueuedEnvelope`, `QueueEnqueue`, `QueueDrain`, and `QueueAck`; the server emits `Handshake`, `Challenge`, `PresenceConfirmed`, `DeviceQueueAvailable`, and `Receive`. Protocol-8 clients append `protocolVersion=8` to the hub query. Background sessions also append `deliveryAck=1&backgroundSync=1`.
 
 #### 5.3.1 Connect and auth handshake
 
@@ -510,23 +510,24 @@ Per-device routing honors `ToDevice`: if set, the message targets only that devi
 
 Atomic agent requests are an explicit exception to broadcast fallback and the ordinary offline inbox. `AgentDispatchCoordinator` persists and assigns them, and `MeshRouter.RouteAtomicAgentRequestAsync` delivers to exactly one connection of the selected device. Atomic responses are routed only after the coordinator completes the durable fence.
 
-Delivery to clients uses the **`Receive`** method. A protocol-5 client acknowledges only after signature verification, decryption, validation, and durable client-side persistence have succeeded. If the acknowledgement is lost, the relay releases or expires the lease and redelivers the same stable envelope ID. `CancelQueuedEnvelope` is authenticated and sender-scoped; it removes only a device-targeted inbox record created by that handle.
+Ordinary delivery uses **`Receive`**. A protocol-8 client acknowledges only after signature verification, decryption, validation, and durable client-side persistence succeed. If the acknowledgement is lost, the relay releases or expires the lease and redelivers the same stable envelope ID. `CancelQueuedEnvelope` is authenticated and sender-scoped; it removes only a device-targeted ordinary inbox record created by that handle.
 
 #### 5.3.3 Passive background synchronization
 
-Protocol version 6 introduced `durableDelivery: true` and `backgroundSync: true`; Protocol 7 relays continue to advertise both in the `capabilities` object returned by `GET /` and `GET /health`. A client must require both flags before opening a background session; the numeric protocol version by itself is not a sufficient safety check.
+The client requires exact protocol 8 plus `durableDelivery: true` and `backgroundSync: true` before opening a background session. Missing or mismatched capability data fails closed.
 
 A background client connects with `deliveryAck=1&backgroundSync=1`, completes the normal device-key challenge, and drains the same authoritative durable inbox. The connection may receive and acknowledge passive updates only after successful decryption, validation, and local persistence. Foreground-only kinds remain queued, including agent and service requests, topic execution or cancellation, attachments, and snapshot requests.
 
 The relay excludes background sessions from ordinary handle and device presence, foreground-only live routing, and atomic agent dispatch. This prevents a short inbox drain from suppressing sibling alerts or being selected to execute work. Push payloads remain metadata-only wake signals and never carry ciphertext, plaintext, or keys.
 
-#### 5.3.4 Protocol 7 reliability
+#### 5.3.4 Protocol 8 reliability
 
-Protocol 7 relays advertise `ephemeralDelivery`, `snapshotTransferV2`, `deviceRevocation`, `processingOutcomes`, and `authoritativeTopicState`. Clients still gate each behavior on its capability flag and retain Protocol 6 behavior when a flag is absent.
+Protocol 8 is the only supported relay/client protocol. Registration, health probing, and the SignalR handshake require version 8 exactly. There is no downgrade path.
 
 - Durable inboxes drain Critical, Control, Normal, Sync, then Bulk traffic while preserving FIFO order inside each class and advancing one aged lower-priority item per bounded drain. Cancellations and snapshot completions are Critical; topic requests, durable phases, and snapshot requests are Control; ordinary messages are Normal; incremental operations and snapshot manifests are Sync; snapshot chunks are Bulk.
 - Inbound processing has four client outcomes: `Processed`, `PermanentReject`, `Retry`, and `Defer`. Only the first two acknowledge the relay delivery. Retry and defer leave the stable envelope queued for redelivery.
-- Snapshot v2 uses Brotli-compressed deterministic content, a manifest, chunks no larger than 512 KB, and a durable completion receipt. A reconnecting receiver reports its known snapshot ID and missing indexes so the sender transmits only missing chunks. Complete transfers are hash-checked before atomic application.
+- The snapshot format uses Brotli-compressed deterministic content, a manifest, chunks no larger than 512 KB, and a durable completion receipt. A reconnecting receiver reports its known snapshot ID and missing indexes so the sender transmits only missing chunks. Complete transfers are hash-checked before atomic application.
+- Device-sync envelopes use only `QueueEnqueue`, `QueueDrain`, and `QueueAck`. The relay partitions by exact target device, derives a stable entry ID from source, target, and operation ID, and atomically admits at most 500 active entries with a partition-local control counter. A duplicate stable ID remains accepted without consuming capacity (`Created=false`). Entries expire logically after 7 days and are removed with the same transaction that decrements the counter. `QueueAck` succeeds only for the connection that owns the current, unexpired lease; a repeated acknowledgement returns false. `SendEnvelope` rejects every device-sync kind with `device_sync_use_queue`.
 - `SendEphemeralEnvelope` accepts only signed, encrypted, device-targeted `topic.run.update` traffic for a currently online sibling device. It never creates an inbox record. Durable phase changes and terminal results continue through `SendEnvelope`.
 - Device registration records the client's protocol version. A linked device can be revoked only by a different authorized device using `DeviceRevocationProtocol.Message`. Revocation removes its public key and metadata, clears live authorization/presence, purges that device's inbox, and rejects later device-scoped sends to the removed ID.
 - Topic requests are persisted as accepted before work starts, receive a durable queued update, and transition to running only when their per-topic queue actually dequeues them. Cancellation remains pending until a terminal update arrives unless `CancelQueuedEnvelope` proves the request was removed before delivery.
@@ -643,7 +644,7 @@ Open a SignalR connection to `MeshHubProtocol.Route` on the relay base URL.
 
 1. The hub invokes `Challenge` with a nonce.
 2. Sign the nonce with your device private key.
-3. Call `Ready` with your device public key and the signature.
+3. Wait for `PresenceConfirmed` after the signed `Authenticate` call completes.
 4. The hub verifies and marks the connection authenticated.
 
 ### 6.5 Step 5: Send an end-to-end-encrypted envelope

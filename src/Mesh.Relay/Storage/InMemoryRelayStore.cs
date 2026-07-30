@@ -13,60 +13,131 @@ namespace Mesh.Relay.Storage;
 public sealed class InMemoryRelayStore : IRelayStore
 {
     private readonly ConcurrentDictionary<string, StoredHandle> handles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, StoredHandle> deletingHandles = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DateTimeOffset>> invites = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, List<StoredEnvelope>> inboxes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, List<StoredDeviceQueueItem>> deviceQueues = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, StoredAgentDispatch> agentDispatches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, StoredService> services = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, HandleRatePolicy> ratePolicies = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, object> handleQueueGates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> registeredHandleLifetimes = new(StringComparer.OrdinalIgnoreCase);
     private readonly TimeProvider timeProvider;
+    private readonly Func<Task>? beforeQueueAdmission;
+    private readonly Func<Task>? beforeInboxAdmission;
+    private readonly Func<Task>? beforeHandleDeleteCompletion;
+    private readonly bool enforceQueueRegistration;
 
     public InMemoryRelayStore(TimeProvider? timeProvider = null)
-        => this.timeProvider = timeProvider ?? TimeProvider.System;
+        : this(timeProvider, null, true, null, null)
+    {
+    }
+
+    internal InMemoryRelayStore(
+        TimeProvider? timeProvider,
+        Func<Task>? beforeQueueAdmission,
+        bool enforceQueueRegistration = true,
+        Func<Task>? beforeHandleDeleteCompletion = null,
+        Func<Task>? beforeInboxAdmission = null)
+    {
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.beforeQueueAdmission = beforeQueueAdmission;
+        this.enforceQueueRegistration = enforceQueueRegistration;
+        this.beforeHandleDeleteCompletion = beforeHandleDeleteCompletion;
+        this.beforeInboxAdmission = beforeInboxAdmission;
+    }
 
     private DateTimeOffset UtcNow => timeProvider.GetUtcNow();
+
+    private object HandleQueueGate(string handle)
+        => handleQueueGates.GetOrAdd(NormalizeHandle(handle), static _ => new object());
+
+    private static bool RegistrationContainsDevice(StoredHandle registration, string deviceId)
+        => registration.DevicePublicKeys.Any(publicKey =>
+            string.Equals(DeviceProtocol.DeviceId(publicKey), deviceId, StringComparison.Ordinal));
 
     public Task<StoredHandle?> GetHandleAsync(string handle, CancellationToken ct = default)
         => Task.FromResult(handles.TryGetValue(handle, out var rec) ? Clone(rec) : null);
 
+    public Task<StoredHandle?> GetHandleForDeletionAsync(string handle, CancellationToken ct = default)
+        => Task.FromResult(
+            handles.TryGetValue(handle, out var active)
+                ? Clone(active)
+                : deletingHandles.TryGetValue(handle, out var deleting) ? Clone(deleting) : null);
+
     public Task<(StoredHandle record, bool deviceAuthorized)> UpsertHandleAsync(
         string handle, string devicePublicKey, string? displayName, bool allowNewDevice, CancellationToken ct = default)
     {
-        var rec = handles.AddOrUpdate(handle,
-            _ =>
+        var normalized = NormalizeHandle(handle);
+        lock (HandleQueueGate(normalized))
+        {
+            if (deletingHandles.TryGetValue(normalized, out var deleting))
+                return Task.FromResult((Clone(deleting), false));
+            if (!handles.TryGetValue(normalized, out var rec))
             {
-                var fresh = new StoredHandle { Handle = handle, DisplayName = displayName, RegisteredAt = DateTimeOffset.UtcNow };
-                fresh.DevicePublicKeys.Add(devicePublicKey);
-                return fresh;
-            },
-            (_, existing) =>
-            {
-                lock (existing)
+                rec = new StoredHandle
                 {
-                    if (displayName is not null) existing.DisplayName = displayName;
-                    if (!existing.DevicePublicKeys.Contains(devicePublicKey) && allowNewDevice)
-                        existing.DevicePublicKeys.Add(devicePublicKey);
+                    Handle = normalized,
+                    DisplayName = displayName,
+                    RegisteredAt = DateTimeOffset.UtcNow,
+                    InboxGeneration = Guid.NewGuid().ToString("n")
+                };
+                rec.DevicePublicKeys.Add(devicePublicKey);
+                rec.DeviceQueueGenerations[DeviceProtocol.DeviceId(devicePublicKey)] =
+                    Guid.NewGuid().ToString("n");
+                handles[normalized] = rec;
+            }
+            else
+            {
+                if (displayName is not null) rec.DisplayName = displayName;
+                if (!rec.DevicePublicKeys.Contains(devicePublicKey) && allowNewDevice)
+                {
+                    rec.DevicePublicKeys.Add(devicePublicKey);
+                    var deviceId = DeviceProtocol.DeviceId(devicePublicKey);
+                    rec.DeviceQueueGenerations[deviceId] = Guid.NewGuid().ToString("n");
+                    deviceQueues.TryRemove(RelayDeviceQueueKey.Create(normalized, deviceId), out _);
                 }
-                return existing;
-            });
+            }
 
-        bool authorized;
-        lock (rec) authorized = rec.DevicePublicKeys.Contains(devicePublicKey);
-        return Task.FromResult((Clone(rec), authorized));
+            var authorized = rec.DevicePublicKeys.Contains(devicePublicKey);
+            registeredHandleLifetimes[normalized] = 0;
+            return Task.FromResult((Clone(rec), authorized));
+        }
     }
 
-    public Task<bool> DeleteHandleAsync(string handle, CancellationToken ct = default)
+    public async Task<bool> DeleteHandleAsync(string handle, CancellationToken ct = default)
     {
-        var removed = handles.TryRemove(handle, out _);
-        invites.TryRemove(handle, out _);
-        foreach (var inboxKey in inboxes.Keys.Where(key =>
-                     string.Equals(key, handle, StringComparison.OrdinalIgnoreCase)
-                     || key.StartsWith(handle + "\u001f", StringComparison.OrdinalIgnoreCase)))
-            inboxes.TryRemove(inboxKey, out _);
-        foreach (var item in agentDispatches)
-            if (string.Equals(item.Value.To, handle, StringComparison.OrdinalIgnoreCase))
-                agentDispatches.TryRemove(item.Key, out _);
-        ratePolicies.TryRemove(NormalizeHandle(handle), out _);
-        return Task.FromResult(removed);
+        var normalized = NormalizeHandle(handle);
+        lock (HandleQueueGate(normalized))
+        {
+            if (!deletingHandles.ContainsKey(normalized))
+            {
+                if (!handles.TryRemove(normalized, out var record))
+                    return false;
+                deletingHandles[normalized] = record;
+            }
+        }
+
+        if (beforeHandleDeleteCompletion is not null)
+            await beforeHandleDeleteCompletion().ConfigureAwait(false);
+
+        lock (HandleQueueGate(normalized))
+        {
+            invites.TryRemove(normalized, out _);
+            foreach (var inboxKey in inboxes.Keys.Where(key =>
+                         string.Equals(key, normalized, StringComparison.OrdinalIgnoreCase)
+                         || key.StartsWith(normalized + "\u001f", StringComparison.OrdinalIgnoreCase)))
+                inboxes.TryRemove(inboxKey, out _);
+            foreach (var item in agentDispatches)
+                if (string.Equals(item.Value.To, normalized, StringComparison.OrdinalIgnoreCase))
+                    agentDispatches.TryRemove(item.Key, out _);
+            foreach (var queueKey in deviceQueues.Keys.Where(key =>
+                         key.StartsWith(normalized + "\u001fqueue\u001f", StringComparison.OrdinalIgnoreCase)))
+                deviceQueues.TryRemove(queueKey, out _);
+            ratePolicies.TryRemove(normalized, out _);
+            deletingHandles.TryRemove(normalized, out _);
+            return true;
+        }
     }
 
     public Task SetDisplayNameAsync(string handle, string displayName, CancellationToken ct = default)
@@ -90,7 +161,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         string platform,
         bool remoteAgentEnabled,
         bool atomicAgentDispatchEnabled,
-        int protocolVersion = 6,
+        int protocolVersion = MeshProtocol.Version,
         CancellationToken ct = default)
     {
         if (handles.TryGetValue(handle, out var rec))
@@ -111,6 +182,7 @@ public sealed class InMemoryRelayStore : IRelayStore
                     rec.AgentPrimaryWasSelectedAutomatically = true;
                 }
             }
+
         return Task.CompletedTask;
     }
 
@@ -120,10 +192,11 @@ public sealed class InMemoryRelayStore : IRelayStore
         string? authorizingPublicKey = null,
         CancellationToken ct = default)
     {
-        var revoked = false;
-        if (handles.TryGetValue(handle, out var rec))
+        var normalized = NormalizeHandle(handle);
+        lock (HandleQueueGate(normalized))
         {
-            lock (rec)
+            var revoked = false;
+            if (handles.TryGetValue(normalized, out var rec))
             {
                 if (authorizingPublicKey is not null
                     && !rec.DevicePublicKeys.Contains(authorizingPublicKey, StringComparer.Ordinal))
@@ -139,6 +212,7 @@ public sealed class InMemoryRelayStore : IRelayStore
                     rec.DeviceAtomicAgentDispatchEnabled.Remove(targetDeviceId);
                     rec.DeviceProtocolVersions.Remove(targetDeviceId);
                     rec.DevicePushTokens.Remove(targetDeviceId);
+                    rec.DeviceQueueGenerations.Remove(targetDeviceId);
                     if (string.Equals(rec.AgentPrimaryDeviceId, targetDeviceId, StringComparison.Ordinal))
                         rec.AgentPrimaryDeviceId = null;
                     if (string.Equals(rec.AgentFailoverDeviceId, targetDeviceId, StringComparison.Ordinal))
@@ -148,15 +222,19 @@ public sealed class InMemoryRelayStore : IRelayStore
                     revoked = true;
                 }
             }
-        }
 
-        var inboxKey = RelayInboxKey.Device(handle, targetDeviceId);
-        var purged = 0;
-        if (inboxes.TryRemove(inboxKey, out var inbox))
-        {
-            lock (inbox) purged = inbox.Count;
+            var inboxKey = RelayInboxKey.Device(normalized, targetDeviceId);
+            var purged = 0;
+            if (inboxes.TryRemove(inboxKey, out var inbox))
+            {
+                lock (inbox) purged = inbox.Count;
+            }
+            if (deviceQueues.TryRemove(RelayDeviceQueueKey.Create(normalized, targetDeviceId), out var queue))
+            {
+                lock (queue) purged += queue.Count;
+            }
+            return Task.FromResult(new DeviceRevocationResult(revoked, purged));
         }
-        return Task.FromResult(new DeviceRevocationResult(revoked, purged));
     }
 
     public Task<bool> SetAgentRoutingAsync(
@@ -264,40 +342,62 @@ public sealed class InMemoryRelayStore : IRelayStore
         return Task.FromResult(ok);
     }
 
-    public Task<InboxEnqueueResult> EnqueueAsync(
+    public async Task<InboxEnqueueResult> EnqueueAsync(
         string toHandle,
         string envelopeId,
         string fromHandle,
         string envelopeJson,
         int priority = RelayInboxPriority.Normal,
+        bool requiresForeground = false,
         CancellationToken ct = default)
     {
+        var normalizedInbox = NormalizeHandle(toHandle);
         var deliveryId = InboxDeliveryId.Create(fromHandle, envelopeId);
-        var inbox = inboxes.GetOrAdd(toHandle, _ => new List<StoredEnvelope>());
-        var now = UtcNow;
-        var created = false;
-        lock (inbox)
+        string? admittedGeneration;
+        lock (HandleQueueGate(InboxHandle(normalizedInbox)))
+            admittedGeneration = GetInboxAdmissionGeneration(normalizedInbox);
+        if (admittedGeneration is "")
+            return new InboxEnqueueResult(deliveryId, Accepted: false, Created: false, "inbox_admission_rejected");
+
+        if (beforeInboxAdmission is not null)
+            await beforeInboxAdmission().ConfigureAwait(false);
+
+        lock (HandleQueueGate(InboxHandle(normalizedInbox)))
         {
-            PurgeExpiredInbox(inbox, now);
-            if (inbox.All(item => !string.Equals(item.Id, deliveryId, StringComparison.Ordinal)))
+            if (admittedGeneration is not null
+                && !string.Equals(
+                    admittedGeneration,
+                    GetInboxAdmissionGeneration(normalizedInbox),
+                    StringComparison.Ordinal))
+                return new InboxEnqueueResult(deliveryId, Accepted: false, Created: false, "inbox_admission_rejected");
+
+            var inbox = inboxes.GetOrAdd(normalizedInbox, _ => new List<StoredEnvelope>());
+            var now = UtcNow;
+            var created = false;
+            lock (inbox)
             {
-                inbox.Add(new StoredEnvelope
+                PurgeExpiredInbox(inbox, now);
+                if (inbox.All(item => !string.Equals(item.Id, deliveryId, StringComparison.Ordinal)))
                 {
-                    Id = deliveryId,
-                    EnvelopeId = envelopeId,
-                    From = LinkProtocol.Normalize(fromHandle),
-                    To = toHandle,
-                    Json = envelopeJson,
-                    QueuedAt = now,
-                    ExpiresAt = RelayInboxPolicy.NeverExpires(toHandle)
-                        ? null
-                        : now + RelayInboxPolicy.Retention,
-                    Priority = priority
-                });
-                created = true;
+                    inbox.Add(new StoredEnvelope
+                    {
+                        Id = deliveryId,
+                        EnvelopeId = envelopeId,
+                        From = LinkProtocol.Normalize(fromHandle),
+                        To = normalizedInbox,
+                        Json = envelopeJson,
+                        QueuedAt = now,
+                        ExpiresAt = RelayInboxPolicy.NeverExpires(normalizedInbox)
+                            ? null
+                            : now + RelayInboxPolicy.Retention,
+                        Priority = priority,
+                        RequiresForeground = requiresForeground
+                    });
+                    created = true;
+                }
             }
+            return new InboxEnqueueResult(deliveryId, Accepted: true, created);
         }
-        return Task.FromResult(new InboxEnqueueResult(deliveryId, created));
     }
 
     public Task<IReadOnlyList<StoredEnvelope>> LeaseInboxAsync(
@@ -305,6 +405,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         string leaseOwner,
         int maxItems = RelayInboxPolicy.DeliveryWindow,
         TimeSpan? leaseDuration = null,
+        bool includeForeground = true,
         CancellationToken ct = default)
     {
         if (maxItems <= 0) return Task.FromResult<IReadOnlyList<StoredEnvelope>>([]);
@@ -319,7 +420,10 @@ public sealed class InMemoryRelayStore : IRelayStore
                 string.Equals(item.LeaseOwner, leaseOwner, StringComparison.Ordinal)
                 && item.LeaseUntil > now);
             var capacity = Math.Max(0, maxItems - outstanding);
-            var result = OrderInboxCandidates(inbox, now)
+            var eligible = includeForeground
+                ? inbox
+                : inbox.Where(item => !item.RequiresForeground);
+            var result = OrderInboxCandidates(eligible, now)
                 .Take(capacity)
                 .ToList();
             foreach (var item in result)
@@ -336,15 +440,19 @@ public sealed class InMemoryRelayStore : IRelayStore
     public Task<StoredEnvelope?> AcknowledgeInboxAsync(
         string toHandle,
         string deliveryId,
+        string leaseOwner,
         CancellationToken ct = default)
     {
         if (!inboxes.TryGetValue(toHandle, out var inbox))
             return Task.FromResult<StoredEnvelope?>(null);
         lock (inbox)
         {
-            PurgeExpiredInbox(inbox, UtcNow);
+            var now = UtcNow;
+            PurgeExpiredInbox(inbox, now);
             var index = inbox.FindIndex(item =>
-                string.Equals(item.Id, deliveryId, StringComparison.Ordinal));
+                string.Equals(item.Id, deliveryId, StringComparison.Ordinal)
+                && string.Equals(item.LeaseOwner, leaseOwner, StringComparison.Ordinal)
+                && item.LeaseUntil > now);
             if (index < 0) return Task.FromResult<StoredEnvelope?>(null);
             var acknowledged = CloneEnvelope(inbox[index]);
             inbox.RemoveAt(index);
@@ -463,30 +571,239 @@ public sealed class InMemoryRelayStore : IRelayStore
                 if (oldest is null || candidate < oldest) oldest = candidate;
             }
         }
+        foreach (var queue in deviceQueues.Values)
+        {
+            lock (queue)
+            {
+                PurgeExpiredDeviceQueue(queue, now);
+                count += queue.Count;
+                if (queue.Count == 0) continue;
+                var candidate = queue.Min(item => item.EnqueuedAt);
+                if (oldest is null || candidate < oldest) oldest = candidate;
+            }
+        }
         return Task.FromResult(new RelayInboxStats(count, oldest));
+    }
+
+    public async Task<QueueEnqueueResult> EnqueueDeviceQueueAsync(
+        string handle,
+        QueueEnqueue request,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var normalized = NormalizeHandle(handle);
+        string? sourceGeneration = null;
+        string? targetGeneration = null;
+        if (enforceQueueRegistration)
+        {
+            lock (HandleQueueGate(normalized))
+            {
+                if (!handles.TryGetValue(normalized, out var admitted)
+                    || !RegistrationContainsDevice(admitted, request.SourceDeviceId)
+                    || !RegistrationContainsDevice(admitted, request.TargetDeviceId)
+                    || !admitted.DeviceQueueGenerations.TryGetValue(
+                        request.SourceDeviceId, out sourceGeneration)
+                    || !admitted.DeviceQueueGenerations.TryGetValue(
+                        request.TargetDeviceId, out targetGeneration))
+                    return new QueueEnqueueResult(
+                        false,
+                        DeviceQueueEntryIdProtocol.Create(
+                            request.SourceDeviceId, request.TargetDeviceId, request.OperationId),
+                        "sync_target_unknown");
+            }
+        }
+        if (beforeQueueAdmission is not null)
+            await beforeQueueAdmission().ConfigureAwait(false);
+        var admittedSourceGeneration = sourceGeneration ?? "";
+        var entryId = DeviceQueueEntryIdProtocol.Create(
+            request.SourceDeviceId,
+            request.TargetDeviceId,
+            request.OperationId);
+        lock (HandleQueueGate(normalized))
+        {
+            StoredHandle? registration = null;
+            if (enforceQueueRegistration
+                && (!handles.TryGetValue(normalized, out registration)
+                    || !RegistrationContainsDevice(registration, request.TargetDeviceId)
+                    || !registration.DeviceQueueGenerations.TryGetValue(
+                        request.TargetDeviceId, out var currentTargetGeneration)
+                    || !string.Equals(
+                        currentTargetGeneration, targetGeneration, StringComparison.Ordinal)))
+                return new QueueEnqueueResult(false, entryId, "sync_target_unknown");
+
+            var queueKey = RelayDeviceQueueKey.Create(normalized, request.TargetDeviceId);
+            var queue = deviceQueues.GetOrAdd(queueKey, _ => new List<StoredDeviceQueueItem>());
+            var now = UtcNow;
+            lock (queue)
+            {
+                PurgeExpiredDeviceQueue(queue, now);
+                var existing = queue.FirstOrDefault(item =>
+                    string.Equals(item.EntryId, entryId, StringComparison.Ordinal));
+                if (existing is not null)
+                {
+                    if (string.Equals(
+                            existing.SourceGeneration,
+                            admittedSourceGeneration,
+                            StringComparison.Ordinal))
+                        return new QueueEnqueueResult(true, existing.EntryId, Created: false);
+                    queue.Remove(existing);
+                }
+                if (queue.Count >= DeviceQueueProtocol.MaxEntries)
+                    return new QueueEnqueueResult(false, entryId, DeviceQueueProtocol.BoundedQueueFull);
+                queue.Add(new StoredDeviceQueueItem
+                {
+                    EntryId = entryId,
+                    Handle = normalized,
+                    SourceDeviceId = request.SourceDeviceId,
+                    SourceGeneration = admittedSourceGeneration,
+                    TargetDeviceId = request.TargetDeviceId,
+                    OperationId = request.OperationId,
+                    Payload = request.Payload,
+                    EnqueuedAt = now,
+                    ExpiresAt = now + DeviceQueueProtocol.EntryTtl
+                });
+                return new QueueEnqueueResult(true, entryId, Created: true);
+            }
+        }
+    }
+
+    public Task<QueueDrainResponse> DrainDeviceQueueAsync(
+        string handle,
+        string deviceId,
+        string leaseOwner,
+        int maxEntries = 64,
+        CancellationToken ct = default)
+    {
+        if (maxEntries <= 0)
+            return Task.FromResult(new QueueDrainResponse([]));
+        var queueKey = RelayDeviceQueueKey.Create(handle, deviceId);
+        var normalized = NormalizeHandle(handle);
+        lock (HandleQueueGate(normalized))
+        {
+            if (!deviceQueues.TryGetValue(queueKey, out var queue))
+                return Task.FromResult(new QueueDrainResponse([]));
+            var now = UtcNow;
+            var until = now + DeviceQueueProtocol.LeaseDuration;
+            lock (queue)
+            {
+                PurgeExpiredDeviceQueue(queue, now);
+                if (enforceQueueRegistration)
+                {
+                    handles.TryGetValue(normalized, out var registration);
+                    queue.RemoveAll(item =>
+                        registration is null
+                        || !registration.DeviceQueueGenerations.TryGetValue(
+                            item.SourceDeviceId, out var sourceGeneration)
+                        || !string.Equals(
+                            sourceGeneration, item.SourceGeneration, StringComparison.Ordinal));
+                }
+                var entries = queue
+                    .Where(item => item.LeaseUntil is null || item.LeaseUntil <= now)
+                    .OrderBy(item => item.EnqueuedAt)
+                    .Take(maxEntries)
+                    .ToArray();
+                foreach (var item in entries)
+                {
+                    item.LeaseOwner = leaseOwner;
+                    item.LeaseUntil = until;
+                }
+                return Task.FromResult(new QueueDrainResponse(entries.Select(ToQueueEntry).ToArray()));
+            }
+        }
+    }
+
+    public Task<bool> AcknowledgeDeviceQueueAsync(
+        string handle,
+        string deviceId,
+        string entryId,
+        string leaseOwner,
+        CancellationToken ct = default)
+    {
+        var queueKey = RelayDeviceQueueKey.Create(handle, deviceId);
+        if (!deviceQueues.TryGetValue(queueKey, out var queue))
+            return Task.FromResult(false);
+        lock (queue)
+        {
+            var now = UtcNow;
+            PurgeExpiredDeviceQueue(queue, now);
+            var index = queue.FindIndex(item =>
+                string.Equals(item.EntryId, entryId, StringComparison.Ordinal)
+                && string.Equals(item.LeaseOwner, leaseOwner, StringComparison.Ordinal)
+                && item.LeaseUntil > now);
+            if (index < 0)
+                return Task.FromResult(false);
+            queue.RemoveAt(index);
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task ReleaseDeviceQueueLeasesAsync(
+        string handle,
+        string deviceId,
+        string leaseOwner,
+        CancellationToken ct = default)
+    {
+        var queueKey = RelayDeviceQueueKey.Create(handle, deviceId);
+        if (!deviceQueues.TryGetValue(queueKey, out var queue))
+            return Task.CompletedTask;
+        lock (queue)
+        {
+            PurgeExpiredDeviceQueue(queue, UtcNow);
+            foreach (var item in queue.Where(item =>
+                         string.Equals(item.LeaseOwner, leaseOwner, StringComparison.Ordinal)))
+            {
+                item.LeaseOwner = null;
+                item.LeaseUntil = null;
+            }
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task<int> GetDeviceQueueSizeAsync(
+        string handle,
+        string deviceId,
+        CancellationToken ct = default)
+    {
+        var queueKey = RelayDeviceQueueKey.Create(handle, deviceId);
+        if (!deviceQueues.TryGetValue(queueKey, out var queue))
+            return Task.FromResult(0);
+        lock (queue)
+        {
+            PurgeExpiredDeviceQueue(queue, UtcNow);
+            return Task.FromResult(queue.Count);
+        }
     }
 
     public Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
         StoredAgentDispatch dispatch,
         CancellationToken ct = default)
     {
-        var key = DispatchDictionaryKey(dispatch.To, dispatch.Id);
-        var stored = CloneDispatch(dispatch);
-        if (agentDispatches.TryAdd(key, stored))
-            return Task.FromResult(new AgentDispatchCreateResult(
-                AgentDispatchCreateStatus.Created, stored.State, stored.AssignedDeviceId));
-
-        var existing = agentDispatches[key];
-        lock (existing)
+        var normalized = NormalizeHandle(dispatch.To);
+        lock (HandleQueueGate(normalized))
         {
-            var duplicate = string.Equals(existing.RequestId, dispatch.RequestId, StringComparison.Ordinal)
-                && string.Equals(existing.From, dispatch.From, StringComparison.OrdinalIgnoreCase)
-                && string.Equals(existing.To, dispatch.To, StringComparison.OrdinalIgnoreCase)
-                && string.Equals(existing.EnvelopeHash, dispatch.EnvelopeHash, StringComparison.Ordinal);
-            return Task.FromResult(new AgentDispatchCreateResult(
-                duplicate ? AgentDispatchCreateStatus.Duplicate : AgentDispatchCreateStatus.Conflict,
-                existing.State,
-                existing.AssignedDeviceId));
+            if (deletingHandles.ContainsKey(normalized)
+                || registeredHandleLifetimes.ContainsKey(normalized) && !handles.ContainsKey(normalized))
+                return Task.FromResult(new AgentDispatchCreateResult(
+                    AgentDispatchCreateStatus.Conflict, "", null));
+
+            var key = DispatchDictionaryKey(normalized, dispatch.Id);
+            var stored = CloneDispatch(dispatch);
+            if (agentDispatches.TryAdd(key, stored))
+                return Task.FromResult(new AgentDispatchCreateResult(
+                    AgentDispatchCreateStatus.Created, stored.State, stored.AssignedDeviceId));
+
+            var existing = agentDispatches[key];
+            lock (existing)
+            {
+                var duplicate = string.Equals(existing.RequestId, dispatch.RequestId, StringComparison.Ordinal)
+                    && string.Equals(existing.From, dispatch.From, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(existing.To, dispatch.To, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(existing.EnvelopeHash, dispatch.EnvelopeHash, StringComparison.Ordinal);
+                return Task.FromResult(new AgentDispatchCreateResult(
+                    duplicate ? AgentDispatchCreateStatus.Duplicate : AgentDispatchCreateStatus.Conflict,
+                    existing.State,
+                    existing.AssignedDeviceId));
+            }
         }
     }
 
@@ -509,6 +826,13 @@ public sealed class InMemoryRelayStore : IRelayStore
         foreach (var dispatch in AgentDispatchesFor(toHandle))
             lock (dispatch)
             {
+                if (dispatch.State == AgentDispatchStates.Delivering
+                    && dispatch.DeliveryLeaseUntil <= UtcNow)
+                {
+                    dispatch.State = AgentDispatchStates.Assigned;
+                    dispatch.DeliveryLeaseOwner = null;
+                    dispatch.DeliveryLeaseUntil = null;
+                }
                 if (dispatch.State is not (AgentDispatchStates.Pending or AgentDispatchStates.Assigned)) continue;
                 var deviceId = AgentDispatchRecipientPolicy.ChooseDevice(
                     dispatch.RecipientDeviceIds, candidateDeviceIds);
@@ -535,27 +859,56 @@ public sealed class InMemoryRelayStore : IRelayStore
     public Task<IReadOnlyList<StoredAgentDispatch>> TakeAssignedAgentDispatchesAsync(
         string toHandle,
         string deviceId,
+        string leaseOwner,
+        TimeSpan? leaseDuration = null,
         CancellationToken ct = default)
     {
         var result = new List<StoredAgentDispatch>();
+        var now = UtcNow;
         foreach (var dispatch in AgentDispatchesFor(toHandle))
             lock (dispatch)
             {
                 if (result.Count > 0) break;
-                if (!string.Equals(dispatch.State, AgentDispatchStates.Assigned, StringComparison.Ordinal)
+                var claimable = dispatch.State == AgentDispatchStates.Assigned
+                    || (dispatch.State == AgentDispatchStates.Delivering
+                        && dispatch.DeliveryLeaseUntil <= now);
+                if (!claimable
                     || !string.Equals(dispatch.AssignedDeviceId, deviceId, StringComparison.Ordinal))
                     continue;
-                dispatch.State = AgentDispatchStates.Delivered;
-                dispatch.DeliveredAt = DateTimeOffset.UtcNow;
+                dispatch.State = AgentDispatchStates.Delivering;
+                dispatch.DeliveryLeaseOwner = leaseOwner;
+                dispatch.DeliveryLeaseUntil = now + (leaseDuration ?? RelayInboxPolicy.LeaseDuration);
                 result.Add(CloneDispatch(dispatch));
             }
         return Task.FromResult<IReadOnlyList<StoredAgentDispatch>>(result);
+    }
+
+    public Task<bool> MarkAgentDispatchDeliveredAsync(
+        string toHandle,
+        string dispatchId,
+        string deviceId,
+        string leaseOwner,
+        CancellationToken ct = default)
+    {
+        var key = DispatchDictionaryKey(toHandle, dispatchId);
+        if (!agentDispatches.TryGetValue(key, out var dispatch)) return Task.FromResult(false);
+        lock (dispatch)
+        {
+            if (!OwnsLiveDeliveryLease(dispatch, deviceId, leaseOwner, UtcNow))
+                return Task.FromResult(false);
+            dispatch.State = AgentDispatchStates.Delivered;
+            dispatch.DeliveredAt = UtcNow;
+            dispatch.DeliveryLeaseOwner = null;
+            dispatch.DeliveryLeaseUntil = null;
+            return Task.FromResult(true);
+        }
     }
 
     public Task<bool> ReleaseAgentDispatchAsync(
         string toHandle,
         string dispatchId,
         string deviceId,
+        string leaseOwner,
         string? nextDeviceId = null,
         CancellationToken ct = default)
     {
@@ -563,8 +916,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         if (!agentDispatches.TryGetValue(key, out var dispatch)) return Task.FromResult(false);
         lock (dispatch)
         {
-            if (!string.Equals(dispatch.State, AgentDispatchStates.Delivered, StringComparison.Ordinal)
-                || !string.Equals(dispatch.AssignedDeviceId, deviceId, StringComparison.Ordinal))
+            if (!OwnsLiveDeliveryLease(dispatch, deviceId, leaseOwner, UtcNow))
                 return Task.FromResult(false);
             if (string.IsNullOrWhiteSpace(nextDeviceId))
             {
@@ -579,33 +931,106 @@ public sealed class InMemoryRelayStore : IRelayStore
                 dispatch.AssignedAt = DateTimeOffset.UtcNow;
             }
             dispatch.DeliveredAt = null;
+            dispatch.DeliveryLeaseOwner = null;
+            dispatch.DeliveryLeaseUntil = null;
             return Task.FromResult(true);
         }
     }
 
-    public Task<bool> CompleteAgentDispatchAsync(
+    private static bool OwnsLiveDeliveryLease(
+        StoredAgentDispatch dispatch,
+        string deviceId,
+        string leaseOwner,
+        DateTimeOffset now)
+        => dispatch.State == AgentDispatchStates.Delivering
+           && string.Equals(dispatch.AssignedDeviceId, deviceId, StringComparison.Ordinal)
+           && string.Equals(dispatch.DeliveryLeaseOwner, leaseOwner, StringComparison.Ordinal)
+           && dispatch.DeliveryLeaseUntil > now;
+
+    public Task<AgentDispatchResponseStageResult> StageAgentDispatchResponseAsync(
         string toHandle,
         string dispatchId,
         string fromHandle,
         string dispatchToken,
         string respondingDeviceId,
+        string responseId,
+        string responseJson,
+        string responseHash,
+        CancellationToken ct = default)
+    {
+        var key = DispatchDictionaryKey(toHandle, dispatchId);
+        if (!agentDispatches.TryGetValue(key, out var dispatch))
+            return Task.FromResult(new AgentDispatchResponseStageResult(false, false, false, null));
+        lock (dispatch)
+        {
+            if (!string.Equals(dispatch.From, fromHandle, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(dispatch.DispatchToken, dispatchToken, StringComparison.Ordinal)
+                || !string.Equals(dispatch.AssignedDeviceId, respondingDeviceId, StringComparison.Ordinal))
+                return Task.FromResult(new AgentDispatchResponseStageResult(false, false, false, null));
+
+            if (dispatch.State is AgentDispatchStates.ResponsePending or AgentDispatchStates.Completed)
+            {
+                var duplicate = string.Equals(dispatch.ResponseId, responseId, StringComparison.Ordinal)
+                    && string.Equals(dispatch.ResponseHash, responseHash, StringComparison.Ordinal);
+                return Task.FromResult(new AgentDispatchResponseStageResult(
+                    duplicate,
+                    false,
+                    duplicate && dispatch.State == AgentDispatchStates.Completed,
+                    duplicate ? dispatch.ResponseJson : null));
+            }
+            if (!string.Equals(dispatch.State, AgentDispatchStates.Delivered, StringComparison.Ordinal))
+                return Task.FromResult(new AgentDispatchResponseStageResult(false, false, false, null));
+
+            dispatch.State = AgentDispatchStates.ResponsePending;
+            dispatch.ResponseId = responseId;
+            dispatch.ResponseJson = responseJson;
+            dispatch.ResponseHash = responseHash;
+            dispatch.ResponseStagedAt = UtcNow;
+            dispatch.EnvelopeJson = "";
+            dispatch.RecipientDeviceIds.Clear();
+            return Task.FromResult(new AgentDispatchResponseStageResult(true, true, false, responseJson));
+        }
+    }
+
+    public Task<bool> CompleteAgentDispatchResponseAsync(
+        string toHandle,
+        string dispatchId,
+        string responseId,
         CancellationToken ct = default)
     {
         var key = DispatchDictionaryKey(toHandle, dispatchId);
         if (!agentDispatches.TryGetValue(key, out var dispatch)) return Task.FromResult(false);
         lock (dispatch)
         {
-            if (!string.Equals(dispatch.State, AgentDispatchStates.Delivered, StringComparison.Ordinal)
-                || !string.Equals(dispatch.From, fromHandle, StringComparison.OrdinalIgnoreCase)
-                || !string.Equals(dispatch.DispatchToken, dispatchToken, StringComparison.Ordinal)
-                || !string.Equals(dispatch.AssignedDeviceId, respondingDeviceId, StringComparison.Ordinal))
+            if (string.Equals(dispatch.State, AgentDispatchStates.Completed, StringComparison.Ordinal)
+                && string.Equals(dispatch.ResponseId, responseId, StringComparison.Ordinal))
+                return Task.FromResult(true);
+            if (!string.Equals(dispatch.State, AgentDispatchStates.ResponsePending, StringComparison.Ordinal)
+                || !string.Equals(dispatch.ResponseId, responseId, StringComparison.Ordinal))
                 return Task.FromResult(false);
             dispatch.State = AgentDispatchStates.Completed;
-            dispatch.CompletedAt = DateTimeOffset.UtcNow;
-            dispatch.EnvelopeJson = "";
-            dispatch.RecipientDeviceIds.Clear();
+            dispatch.CompletedAt = UtcNow;
             return Task.FromResult(true);
         }
+    }
+
+    public Task<IReadOnlyList<StoredAgentDispatch>> GetPendingAgentResponsesAsync(
+        int maxItems = 100,
+        CancellationToken ct = default)
+    {
+        if (maxItems <= 0) return Task.FromResult<IReadOnlyList<StoredAgentDispatch>>([]);
+        var pending = agentDispatches.Values
+            .Where(dispatch => string.Equals(
+                dispatch.State, AgentDispatchStates.ResponsePending, StringComparison.Ordinal))
+            .OrderBy(dispatch => dispatch.ResponseStagedAt)
+            .ThenBy(dispatch => dispatch.Id, StringComparer.Ordinal)
+            .Take(maxItems)
+            .Select(dispatch =>
+            {
+                lock (dispatch) return CloneDispatch(dispatch);
+            })
+            .ToArray();
+        return Task.FromResult<IReadOnlyList<StoredAgentDispatch>>(pending);
     }
 
     public Task<HandleRatePolicy?> GetHandleRatePolicyAsync(string handle, CancellationToken ct = default)
@@ -723,6 +1148,37 @@ public sealed class InMemoryRelayStore : IRelayStore
     private static string NormalizeHandle(string handle)
         => handle.Trim().TrimStart('@').ToLowerInvariant();
 
+    private static string InboxHandle(string inboxKey)
+    {
+        var separator = inboxKey.IndexOf('\u001f');
+        return separator < 0 ? inboxKey : inboxKey[..separator];
+    }
+
+    private string? GetInboxAdmissionGeneration(string inboxKey)
+    {
+        var handle = InboxHandle(inboxKey);
+        if (!handles.TryGetValue(handle, out var registration))
+            return deletingHandles.ContainsKey(handle) || registeredHandleLifetimes.ContainsKey(handle)
+                ? ""
+                : null;
+        var separator = inboxKey.IndexOf('\u001f');
+        if (separator < 0)
+            return registration.InboxGeneration;
+        var deviceId = inboxKey[(separator + 1)..];
+        return registration.DeviceQueueGenerations.TryGetValue(deviceId, out var deviceGeneration)
+            ? registration.InboxGeneration + ":" + deviceGeneration
+            : "";
+    }
+
+    private static QueueEntry ToQueueEntry(StoredDeviceQueueItem item)
+        => new(
+            item.EntryId,
+            item.SourceDeviceId,
+            item.TargetDeviceId,
+            item.Payload,
+            item.EnqueuedAt,
+            item.ExpiresAt);
+
     private IEnumerable<StoredAgentDispatch> AgentDispatchesFor(string toHandle)
         => agentDispatches.Values
             .Where(dispatch => string.Equals(dispatch.To, toHandle, StringComparison.OrdinalIgnoreCase))
@@ -740,7 +1196,10 @@ public sealed class InMemoryRelayStore : IRelayStore
                 Handle = r.Handle,
                 DisplayName = r.DisplayName,
                 RegisteredAt = r.RegisteredAt,
+                InboxGeneration = r.InboxGeneration,
                 DevicePublicKeys = r.DevicePublicKeys.ToList(),
+                DeviceQueueGenerations = new Dictionary<string, string>(
+                    r.DeviceQueueGenerations, StringComparer.Ordinal),
                 RecoveryPublicKey = r.RecoveryPublicKey,
                 DeviceNames = new Dictionary<string, string>(r.DeviceNames),
                 DevicePlatforms = new Dictionary<string, string>(r.DevicePlatforms),
@@ -791,6 +1250,11 @@ public sealed class InMemoryRelayStore : IRelayStore
     private static void PurgeExpiredInbox(List<StoredEnvelope> inbox, DateTimeOffset now)
         => inbox.RemoveAll(item => item.ExpiresAt is { } expiresAt && expiresAt <= now);
 
+    private static void PurgeExpiredDeviceQueue(
+        List<StoredDeviceQueueItem> queue,
+        DateTimeOffset now)
+        => queue.RemoveAll(item => item.ExpiresAt <= now);
+
     private static StoredEnvelope CloneEnvelope(StoredEnvelope envelope) => new()
     {
         Id = envelope.Id,
@@ -803,7 +1267,8 @@ public sealed class InMemoryRelayStore : IRelayStore
         LeaseOwner = envelope.LeaseOwner,
         LeaseUntil = envelope.LeaseUntil,
         DeliveryAttempts = envelope.DeliveryAttempts,
-        Priority = envelope.Priority
+        Priority = envelope.Priority,
+        RequiresForeground = envelope.RequiresForeground
     };
 
     private static StoredAgentDispatch CloneDispatch(StoredAgentDispatch dispatch) => new()
@@ -818,9 +1283,15 @@ public sealed class InMemoryRelayStore : IRelayStore
         DispatchToken = dispatch.DispatchToken,
         State = dispatch.State,
         AssignedDeviceId = dispatch.AssignedDeviceId,
+        DeliveryLeaseOwner = dispatch.DeliveryLeaseOwner,
+        DeliveryLeaseUntil = dispatch.DeliveryLeaseUntil,
         QueuedAt = dispatch.QueuedAt,
         AssignedAt = dispatch.AssignedAt,
         DeliveredAt = dispatch.DeliveredAt,
+        ResponseId = dispatch.ResponseId,
+        ResponseJson = dispatch.ResponseJson,
+        ResponseHash = dispatch.ResponseHash,
+        ResponseStagedAt = dispatch.ResponseStagedAt,
         CompletedAt = dispatch.CompletedAt
     };
 }

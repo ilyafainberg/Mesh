@@ -13,6 +13,8 @@
 @inject NavigationManager Nav
 @implements IDisposable
 
+<MobileOverlayScope Active="@(newDeviceMenuOpen || moveMenuOpen || pendingMove is not null)" />
+
 @if (Active is null)
 {
     @* A) LIST screen: shown when no thread is selected, or the selected thread no longer exists. *@
@@ -30,7 +32,7 @@
                 <span class="new-chat-device">This device</span>
             </button>
             <button class="new-chat-menu-button" @onclick="OpenNewDeviceMenu" aria-label="Choose a device for new chat"
-                    aria-haspopup="menu" aria-expanded="@newDeviceMenuOpen">
+                    aria-haspopup="dialog" aria-expanded="@newDeviceMenuOpen">
                 <i class="bi bi-chevron-down"></i>
             </button>
         </div>
@@ -105,13 +107,13 @@
     {
         <MobileOverlayScope />
         <div class="sheet-scrim" @onclick="CloseDeviceMenus">
-            <div class="device-sheet" role="menu" aria-label="Choose a device" tabindex="-1" autofocus
+            <div class="device-sheet" role="dialog" aria-modal="true" aria-label="Choose a device" tabindex="-1" autofocus
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
                 <div class="sheet-handle"></div>
                 <h3>Start a new chat</h3>
                 @foreach (var device in DeviceChoices)
                 {
-                    <button class="device-choice" role="menuitem"
+                    <button class="device-choice"
                             disabled="@(!CanRunHere(device))"
                             @onclick="() => NewThread(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
@@ -191,6 +193,8 @@ else
                     var allVisibleLines = OrderedVisibleLines;
                     var renderedLines = MessageRenderWindow.Latest(allVisibleLines, messageRenderCount);
                     var hiddenMessageCount = MessageRenderWindow.HiddenCount(allVisibleLines.Count, messageRenderCount);
+                    var transcriptItems = TopicTranscriptPresentation.Compose(
+                        renderedLines, IsQueued, ActiveBusy ? Active.Id : null);
                 }
                 @if (hiddenMessageCount > 0)
                 {
@@ -207,139 +211,83 @@ else
                         and helps you manage what your public agent shares with others. Ask it anything.
                     </div>
                 }
-                @foreach (var line in renderedLines)
+                @foreach (var item in transcriptItems)
                 {
-                    var queued = IsQueued(line);
-                    var bubbleClass = $"bubble {TopicTranscriptPresentation.BubbleRole(line.Role)}{(queued ? " topic-queued-line" : "")}";
-                    <div class="@bubbleClass" @key="line.Id">
-                        <ModelAttribution ModelId="@line.ModelId" />
-                        @if (!string.IsNullOrEmpty(line.Reasoning))
-                        {
-                            <button class="reasoning-toggle" @onclick="() => ToggleReasoning(line)" aria-label="Show reasoning">
-                                <i class="bi bi-lightbulb"></i>
-                                <span>Reasoning</span>
-                                <i class="bi @(expandedReasoning.Contains(line) ? "bi-chevron-up" : "bi-chevron-down")"></i>
-                            </button>
-                            @if (expandedReasoning.Contains(line))
+                    if (item.Line is { } line)
+                    {
+                        var queued = IsQueued(line);
+                        <div class="bubble @TopicTranscriptPresentation.BubbleRole(line)" @key="item.Key">
+                            @if (!queued)
                             {
-                                <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(line.Reasoning!))</div>
-                            }
-                        }
-                        <MessageContent Text="@line.Text" Attachments="@line.Attachments"
-                                        OnPin="html => PinWidget(html, line)" />
-                        @if (queued)
-                        {
-                            <div class="msg-tag queue-tag">
-                                <i class="bi @QueueIcon(line)"></i>
-                                <span>@QueueLabel(line)</span>
-                                <button type="button" class="queue-cancel" title="Cancel queued turn"
-                                        aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
-                                        @onclick:stopPropagation="true">
-                                    <i class="bi bi-x-lg"></i>
-                                </button>
-                            </div>
-                        }
-                    </div>
-                }
-                @if (ActiveBusy)
-                {
-                    <div class="bubble assistant topic-live-run" @key="Active">
-                        @{ var run = Active is null ? null : State.AgentRunFor(Active.Id); }
-                        @if (run is not null)
-                        {
-                            @if (run.Phase == AgentRunPhase.Planning)
-                            {
-                                <div class="planning-row"><i class="bi bi-diagram-3"></i> Planning</div>
-                            }
-                            else
-                            {
-                                <div class="text md">@((MarkupString)Markdown.ToHtml(run.Plan))</div>
-                                <div class="msg-tag"><i class="bi bi-diagram-3"></i> @run.Phase.ToString().ToLowerInvariant()</div>
-                            }
-                        }
-                        @{ var steps = Active is null ? null : State.AgentStepsFor(Active.Id); }
-                        @if (steps is { Count: > 0 })
-                        {
-                            <div class="agent-steps">
-                                @foreach (var s in steps)
+                                <ModelAttribution ModelId="@line.ModelId" />
+                                @if (!string.IsNullOrEmpty(line.Reasoning))
                                 {
-                                    <div class="agent-step-item">
-                                        <div class="agent-step @s.State.ToString().ToLowerInvariant()">
-                                            <i class="bi @StepIcon(s.State)"></i>
-                                            <span>@s.Label</span>
-                                        </div>
-                                        @if (showStepDetails && (!string.IsNullOrEmpty(s.Arguments) || !string.IsNullOrEmpty(s.Result)))
-                                        {
-                                            <div class="agent-step-detail">
-                                                @if (!string.IsNullOrEmpty(s.Arguments))
-                                                {
-                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
-                                                                    Content="@s.Arguments" />
-                                                }
-                                                @if (!string.IsNullOrEmpty(s.Result))
-                                                {
-                                                    <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
-                                                                    Content="@s.Result" IsOutput="true" />
-                                                }
-                                            </div>
-                                        }
-                                    </div>
+                                    <button class="reasoning-toggle" @onclick="() => ToggleReasoning(line)" aria-label="Show reasoning">
+                                        <i class="bi bi-lightbulb"></i>
+                                        <span>Reasoning</span>
+                                        <i class="bi @(expandedReasoning.Contains(line) ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                                    </button>
+                                    @if (expandedReasoning.Contains(line))
+                                    {
+                                        <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(line.Reasoning!))</div>
+                                    }
                                 }
-                            </div>
-                            <button class="step-details-toggle" @onclick="() => showStepDetails = !showStepDetails">
-                                <i class="bi @(showStepDetails ? "bi-chevron-up" : "bi-chevron-down")"></i>
-                                @(showStepDetails ? "Hide details" : "Show details")
-                            </button>
-                        }
-                        @{ var draft = Active is null ? null : State.AssistantDraftFor(Active.Id); }
-                        @if (draft is { HasReasoning: true })
-                        {
-                            <button class="reasoning-toggle" @onclick="ToggleDraftReasoning" aria-label="Show reasoning">
-                                <i class="bi bi-lightbulb"></i>
-                                <span>Reasoning</span>
-                                <i class="bi @(draftReasoningExpanded ? "bi-chevron-up" : "bi-chevron-down")"></i>
-                            </button>
-                            @if (draftReasoningExpanded)
-                            {
-                                <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(draft.Reasoning))</div>
                             }
-                        }
-                        @if (draft is { HasAnswer: true })
-                        {
-                            <div class="text md">@((MarkupString)Markdown.ToHtml(draft.Answer))</div>
-                        }
-                        @if (RemoteRun is { } remote)
-                        {
-                            @if (!string.IsNullOrWhiteSpace(remote.Plan))
+                            <MessageContent Text="@line.Text" Attachments="@line.Attachments"
+                                            OnPin="html => PinWidget(html, line)" />
+                            @if (queued)
                             {
-                                <div class="text md">@((MarkupString)Markdown.ToHtml(remote.Plan))</div>
+                                <div class="msg-tag queue-tag">
+                                    <i class="bi @QueueIcon(line)"></i>
+                                    <span>@QueueLabel(line)</span>
+                                    <button type="button" class="queue-cancel" title="Cancel queued turn"
+                                            aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
+                                            @onclick:stopPropagation="true">
+                                        <i class="bi bi-x-lg"></i>
+                                    </button>
+                                </div>
                             }
-                            <div class="planning-row">
-                                <i class="bi bi-arrow-repeat spin"></i>
-                                @RemoteRunPresentation.StatusLabel(remote)
-                            </div>
-                            @if (remote.Steps is { Count: > 0 })
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="bubble assistant" @key="item.Key">
+                            @{ var run = Active is null ? null : State.AgentRunFor(Active.Id); }
+                            @if (run is not null)
+                            {
+                                @if (run.Phase == AgentRunPhase.Planning)
+                                {
+                                    <div class="planning-row"><i class="bi bi-diagram-3"></i> Planning</div>
+                                }
+                                else
+                                {
+                                    <div class="text md">@((MarkupString)Markdown.ToHtml(run.Plan))</div>
+                                    <div class="msg-tag"><i class="bi bi-diagram-3"></i> @run.Phase.ToString().ToLowerInvariant()</div>
+                                }
+                            }
+                            @{ var steps = Active is null ? null : State.AgentStepsFor(Active.Id); }
+                            @if (steps is { Count: > 0 })
                             {
                                 <div class="agent-steps">
-                                    @foreach (var step in remote.Steps)
+                                    @foreach (var s in steps)
                                     {
                                         <div class="agent-step-item">
-                                            <div class="agent-step @step.State.ToString().ToLowerInvariant()">
-                                                <i class="bi @RemoteStepIcon(step.State)"></i>
-                                                <span>@step.Label</span>
+                                            <div class="agent-step @s.State.ToString().ToLowerInvariant()">
+                                                <i class="bi @StepIcon(s.State)"></i>
+                                                <span>@s.Label</span>
                                             </div>
-                                            @if (showStepDetails && (!string.IsNullOrEmpty(step.Arguments) || !string.IsNullOrEmpty(step.Result)))
+                                            @if (showStepDetails && (!string.IsNullOrEmpty(s.Arguments) || !string.IsNullOrEmpty(s.Result)))
                                             {
                                                 <div class="agent-step-detail">
-                                                    @if (!string.IsNullOrEmpty(step.Arguments))
+                                                    @if (!string.IsNullOrEmpty(s.Arguments))
                                                     {
-                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
-                                                                        Content="@step.Arguments" />
+                                                        <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                        Content="@s.Arguments" />
                                                     }
-                                                    @if (!string.IsNullOrEmpty(step.Result))
+                                                    @if (!string.IsNullOrEmpty(s.Result))
                                                     {
-                                                        <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
-                                                                        Content="@step.Result" IsOutput="true" />
+                                                        <ToolStepDetail Tool="@(s.ToolName ?? s.Tool)"
+                                                                        Content="@s.Result" IsOutput="true" />
                                                     }
                                                 </div>
                                             }
@@ -351,17 +299,78 @@ else
                                     @(showStepDetails ? "Hide details" : "Show details")
                                 </button>
                             }
-                            @if (remote.Queued > 0)
+                            @{ var draft = Active is null ? null : State.AssistantDraftFor(Active.Id); }
+                            @if (draft is { HasReasoning: true })
                             {
-                                <div class="msg-tag"><i class="bi bi-hourglass-split"></i> @remote.Queued queued</div>
+                                <button class="reasoning-toggle" @onclick="ToggleDraftReasoning" aria-label="Show reasoning">
+                                    <i class="bi bi-lightbulb"></i>
+                                    <span>Reasoning</span>
+                                    <i class="bi @(draftReasoningExpanded ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                                </button>
+                                @if (draftReasoningExpanded)
+                                {
+                                    <div class="reasoning-body">@((MarkupString)Markdown.ToHtml(draft.Reasoning))</div>
+                                }
                             }
-                        }
-                        else if (run?.Phase != AgentRunPhase.Planning
-                                 && (draft is null or { HasReasoning: false, HasAnswer: false }))
-                        {
-                            <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
-                        }
-                    </div>
+                            @if (draft is { HasAnswer: true })
+                            {
+                                <div class="text md">@((MarkupString)Markdown.ToHtml(draft.Answer))</div>
+                            }
+                            @if (RemoteRun is { } remote)
+                            {
+                                @if (!string.IsNullOrWhiteSpace(remote.Plan))
+                                {
+                                    <div class="text md">@((MarkupString)Markdown.ToHtml(remote.Plan))</div>
+                                }
+                                <div class="planning-row">
+                                    <i class="bi bi-arrow-repeat spin"></i>
+                                    @RemoteRunPresentation.StatusLabel(remote)
+                                </div>
+                                @if (remote.Steps is { Count: > 0 })
+                                {
+                                    <div class="agent-steps">
+                                        @foreach (var step in remote.Steps)
+                                        {
+                                            <div class="agent-step-item">
+                                                <div class="agent-step @step.State.ToString().ToLowerInvariant()">
+                                                    <i class="bi @RemoteStepIcon(step.State)"></i>
+                                                    <span>@step.Label</span>
+                                                </div>
+                                                @if (showStepDetails && (!string.IsNullOrEmpty(step.Arguments) || !string.IsNullOrEmpty(step.Result)))
+                                                {
+                                                    <div class="agent-step-detail">
+                                                        @if (!string.IsNullOrEmpty(step.Arguments))
+                                                        {
+                                                            <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                            Content="@step.Arguments" />
+                                                        }
+                                                        @if (!string.IsNullOrEmpty(step.Result))
+                                                        {
+                                                            <ToolStepDetail Tool="@(step.ToolName ?? step.Tool)"
+                                                                            Content="@step.Result" IsOutput="true" />
+                                                        }
+                                                    </div>
+                                                }
+                                            </div>
+                                        }
+                                    </div>
+                                    <button class="step-details-toggle" @onclick="() => showStepDetails = !showStepDetails">
+                                        <i class="bi @(showStepDetails ? "bi-chevron-up" : "bi-chevron-down")"></i>
+                                        @(showStepDetails ? "Hide details" : "Show details")
+                                    </button>
+                                }
+                                @if (remote.Queued > 0)
+                                {
+                                    <div class="msg-tag"><i class="bi bi-hourglass-split"></i> @remote.Queued queued</div>
+                                }
+                            }
+                            else if (run?.Phase != AgentRunPhase.Planning
+                                     && (draft is null or { HasReasoning: false, HasAnswer: false }))
+                            {
+                                <div class="text muted">@(ActiveBuilding ? "…building widget" : "…thinking")</div>
+                            }
+                        </div>
+                    }
                 }
                 </div>
             </div>
@@ -498,14 +507,14 @@ else
     {
         <MobileOverlayScope />
         <div class="sheet-scrim" @onclick="CloseDeviceMenus">
-            <div class="device-sheet" role="menu" aria-label="Move topic to device" tabindex="-1" autofocus
+            <div class="device-sheet" role="dialog" aria-modal="true" aria-label="Move topic to device" tabindex="-1" autofocus
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
                 <div class="sheet-handle"></div>
                 <h3>Move topic</h3>
                 <p class="sheet-copy">The full topic history stays with this chat.</p>
                 @foreach (var device in DeviceChoices)
                 {
-                    <button class="device-choice" role="menuitem"
+                    <button class="device-choice"
                             disabled="@(!CanRunHere(device) || IsActiveDevice(device))"
                             @onclick="() => ChooseMoveTarget(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
@@ -1218,8 +1227,8 @@ else
         attachError = null;
         if (clearedVisibleDraft) _ = ResetComposer();
 
-        // Let the persisted prompt paint before dispatch can reclassify it as queued.
-        await Task.Yield();
+        // Paint the persisted prompt before dispatch can classify it as queued or start streaming.
+        await InvokeAsync(StateHasChanged);
 
         try
         {

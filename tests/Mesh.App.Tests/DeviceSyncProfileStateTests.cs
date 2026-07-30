@@ -440,6 +440,40 @@ public sealed class DeviceSyncProfileStateTests
     }
 
     [TestMethod]
+    public async Task SharedDatabase_ConcurrentTransactionAndVersionAdvanceDoNotCrash()
+    {
+        using var db = MeshDb.Open(databasePath, key);
+        var profileVersion = Version(10, "profile");
+        var topicVersion = Version(11, "topic");
+        using var transactionEntered = new ManualResetEventSlim();
+        using var releaseTransaction = new ManualResetEventSlim();
+
+        var profileWrite = Task.Run(() => db.SaveProfileAndSyncState(
+            Profile(contacts: [new Contact { Handle = "alice" }]),
+            [new MeshDb.SyncVersionWrite("contact.upsert\u001falice", profileVersion)],
+            [],
+            beforeCommit: () =>
+            {
+                transactionEntered.Set();
+                releaseTransaction.Wait();
+            }));
+
+        Assert.IsTrue(transactionEntered.Wait(TimeSpan.FromSeconds(5)));
+        var topicWrite = Task.Run(() =>
+            db.TryAdvanceSyncVersion("topic.upsert\u001fthread", topicVersion));
+
+        await Task.Delay(100);
+        Assert.IsFalse(topicWrite.IsCompleted);
+        releaseTransaction.Set();
+
+        await Task.WhenAll(profileWrite, topicWrite);
+        Assert.IsTrue(profileWrite.Result);
+        Assert.IsTrue(topicWrite.Result);
+        Assert.AreEqual(profileVersion, db.GetSyncVersion("contact.upsert\u001falice"));
+        Assert.AreEqual(topicVersion, db.GetSyncVersion("topic.upsert\u001fthread"));
+    }
+
+    [TestMethod]
     public void AtomicWrite_RejectsUpsertOlderThanDeleteTombstone()
     {
         using var db = MeshDb.Open(databasePath, key);

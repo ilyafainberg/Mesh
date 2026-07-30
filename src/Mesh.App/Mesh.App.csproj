@@ -40,10 +40,10 @@
         <ApplicationIcon>Platforms\Windows\appicon.ico</ApplicationIcon>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.15.0</ApplicationDisplayVersion>
-        <ApplicationVersion>60</ApplicationVersion>
+        <ApplicationDisplayVersion>1.16.0</ApplicationDisplayVersion>
+        <ApplicationVersion>61</ApplicationVersion>
         <!-- Drives AssemblyVersion/FileVersion/InformationalVersion, read by the self-updater. -->
-        <Version>1.15.0</Version>
+        <Version>1.16.0</Version>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
@@ -76,7 +76,7 @@
                   Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'" />
         <MauiIcon Include="Resources\AppIcon\MacCatalyst\meshicon.png" BaseSize="1024,1024" Color="#131316"
                   Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'" />
-        <MauiIcon Include="Resources\AppIcon\Windows\meshicon.png" BaseSize="1024,1024" Color="#131316"
+        <MauiIcon Include="Resources\AppIcon\Windows\meshicon.png" BaseSize="512,512" Color="#131316"
                   Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'" />
 
         <!-- Splash Screen -->

@@ -38,8 +38,24 @@ public sealed class MeshHub(
     {
         var http = Context.GetHttpContext();
         var handle = Normalize(http?.Request.Query["handle"].ToString() ?? "");
+        var protocolVersion = int.TryParse(
+            http?.Request.Query["protocolVersion"].ToString(),
+            out var parsedProtocolVersion)
+            ? parsedProtocolVersion
+            : 0;
         if (string.IsNullOrWhiteSpace(handle))
         {
+            Context.Abort();
+            return;
+        }
+        if (protocolVersion != MeshProtocol.Version)
+        {
+            await Clients.Caller.SendAsync(
+                MeshHubProtocol.Handshake,
+                new HandshakeResponse(
+                    MeshProtocol.Version,
+                    HandshakeResult.VersionMismatch,
+                    $"Relay protocol {MeshProtocol.Version} is required. Client sent {protocolVersion}."));
             Context.Abort();
             return;
         }
@@ -60,6 +76,9 @@ public sealed class MeshHub(
         registry.Add(Context.ConnectionId, handle, nonce, supportsDurableDelivery, isBackgroundSync);
         metrics.ConnectionOpened();
         logger.LogInformation("hub connection opened: {Handle}", handle);
+        await Clients.Caller.SendAsync(
+            MeshHubProtocol.Handshake,
+            new HandshakeResponse(MeshProtocol.Version, HandshakeResult.Accepted));
         await Clients.Caller.SendAsync(MeshHubProtocol.Challenge, nonce);
         await base.OnConnectedAsync();
     }
@@ -81,12 +100,24 @@ public sealed class MeshHub(
 
         registry.MarkAuthenticated(Context.ConnectionId, publicKey);
         var deviceId = DeviceProtocol.DeviceId(publicKey);
+        var now = DateTimeOffset.UtcNow;
         if (!state.IsBackgroundSync)
         {
             await backplane.SetPresenceAsync(state.Handle);
             await backplane.SetDevicePresenceAsync(state.Handle, deviceId);
         }
-        await Clients.Caller.SendAsync(MeshHubProtocol.Ready);
+        else
+        {
+            await backplane.SetTransientDeviceRouteAsync(state.Handle, deviceId);
+        }
+        await Clients.Caller.SendAsync(
+            MeshHubProtocol.PresenceConfirmed,
+            new PresenceConfirmed(
+                state.Handle,
+                deviceId,
+                now,
+                state.IsBackgroundSync ? now : now + TimeSpan.FromSeconds(30),
+                backplane.InstanceId));
         logger.LogInformation(
             "hub authenticated: {Handle}; device={DeviceId}; background={Background}; durable={Durable}",
             state.Handle,
@@ -96,17 +127,92 @@ public sealed class MeshHub(
         if (!state.IsBackgroundSync)
             _ = DispatchAvailableAfterAuthenticationAsync(state.Handle);
 
-        // Device-targeted fan-out must drain only on the intended device. Legacy handle-wide
-        // messages are delivered afterward for backward compatibility.
-        // Acknowledged clients request their first bounded batch after handling Ready. Leasing a
-        // large Cosmos backlog here keeps Authenticate open and can strand the client in a retry loop.
-        if (RelayInboxPolicy.UsesClientInitiatedDrain(state.SupportsDurableDelivery))
-            return;
+        // Protocol 8 clients initiate every bounded durable drain after authentication returns.
+        // Authentication never scans or leases either durable store.
+    }
 
-        foreach (var pending in await store.DrainInboxAsync(MeshRouter.DeviceInboxKey(state.Handle, deviceId)))
-            await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
-        foreach (var pending in await store.DrainInboxAsync(state.Handle))
-            await Clients.Caller.SendAsync(MeshHubProtocol.Receive, pending);
+    public async Task<QueueEnqueueResult> QueueEnqueue(QueueEnqueue request)
+    {
+        var authorization = await GetAuthorizedConnectionAsync();
+        var connection = authorization.Connection;
+        if (connection is not { Handle: not null, DeviceId: not null })
+            return new QueueEnqueueResult(false, "", authorization.Revoked ? "device_revoked" : "unauthenticated");
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.SourceDeviceId)
+            || string.IsNullOrWhiteSpace(request.TargetDeviceId)
+            || string.IsNullOrWhiteSpace(request.OperationId)
+            || string.IsNullOrWhiteSpace(request.Payload))
+            return new QueueEnqueueResult(false, "", "invalid_queue_request");
+        if (!string.Equals(request.SourceDeviceId, connection.DeviceId, StringComparison.Ordinal))
+            return new QueueEnqueueResult(false, "", "source_device_mismatch");
+        if (string.Equals(request.TargetDeviceId, connection.DeviceId, StringComparison.Ordinal))
+            return new QueueEnqueueResult(false, "", "sync_self_target");
+
+        var registration = authorization.Registration!;
+        var targetKnown = registration.DevicePublicKeys.Any(publicKey =>
+            string.Equals(
+                DeviceProtocol.DeviceId(publicKey),
+                request.TargetDeviceId,
+                StringComparison.Ordinal));
+        if (!targetKnown)
+            return new QueueEnqueueResult(false, "", "sync_target_unknown");
+
+        var result = await store.EnqueueDeviceQueueAsync(
+            connection.Handle,
+            request,
+            Context.ConnectionAborted);
+        if (result.Created)
+            metrics.QueueEnqueued();
+        if (result.Accepted)
+        {
+            try
+            {
+                await NotifyDeviceQueueAvailableAsync(connection.Handle, request.TargetDeviceId);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Device queue notification failed after durable enqueue: {Handle}; device={DeviceId}",
+                    connection.Handle,
+                    request.TargetDeviceId);
+            }
+        }
+        return result;
+    }
+
+    public async Task<QueueDrainResponse> QueueDrain(QueueDrainRequest request)
+    {
+        var authorization = await GetAuthorizedConnectionAsync();
+        var connection = authorization.Connection;
+        if (connection is not { Handle: not null, DeviceId: not null })
+            return new QueueDrainResponse([]);
+        if (request is null
+            || !string.Equals(request.TargetDeviceId, connection.DeviceId, StringComparison.Ordinal))
+            return new QueueDrainResponse([]);
+        return await store.DrainDeviceQueueAsync(
+            connection.Handle,
+            connection.DeviceId,
+            Context.ConnectionId,
+            Math.Clamp(request.MaxEntries, 1, 128),
+            Context.ConnectionAborted);
+    }
+
+    public async Task<bool> QueueAck(QueueAck request)
+    {
+        var authorization = await GetAuthorizedConnectionAsync();
+        var connection = authorization.Connection;
+        if (connection is not { Handle: not null, DeviceId: not null }
+            || request is null
+            || string.IsNullOrWhiteSpace(request.EntryId)
+            || !string.Equals(request.TargetDeviceId, connection.DeviceId, StringComparison.Ordinal))
+            return false;
+        return await store.AcknowledgeDeviceQueueAsync(
+            connection.Handle,
+            connection.DeviceId,
+            request.EntryId,
+            Context.ConnectionId,
+            Context.ConnectionAborted);
     }
 
     public async Task<bool> AcknowledgeDelivery(string deliveryId, bool deviceScoped)
@@ -126,7 +232,7 @@ public sealed class MeshHub(
                 ? MeshRouter.DeviceInboxKey(connection.Handle, connection.DeviceId)
                 : connection.Handle;
             var acknowledged = await store.AcknowledgeInboxAsync(
-                inboxKey, deliveryId, Context.ConnectionAborted);
+                inboxKey, deliveryId, Context.ConnectionId, Context.ConnectionAborted);
             if (acknowledged is not null)
             {
                 metrics.DeliveryAcknowledged(DateTimeOffset.UtcNow - acknowledged.QueuedAt);
@@ -198,6 +304,7 @@ public sealed class MeshHub(
             inboxKey,
             Context.ConnectionId,
             Math.Clamp(maxItems, 1, RelayInboxPolicy.DeliveryWindow),
+            includeForeground: !connection.IsBackgroundSync,
             ct: Context.ConnectionAborted);
         var delivered = 0;
         foreach (var item in pending)
@@ -215,22 +322,16 @@ public sealed class MeshHub(
             }
             catch (JsonException)
             {
-                await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
+                await store.AcknowledgeInboxAsync(
+                    inboxKey, item.Id, Context.ConnectionId, Context.ConnectionAborted);
                 continue;
             }
             if (envelope is null)
             {
-                await store.AcknowledgeInboxAsync(inboxKey, item.Id, Context.ConnectionAborted);
-                continue;
-            }
-            if (connection.IsBackgroundSync
-                && BackgroundSyncProtocol.RequiresForeground(envelope.Kind))
-            {
-                await store.ReleaseInboxLeaseAsync(
+                await store.AcknowledgeInboxAsync(
                     inboxKey, item.Id, Context.ConnectionId, Context.ConnectionAborted);
                 continue;
             }
-
             if (item.DeliveryAttempts > 1) metrics.DeliveryRedelivered();
             var deliveryJson = JsonSerializer.Serialize(
                 envelope with { RelayDeliveryId = item.Id, RelayDeviceScoped = deviceScoped }, Json);
@@ -268,6 +369,8 @@ public sealed class MeshHub(
         if (!isDeviceSync
             && env.Kind?.StartsWith("device.sync.", StringComparison.OrdinalIgnoreCase) == true)
             return MeshSendResult.Reject("sync_kind_unknown");
+        if (isDeviceSync)
+            return MeshSendResult.Reject("device_sync_use_queue");
         if (!string.IsNullOrWhiteSpace(stamped.ToDevice))
         {
             var targetHandle = Normalize(stamped.To);
@@ -281,26 +384,6 @@ public sealed class MeshHub(
                     StringComparison.Ordinal)) == true;
             if (!targetKnown)
                 return MeshSendResult.Reject(isDeviceSync ? "sync_target_unknown" : "target_device_unknown");
-        }
-
-        if (isDeviceSync)
-        {
-            if (Normalize(env.To) != handle)
-                return MeshSendResult.Reject("sync_same_handle_required");
-            if (string.IsNullOrWhiteSpace(state.DeviceId))
-                return MeshSendResult.Reject("unauthenticated");
-            if (string.IsNullOrWhiteSpace(env.ToDevice))
-                return MeshSendResult.Reject("sync_target_required");
-            if (string.Equals(env.ToDevice, state.DeviceId, StringComparison.Ordinal))
-                return MeshSendResult.Reject("sync_self_target");
-
-            var syncEnvelope = stamped;
-            var syncRoute = await router.RouteToDeviceAsync(syncEnvelope);
-            if (syncRoute.NewlyQueued) metrics.QueueEnqueued();
-            metrics.MessageRouted();
-            return syncRoute.Queued
-                ? MeshSendResult.Queued(syncRoute.DeliveryId)
-                : MeshSendResult.Delivered(syncRoute.DeliveryId);
         }
 
         var (decision, policy) = await rateLimiter.TryAcquireAsync(
@@ -327,15 +410,22 @@ public sealed class MeshHub(
 
         if (AgentDispatchProtocol.IsAtomicResponse(stamped.Kind))
         {
-            if (!string.IsNullOrWhiteSpace(stamped.ToDevice)
-                || !await agentDispatch.CompleteResponseAsync(
-                    stamped,
-                    state.DeviceId ?? "",
-                    Context.ConnectionAborted))
+            if (!string.IsNullOrWhiteSpace(stamped.ToDevice))
                 return MeshSendResult.Reject("invalid_agent_dispatch_response");
+            var completion = await agentDispatch.CompleteResponseAsync(
+                stamped,
+                state.DeviceId ?? "",
+                Context.ConnectionAborted);
+            if (!completion.Accepted || completion.Response is null)
+                return MeshSendResult.Reject(completion.Error ?? "invalid_agent_dispatch_response");
 
-            var responseRoute = await router.RouteAsync(stamped with { AgentDispatchToken = null });
-            if (responseRoute.NewlyQueued) metrics.QueueEnqueued();
+            _ = await router.RouteEnqueuedAsync(
+                completion.Response,
+                new InboxEnqueueResult(
+                    InboxDeliveryId.Create(completion.Response.From, completion.Response.Id),
+                    Accepted: true,
+                    Created: completion.Created));
+            if (completion.Created) metrics.QueueEnqueued();
             metrics.MessageRouted();
             return MeshSendResult.Ok();
         }
@@ -377,8 +467,11 @@ public sealed class MeshHub(
         // When a device sends to its own handle (remote-to-desktop), exclude the sender's own
         // connection so the message reaches the owner's OTHER devices rather than echoing back.
         var exclude = Normalize(stamped.To) == handle ? Context.ConnectionId : null;
-        var route = await router.RouteAsync(stamped, exclude);
-        if (route.NewlyQueued) metrics.QueueEnqueued();
+        var routed = await RouteDurablyAsync(stamped, exclude);
+        if (!routed.Admission.Accepted || routed.Route is null)
+            return MeshSendResult.Reject(routed.Admission.Error ?? "inbox_admission_rejected");
+        var route = routed.Route.Value;
+        if (routed.Admission.Created) metrics.QueueEnqueued();
         metrics.MessageRouted();
         return route.Queued
             ? MeshSendResult.Queued(route.DeliveryId)
@@ -501,7 +594,7 @@ public sealed class MeshHub(
             .ToList();
 
         var sentAt = request.SentAt == default ? DateTimeOffset.UtcNow : request.SentAt;
-        var tasks = targets.Select(target =>
+        var tasks = targets.Select(async target =>
         {
             var envelope = new MeshEnvelope(
                 request.Id,
@@ -513,13 +606,40 @@ public sealed class MeshHub(
                 sentAt,
                 state.DeviceId,
                 target.DeviceId);
-            return router.RouteToDeviceAsync(envelope);
+            return await RouteDurablyAsync(envelope);
         });
 
         var routes = await Task.WhenAll(tasks);
-        metrics.QueueEnqueued(routes.Count(route => route.NewlyQueued));
+        if (routes.Any(result => !result.Admission.Accepted || result.Route is null))
+            return MeshSendResult.Reject("inbox_admission_rejected");
+        metrics.QueueEnqueued(routes.Count(result => result.Admission.Created));
         metrics.MessageRouted(targets.Count);
         return MeshSendResult.Ok(recipients.Count);
+    }
+
+    private async Task<(InboxEnqueueResult Admission, MeshRouteResult? Route)> RouteDurablyAsync(
+        MeshEnvelope envelope,
+        string? excludeConnectionId = null)
+    {
+        var clean = envelope with { RelayDeliveryId = null, RelayDeviceScoped = false };
+        var to = Normalize(clean.To);
+        var inboxKey = string.IsNullOrWhiteSpace(clean.ToDevice)
+            ? to
+            : RelayInboxKey.Device(to, clean.ToDevice);
+        var admission = await store.EnqueueAsync(
+            inboxKey,
+            clean.Id,
+            clean.From,
+            JsonSerializer.Serialize(clean, Json),
+            RelayInboxPriority.ForKind(clean.Kind),
+            BackgroundSyncProtocol.RequiresForeground(clean.Kind),
+            Context.ConnectionAborted);
+        if (!admission.Accepted)
+            return (admission, null);
+        var route = string.IsNullOrWhiteSpace(clean.ToDevice)
+            ? await router.RouteEnqueuedAsync(clean, admission, excludeConnectionId)
+            : await router.RouteEnqueuedToDeviceAsync(clean, admission, excludeConnectionId);
+        return (admission, route);
     }
 
     private async Task<(
@@ -543,6 +663,7 @@ public sealed class MeshHub(
         {
             registry.RevokeDevice(connection.Handle, connection.DeviceId);
             await backplane.ClearDevicePresenceAsync(connection.Handle, connection.DeviceId);
+            await backplane.ClearTransientDeviceRouteAsync(connection.Handle, connection.DeviceId);
         }
         else
         {
@@ -565,6 +686,56 @@ public sealed class MeshHub(
         }
     }
 
+    private async Task NotifyDeviceQueueAvailableAsync(string handle, string targetDeviceId)
+    {
+        var localConnections = registry.ConnectionsForDevice(
+            handle,
+            targetDeviceId,
+            includeBackgroundSync: false);
+        if (localConnections.Count > 0)
+        {
+            await Clients.Clients(localConnections).SendAsync(MeshHubProtocol.DeviceQueueAvailable);
+            return;
+        }
+
+        var notification = MeshEnvelope.Create(
+            from: handle,
+            to: handle,
+            kind: MeshHubProtocol.DeviceQueueAvailable,
+            body: "",
+            toDevice: targetDeviceId);
+        var notificationJson = System.Text.Json.JsonSerializer.Serialize(notification);
+
+        // Prefer foreground presence on any replica before considering a transient route.
+        var foregroundOwner = await backplane.GetInstanceForDeviceAsync(
+            handle, targetDeviceId, Context.ConnectionAborted);
+        if (foregroundOwner is not null
+            && !string.Equals(foregroundOwner, backplane.InstanceId, StringComparison.Ordinal))
+        {
+            var receipt = await backplane.PublishToOwnerAsync(
+                foregroundOwner, handle, notificationJson, Context.ConnectionAborted);
+            if (receipt.Outcome == BackplaneDeliveryOutcome.Delivered)
+                return;
+        }
+
+        var backgroundConnections = registry.ConnectionsForDevice(
+            handle,
+            targetDeviceId,
+            includeBackgroundSync: true);
+        if (backgroundConnections.Count > 0)
+        {
+            await Clients.Clients(backgroundConnections).SendAsync(MeshHubProtocol.DeviceQueueAvailable);
+            return;
+        }
+
+        var transientOwner = await backplane.GetTransientInstanceForDeviceAsync(
+            handle, targetDeviceId, Context.ConnectionAborted);
+        if (transientOwner is not null
+            && !string.Equals(transientOwner, backplane.InstanceId, StringComparison.Ordinal))
+            await backplane.PublishToOwnerAsync(
+                transientOwner, handle, notificationJson, Context.ConnectionAborted);
+    }
+
     private async Task ReleaseDeliveryLeasesAfterDisconnectAsync(ConnectionRegistry.ConnState connection)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -576,6 +747,11 @@ public sealed class MeshHub(
                 timeout.Token);
             await store.ReleaseInboxLeasesAsync(
                 connection.Handle!,
+                Context.ConnectionId,
+                timeout.Token);
+            await store.ReleaseDeviceQueueLeasesAsync(
+                connection.Handle!,
+                connection.DeviceId!,
                 Context.ConnectionId,
                 timeout.Token);
         }
@@ -595,7 +771,7 @@ public sealed class MeshHub(
         var connection = registry.Get(Context.ConnectionId);
         var counted = connection is not null;
         var handle = registry.Remove(Context.ConnectionId);
-        if (connection is { Authenticated: true, SupportsDurableDelivery: true, Handle: not null, DeviceId: not null })
+        if (connection is { Handle: not null, DeviceId: not null })
             await ReleaseDeliveryLeasesAfterDisconnectAsync(connection);
         if (counted)
         {
@@ -610,6 +786,9 @@ public sealed class MeshHub(
             && registry.ConnectionsForDevice(
                 connection.Handle, connection.DeviceId, includeBackgroundSync: false).Count == 0)
             await backplane.ClearDevicePresenceAsync(connection.Handle, connection.DeviceId);
+        if (connection is { Authenticated: true, IsBackgroundSync: true, Handle: not null, DeviceId: not null }
+            && !registry.HasBackgroundConnectionForDevice(connection.Handle, connection.DeviceId))
+            await backplane.ClearTransientDeviceRouteAsync(connection.Handle, connection.DeviceId);
         if (handle is not null)
             await backplane.ClearPresenceAsync(handle); // only when it was the last local connection
         await base.OnDisconnectedAsync(exception);

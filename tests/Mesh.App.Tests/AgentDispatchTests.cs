@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Mesh.App.Domain;
 using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
 using Mesh.Relay.Storage;
@@ -20,8 +21,12 @@ public sealed class AgentDispatchTests
         public Task SetPresenceAsync(string handle, CancellationToken ct = default) => Task.CompletedTask;
         public Task SetDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default)
             => Task.CompletedTask;
+        public Task SetTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default)
+            => Task.CompletedTask;
         public Task ClearPresenceAsync(string handle, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default)
+            => Task.CompletedTask;
+        public Task ClearTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default)
             => Task.CompletedTask;
         public Task<string?> GetInstanceForAsync(string handle, CancellationToken ct = default)
             => Task.FromResult<string?>(null);
@@ -30,6 +35,11 @@ public sealed class AgentDispatchTests
             string deviceId,
             CancellationToken ct = default)
             => Task.FromResult<string?>("remote");
+        public Task<string?> GetTransientInstanceForDeviceAsync(
+            string handle,
+            string deviceId,
+            CancellationToken ct = default)
+            => Task.FromResult<string?>(null);
         public Task<BackplaneDeliveryReceipt> PublishToOwnerAsync(
             string instanceId,
             string toHandle,
@@ -118,7 +128,7 @@ public sealed class AgentDispatchTests
     }
 
     [TestMethod]
-    public async Task DispatchCanBeDeliveredAndCompletedOnlyOnce()
+    public async Task DispatchResponseCanBeStagedAndCompletedIdempotently()
     {
         var store = new InMemoryRelayStore();
         var dispatch = NewDispatch();
@@ -127,16 +137,30 @@ public sealed class AgentDispatchTests
 
         await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary"]);
         var takes = await Task.WhenAll(
-            store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary"),
-            store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary"));
+            store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary", "claim-a"),
+            store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary", "claim-b"));
         Assert.AreEqual(1, takes.Sum(items => items.Count));
+        var claimOwner = takes[0].Count == 1 ? "claim-a" : "claim-b";
+        Assert.IsTrue(await store.MarkAgentDispatchDeliveredAsync(
+            dispatch.To, dispatch.Id, "primary", claimOwner));
 
-        var completions = await Task.WhenAll(
-            store.CompleteAgentDispatchAsync(
-                dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary"),
-            store.CompleteAgentDispatchAsync(
-                dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary"));
-        Assert.AreEqual(1, completions.Count(result => result));
+        const string responseJson = "{\"id\":\"response-1\"}";
+        var responseHash = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(responseJson))).ToLowerInvariant();
+        var stages = await Task.WhenAll(
+            store.StageAgentDispatchResponseAsync(
+                dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary",
+                "response-1", responseJson, responseHash),
+            store.StageAgentDispatchResponseAsync(
+                dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary",
+                "response-1", responseJson, responseHash));
+        Assert.IsTrue(stages.All(result => result.Accepted));
+        Assert.AreEqual(1, stages.Count(result => result.Created));
+        Assert.IsTrue(await store.CompleteAgentDispatchResponseAsync(
+            dispatch.To, dispatch.Id, "response-1"));
+        Assert.IsTrue(await store.CompleteAgentDispatchResponseAsync(
+            dispatch.To, dispatch.Id, "response-1"));
 
         var completed = await store.GetAgentDispatchAsync(dispatch.To, dispatch.Id);
         Assert.IsNotNull(completed);
@@ -144,6 +168,8 @@ public sealed class AgentDispatchTests
         Assert.AreEqual("", completed.EnvelopeJson);
         Assert.AreEqual(dispatch.EnvelopeHash, completed.EnvelopeHash);
         Assert.AreEqual(0, completed.RecipientDeviceIds.Count);
+        Assert.AreEqual("response-1", completed.ResponseId);
+        Assert.AreEqual(responseJson, completed.ResponseJson);
 
         var retry = await store.CreateAgentDispatchAsync(dispatch);
         Assert.AreEqual(AgentDispatchCreateStatus.Duplicate, retry.Status);
@@ -156,14 +182,22 @@ public sealed class AgentDispatchTests
         var dispatch = NewDispatch();
         await store.CreateAgentDispatchAsync(dispatch);
         await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary"]);
-        _ = await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary");
+        _ = await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary", "claim");
+        Assert.IsTrue(await store.MarkAgentDispatchDeliveredAsync(
+            dispatch.To, dispatch.Id, "primary", "claim"));
 
-        Assert.IsFalse(await store.CompleteAgentDispatchAsync(
-            dispatch.To, dispatch.Id, dispatch.From, "wrong-token", "primary"));
-        Assert.IsFalse(await store.CompleteAgentDispatchAsync(
-            dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "failover"));
-        Assert.IsTrue(await store.CompleteAgentDispatchAsync(
-            dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary"));
+        var wrongToken = await store.StageAgentDispatchResponseAsync(
+            dispatch.To, dispatch.Id, dispatch.From, "wrong-token", "primary",
+            "response-1", "response", "hash");
+        var wrongDevice = await store.StageAgentDispatchResponseAsync(
+            dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "failover",
+            "response-1", "response", "hash");
+        var accepted = await store.StageAgentDispatchResponseAsync(
+            dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary",
+            "response-1", "response", "hash");
+        Assert.IsFalse(wrongToken.Accepted);
+        Assert.IsFalse(wrongDevice.Accepted);
+        Assert.IsTrue(accepted.Accepted);
     }
 
     [TestMethod]
@@ -176,8 +210,10 @@ public sealed class AgentDispatchTests
 
         await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["failover"]);
 
-        Assert.AreEqual(0, (await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary")).Count);
-        Assert.AreEqual(1, (await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "failover")).Count);
+        Assert.AreEqual(0, (await store.TakeAssignedAgentDispatchesAsync(
+            dispatch.To, "primary", "primary-claim")).Count);
+        Assert.AreEqual(1, (await store.TakeAssignedAgentDispatchesAsync(
+            dispatch.To, "failover", "failover-claim")).Count);
     }
 
     [TestMethod]
@@ -187,9 +223,10 @@ public sealed class AgentDispatchTests
         var dispatch = NewDispatch();
         await store.CreateAgentDispatchAsync(dispatch);
         await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary"]);
-        _ = await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary");
+        _ = await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary", "claim");
 
-        Assert.IsTrue(await store.ReleaseAgentDispatchAsync(dispatch.To, dispatch.Id, "primary"));
+        Assert.IsTrue(await store.ReleaseAgentDispatchAsync(
+            dispatch.To, dispatch.Id, "primary", "claim"));
         var pending = await store.GetAgentDispatchAsync(dispatch.To, dispatch.Id);
         Assert.IsNotNull(pending);
         Assert.AreEqual(AgentDispatchStates.Pending, pending.State);
@@ -203,15 +240,15 @@ public sealed class AgentDispatchTests
         var dispatch = NewDispatch();
         await store.CreateAgentDispatchAsync(dispatch);
         await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary", "failover"]);
-        _ = await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary");
+        _ = await store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary", "claim");
 
         Assert.IsTrue(await store.ReleaseAgentDispatchAsync(
-            dispatch.To, dispatch.Id, "primary", "failover"));
+            dispatch.To, dispatch.Id, "primary", "claim", "failover"));
 
         var failoverTake = await store.TakeAssignedAgentDispatchesAsync(
-            dispatch.To, "failover");
+            dispatch.To, "failover", "failover-claim");
         Assert.AreEqual(1, failoverTake.Count);
-        Assert.AreEqual(AgentDispatchStates.Delivered, failoverTake[0].State);
+        Assert.AreEqual(AgentDispatchStates.Delivering, failoverTake[0].State);
         Assert.AreEqual("failover", failoverTake[0].AssignedDeviceId);
     }
 
@@ -227,9 +264,9 @@ public sealed class AgentDispatchTests
             dispatch.To, ["new-primary", "failover"]);
 
         Assert.AreEqual(0, (await store.TakeAssignedAgentDispatchesAsync(
-            dispatch.To, "new-primary")).Count);
+            dispatch.To, "new-primary", "primary-claim")).Count);
         Assert.AreEqual(1, (await store.TakeAssignedAgentDispatchesAsync(
-            dispatch.To, "failover")).Count);
+            dispatch.To, "failover", "failover-claim")).Count);
     }
 
     [TestMethod]
@@ -242,8 +279,12 @@ public sealed class AgentDispatchTests
         await store.CreateAgentDispatchAsync(second);
         await store.AssignPendingAgentDispatchesAsync(first.To, ["primary"]);
 
-        var firstTake = await store.TakeAssignedAgentDispatchesAsync(first.To, "primary");
-        var secondTake = await store.TakeAssignedAgentDispatchesAsync(first.To, "primary");
+        var firstTake = await store.TakeAssignedAgentDispatchesAsync(
+            first.To, "primary", "claim-1");
+        Assert.IsTrue(await store.MarkAgentDispatchDeliveredAsync(
+            first.To, firstTake.Single().Id, "primary", "claim-1"));
+        var secondTake = await store.TakeAssignedAgentDispatchesAsync(
+            first.To, "primary", "claim-2");
 
         Assert.AreEqual(1, firstTake.Count);
         Assert.AreEqual(1, secondTake.Count);
@@ -255,8 +296,21 @@ public sealed class AgentDispatchTests
     {
         var dispatch = await DispatchWithOutcomeAsync(BackplaneDeliveryOutcome.Uncertain);
 
-        Assert.AreEqual(AgentDispatchStates.Delivered, dispatch.State);
+        Assert.AreEqual(AgentDispatchStates.Delivering, dispatch.State);
+        Assert.IsFalse(string.IsNullOrWhiteSpace(dispatch.DeliveryLeaseOwner));
+        Assert.IsNotNull(dispatch.DeliveryLeaseUntil);
         Assert.IsFalse(string.IsNullOrWhiteSpace(dispatch.AssignedDeviceId));
+    }
+
+    [TestMethod]
+    public async Task ConfirmedCrossReplicaDeliveryTransitionsToDelivered()
+    {
+        var dispatch = await DispatchWithOutcomeAsync(BackplaneDeliveryOutcome.Delivered);
+
+        Assert.AreEqual(AgentDispatchStates.Delivered, dispatch.State);
+        Assert.IsNotNull(dispatch.DeliveredAt);
+        Assert.IsNull(dispatch.DeliveryLeaseOwner);
+        Assert.IsNull(dispatch.DeliveryLeaseUntil);
     }
 
     [TestMethod]
@@ -266,6 +320,95 @@ public sealed class AgentDispatchTests
 
         Assert.AreEqual(AgentDispatchStates.Pending, dispatch.State);
         Assert.IsNull(dispatch.AssignedDeviceId);
+    }
+
+    [TestMethod]
+    public async Task ExpiredDeliveryClaimIsReclaimedAfterCrashBeforeSend()
+    {
+        var clock = new DispatchTimeProvider(
+            new DateTimeOffset(2026, 7, 29, 20, 0, 0, TimeSpan.Zero));
+        var store = new InMemoryRelayStore(clock);
+        var dispatch = NewDispatch();
+        await store.CreateAgentDispatchAsync(dispatch);
+        await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary"]);
+
+        var abandoned = await store.TakeAssignedAgentDispatchesAsync(
+            dispatch.To, "primary", "crashed-relay");
+        Assert.HasCount(1, abandoned);
+        clock.Advance(RelayInboxPolicy.LeaseDuration + TimeSpan.FromTicks(1));
+
+        var reclaimed = await store.TakeAssignedAgentDispatchesAsync(
+            dispatch.To, "primary", "recovery-relay");
+        Assert.HasCount(1, reclaimed);
+        Assert.AreEqual("recovery-relay", reclaimed[0].DeliveryLeaseOwner);
+        Assert.IsTrue(await store.MarkAgentDispatchDeliveredAsync(
+            dispatch.To, dispatch.Id, "primary", "recovery-relay"));
+        Assert.AreEqual(
+            AgentDispatchStates.Delivered,
+            (await store.GetAgentDispatchAsync(dispatch.To, dispatch.Id))!.State);
+    }
+
+    [TestMethod]
+    public async Task ConcurrentDeliveryClaimHasSingleOwner()
+    {
+        var store = new InMemoryRelayStore();
+        var dispatch = NewDispatch();
+        await store.CreateAgentDispatchAsync(dispatch);
+        await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary"]);
+
+        var claims = await Task.WhenAll(
+            store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary", "relay-a"),
+            store.TakeAssignedAgentDispatchesAsync(dispatch.To, "primary", "relay-b"));
+
+        Assert.AreEqual(1, claims.Sum(claim => claim.Count));
+        var owner = claims.Single(claim => claim.Count == 1).Single().DeliveryLeaseOwner;
+        Assert.IsTrue(owner is "relay-a" or "relay-b");
+    }
+
+    [TestMethod]
+    public async Task StaleDeliveryClaimCannotMarkDeliveredOrRelease()
+    {
+        var clock = new DispatchTimeProvider(
+            new DateTimeOffset(2026, 7, 29, 20, 0, 0, TimeSpan.Zero));
+        var store = new InMemoryRelayStore(clock);
+        var dispatch = NewDispatch();
+        await store.CreateAgentDispatchAsync(dispatch);
+        await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary"]);
+        _ = await store.TakeAssignedAgentDispatchesAsync(
+            dispatch.To, "primary", "stale-relay");
+        clock.Advance(RelayInboxPolicy.LeaseDuration + TimeSpan.FromTicks(1));
+        _ = await store.TakeAssignedAgentDispatchesAsync(
+            dispatch.To, "primary", "current-relay");
+
+        Assert.IsFalse(await store.MarkAgentDispatchDeliveredAsync(
+            dispatch.To, dispatch.Id, "primary", "stale-relay"));
+        Assert.IsFalse(await store.ReleaseAgentDispatchAsync(
+            dispatch.To, dispatch.Id, "primary", "stale-relay"));
+        Assert.IsTrue(await store.MarkAgentDispatchDeliveredAsync(
+            dispatch.To, dispatch.Id, "primary", "current-relay"));
+    }
+
+    [TestMethod]
+    public async Task ResponseIsRejectedUntilDeliveryIsConfirmed()
+    {
+        var store = new InMemoryRelayStore();
+        var dispatch = NewDispatch();
+        await store.CreateAgentDispatchAsync(dispatch);
+        await store.AssignPendingAgentDispatchesAsync(dispatch.To, ["primary"]);
+        _ = await store.TakeAssignedAgentDispatchesAsync(
+            dispatch.To, "primary", "relay");
+
+        var beforeConfirmation = await store.StageAgentDispatchResponseAsync(
+            dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary",
+            "response-1", "response", "hash");
+        Assert.IsFalse(beforeConfirmation.Accepted);
+
+        Assert.IsTrue(await store.MarkAgentDispatchDeliveredAsync(
+            dispatch.To, dispatch.Id, "primary", "relay"));
+        var afterConfirmation = await store.StageAgentDispatchResponseAsync(
+            dispatch.To, dispatch.Id, dispatch.From, dispatch.DispatchToken, "primary",
+            "response-1", "response", "hash");
+        Assert.IsTrue(afterConfirmation.Accepted);
     }
 
     [TestMethod]
@@ -313,11 +456,66 @@ public sealed class AgentDispatchTests
 
         Assert.IsFalse(result.Accepted);
         Assert.AreEqual("agent_dispatch_encryption_required", result.Code);
-        Assert.IsFalse(await coordinator.CompleteResponseAsync(response, "primary"));
+        Assert.IsFalse((await coordinator.CompleteResponseAsync(response, "primary")).Accepted);
     }
 
     [TestMethod]
-    public void AtomicEnvelopeRoundTripsDispatchMetadataAndStableId()
+    public async Task ResponseAdmissionRejectionLeavesDispatchRecoverableForRetry()
+    {
+        InMemoryRelayStore? store = null;
+        var rejectFirstAdmission = true;
+        store = new InMemoryRelayStore(
+            timeProvider: null,
+            beforeQueueAdmission: null,
+            beforeInboxAdmission: async () =>
+            {
+                if (!rejectFirstAdmission) return;
+                rejectFirstAdmission = false;
+                Assert.IsTrue(await store!.DeleteHandleAsync("alice"));
+            });
+        await store.UpsertHandleAsync("owner", "owner-key", "Owner", allowNewDevice: true);
+        await store.UpsertHandleAsync("alice", "alice-key", "Alice", allowNewDevice: true);
+        var dispatch = NewDispatch();
+        dispatch.State = AgentDispatchStates.Delivered;
+        dispatch.AssignedDeviceId = "primary";
+        dispatch.DeliveredAt = DateTimeOffset.UtcNow;
+        await store.CreateAgentDispatchAsync(dispatch);
+        var coordinator = new AgentDispatchCoordinator(
+            store, null!, null!, NullLogger<AgentDispatchCoordinator>.Instance);
+        var response = MeshEnvelope.Create(
+            "owner",
+            "alice",
+            MeshKinds.AtomicAgentResponse,
+            EncryptedBody("primary"),
+            id: "response-1",
+            agentRequestId: dispatch.RequestId,
+            agentDispatchToken: dispatch.DispatchToken);
+
+        var rejected = await coordinator.CompleteResponseAsync(response, "primary");
+
+        Assert.IsFalse(rejected.Accepted);
+        Assert.AreEqual("response_admission_rejected", rejected.Error);
+        var pending = await store.GetAgentDispatchAsync(dispatch.To, dispatch.Id);
+        Assert.IsNotNull(pending);
+        Assert.AreEqual(AgentDispatchStates.ResponsePending, pending.State);
+        Assert.AreEqual("response-1", pending.ResponseId);
+
+        await store.UpsertHandleAsync("alice", "new-alice-key", "Alice", allowNewDevice: true);
+        Assert.AreEqual(1, await coordinator.ReplayResponseOutboxAsync());
+        var retried = await coordinator.CompleteResponseAsync(response, "primary");
+
+        Assert.IsTrue(retried.Accepted);
+        Assert.IsFalse(retried.Created);
+        var completed = await store.GetAgentDispatchAsync(dispatch.To, dispatch.Id);
+        Assert.IsNotNull(completed);
+        Assert.AreEqual(AgentDispatchStates.Completed, completed.State);
+        var queued = await store.LeaseInboxAsync("alice", "alice-connection");
+        Assert.HasCount(1, queued);
+        Assert.AreEqual("response-1", queued[0].EnvelopeId);
+    }
+
+    [TestMethod]
+    public void AtomicEnvelopeStableIdSupportsPersistedClientDeduplication()
     {
         var envelope = MeshEnvelope.Create(
             "alice",
@@ -333,6 +531,19 @@ public sealed class AgentDispatchTests
         Assert.AreEqual("question-1", envelope.AgentRequestId);
         Assert.AreEqual("token-1", envelope.AgentDispatchToken);
         Assert.AreEqual("primary", envelope.ToDevice);
+
+        var persistedChatLines = new List<ChatLine>();
+        var executionCount = 0;
+        foreach (var delivery in new[] { envelope, envelope with { } })
+        {
+            if (persistedChatLines.Any(line =>
+                    string.Equals(line.Id, delivery.Id, StringComparison.Ordinal)))
+                continue;
+            persistedChatLines.Add(new ChatLine { Id = delivery.Id });
+            executionCount++;
+        }
+        Assert.AreEqual(1, executionCount);
+        Assert.HasCount(1, persistedChatLines);
     }
 
     private static StoredHandle NewRoutingHandle()
@@ -431,4 +642,21 @@ public sealed class AgentDispatchTests
         State = AgentDispatchStates.Pending,
         QueuedAt = new DateTimeOffset(2026, 7, 25, 12, 0, 0, TimeSpan.Zero)
     };
+
+    private static string EncryptedBody(string deviceId)
+        => JsonSerializer.Serialize(new
+        {
+            alg = "ECIES-P256-AESGCM",
+            keys = new Dictionary<string, object>
+            {
+                [deviceId] = new { iv = "", wrap = "", tag = "" }
+            }
+        });
+
+    private sealed class DispatchTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        private DateTimeOffset current = utcNow;
+        public override DateTimeOffset GetUtcNow() => current;
+        public void Advance(TimeSpan duration) => current += duration;
+    }
 }

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Mesh.App.Services;
+using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
 using Mesh.Shared;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -55,15 +56,92 @@ public sealed class BackgroundSyncTests
     }
 
     [DataTestMethod]
-    [DataRow("{\"protocolVersion\":6,\"durableDelivery\":true,\"backgroundSync\":true}", true)]
-    [DataRow("{\"protocolVersion\":6,\"durableDelivery\":true,\"backgroundSync\":false}", false)]
-    [DataRow("{\"protocolVersion\":6,\"durableDelivery\":false,\"backgroundSync\":true}", false)]
-    [DataRow("{\"protocolVersion\":5,\"durableDelivery\":true}", false)]
+    [DataRow("{\"protocolVersion\":8,\"durableDelivery\":true,\"backgroundSync\":true}", true)]
+    [DataRow("{\"protocolVersion\":8,\"durableDelivery\":true,\"backgroundSync\":false}", false)]
+    [DataRow("{\"protocolVersion\":8,\"durableDelivery\":false,\"backgroundSync\":true}", false)]
+    [DataRow("{\"protocolVersion\":6,\"durableDelivery\":true,\"backgroundSync\":true}", false)]
     public void BackgroundSyncRequiresBothRelayCapabilities(string json, bool expected)
     {
         using var document = JsonDocument.Parse(json);
 
         Assert.AreEqual(expected, BackgroundSyncCapabilityPolicy.IsSupported(document.RootElement));
+    }
+
+    [TestMethod]
+    public async Task AuthenticatedHandshakeDrainsBeforeDirectoryFailureAndRetriesDiscovery()
+    {
+        var sequence = new List<string>();
+        var discoveryAttempts = 0;
+        var failures = 0;
+
+        await DeviceSyncHandshakeCoordinator.RunAsync(
+            drain: () =>
+            {
+                sequence.Add("drain");
+                return Task.FromResult(DeviceSyncQueueDrainResult.Completed(0));
+            },
+            discoverSnapshots: () =>
+            {
+                sequence.Add("directory");
+                discoveryAttempts++;
+                if (discoveryAttempts < 3)
+                    throw new HttpRequestException("directory unavailable");
+                return Task.CompletedTask;
+            },
+            shouldContinue: () => true,
+            reportFailure: _ => failures++,
+            retryDelay: _ => Task.CompletedTask);
+
+        CollectionAssert.AreEqual(
+            new[] { "drain", "directory", "directory", "directory" },
+            sequence);
+        Assert.AreEqual(2, failures);
+    }
+
+    [TestMethod]
+    public async Task DrainExceptionAbortsSnapshotDiscovery()
+    {
+        var discoveryCalls = 0;
+        var recoveryCalls = 0;
+
+        var result = await DeviceSyncHandshakeCoordinator.RunAsync(
+            drain: () => throw new HttpRequestException("drain unavailable"),
+            discoverSnapshots: () =>
+            {
+                discoveryCalls++;
+                return Task.CompletedTask;
+            },
+            shouldContinue: () => true,
+            reportFailure: _ => recoveryCalls++);
+
+        Assert.IsFalse(result.Succeeded);
+        Assert.AreEqual("queue_drain_exception", result.Error);
+        Assert.IsInstanceOfType<HttpRequestException>(result.Exception);
+        Assert.AreEqual(0, discoveryCalls);
+        Assert.AreEqual(1, recoveryCalls);
+    }
+
+    [TestMethod]
+    public async Task DrainRejectionAbortsSnapshotDiscovery()
+    {
+        var discoveryCalls = 0;
+        var recoveryCalls = 0;
+
+        var result = await DeviceSyncHandshakeCoordinator.RunAsync(
+            drain: () => Task.FromResult(
+                DeviceSyncQueueDrainResult.Failed("queue_ack_rejected")),
+            discoverSnapshots: () =>
+            {
+                discoveryCalls++;
+                return Task.CompletedTask;
+            },
+            shouldContinue: () => true,
+            reportFailure: _ => recoveryCalls++);
+
+        Assert.IsFalse(result.Succeeded);
+        Assert.AreEqual("queue_ack_rejected", result.Error);
+        Assert.AreEqual(0, discoveryCalls);
+        Assert.AreEqual(1, recoveryCalls);
     }
 
     [DataTestMethod]
@@ -143,6 +221,45 @@ public sealed class BackgroundSyncTests
     }
 
     [TestMethod]
+    public async Task BackgroundRouteIsSeparateFromForegroundOnlinePresence()
+    {
+        var backplane = new InMemoryBackplane();
+
+        await backplane.SetTransientDeviceRouteAsync("ifain", "phone");
+
+        Assert.IsNull(await backplane.GetInstanceForAsync("ifain"));
+        Assert.IsNull(await backplane.GetInstanceForDeviceAsync("ifain", "phone"));
+        Assert.AreEqual(
+            backplane.InstanceId,
+            await backplane.GetTransientInstanceForDeviceAsync("ifain", "phone"));
+        await backplane.SetDevicePresenceAsync("ifain", "phone");
+        await backplane.ClearTransientDeviceRouteAsync("ifain", "phone");
+        Assert.IsNull(await backplane.GetTransientInstanceForDeviceAsync("ifain", "phone"));
+        Assert.AreEqual(backplane.InstanceId, await backplane.GetInstanceForDeviceAsync("ifain", "phone"));
+    }
+
+    [TestMethod]
+    public void RegistryTracksBackgroundRoutesWithoutForegroundPresence()
+    {
+        var registry = new ConnectionRegistry();
+        registry.Add(
+            "background", "ifain", "nonce",
+            supportsDurableDelivery: true, isBackgroundSync: true);
+        registry.MarkAuthenticated("background", "phone-key");
+        var deviceId = DeviceProtocol.DeviceId("phone-key");
+
+        Assert.HasCount(0, registry.LocalHandles(includeBackgroundSync: false));
+        Assert.HasCount(0, registry.LocalDevices(includeBackgroundSync: false));
+        CollectionAssert.AreEqual(
+            new[] { ("ifain", deviceId) },
+            registry.LocalBackgroundDevices().ToArray());
+        Assert.IsTrue(registry.HasBackgroundConnectionForDevice("ifain", deviceId));
+
+        registry.Remove("background");
+        Assert.IsFalse(registry.HasBackgroundConnectionForDevice("ifain", deviceId));
+    }
+
+    [TestMethod]
     public void RevokedDeviceConnectionsAreRemovedFromEveryDeliveryIndex()
     {
         var registry = new ConnectionRegistry();
@@ -186,5 +303,29 @@ public sealed class BackgroundSyncTests
         Assert.IsTrue(InboundAcknowledgementPolicy.ShouldAcknowledge(InboundDisposition.PermanentReject));
         Assert.IsFalse(InboundAcknowledgementPolicy.ShouldAcknowledge(InboundDisposition.Retry));
         Assert.IsFalse(InboundAcknowledgementPolicy.ShouldAcknowledge(InboundDisposition.Defer));
+    }
+
+    [TestMethod]
+    public void QueueDrainRetryFailsWhileBackgroundDeferralSucceeds()
+    {
+        var retry = DeviceSyncQueueDrainPolicy.StopResult(InboundDisposition.Retry, 2);
+        var defer = DeviceSyncQueueDrainPolicy.StopResult(InboundDisposition.Defer, 2);
+
+        Assert.IsFalse(retry.Succeeded);
+        Assert.AreEqual("queue_processing_retry", retry.Error);
+        Assert.AreEqual(2, retry.ProcessedEnvelopes);
+        Assert.IsTrue(defer.Succeeded);
+        Assert.IsNull(defer.Error);
+        Assert.AreEqual(2, defer.ProcessedEnvelopes);
+    }
+
+    [TestMethod]
+    public void SnapshotCompletionUsesBoundedDeviceQueueTransport()
+    {
+        var method = DeviceSyncTransportPolicy.MethodFor(
+            DeviceSyncKinds.EnvelopeSnapshotComplete);
+
+        Assert.AreEqual(MeshHubProtocol.QueueEnqueue, method);
+        Assert.AreNotEqual(MeshHubProtocol.SendEnvelope, method);
     }
 }

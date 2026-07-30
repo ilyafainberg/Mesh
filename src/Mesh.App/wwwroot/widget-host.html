@@ -13,7 +13,8 @@
 
     addEventListener('message', function (event) {
         var data = event.data;
-        if (event.source !== parent || !data || data.type !== 'mesh-widget-render' ||
+        if (event.source !== parent || event.origin !== location.origin ||
+            !data || data.type !== 'mesh-widget-render' ||
             data.nonce !== nonce || typeof data.html !== 'string') return;
         try {
             document.open();
@@ -23,7 +24,7 @@
             parent.postMessage({
                 type: 'mesh-widget-error',
                 nonce: nonce,
-                message: error && error.message ? error.message : 'Widget host failed'
+                stage: 'document-write'
             }, '*');
         }
     });

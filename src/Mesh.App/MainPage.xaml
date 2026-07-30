@@ -8,6 +8,7 @@
 
     <BlazorWebView x:Name="blazorWebView" HostPage="wwwroot/index.html"
                    BackgroundColor="#F5F5F5"
+                   Loaded="BlazorWebView_Loaded"
                    UrlLoading="BlazorWebView_UrlLoading">
         <BlazorWebView.RootComponents>
             <RootComponent Selector="#app" ComponentType="{x:Type components:Routes}" />

@@ -3,6 +3,8 @@
 @inject SkillMarketplaceService Marketplace
 @implements IDisposable
 
+<MobileOverlayScope Active="@(openMarketId is not null)" />
+
 <div class="pane-scroll">
     <div class="pane-narrow">
     <SectionHeader Title="Skills"

@@ -144,8 +144,8 @@ curl http://localhost:8080/health
 # -> {"status":"ok",...}
 ```
 
-For single-device agent responses, confirm the nested `capabilities` object reports
-`"protocolVersion": 4` (or newer) and `"atomicAgentDispatch": true`.
+For current clients, confirm the nested `capabilities` object reports
+`"protocolVersion": 8`, `"durableDelivery": true`, and `"backgroundSync": true`.
 
 You can also open `http://localhost:8080/` for service status (including the
 instance id) and `http://localhost:8080/metrics` for aggregate counters.
@@ -472,11 +472,9 @@ load balancer. Three requirements:
    connected, and forwards directed messages to the replica that holds the
    recipient's connection. Because forwarding is directed rather than broadcast,
    load stays proportional to delivered messages rather than to replica count.
-3. **Atomic delivery is negotiated per replica.** Protocol-4 replicas advertise
-   acknowledged single-connection delivery internally. During a rolling upgrade,
-   atomic questions targeting a device connected to an older replica remain queued
-   instead of being forwarded through legacy fan-out behavior. Upgrade every replica
-   before expecting normal atomic-dispatch throughput across the cluster.
+3. **Atomic delivery requires protocol 8 on every replica.** Replicas use
+   acknowledged single-connection delivery internally. Mixed-version rolling
+   upgrades are unsupported; stop and upgrade every replica together.
 
 Atomic agent routing uses both services: Cosmos provides the shared compare-and-swap
 dispatch fence and Redis provides exact device presence plus acknowledged directed
@@ -549,9 +547,9 @@ The relay exposes plain HTTP endpoints for status and observability.
 - deliveries redelivered
 - queued envelopes cancelled
 
-Normal and fan-out hub sends return explicit accepted or rejected results. Ordinary envelopes are enqueued before live delivery. Protocol-5 authentication returns before Cosmos inbox leasing; the client requests a bounded batch after `Ready` and acknowledges each item after processing. Until then, the inbox item remains leased and can be redelivered after a disconnect or dropped acknowledgement. An accepted fan-out still has no atomic simultaneous physical-delivery guarantee.
+Normal and fan-out hub sends return explicit accepted or rejected results. Ordinary envelopes are enqueued before live delivery. Protocol-8 authentication fails closed on version mismatch, the relay confirms routable presence before any backlog work, and the client emits its ready signal immediately after `PresenceConfirmed`. Durable inbox work and per-device queue drains happen afterward and are acknowledged explicitly. Until then, the leased item can be redelivered after a disconnect or dropped acknowledgement. An accepted fan-out still has no atomic simultaneous physical-delivery guarantee.
 
-Protocol 7 adds priority-separated inbox leasing, resumable snapshot manifests/chunks, online-only ephemeral topic progress, explicit client processing outcomes, authoritative queued/running topic state, and signed exact-device revocation. Snapshot chunks are Bulk priority and cannot starve Control traffic. Revoking a device removes its registration, purges only its device-specific partition, and rejects later sends to the removed device ID; it does not touch sibling device inboxes.
+Protocol 8 adds per-device queues for device-sync traffic (enqueue/drain/ack), priority-separated inbox leasing, resumable snapshot manifests/chunks, online-only ephemeral topic progress, explicit client processing outcomes, authoritative queued/running topic state, and signed exact-device revocation. Device-sync envelope kinds are rejected through the old SendEnvelope path and must use the new QueueEnqueue hub method. Snapshot chunks are Bulk priority and cannot starve Control traffic. Revoking a device removes its registration, purges only its device-specific partition and per-device queue, and rejects later sends to the removed device ID; it does not touch sibling device inboxes.
 
 Atomic agent sends are different: `agent_dispatch_accepted` means the request reached
 its assigned device fence, while `agent_dispatch_queued` means the relay accepted
@@ -591,38 +589,23 @@ people you want to talk to onto that same relay.
 
 ---
 
-## 10. Version compatibility
+## 10. Protocol version
 
-The relay and client share a registration protocol, and it has a hard version
-floor:
+Protocol 8 is the only supported relay/client protocol. Handle registration, health
+capability checks, and SignalR connection setup all require version 8 exactly.
+Mismatches are rejected with the required and actual versions; there is no fallback
+or downgrade.
 
-- Since **v1.1.0**, the relay requires a signed proof-of-possession on handle
-  registration.
-- Run a client **v1.1.0+** against a relay **v1.1.0+**.
-- Older clients cannot register on a newer relay.
+Treat this as a coordinated breaking deployment:
 
-Keep relay and clients reasonably current, and upgrade them together when crossing
-the v1.1.0 boundary.
+1. Stop every relay replica.
+2. Discard old Cosmos ordinary-inbox and device-sync queue data.
+3. Deploy all protocol-8 relay replicas.
+4. Release protocol-8 clients.
 
-| Relay version | Client version | Result |
-| --- | --- | --- |
-| v1.1.0+ | v1.1.0+ | Works |
-| v1.1.0+ | older than v1.1.0 | Client cannot register (no proof-of-possession) |
-
-Transport features use capability negotiation rather than the registration version
-floor:
-
-| Relay capability | Client behavior | Result |
-| --- | --- | --- |
-| Protocol 7+, `ephemeralDelivery`, `snapshotTransferV2`, `deviceRevocation`, `processingOutcomes`, `authoritativeTopicState` | Protocol-7 client | Priority-separated durable traffic, resumable compressed snapshots, confirmed cancellation state, online-only transient progress, exact-device revocation, and restart-safe topic ordering |
-| Protocol 6+, `durableDelivery: true`, `backgroundSync: true` | Current iOS client with `deliveryAck=1&backgroundSync=1` | Bounded passive inbox drain without foreground presence or agent/topic execution |
-| Protocol 5+, `durableDelivery: true` | Current client with `deliveryAck=1` | Enqueue-before-deliver, lease/ack redelivery, strict device inboxes, and queued-envelope cancellation |
-| Protocol 4+, `atomicAgentDispatch: true` | Atomic-capable client | Primary/failover assignment, queueing (durable with Cosmos), relay-enforced at-most-one accepted response |
-| `backgroundSync` absent | Current iOS client | Skips silent background sessions and drains queued records in the foreground |
-| `atomicAgentDispatch` absent | Current client | Falls back to legacy agent kinds; no single-device guarantee |
-| Capability present | Legacy client | Legacy kinds continue to route; no single-device guarantee |
-
-Protocol version alone is not sufficient: clients require the individual capability flags for every Protocol 7 behavior, and background clients still require both durable-delivery flags. In a mixed relay cluster, protocol-4 coordinators queue atomic work rather than forward it to replicas that do not advertise single-connection atomic delivery.
+Do not perform a rolling mixed-version relay deployment. Existing handle and device
+registrations may be retained only if their device metadata is re-registered as
+protocol 8 before routing is enabled.
 
 ---
 
@@ -702,7 +685,7 @@ changes.
 - Ask the recipient to open **Settings > Agent responses** and confirm the selected primary, plus optional failover, is a compatible desktop. The device must be online and advertise a configured model.
 - With failover set to **None**, questions intentionally stay queued until the primary is ready.
 - A queued request can run only on a configured device whose key existed when the sender encrypted it. After linking or selecting a new desktop, the sender may need to verify the updated contact identity and send a new question, or the owner can choose an older decrypt-capable failover.
-- During a rolling relay upgrade, a device connected to an older replica is intentionally ineligible for atomic forwarding until it reconnects to a protocol-4 replica.
+- Do not perform a mixed-version rolling relay upgrade. Stop and upgrade all replicas together.
 - In a multi-replica deployment, configure both Cosmos and Redis. Without shared durable dispatch state and shared device presence, atomic routing is not production-safe across replicas.
 - Cosmos dispatch records use a 14-day TTL. A question that remains unserviceable past that retention window expires.
 

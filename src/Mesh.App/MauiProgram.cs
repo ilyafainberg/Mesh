@@ -45,6 +45,7 @@ public static class MauiProgram
 		var uiModeOptions = UiModeParser.ParseArgs(Environment.GetCommandLineArgs());
 		builder.Services.AddSingleton(uiModeOptions);
 		builder.Services.AddSingleton<IUiModeService, UiModeService>();
+		builder.Services.AddSingleton<MobileOverlayState>();
 
 		builder.Services.AddMauiBlazorWebView();
 

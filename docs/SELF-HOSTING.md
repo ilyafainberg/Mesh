@@ -21,21 +21,18 @@ inference. Mesh does not claim traffic-analysis resistance.
 
 Running a relay does NOT give you access to anyone's messages. It is transport.
 
-## Version compatibility
+## Protocol version
 
-Relay and client share a registration protocol. Since v1.1.0 the relay requires a
-signed proof-of-possession on handle registration (collision avoidance), so run a
-client of v1.1.0 or newer against a v1.1.0 or newer relay. Older clients cannot
-register on a v1.1.0 relay.
+Relay and client must both run protocol 8. Registration, health capability checks,
+and SignalR connection setup reject every other version. Required synchronization
+capabilities include `durableDelivery`, `backgroundSync`, and `deviceSync`; atomic
+single-device responses additionally require `atomicAgentDispatch`. Missing
+capabilities fail closed.
 
-Single-device agent responses require a relay whose health capabilities report
-`protocolVersion` 4 or newer and `atomicAgentDispatch: true`. New clients fall back
-to legacy agent routing when that capability is absent; legacy routing does not have
-the relay-enforced at-most-one-response guarantee.
-
-iOS passive background synchronization requires both `durableDelivery: true` and
-`backgroundSync: true`; the current relay advertises them as protocol version 6.
-When either flag is absent, the client keeps queued records for foreground delivery.
+Protocol 8 is a coordinated breaking change. Stop all replicas, discard old Cosmos
+ordinary-inbox and device-sync queue data, deploy the relay, and then release the
+matching clients. Do not mix relay versions or preserve old queued synchronization
+records.
 
 ## Quick start (Docker)
 
@@ -166,9 +163,8 @@ to enable Android. With none set, the relay behaves exactly as before (no push).
   per-handle policy overrides;
   Redis handles device presence, shared live rate buckets, and directed cross-replica
   message forwarding. Both services are required for durable atomic dispatch across replicas.
-  Protocol-4 replicas also negotiate acknowledged single-connection delivery through
-  Redis. During a rolling upgrade, atomic work for a device on an older replica stays
-  queued until it reconnects to an upgraded replica.
+  Protocol-8 replicas use acknowledged single-connection delivery through Redis.
+  Mixed-version rolling upgrades are unsupported; stop and upgrade all replicas together.
 
 ```bash
 docker compose --profile redis up   # relay + Redis locally
