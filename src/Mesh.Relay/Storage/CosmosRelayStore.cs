@@ -1587,7 +1587,7 @@ public sealed class CosmosRelayStore : IRelayStore
         string handle,
         string deviceId,
         string leaseOwner,
-        int maxEntries = 64,
+        int maxEntries = DeviceQueueProtocol.DeliveryWindow,
         CancellationToken ct = default)
     {
         if (maxEntries <= 0)
@@ -1613,7 +1613,7 @@ public sealed class CosmosRelayStore : IRelayStore
             requestOptions: new QueryRequestOptions
             {
                 PartitionKey = new PartitionKey(queueKey),
-                MaxItemCount = Math.Min(maxEntries, 64)
+                MaxItemCount = Math.Min(maxEntries, DeviceQueueProtocol.DeliveryWindow)
             });
         while (iterator.HasMoreResults && result.Count < maxEntries)
         {

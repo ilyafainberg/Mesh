@@ -671,7 +671,7 @@ public sealed class InMemoryRelayStore : IRelayStore
         string handle,
         string deviceId,
         string leaseOwner,
-        int maxEntries = 64,
+        int maxEntries = DeviceQueueProtocol.DeliveryWindow,
         CancellationToken ct = default)
     {
         if (maxEntries <= 0)
@@ -700,7 +700,7 @@ public sealed class InMemoryRelayStore : IRelayStore
                 var entries = queue
                     .Where(item => item.LeaseUntil is null || item.LeaseUntil <= now)
                     .OrderBy(item => item.EnqueuedAt)
-                    .Take(maxEntries)
+                    .Take(Math.Min(maxEntries, DeviceQueueProtocol.DeliveryWindow))
                     .ToArray();
                 foreach (var item in entries)
                 {

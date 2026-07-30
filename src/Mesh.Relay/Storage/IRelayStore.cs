@@ -446,7 +446,7 @@ public interface IRelayStore
         string handle,
         string deviceId,
         string leaseOwner,
-        int maxEntries = 64,
+        int maxEntries = DeviceQueueProtocol.DeliveryWindow,
         CancellationToken ct = default);
 
     Task<bool> AcknowledgeDeviceQueueAsync(
