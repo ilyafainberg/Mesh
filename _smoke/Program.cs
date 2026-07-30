@@ -222,7 +222,7 @@ async Task<(HubConnection conn, ConcurrentQueue<MeshEnvelope> inbox, Task ready)
     string handle,
     string priv,
     string pub,
-    bool deliveryAck = false)
+    bool deliveryAck = true)
 {
     var deliveryQuery = deliveryAck ? "&deliveryAck=1" : "";
     var conn = new HubConnectionBuilder()
@@ -242,7 +242,16 @@ async Task<(HubConnection conn, ConcurrentQueue<MeshEnvelope> inbox, Task ready)
         var sig = Sign(priv, nonce);
         await conn.InvokeAsync(MeshHubProtocol.Authenticate, pub, sig);
     });
-    conn.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, _ => readyTcs.TrySetResult());
+    conn.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, async _ =>
+    {
+        try
+        {
+            if (deliveryAck)
+                await conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
+            readyTcs.TrySetResult();
+        }
+        catch (Exception ex) { readyTcs.TrySetException(ex); }
+    });
     conn.On<string>(MeshHubProtocol.Receive, json =>
     {
         var e = JsonSerializer.Deserialize<MeshEnvelope>(json, web);
@@ -297,19 +306,6 @@ async Task<MeshEnvelope?> WaitForEnvelope(ConcurrentQueue<MeshEnvelope> inbox, s
     {
         foreach (var envelope in skipped) inbox.Enqueue(envelope);
     }
-}
-
-async Task<MeshEnvelope?> WaitForNextEnvelope(
-    ConcurrentQueue<MeshEnvelope> inbox,
-    int ms = 10000)
-{
-    var deadline = DateTimeOffset.UtcNow.AddMilliseconds(ms);
-    while (DateTimeOffset.UtcNow < deadline)
-    {
-        if (inbox.TryDequeue(out var envelope)) return envelope;
-        await Task.Delay(50);
-    }
-    return null;
 }
 
 bool SnapshotMatches(string? json, GroupSnapshotPayload expected)
@@ -609,283 +605,210 @@ var badFanoutCharlie = await WaitForEnvelope(charlie2.inbox, badFanoutRequest.Id
 Check(badFanoutBob is null && badFanoutCharlie is null,
     "invalid fanout signature produces no delivery");
 
-// 8. Protocol 7 reliability: durable replay, priority, partial snapshots, cancellation,
-// ephemeral progress, and exact-device revocation through a real relay.
-var (p7RecoveryPriv, p7RecoveryPub) = Gen();
-var (p7OwnerPriv, p7OwnerPub) = Gen();
-var (p7PeerPriv, p7PeerPub) = Gen();
-var p7Handle = "p7" + Guid.NewGuid().ToString("n")[..10];
-var p7Registration = await Register(
-    p7Handle, p7OwnerPub, p7OwnerPriv, "Protocol 7", p7RecoveryPub, protocolVersion: 7);
-var p7RecoverySignature = Sign(
-    p7RecoveryPriv, RecoveryProtocol.Message(p7Handle, p7PeerPub));
-var p7Recovery = await http.PostAsJsonAsync(
-    $"{relay}/handles/{p7Handle}/recover",
-    new RecoverHandleRequest(p7Handle, p7PeerPub, p7RecoverySignature));
-var p7Devices = await http.GetFromJsonAsync<DeviceInfo[]>($"{relay}/handles/{p7Handle}/devices");
-Check(p7Registration.IsSuccessStatusCode
-      && p7Recovery.IsSuccessStatusCode
-      && p7Devices?.Any(device =>
-          device.DeviceId == DeviceProtocol.DeviceId(p7OwnerPub)
-          && device.ProtocolVersion == 7) == true,
-    "protocol 7 registration metadata is advertised in the device directory");
 
-var p7OwnerId = DeviceProtocol.DeviceId(p7OwnerPub);
-var p7PeerId = DeviceProtocol.DeviceId(p7PeerPub);
-var p7Owner = await ConnectAsync(p7Handle, p7OwnerPriv, p7OwnerPub, deliveryAck: true);
-Check(await Within(p7Owner.ready, 10000), "protocol 7 owner authenticated");
+// 8. Protocol 8 reliability: QueueEnqueue/QueueDrain/QueueAck, DeviceQueueAvailable notification,
+// revocation mechanics, and legacy rejection path through a production relay.
 
-var duplicateId = "duplicate-" + Guid.NewGuid().ToString("n");
-var duplicateBody = "durable duplicate";
-var duplicateEnvelope = MeshEnvelope.Create(
-    p7Handle,
-    p7Handle,
-    DeviceSyncKinds.EnvelopeOperation,
-    duplicateBody,
-    Sign(p7OwnerPriv, duplicateBody),
-    fromDevice: p7OwnerId,
-    toDevice: p7PeerId,
-    id: duplicateId);
-var duplicateFirst = await p7Owner.conn.InvokeAsync<MeshSendResult>(
-    MeshHubProtocol.SendEnvelope, duplicateEnvelope);
-var duplicateSecond = await p7Owner.conn.InvokeAsync<MeshSendResult>(
-    MeshHubProtocol.SendEnvelope, duplicateEnvelope);
-Check(duplicateFirst.Accepted && duplicateSecond.Accepted,
-    "stable duplicate submissions are idempotently accepted");
+// --- Setup: register a handle with two devices (owner + peer via recovery key) ---
+var (p8RecoveryPriv, p8RecoveryPub) = Gen();
+var (p8OwnerPriv, p8OwnerPub) = Gen();
+var (p8PeerPriv, p8PeerPub) = Gen();
+var p8Handle = "p8" + Guid.NewGuid().ToString("n")[..10];
+var p8OwnerId = DeviceProtocol.DeviceId(p8OwnerPub);
+var p8PeerId  = DeviceProtocol.DeviceId(p8PeerPub);
 
-var p7Peer = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(p7Peer.ready, 10000), "protocol 7 peer reconnects for offline delivery");
-await p7Peer.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-var duplicateDelivery = await WaitForEnvelope(p7Peer.inbox, duplicateId);
-Check(duplicateDelivery is { RelayDeviceScoped: true, RelayDeliveryId: not null },
-    "offline device-scoped delivery carries a durable acknowledgement id");
-await p7Peer.conn.StopAsync();
-await p7Peer.conn.DisposeAsync();
+var p8Registration = await Register(
+    p8Handle, p8OwnerPub, p8OwnerPriv, "Protocol 8 Smoke Owner", p8RecoveryPub);
 
-var p7PeerRestarted = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(p7PeerRestarted.ready, 10000), "protocol 7 peer reconnects after restart");
-await p7PeerRestarted.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-var duplicateReplay = await WaitForEnvelope(p7PeerRestarted.inbox, duplicateId);
-Check(duplicateReplay?.Id == duplicateId,
-    "unacknowledged delivery replays after restart");
-var duplicateAcknowledged = duplicateReplay is not null
-    && await p7PeerRestarted.conn.InvokeAsync<bool>(
-        MeshHubProtocol.AcknowledgeDelivery,
-        duplicateReplay.RelayDeliveryId!,
-        duplicateReplay.RelayDeviceScoped);
-Check(duplicateAcknowledged, "replayed delivery is acknowledged");
-await p7PeerRestarted.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-Check(await WaitForEnvelope(p7PeerRestarted.inbox, duplicateId, 1000) is null,
-    "acknowledged duplicate is removed exactly once");
+var p8PeerRecovery = await http.PostAsJsonAsync(
+    $"{relay}/handles/{p8Handle}/recover",
+    new RecoverHandleRequest(p8Handle, p8PeerPub,
+        Sign(p8RecoveryPriv, RecoveryProtocol.Message(p8Handle, p8PeerPub))));
 
-await p7PeerRestarted.conn.StopAsync();
-await p7PeerRestarted.conn.DisposeAsync();
-var bulkBody = "bulk";
-var normalBody = "normal";
-var controlBody = "control";
-var bulkEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, DeviceSyncKinds.EnvelopeSnapshotChunk,
-    bulkBody, Sign(p7OwnerPriv, bulkBody), p7OwnerId, p7PeerId,
-    id: "bulk-" + Guid.NewGuid().ToString("n"));
-var normalEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, MeshKinds.Chat,
-    normalBody, Sign(p7OwnerPriv, normalBody), p7OwnerId, p7PeerId,
-    id: "normal-" + Guid.NewGuid().ToString("n"));
-var controlEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, DeviceSyncKinds.EnvelopeSnapshotRequest,
-    controlBody, Sign(p7OwnerPriv, controlBody), p7OwnerId, p7PeerId,
-    id: "control-" + Guid.NewGuid().ToString("n"));
-await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, bulkEnvelope);
-await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, normalEnvelope);
-await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, controlEnvelope);
-var p7PriorityPeer = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(p7PriorityPeer.ready, 10000), "protocol 7 peer reconnects for priority drain");
-await p7PriorityPeer.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-var priorityDeliveries = new List<MeshEnvelope>();
-for (var index = 0; index < 3; index++)
+var p8DeviceDir = await http.GetFromJsonAsync<DeviceInfo[]>($"{relay}/handles/{p8Handle}/devices");
+Check(p8Registration.IsSuccessStatusCode
+      && p8PeerRecovery.IsSuccessStatusCode
+      && p8DeviceDir?.Any(d => d.DeviceId == p8OwnerId && d.ProtocolVersion == MeshProtocol.Version) == true
+      && p8DeviceDir?.Any(d => d.DeviceId == p8PeerId) == true,
+    "protocol 8 handle: owner registered with version 8 in device directory; peer linked via recovery");
+
+// Connect both devices
+var p8Owner = await ConnectAsync(p8Handle, p8OwnerPriv, p8OwnerPub);
+Check(await Within(p8Owner.ready, 10000), "p8 owner connects and authenticates");
+
+var p8Peer = await ConnectAsync(p8Handle, p8PeerPriv, p8PeerPub);
+Check(await Within(p8Peer.ready, 10000), "p8 peer connects and authenticates");
+
+// --- 8a: QueueEnqueue idempotency ---
+var syncOpId = Guid.NewGuid().ToString("n");
+var r8a1 = await p8Owner.conn.InvokeAsync<QueueEnqueueResult>(
+    MeshHubProtocol.QueueEnqueue,
+    new QueueEnqueue(p8OwnerId, p8PeerId, syncOpId, "p8-payload"));
+Check(r8a1.Accepted && r8a1.Created,
+    "8a: first QueueEnqueue is accepted and Created=true");
+
+var r8a2 = await p8Owner.conn.InvokeAsync<QueueEnqueueResult>(
+    MeshHubProtocol.QueueEnqueue,
+    new QueueEnqueue(p8OwnerId, p8PeerId, syncOpId, "p8-payload"));
+Check(r8a2.Accepted && !r8a2.Created && r8a2.EntryId == r8a1.EntryId,
+    "8a: duplicate enqueue (same operationId) is idempotent: Accepted=true, Created=false, same EntryId");
+
+// --- 8b: DeviceQueueAvailable notification when target is online ---
+var queueAvailTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+p8Peer.conn.On(MeshHubProtocol.DeviceQueueAvailable, () => queueAvailTcs.TrySetResult());
+var notifyOpId = Guid.NewGuid().ToString("n");
+await p8Owner.conn.InvokeAsync<QueueEnqueueResult>(
+    MeshHubProtocol.QueueEnqueue,
+    new QueueEnqueue(p8OwnerId, p8PeerId, notifyOpId, "notify-payload"));
+Check(await Within(queueAvailTcs.Task, 5000),
+    "8b: online target receives DeviceQueueAvailable after enqueue");
+
+// --- 8c: Own-queue isolation ---
+var drain8c = await p8Peer.conn.InvokeAsync<QueueDrainResponse>(
+    MeshHubProtocol.QueueDrain, new QueueDrainRequest(p8OwnerId, 64));
+Check(drain8c.Entries.Count == 0,
+    "8c: own-queue isolation: QueueDrain for a different device ID returns empty");
+
+// --- 8d: Disconnect without ACK, then redeliver on reconnect ---
+var preDrain8d = await p8Peer.conn.InvokeAsync<QueueDrainResponse>(
+    MeshHubProtocol.QueueDrain, new QueueDrainRequest(p8PeerId, 64));
+Check(preDrain8d.Entries.Count >= 1 && preDrain8d.Entries.All(e => e.TargetDeviceId == p8PeerId),
+    "8d: peer drains its queue; all entries target the peer");
+
+// Disconnect without ACKing; the server releases leases on OnDisconnected.
+await p8Peer.conn.StopAsync();
+await Task.Delay(400); // allow server-side OnDisconnectedAsync to release leases
+
+// Reconnect; the same entries must be redeliverable.
+var p8PeerRestart = await ConnectAsync(p8Handle, p8PeerPriv, p8PeerPub);
+Check(await Within(p8PeerRestart.ready, 10000), "8d: peer reconnects after unacked disconnect");
+var reDrain8d = await p8PeerRestart.conn.InvokeAsync<QueueDrainResponse>(
+    MeshHubProtocol.QueueDrain, new QueueDrainRequest(p8PeerId, 64));
+Check(reDrain8d.Entries.Count >= 1,
+    "8d: entries are redelivered after disconnect without ACK");
+
+// --- 8e: ACK removes entry exactly once, then subsequent drain is empty ---
+foreach (var entry in reDrain8d.Entries)
 {
-    var delivery = await WaitForNextEnvelope(p7PriorityPeer.inbox);
-    if (delivery is null) break;
-    priorityDeliveries.Add(delivery);
-    await p7PriorityPeer.conn.InvokeAsync<bool>(
-        MeshHubProtocol.AcknowledgeDelivery,
-        delivery.RelayDeliveryId!,
-        delivery.RelayDeviceScoped);
+    var ackOk = await p8PeerRestart.conn.InvokeAsync<bool>(
+        MeshHubProtocol.QueueAck, new QueueAck(entry.EntryId, p8PeerId));
+    Check(ackOk, $"8e: ACK for entry {entry.EntryId[..8]} returns true");
 }
-Check(priorityDeliveries.Select(item => item.Id).SequenceEqual(
-        new[] { controlEnvelope.Id, normalEnvelope.Id, bulkEnvelope.Id }),
-    "control, normal, and bulk traffic drain in priority order");
+var postAck8e = await p8PeerRestart.conn.InvokeAsync<QueueDrainResponse>(
+    MeshHubProtocol.QueueDrain, new QueueDrainRequest(p8PeerId, 64));
+Check(postAck8e.Entries.Count == 0,
+    "8e: drain after full ACK returns empty; entries removed exactly once");
 
-await p7PriorityPeer.conn.StopAsync();
-await p7PriorityPeer.conn.DisposeAsync();
-var snapshotBytes = new byte[900_000];
-Random.Shared.NextBytes(snapshotBytes);
-var snapshotTransfer = DeviceSyncSnapshotProtocol.Create(
-    p7OwnerId,
-    [new DeviceSyncOperation(
-        "snapshot-operation",
-        p7OwnerId,
-        DeviceSyncKinds.TopicUpsert,
-        "topic-1",
-        "2026-08-01T12:00:00.0000000Z/protocol7/1",
-        Convert.ToBase64String(snapshotBytes))]);
-Check(snapshotTransfer.Chunks.Count > 1, "snapshot transfer is split into resumable chunks");
-var manifestBody = JsonSerializer.Serialize(snapshotTransfer.Manifest, web);
-var manifestEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, DeviceSyncKinds.EnvelopeSnapshotManifest,
-    manifestBody, Sign(p7OwnerPriv, manifestBody), p7OwnerId, p7PeerId,
-    id: "manifest-" + snapshotTransfer.Manifest.SnapshotId);
-var firstChunkBody = JsonSerializer.Serialize(snapshotTransfer.Chunks[0], web);
-var firstChunkEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, DeviceSyncKinds.EnvelopeSnapshotChunk,
-    firstChunkBody, Sign(p7OwnerPriv, firstChunkBody), p7OwnerId, p7PeerId,
-    id: $"chunk-{snapshotTransfer.Manifest.SnapshotId}-0");
-await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, manifestEnvelope);
-await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, firstChunkEnvelope);
-var partialPeer = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(partialPeer.ready, 10000), "peer reconnects for partial snapshot transfer");
-await partialPeer.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-foreach (var envelopeId in new[] { manifestEnvelope.Id, firstChunkEnvelope.Id })
+// --- 8f: Third-device add/revoke preserves peer's queued work ---
+var (p8ThirdPriv, p8ThirdPub) = Gen();
+var p8ThirdId = DeviceProtocol.DeviceId(p8ThirdPub);
+
+var p8ThirdRecovery = await http.PostAsJsonAsync(
+    $"{relay}/handles/{p8Handle}/recover",
+    new RecoverHandleRequest(p8Handle, p8ThirdPub,
+        Sign(p8RecoveryPriv, RecoveryProtocol.Message(p8Handle, p8ThirdPub))));
+Check(p8ThirdRecovery.IsSuccessStatusCode, "8f: third device added via recovery");
+
+// Enqueue new work for peer before revoking third device.
+var preserveOpId = Guid.NewGuid().ToString("n");
+var preserveEntryId = DeviceQueueEntryIdProtocol.Create(p8OwnerId, p8PeerId, preserveOpId);
+await p8Owner.conn.InvokeAsync<QueueEnqueueResult>(
+    MeshHubProtocol.QueueEnqueue,
+    new QueueEnqueue(p8OwnerId, p8PeerId, preserveOpId, "preserve-payload"));
+
+// Revoke third device using owner's key.
+var revokeThirdSig = Sign(p8OwnerPriv, DeviceRevocationProtocol.Message(p8Handle, p8ThirdId));
+var revokeThirdResp = await http.SendAsync(new HttpRequestMessage(HttpMethod.Delete,
+    $"{relay}/handles/{p8Handle}/devices/{p8ThirdId}")
 {
-    var delivery = await WaitForEnvelope(partialPeer.inbox, envelopeId);
-    Check(delivery is not null, $"partial snapshot delivery {envelopeId} arrived");
-    if (delivery is not null)
-        await partialPeer.conn.InvokeAsync<bool>(
-            MeshHubProtocol.AcknowledgeDelivery,
-            delivery.RelayDeliveryId!,
-            delivery.RelayDeviceScoped);
-}
-await partialPeer.conn.StopAsync();
-await partialPeer.conn.DisposeAsync();
-foreach (var chunk in snapshotTransfer.Chunks.Skip(1))
+    Content = JsonContent.Create(new RevokeDeviceRequest(p8OwnerPub, p8ThirdId, revokeThirdSig))
+});
+Check(revokeThirdResp.IsSuccessStatusCode, "8f: third device revocation HTTP 200");
+
+// Peer's queued work must still be drainable.
+var survive8f = await p8PeerRestart.conn.InvokeAsync<QueueDrainResponse>(
+    MeshHubProtocol.QueueDrain, new QueueDrainRequest(p8PeerId, 64));
+Check(survive8f.Entries.Any(e => e.EntryId == preserveEntryId),
+    "8f: revoking an unrelated device preserves the peer's queued work");
+// ACK so queue is clean before next section.
+foreach (var e in survive8f.Entries)
+    await p8PeerRestart.conn.InvokeAsync<bool>(MeshHubProtocol.QueueAck, new QueueAck(e.EntryId, p8PeerId));
+
+// --- 8g: Revoke target device ---
+// Enqueue one item for the peer so there is something to purge on revocation.
+var purgeOpId = Guid.NewGuid().ToString("n");
+await p8Owner.conn.InvokeAsync<QueueEnqueueResult>(
+    MeshHubProtocol.QueueEnqueue,
+    new QueueEnqueue(p8OwnerId, p8PeerId, purgeOpId, "will-be-purged"));
+
+var revokePeerSig = Sign(p8OwnerPriv, DeviceRevocationProtocol.Message(p8Handle, p8PeerId));
+var revokePeerResp = await http.SendAsync(new HttpRequestMessage(HttpMethod.Delete,
+    $"{relay}/handles/{p8Handle}/devices/{p8PeerId}")
 {
-    var body = JsonSerializer.Serialize(chunk, web);
-    var envelope = MeshEnvelope.Create(
-        p7Handle, p7Handle, DeviceSyncKinds.EnvelopeSnapshotChunk,
-        body, Sign(p7OwnerPriv, body), p7OwnerId, p7PeerId,
-        id: $"chunk-{snapshotTransfer.Manifest.SnapshotId}-{chunk.Index}");
-    await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, envelope);
-}
-var resumedPeer = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(resumedPeer.ready, 10000), "peer reconnects to resume snapshot chunks");
-await resumedPeer.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-var resumedChunks = 0;
-for (var index = 1; index < snapshotTransfer.Chunks.Count; index++)
+    Content = JsonContent.Create(new RevokeDeviceRequest(p8OwnerPub, p8PeerId, revokePeerSig))
+});
+var revokePeerBody = revokePeerResp.IsSuccessStatusCode
+    ? await revokePeerResp.Content.ReadFromJsonAsync<RevokeDeviceResponse>()
+    : null;
+Check(revokePeerResp.IsSuccessStatusCode && revokePeerBody?.Revoked == true,
+    "8g: revoke peer HTTP 200, Revoked=true");
+
+// Future enqueue to revoked target must be rejected.
+var postRevokeEnqueue = await p8Owner.conn.InvokeAsync<QueueEnqueueResult>(
+    MeshHubProtocol.QueueEnqueue,
+    new QueueEnqueue(p8OwnerId, p8PeerId, Guid.NewGuid().ToString("n"), "post-revoke"));
+Check(!postRevokeEnqueue.Accepted && postRevokeEnqueue.Error == "sync_target_unknown",
+    "8g: enqueue to revoked device returns sync_target_unknown");
+
+// QueueDrain on revoked device's existing socket must return empty.
+var revokedDrain = await p8PeerRestart.conn.InvokeAsync<QueueDrainResponse>(
+    MeshHubProtocol.QueueDrain, new QueueDrainRequest(p8PeerId, 64));
+Check(revokedDrain.Entries.Count == 0,
+    "8g: revoked device's existing socket gets empty drain");
+
+// Revoked device cannot authenticate on a new connection.
+var revokedReconnect = await ConnectAsync(p8Handle, p8PeerPriv, p8PeerPub);
+Check(!await Within(revokedReconnect.ready, 2000),
+    "8g: revoked device cannot re-authenticate after reconnect");
+
+// --- 8h: SendEnvelope with DeviceSyncKinds returns device_sync_use_queue ---
+var syncKindBody = "sync-kind-test";
+var syncKindEnv = MeshEnvelope.Create(
+    p8Handle, p8Handle, DeviceSyncKinds.EnvelopeOperation,
+    syncKindBody, Sign(p8OwnerPriv, syncKindBody));
+var syncKindResult = await p8Owner.conn.InvokeAsync<MeshSendResult>(
+    MeshHubProtocol.SendEnvelope, syncKindEnv);
+Check(!syncKindResult.Accepted && syncKindResult.Code == "device_sync_use_queue",
+    "8h: SendEnvelope with DeviceSyncKinds kind is rejected with device_sync_use_queue");
+
+// --- 8i: Protocol 7 handshake returns VersionMismatch rejection ---
+var (p7mmPriv, p7mmPub) = Gen();
+var p7mmHandle = "p7mm" + Guid.NewGuid().ToString("n")[..8];
+await Register(p7mmHandle, p7mmPub, p7mmPriv, "Protocol 7 Mismatch Test");
+var mismatchReadyTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var mmConn = new HubConnectionBuilder()
+    .WithUrl($"{relay}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(p7mmHandle)}&deliveryAck=0&protocolVersion=7")
+    .Build();
+connections.Add(mmConn);
+mmConn.On<HandshakeResponse>(MeshHubProtocol.Handshake, response =>
 {
-    var delivery = await WaitForEnvelope(
-        resumedPeer.inbox,
-        $"chunk-{snapshotTransfer.Manifest.SnapshotId}-{index}");
-    if (delivery is null) continue;
-    resumedChunks++;
-    await resumedPeer.conn.InvokeAsync<bool>(
-        MeshHubProtocol.AcknowledgeDelivery,
-        delivery.RelayDeliveryId!,
-        delivery.RelayDeviceScoped);
-}
-Check(resumedChunks == snapshotTransfer.Chunks.Count - 1,
-    "remaining snapshot chunks resume after a receiver restart");
-
-await resumedPeer.conn.StopAsync();
-await resumedPeer.conn.DisposeAsync();
-var cancelRunId = "cancel-" + Guid.NewGuid().ToString("n");
-var cancelRequestBody = TopicRunProtocol.RequestBody(new TopicRunRequestPayload(
-    cancelRunId,
-    "thread-1",
-    "line-1",
-    p7Handle,
-    "cancel before delivery",
-    DateTimeOffset.UtcNow,
-    p7PeerId,
-    TopicTurnMode.Single));
-var cancelRequestEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, MeshKinds.TopicRunRequest,
-    cancelRequestBody, Sign(p7OwnerPriv, cancelRequestBody), p7OwnerId, p7PeerId,
-    id: cancelRunId);
-await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, cancelRequestEnvelope);
-var relayCancelled = await p7Owner.conn.InvokeAsync<bool>(
-    MeshHubProtocol.CancelQueuedEnvelope,
-    new CancelQueuedEnvelopeRequest(cancelRunId, p7PeerId));
-Check(relayCancelled, "queued topic request cancellation is confirmed by the relay");
-var cancellationPeer = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(cancellationPeer.ready, 10000), "peer reconnects after queued cancellation");
-await cancellationPeer.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-Check(await WaitForEnvelope(cancellationPeer.inbox, cancelRunId, 1000) is null,
-    "confirmed queued cancellation prevents later request delivery");
-
-await cancellationPeer.conn.StopAsync();
-await cancellationPeer.conn.DisposeAsync();
-var ephemeralBody = TopicRunProtocol.UpdateBody(new TopicRunUpdatePayload(
-    "ephemeral-run",
-    "thread-1",
-    TopicRunPhase.Executing,
-    Status: "Running",
-    Timestamp: DateTimeOffset.UtcNow));
-var ephemeralEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, MeshKinds.TopicRunUpdate,
-    ephemeralBody, Sign(p7OwnerPriv, ephemeralBody), p7OwnerId, p7PeerId,
-    id: "ephemeral-" + Guid.NewGuid().ToString("n"));
-var ephemeralResult = await p7Owner.conn.InvokeAsync<MeshSendResult>(
-    MeshHubProtocol.SendEphemeralEnvelope, ephemeralEnvelope);
-Check(!ephemeralResult.Accepted && ephemeralResult.Code == "ephemeral_not_delivered",
-    "offline ephemeral progress is rejected instead of queued");
-var afterEphemeralPeer = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(afterEphemeralPeer.ready, 10000), "peer reconnects after ephemeral progress");
-await afterEphemeralPeer.conn.InvokeAsync<int>(MeshHubProtocol.RequestPendingDeliveries);
-Check(await WaitForEnvelope(afterEphemeralPeer.inbox, ephemeralEnvelope.Id, 1000) is null,
-    "ephemeral progress never enters a durable inbox");
-
-await afterEphemeralPeer.conn.StopAsync();
-await afterEphemeralPeer.conn.DisposeAsync();
-var revokedBody = "revoked device backlog";
-var revokedEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, MeshKinds.Chat,
-    revokedBody, Sign(p7OwnerPriv, revokedBody), p7OwnerId, p7PeerId,
-    id: "revoked-" + Guid.NewGuid().ToString("n"));
-await p7Owner.conn.InvokeAsync<MeshSendResult>(MeshHubProtocol.SendEnvelope, revokedEnvelope);
-var connectedRevokedPeer = await ConnectAsync(p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(await Within(connectedRevokedPeer.ready, 10000),
-    "target device is connected while its queued inbox is revoked");
-using var revokeRequest = new HttpRequestMessage(
-    HttpMethod.Delete,
-    $"{relay}/handles/{p7Handle}/devices/{p7PeerId}")
+    if (response.Result == HandshakeResult.VersionMismatch)
+        mismatchReadyTcs.TrySetResult();
+    else
+        mismatchReadyTcs.TrySetException(new InvalidOperationException(
+            $"expected VersionMismatch, got {response.Result}"));
+});
+await mmConn.StartAsync();
+Check(await Within(mismatchReadyTcs.Task, 5000),
+    "8i: connecting with protocol version 7 is rejected with VersionMismatch");
+// Clean up the mismatch handle immediately.
+await http.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"{relay}/handles/{p7mmHandle}")
 {
-    Content = JsonContent.Create(new RevokeDeviceRequest(
-        p7OwnerPub,
-        p7PeerId,
-        Sign(p7OwnerPriv, DeviceRevocationProtocol.Message(p7Handle, p7PeerId))))
-};
-using var revokeResponse = await http.SendAsync(revokeRequest);
-var revokeResult = await revokeResponse.Content.ReadFromJsonAsync<RevokeDeviceResponse>(web);
-Check(revokeResponse.IsSuccessStatusCode
-      && revokeResult is { Revoked: true, PurgedEnvelopes: 1 },
-    "device revocation purges the exact device inbox");
-var revokedDrain = await connectedRevokedPeer.conn.InvokeAsync<int>(
-    MeshHubProtocol.RequestPendingDeliveries);
-Check(revokedDrain == 0
-      && await WaitForEnvelope(connectedRevokedPeer.inbox, revokedEnvelope.Id, 1000) is null,
-    "connected revoked device cannot drain its former inbox");
-var postRevocationBody = "do not recreate revoked inbox";
-var postRevocationEnvelope = MeshEnvelope.Create(
-    p7Handle, p7Handle, MeshKinds.Chat,
-    postRevocationBody, Sign(p7OwnerPriv, postRevocationBody), p7OwnerId, p7PeerId);
-var postRevocationResult = await p7Owner.conn.InvokeAsync<MeshSendResult>(
-    MeshHubProtocol.SendEnvelope, postRevocationEnvelope);
-Check(!postRevocationResult.Accepted
-      && postRevocationResult.Code == "target_device_unknown",
-    "revoked device targets are rejected instead of recreating a ghost inbox");
-var revokedAttemptBody = "send after revocation";
-var revokedAttempt = MeshEnvelope.Create(
-    p7Handle, p7Handle, MeshKinds.Chat,
-    revokedAttemptBody, Sign(p7PeerPriv, revokedAttemptBody), p7PeerId, p7OwnerId);
-var revokedAttemptResult = await connectedRevokedPeer.conn.InvokeAsync<MeshSendResult>(
-    MeshHubProtocol.SendEnvelope, revokedAttempt);
-Check(!revokedAttemptResult.Accepted,
-    "connected revoked device cannot send on its existing socket");
-var reconnectedRevokedPeer = await ConnectAsync(
-    p7Handle, p7PeerPriv, p7PeerPub, deliveryAck: true);
-Check(!await Within(reconnectedRevokedPeer.ready, 1500),
-    "revoked device cannot authenticate after reconnect");
+    Content = JsonContent.Create(new DeleteHandleRequest(
+        p7mmHandle, p7mmPub, Sign(p7mmPriv, DeleteProtocol.Message(p7mmHandle))))
+});
 
+// ---- Connection teardown -------------------------------------------------
 foreach (var connection in connections)
 {
     try
@@ -900,6 +823,28 @@ foreach (var connection in connections)
         Console.WriteLine("FAIL clean up hub connection");
     }
 }
+
+// ---- Handle cleanup (best-effort; cleanup failures are reported) ----------
+async Task CleanupHandle(string handle, string pub, string priv)
+{
+    var resp = await http.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"{relay}/handles/{handle}")
+    {
+        Content = JsonContent.Create(new DeleteHandleRequest(
+            handle, pub, Sign(priv, DeleteProtocol.Message(handle))))
+    });
+    if (!resp.IsSuccessStatusCode && resp.StatusCode != System.Net.HttpStatusCode.NotFound)
+    {
+        failures++;
+        Console.WriteLine($"FAIL cleanup handle {handle}: HTTP {(int)resp.StatusCode}");
+    }
+}
+
+await CleanupHandle(aliceHandle, aPub, aPriv);
+await CleanupHandle(bobHandle, bPub, bPriv);
+await CleanupHandle(charlieHandle, cPub, cPriv);
+await CleanupHandle(recHandle, d2Pub, d2Priv);
+await CleanupHandle(uHandle, newPub, newPriv);
+await CleanupHandle(p8Handle, p8OwnerPub, p8OwnerPriv);
 
 Console.WriteLine();
 Console.WriteLine(failures == 0 ? "ALL SMOKE TESTS PASSED" : $"{failures} SMOKE TEST(S) FAILED");
