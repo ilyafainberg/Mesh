@@ -67,6 +67,7 @@ internal static class DeviceSyncHandshakeCoordinator
         {
             drainResult = await drain().ConfigureAwait(false);
         }
+
         catch (Exception ex)
         {
             reportFailure(ex);
@@ -102,6 +103,15 @@ internal static class DeviceSyncHandshakeCoordinator
             }
         }
         return DeviceSyncHandshakeResult.Completed();
+    }
+}
+
+internal static class DeviceSyncSnapshotResponsePolicy
+{
+    public static Task Start(Func<Task> response)
+    {
+        ArgumentNullException.ThrowIfNull(response);
+        return Task.Run(response, CancellationToken.None);
     }
 }
 

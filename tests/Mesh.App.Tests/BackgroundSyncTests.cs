@@ -10,6 +10,26 @@ namespace Mesh.App.Tests;
 [TestClass]
 public sealed class BackgroundSyncTests
 {
+    [TestMethod]
+    public async Task SnapshotResponsePolicyStartsTrackedWorkAfterAcknowledgement()
+    {
+        var started = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var response = DeviceSyncSnapshotResponsePolicy.Start(async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsFalse(response.IsCompleted);
+        release.TrySetResult();
+        await response.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
     private sealed class FakeTransport(
         Func<CancellationToken, Task<BackgroundSyncResult>> run) : IBackgroundSyncTransport
     {
