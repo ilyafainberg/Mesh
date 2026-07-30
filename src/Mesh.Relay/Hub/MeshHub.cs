@@ -194,7 +194,7 @@ public sealed class MeshHub(
             connection.Handle,
             connection.DeviceId,
             Context.ConnectionId,
-            Math.Clamp(request.MaxEntries, 1, 128),
+            Math.Clamp(request.MaxEntries, 1, DeviceQueueProtocol.DeliveryWindow),
             Context.ConnectionAborted);
     }
 

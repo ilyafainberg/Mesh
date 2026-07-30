@@ -27,12 +27,12 @@ parameters:
 - name: version
   displayName: App version
   type: string
-  default: '1.16.0'
+  default: '1.16.1'
 
 - name: buildNumber
   displayName: Apple build number (0 uses the unique Azure Pipeline build ID)
   type: number
-  default: 61
+  default: 62
 
 - name: pushTestFlight
   displayName: Validate and upload to TestFlight

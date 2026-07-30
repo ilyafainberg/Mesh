@@ -21,7 +21,8 @@ public sealed partial class MeshClient
         InboundProcessingMode mode,
         DeviceSyncIdentity? identity,
         bool sessionSupportsDeviceSync,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action<Func<Task>>? registerPostAcknowledgement = null)
     {
         if (mode == InboundProcessingMode.Background
             && BackgroundInboundPolicy.RequiresForeground(envelope.Kind))
@@ -29,7 +30,13 @@ public sealed partial class MeshClient
 
         try
         {
-            await HandleInboundAsync(envelope, mode, identity, sessionSupportsDeviceSync, ct);
+            await HandleInboundAsync(
+                envelope,
+                mode,
+                identity,
+                sessionSupportsDeviceSync,
+                ct,
+                registerPostAcknowledgement);
             return InboundDisposition.Processed;
         }
         catch (InboundRetryException ex)

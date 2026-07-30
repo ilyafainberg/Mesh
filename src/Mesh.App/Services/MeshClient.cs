@@ -40,6 +40,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> keyCacheUpdated = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim deviceSyncSendGate = new(1, 1);
+    private readonly SemaphoreSlim deviceSyncSnapshotSendGate = new(1, 1);
     private readonly SemaphoreSlim deviceSyncDrainGate = new(1, 1);
     private readonly DeviceSyncActivityTracker deviceSyncActivity = new(DeviceSyncActivityQuietPeriod);
     private HubConnection? hub;
@@ -691,7 +692,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         InboundProcessingMode mode,
         DeviceSyncIdentity? sessionIdentity,
         bool sessionSupportsDeviceSync,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action<Func<Task>>? registerPostAcknowledgement = null)
     {
         var from = AppState.Norm(env.From);
         if (env.Kind is MeshKinds.RemoteAgentRequest or MeshKinds.RemoteAgentResponse)
@@ -799,7 +801,13 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         if (isDeviceSync)
         {
             await HandleInboundDeviceSyncAsync(
-                env, from, mode, inboundOwnDeviceIdentity, sessionSupportsDeviceSync, ct);
+                env,
+                from,
+                mode,
+                inboundOwnDeviceIdentity,
+                sessionSupportsDeviceSync,
+                ct,
+                registerPostAcknowledgement);
             return;
         }
 
@@ -2180,12 +2188,14 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     continue;
                 }
 
+                Func<Task>? postAcknowledgement = null;
                 var disposition = await ProcessInboundAsync(
                     envelope,
                     mode,
                     identity,
                     true,
-                    ct);
+                    ct,
+                    action => postAcknowledgement = action);
                 if (InboundAcknowledgementPolicy.ShouldAcknowledge(disposition))
                 {
                     var acknowledged = await identity.Connection.InvokeAsync<bool>(
@@ -2195,6 +2205,12 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     if (!acknowledged)
                         return DeviceSyncQueueDrainResult.Failed("queue_ack_rejected", processed);
                     processed++;
+                    if (postAcknowledgement is not null)
+                    {
+                        TrackBackground(
+                            DeviceSyncSnapshotResponsePolicy.Start(postAcknowledgement),
+                            "device sync snapshot response");
+                    }
                     continue;
                 }
 
@@ -2227,7 +2243,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         InboundProcessingMode mode,
         DeviceSyncIdentity? sessionIdentity,
         bool sessionSupportsDeviceSync,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action<Func<Task>>? registerPostAcknowledgement)
     {
         var processingIdentity = sessionIdentity ?? authenticatedDeviceSyncIdentity;
         var currentHandle = processingIdentity?.NormalizedHandle
@@ -2274,7 +2291,21 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     var identity = sessionIdentity ?? authenticatedDeviceSyncIdentity;
                     if (identity is null)
                         throw new InboundRetryException("snapshot_response_identity_unavailable");
-                    await RespondToDeviceSyncSnapshotRequestAsync(identity, request, ct);
+                    if (registerPostAcknowledgement is null)
+                    {
+                        await RespondToDeviceSyncSnapshotRequestWithRetryAsync(
+                            identity,
+                            request,
+                            ct);
+                    }
+                    else
+                    {
+                        registerPostAcknowledgement(() =>
+                            RespondToDeviceSyncSnapshotRequestWithRetryAsync(
+                                identity,
+                                request,
+                                CancellationToken.None));
+                    }
                     return;
                 }
                 case DeviceSyncKinds.EnvelopeSnapshotManifest:
@@ -2410,7 +2441,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         DeviceSyncSnapshotRequest request,
         CancellationToken ct)
     {
-        await deviceSyncSendGate.WaitAsync(ct);
+        await deviceSyncSnapshotSendGate.WaitAsync(ct);
         try
         {
             if (!IsCurrentDeviceSyncIdentity(identity)
@@ -2435,8 +2466,38 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         }
         finally
         {
-            deviceSyncSendGate.Release();
+            deviceSyncSnapshotSendGate.Release();
         }
+    }
+
+    private async Task RespondToDeviceSyncSnapshotRequestWithRetryAsync(
+        DeviceSyncIdentity identity,
+        DeviceSyncSnapshotRequest request,
+        CancellationToken ct)
+    {
+        Exception? failure = null;
+        for (var attempt = 0; attempt < 3 && IsCurrentDeviceSyncIdentity(identity); attempt++)
+        {
+            try
+            {
+                await RespondToDeviceSyncSnapshotRequestAsync(identity, request, ct);
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+                if (attempt < 2 && IsCurrentDeviceSyncIdentity(identity))
+                    await Task.Delay(TimeSpan.FromSeconds(1 << attempt), ct);
+            }
+        }
+
+        throw new InvalidOperationException(
+            "Snapshot response retries were exhausted. The requester will resume discovery.",
+            failure);
     }
 
     private static void ValidateDeviceSyncSnapshotRequest(

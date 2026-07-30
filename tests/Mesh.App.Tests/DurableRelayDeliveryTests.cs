@@ -26,6 +26,36 @@ public sealed class DurableRelayDeliveryTests
         Assert.IsTrue(
             RelayInboxPolicy.DeliveryWindow <= 4,
             "The initial Cosmos lease batch must stay below transport timeout budgets.");
+        Assert.IsTrue(
+            DeviceQueueProtocol.DeliveryWindow <= 4,
+            "Device sync must use the same bounded Cosmos lease window.");
+    }
+
+    [TestMethod]
+    public async Task DeviceQueue_DrainWindowIsBoundedForLargeBacklogs()
+    {
+        var store = CreateQueueStore();
+        const string handle = "owner";
+        const string sourceDeviceId = "device-a";
+        const string targetDeviceId = "device-b";
+        for (var index = 0; index < DeviceQueueProtocol.DeliveryWindow + 3; index++)
+        {
+            Assert.IsTrue((await store.EnqueueDeviceQueueAsync(
+                handle,
+                new QueueEnqueue(
+                    sourceDeviceId,
+                    targetDeviceId,
+                    $"operation-{index}",
+                    $"payload-{index}"))).Created);
+        }
+
+        var first = await store.DrainDeviceQueueAsync(
+            handle,
+            targetDeviceId,
+            "lease",
+            maxEntries: 64);
+
+        Assert.HasCount(DeviceQueueProtocol.DeliveryWindow, first.Entries);
     }
 
     [TestMethod]
