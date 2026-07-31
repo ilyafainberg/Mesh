@@ -6,11 +6,13 @@ public partial class App : Application
 {
 	private readonly IUiModeService _uiModeService;
 	private readonly MeshClient _meshClient;
+	private readonly AppState _state;
 
-	public App(IUiModeService uiModeService, MeshClient meshClient)
+	public App(IUiModeService uiModeService, MeshClient meshClient, AppState state)
 	{
 		_uiModeService = uiModeService;
 		_meshClient = meshClient;
+		_state = state;
 		InitializeComponent();
 	}
 
@@ -18,6 +20,7 @@ public partial class App : Application
 	{
 		var window = new Window(new MainPage()) { Title = "Mesh" };
 		window.Activated += (_, _) => _meshClient.ResumeTransport();
+		window.Stopped += async (_, _) => await FlushPersistenceOnSuspendAsync();
 
 		var hasDesktopWindowGeometry = OperatingSystem.IsWindows() || OperatingSystem.IsMacCatalyst();
 		if (hasDesktopWindowGeometry)
@@ -39,5 +42,17 @@ public partial class App : Application
 			_uiModeService.UpdateWindowSize(0, 0);
 
 		return window;
+	}
+
+	private async Task FlushPersistenceOnSuspendAsync()
+	{
+		try
+		{
+			await _state.FlushPersistenceAsync();
+		}
+		catch (Exception ex)
+		{
+			RuntimeDiagnostics.Current?.MarkLifecycle("persistence-flush-failed", ex.Message);
+		}
 	}
 }

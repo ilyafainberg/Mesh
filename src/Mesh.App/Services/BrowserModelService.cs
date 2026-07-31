@@ -44,6 +44,9 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
             var submissionText = contextMode == "CurrentTurn" ? currentTurn : fullPrompt;
             if (string.IsNullOrWhiteSpace(submissionText))
                 return "[model error: Browser provider found no user message to send.]";
+            // Lazily hydrate only the relevant, enabled skills within a conservative bound instead of
+            // serializing every summary (whose Instructions are blank after startup anyway).
+            var skillPayload = await BuildSkillPayloadAsync(currentTurn, ct).ConfigureAwait(false);
             var request = new
             {
                 requestId,
@@ -54,12 +57,7 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
                 contextMode,
                 systemPrompt,
                 messages = history.Select(x => new { role = x.Role, content = x.Text }).ToArray(),
-                skills = state.Profile.Skills.Select(s => new
-                {
-                    name = s.Name,
-                    description = s.Description,
-                    instructions = s.Instructions
-                }).ToArray(),
+                skills = skillPayload,
                 tools = (tools ?? Array.Empty<IAgentTool>()).Select(t => new
                 {
                     name = t.Name,
@@ -187,6 +185,32 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
 
     private static string LastUserMessage(IReadOnlyList<ChatLine> history)
         => history.LastOrDefault(line => string.Equals(line.Role, "user", StringComparison.OrdinalIgnoreCase))?.Text ?? "";
+
+    /// <summary>
+    /// Builds the browser request's skill payload from fully loaded, relevant, ENABLED skills only,
+    /// within a conservative bound. After startup the profile's skill summaries carry blank Instructions;
+    /// this filters to enabled skills, pre-caps the candidate pool, ranks by relevance with the shared
+    /// TokenOptimizer, then bounded-loads just those bodies (AssetLoadBudget.Default => at most 64 items /
+    /// 4 MiB). It never serializes every skill body.
+    /// </summary>
+    private const int SkillSelectionCap = 200;
+
+    private async Task<object[]> BuildSkillPayloadAsync(string query, CancellationToken ct)
+    {
+        var enabled = state.Profile.Skills.Where(s => s.Enabled).ToList();
+        if (enabled.Count == 0) return Array.Empty<object>();
+        var pool = enabled.Count <= SkillSelectionCap ? enabled : enabled.Take(SkillSelectionCap).ToList();
+        var selection = TokenOptimizer.SelectSkills(pool, query, state.Profile.Model.TokenOptimization);
+        var ids = selection.Included.Select(s => s.Id).ToList();
+        if (ids.Count == 0) return Array.Empty<object>();
+        var loaded = await state.LoadSkillsAsync(ids, AssetLoadBudget.Default, ct).ConfigureAwait(false);
+        return loaded.Select(s => (object)new
+        {
+            name = s.Name,
+            description = s.Description,
+            instructions = s.Instructions
+        }).ToArray();
+    }
 
     private static bool IsBrowserMissing(Exception ex)
     {

@@ -81,6 +81,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         this.lifecycle = lifecycle;
         lifecycle.ForegroundChanged += OnForegroundChanged;
         state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
+        InitializeMesh117Sync();
         deviceSyncActivity.Changed += () => DeviceSyncStateChanged?.Invoke();
         Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged += OnConnectivityChanged;
     }
@@ -1942,6 +1943,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     CancellationToken.None))
                 deviceSyncActivity.ObserveSnapshotActivity();
         }
+        Drain117OnConnect(identity);
     }
 
     private async Task<IReadOnlyList<string>> GetDeviceSyncTargetsAsync(
@@ -2366,6 +2368,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                         throw new InvalidDataException("Snapshot completion did not match its route.");
                     if (!state.RecordDeviceSyncSnapshotCompletion(completion))
                         throw new InboundRetryException("snapshot_completion_persistence_failed");
+                    return;
+                }
+                case Mesh117SyncKinds.Envelope117Operation:
+                {
+                    await ApplyInbound117OperationAsync(env, plaintext, myDeviceId, ct);
                     return;
                 }
                 default:

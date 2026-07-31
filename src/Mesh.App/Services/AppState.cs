@@ -145,6 +145,7 @@ public sealed partial class AppState : IMemoryState
                     ReconcileDeletedCircles();
                     RehydrateUnread();
                     RehydrateDurableTopicState();
+                    MigrateAndHydrateAssets(activeDb);
                     return;
                 }
                 db.Dispose();
@@ -186,11 +187,16 @@ public sealed partial class AppState : IMemoryState
     {
         try
         {
-            File.WriteAllText(indexPath, JsonSerializer.Serialize(
-                new AccountIndex { ActiveId = activeId, Accounts = accounts }, JsonOpts));
-            StorageProtection.TryEnsureBackgroundReadable(indexPath);
+            WriteIndexCore(activeId, accounts);
         }
         catch { /* best-effort */ }
+    }
+
+    private void WriteIndexCore(string? id, IReadOnlyList<AccountRef> accts)
+    {
+        File.WriteAllText(indexPath, JsonSerializer.Serialize(
+            new AccountIndex { ActiveId = id, Accounts = accts.ToList() }, JsonOpts));
+        StorageProtection.TryEnsureBackgroundReadable(indexPath);
     }
 
     private static string NewId() => Guid.NewGuid().ToString("n");
@@ -198,12 +204,7 @@ public sealed partial class AppState : IMemoryState
     public void Save()
     {
         PrepareProfileStorage();
-        if (activeId is not null)
-        {
-            UpdateActiveAccount();
-            activeDb?.SaveProfile(Profile);
-        }
-        WriteIndex();
+        ScheduleSave(Array.Empty<AssetWork>());
     }
 
     /// <summary>Gets the local unsent text for a conversation.</summary>
@@ -466,17 +467,52 @@ public sealed partial class AppState : IMemoryState
     public void Mutate(Action<MeshProfile> change, string? renamedCircleFrom = null)
     {
         ArgumentNullException.ThrowIfNull(change);
-        IReadOnlyList<PendingProfileOperation> pending;
         lock (profileSyncGate)
-            pending = MutateCore(change, renamedCircleFrom);
-        PublishProfileMutation(pending);
+            MutateCore(change, renamedCircleFrom, AssetPlanKind.None, hints: null);
+        NotifyChanged();
+    }
+
+    /// <summary>
+    /// Mutates database-backed Skills, Knowledge, or Widgets via explicit per-asset hints so the
+    /// caller thread never scans the asset corpus. Each hint declares whether the change carries
+    /// full content, is metadata-only (the stored body is preserved), or is a delete.
+    /// </summary>
+    private void MutateAssetsHinted(Action<MeshProfile> change, IReadOnlyList<AssetHint> hints)
+    {
+        ArgumentNullException.ThrowIfNull(change);
+        lock (profileSyncGate)
+            MutateCore(change, renamedCircleFrom: null, AssetPlanKind.Hints, hints);
+        NotifyChanged();
+    }
+
+    /// <summary>Adds or replaces one asset whose full content is materialised on the in-memory object.</summary>
+    public void SaveAssetContent(AssetKind kind, string id, Action<MeshProfile> change)
+        => MutateAssetsHinted(change, new[] { new AssetHint(kind, id, AssetChange.Content) });
+
+    /// <summary>Changes only one asset's metadata; the stored body is preserved off-thread.</summary>
+    public void SaveAssetMetadata(AssetKind kind, string id, Action<MeshProfile> change)
+        => MutateAssetsHinted(change, new[] { new AssetHint(kind, id, AssetChange.Metadata) });
+
+    /// <summary>Removes one asset.</summary>
+    public void RemoveAsset(AssetKind kind, string id, Action<MeshProfile> change)
+        => MutateAssetsHinted(change, new[] { new AssetHint(kind, id, AssetChange.Delete) });
+
+    /// <summary>
+    /// Adds or replaces several assets whose full content is materialised on the in-memory objects
+    /// (bounded bulk import). The batch is applied as one mutation.
+    /// </summary>
+    public void SaveAssetsContent(
+        IReadOnlyList<(AssetKind Kind, string Id)> assets, Action<MeshProfile> change)
+    {
+        ArgumentNullException.ThrowIfNull(assets);
+        var hints = assets.Select(a => new AssetHint(a.Kind, a.Id, AssetChange.Content)).ToList();
+        MutateAssetsHinted(change, hints);
     }
 
     public bool RenameCircle(string oldName, string newName)
     {
         var oldEntityId = CircleEntityId(oldName);
         var replacement = newName.Trim();
-        IReadOnlyList<PendingProfileOperation> pending;
         lock (profileSyncGate)
         {
             var circle = Profile.Circles.FirstOrDefault(item =>
@@ -488,39 +524,40 @@ public sealed partial class AppState : IMemoryState
                     && CircleEntityId(item.Name) == CircleEntityId(replacement)))
                 return false;
             var previousName = circle.Name;
-            pending = MutateCore(profile =>
+            MutateCore(profile =>
             {
                 circle.Name = replacement;
                 ProfileSyncState.RenameCircleReferences(profile, previousName, replacement);
-            }, previousName);
+            }, previousName, AssetPlanKind.MetadataSweep, hints: null);
         }
-        PublishProfileMutation(pending);
+        NotifyChanged();
         return true;
     }
 
     public bool DeleteCircle(string name)
     {
         var entityId = CircleEntityId(name);
-        IReadOnlyList<PendingProfileOperation> pending;
         lock (profileSyncGate)
         {
             var circle = Profile.Circles.FirstOrDefault(item =>
                 CircleEntityId(item.Name) == entityId);
             if (circle is null) return false;
             var currentName = circle.Name;
-            pending = MutateCore(profile =>
+            MutateCore(profile =>
             {
                 profile.Circles.Remove(circle);
                 ProfileSyncState.DeleteCircleReferences(profile, currentName);
-            }, null);
+            }, null, AssetPlanKind.MetadataSweep, hints: null);
         }
-        PublishProfileMutation(pending);
+        NotifyChanged();
         return true;
     }
 
-    private IReadOnlyList<PendingProfileOperation> MutateCore(
+    private void MutateCore(
         Action<MeshProfile> change,
-        string? renamedCircleFrom)
+        string? renamedCircleFrom,
+        AssetPlanKind assetPlan = AssetPlanKind.None,
+        IReadOnlyList<AssetHint>? hints = null)
     {
         var previousProfile = CloneProfile(Profile);
         var previousActiveId = activeId;
@@ -534,7 +571,10 @@ public sealed partial class AppState : IMemoryState
             })
             .ToList();
         var before = ProfileSyncState.Snapshot(Profile);
-        IReadOnlyList<PendingProfileOperation> pending = Array.Empty<PendingProfileOperation>();
+        // A metadata sweep (circle rename/delete) may touch many asset rows, so capture a bounded
+        // metadata-only signature snapshot before the change and diff it after. Hinted mutations
+        // build their work list directly from the hints and need no pre-change snapshot.
+        var beforeMeta = assetPlan == AssetPlanKind.MetadataSweep ? SnapshotAssetMetadata() : null;
         try
         {
             change(Profile);
@@ -542,24 +582,28 @@ public sealed partial class AppState : IMemoryState
             var profileChanged = HasProfileSyncChanges(before, after);
             PrepareProfileStorage();
             var deviceId = LocalDeviceId();
+            var assetWorks = BuildAssetWorks(assetPlan, hints, beforeMeta, deviceId, PlatformCaps.IsMobile);
             if (!applyingDeviceSync && profileChanged && activeDb is not null && deviceId is not null)
             {
-                pending = PrepareProfileChanges(before, after, deviceId, renamedCircleFrom);
-                if (!activeDb.SaveProfileAndSyncState(
-                    Profile,
+                var pending = PrepareProfileChanges(before, after, deviceId, renamedCircleFrom);
+                UpdateActiveAccount();
+                // The DB save runs on the persistence worker: the mutation thread only computes the
+                // immutable snapshot (bounded blob + sync writes + asset diffs) and hands it off.
+                Enqueue(new ProfileWork(
+                    activeDb,
+                    MeshDb.SerializeProfileForStorage(Profile),
                     pending.Where(item => item.Version is not null).Select(item => item.Version!).ToList(),
                     pending.Where(item => item.Tombstone is not null).Select(item => item.Tombstone!).ToList(),
-                    circleRenames: pending
-                        .Where(item => item.CircleRename is not null)
-                        .Select(item => item.CircleRename!)
-                        .ToList()))
-                    throw new InvalidOperationException("The profile sync transaction was not accepted.");
-                UpdateActiveAccount();
-                WriteIndex();
+                    pending.Where(item => item.CircleRename is not null).Select(item => item.CircleRename!).ToList(),
+                    pending.Select(item => item.Operation).ToList(),
+                    WriteAccountIndex: true,
+                    activeId,
+                    SnapshotAccounts(),
+                    assetWorks));
             }
             else
             {
-                Save();
+                ScheduleSave(assetWorks);
             }
         }
         catch
@@ -587,14 +631,6 @@ public sealed partial class AppState : IMemoryState
             Profile = previousProfile;
             throw;
         }
-        return pending;
-    }
-
-    private void PublishProfileMutation(IReadOnlyList<PendingProfileOperation> pending)
-    {
-        foreach (var item in pending)
-            DeviceSyncOperationCreated?.Invoke(item.Operation);
-        NotifyChanged();
     }
 
     public void NotifyChanged() => Changed?.Invoke();
@@ -1483,7 +1519,7 @@ public sealed partial class AppState : IMemoryState
         if (!Profile.UnreadFrom.Contains(normalized))
         {
             Profile.UnreadFrom.Add(normalized);
-            activeDb?.SaveProfile(Profile);
+            ScheduleProfileSave();
         }
         return true;
     }
@@ -1521,7 +1557,7 @@ public sealed partial class AppState : IMemoryState
         var changed = Profile.Conversations.RemoveAll(
             c => c.Handle.Equals(handle, StringComparison.OrdinalIgnoreCase)) > 0;
         unread.Remove(handle);
-        if (Profile.UnreadFrom.Remove(handle)) activeDb!.SaveProfile(Profile);
+        if (Profile.UnreadFrom.Remove(handle)) ScheduleProfileSave();
         activeDb!.ApplyConversationDelete(handle, operation.Kind, operation.Version);
         return changed;
     }
@@ -1889,9 +1925,10 @@ public sealed partial class AppState : IMemoryState
         var operationId = NewId();
         var version = CreateNewerVersion(deviceId, operationId, new[]
         {
-            activeDb!.GetSyncVersion(SyncKey(kind, entityId)),
-            activeDb.GetSyncTombstoneVersion(deleteKind, entityId)
+            LatestSyncVersion(SyncKey(kind, entityId)),
+            LatestTombstoneVersion(deleteKind, entityId)
         });
+        RememberIssuedVersion(SyncKey(kind, entityId), version);
         return new PendingProfileOperation(
             new DeviceSyncOperation(
                 operationId,
@@ -1918,9 +1955,10 @@ public sealed partial class AppState : IMemoryState
         var operationId = NewId();
         var version = CreateNewerVersion(deviceId, operationId, new[]
         {
-            activeDb!.GetSyncTombstoneVersion(kind, entityId),
-            activeDb.GetSyncVersion(SyncKey(upsertKind, entityId))
+            LatestTombstoneVersion(kind, entityId),
+            LatestSyncVersion(SyncKey(upsertKind, entityId))
         });
+        RememberIssuedTombstone(kind, entityId, version);
         return new PendingProfileOperation(
             new DeviceSyncOperation(operationId, deviceId, kind, entityId, version, ""),
             null,
@@ -2610,7 +2648,7 @@ public sealed partial class AppState : IMemoryState
         var h = Norm(handle);
         if (unread.Add(h))
         {
-            if (!Profile.UnreadFrom.Contains(h)) { Profile.UnreadFrom.Add(h); activeDb?.SaveProfile(Profile); }
+            if (!Profile.UnreadFrom.Contains(h)) { Profile.UnreadFrom.Add(h); ScheduleProfileSave(); }
             NotifyChanged();
         }
     }
@@ -3427,7 +3465,7 @@ public sealed partial class AppState : IMemoryState
     {
         var h = Norm(handle);
         var changed = unread.Remove(h);
-        if (Profile.UnreadFrom.Remove(h)) { activeDb?.SaveProfile(Profile); changed = true; }
+        if (Profile.UnreadFrom.Remove(h)) { ScheduleProfileSave(); changed = true; }
         if (changed) NotifyChanged();
     }
 
@@ -3521,7 +3559,19 @@ public sealed partial class AppState : IMemoryState
     // ---- export / import --------------------------------------------------
 
     /// <summary>Produces a portable, passphrase-encrypted export of the active identity.</summary>
-    public byte[] ExportActiveProfile(string passphrase) => MeshExport.Create(Profile, passphrase);
+    public byte[] ExportActiveProfile(string passphrase)
+    {
+        FlushBlocking();
+        return MeshExport.Create(BuildExportBundle(), passphrase);
+    }
+
+    public string ImportProfile(MeshExportBundle bundle)
+    {
+        ArgumentNullException.ThrowIfNull(bundle);
+        var id = ImportProfile(bundle.Profile);
+        ImportSkillPackages(bundle.SkillPackages, id);
+        return id;
+    }
 
     /// <summary>
     /// Imports a profile bundle as a NEW identity on this device: mints a fresh device keypair,
@@ -3535,7 +3585,7 @@ public sealed partial class AppState : IMemoryState
         imported.PrivateKey = priv;
         imported.PublicKey = pub;
 
-        if (activeId is not null && activeDb is not null) activeDb.SaveProfile(Profile);
+        if (activeId is not null && activeDb is not null) FlushBlocking();
 
         var id = NewId();
         var db = OpenDb(id);
@@ -3597,6 +3647,7 @@ public sealed partial class AppState : IMemoryState
         activeDb = db;
         activeId = id;
         Profile = imported;
+        MigrateAndHydrateAssets(db);
         RehydrateUnread();
         RehydrateDurableTopicState();
         accounts.Add(new AccountRef { Id = id, Handle = imported.Handle, DisplayName = imported.DisplayName });
@@ -3613,11 +3664,12 @@ public sealed partial class AppState : IMemoryState
     /// </summary>
     public void SignOut()
     {
-        if (activeId is not null) activeDb?.SaveProfile(Profile);
+        if (activeId is not null) FlushBlocking();
         activeDb?.Dispose();
         activeDb = null;
         activeId = null;
         Profile = new MeshProfile();
+        ResetAssetState();
         queuedTopicRuns.Clear();
         WriteIndex();
         NotifyChanged();
@@ -3634,11 +3686,12 @@ public sealed partial class AppState : IMemoryState
             var loaded = db.LoadProfile();
             if (loaded is null) { db.Dispose(); return false; }
 
-            if (activeId is not null) activeDb?.SaveProfile(Profile); // persist the one we're leaving
+            if (activeId is not null) FlushBlocking(); // persist the one we're leaving
             activeDb?.Dispose();
             activeDb = db;
             activeId = id;
             Profile = loaded;
+            MigrateAndHydrateAssets(db);
             RehydrateUnread();
             RehydrateDurableTopicState();
             WriteIndex();
@@ -3654,10 +3707,12 @@ public sealed partial class AppState : IMemoryState
         accounts.RemoveAll(a => a.Id == id);
         if (id == activeId)
         {
+            FlushBlocking();
             activeDb?.Dispose();
             activeDb = null;
             activeId = null;
             Profile = new MeshProfile();
+            ResetAssetState();
         }
         try { var p = DbPath(id); if (File.Exists(p)) File.Delete(p); } catch { }
         secrets.DeleteDbKey(id);
@@ -3907,7 +3962,7 @@ public sealed partial class AppState : IMemoryState
             .ToList();
         Profile.Conversations.Remove(conversation);
         unread.Remove(h);
-        if (Profile.UnreadFrom.Remove(h)) activeDb?.SaveProfile(Profile);
+        if (Profile.UnreadFrom.Remove(h)) ScheduleProfileSave();
         EmitTombstone(DeviceSyncKinds.ConversationDelete, h, lineVersions);
         NotifyChanged();
     }

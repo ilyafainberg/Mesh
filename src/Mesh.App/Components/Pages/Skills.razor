@@ -1,6 +1,7 @@
-﻿@page "/skills"
+@page "/skills"
 @inject AppState State
 @inject SkillMarketplaceService Marketplace
+@inject ISkillCatalogService Catalog
 @implements IDisposable
 
 <MobileOverlayScope Active="@(openMarketId is not null)" />
@@ -33,6 +34,104 @@
         <button class="primary" @onclick="Add" disabled="@string.IsNullOrWhiteSpace(name)">
             <i class="bi bi-plus-lg"></i> Add skill
         </button>
+    </div>
+
+    <div class="card-panel skill-catalog">
+        <div class="mp-title">
+            <h3><i class="bi bi-stars"></i> Find skills</h3>
+            <span class="field-hint">
+                Search the built-in catalog. Mesh checks operating system, desktop/mobile support,
+                required CLI tools, and package files before installing.
+            </span>
+        </div>
+        <div class="mp-add-row">
+            <input class="full"
+                   placeholder="Search by capability, tool, or task"
+                   @bind="catalogQuery"
+                   @bind:event="oninput"
+                   @onkeydown="OnCatalogKeyDown"
+                   disabled="@catalogSearching"
+                   aria-label="Search the skill catalog" />
+            <button class="primary"
+                    @onclick="SearchCatalogAsync"
+                    disabled="@(catalogSearching || string.IsNullOrWhiteSpace(catalogQuery))">
+                @if (catalogSearching)
+                {
+                    <i class="bi bi-arrow-repeat spin"></i> <span>Searching</span>
+                }
+                else
+                {
+                    <i class="bi bi-search"></i> <span>Search</span>
+                }
+            </button>
+        </div>
+        @if (!string.IsNullOrWhiteSpace(catalogStatus))
+        {
+            <div class="@(catalogError ? "err-text" : "muted small")" role="status">@catalogStatus</div>
+        }
+        @if (catalogResults.Count > 0)
+        {
+            <div class="skill-catalog-results">
+                @foreach (var result in catalogResults)
+                {
+                    var verdict = CatalogVerdict(result);
+                    var installed = IsCatalogSkillInstalled(result);
+                    var busy = installingCatalogKey == CatalogKey(result);
+                    <article class="skill-catalog-result">
+                        <div class="skill-catalog-head">
+                            <div>
+                                <b>@result.Name</b>
+                                <div class="muted small">
+                                    @result.Source
+                                    @if (!string.IsNullOrWhiteSpace(result.Stars))
+                                    {
+                                        <span> · <i class="bi bi-star-fill"></i> @result.Stars</span>
+                                    }
+                                    @if (!string.IsNullOrWhiteSpace(result.Category))
+                                    {
+                                        <span> · @result.Category</span>
+                                    }
+                                </div>
+                            </div>
+                            <span class="chip @CompatibilityClass(verdict.Level)">
+                                @CompatibilityLabel(verdict)
+                            </span>
+                        </div>
+                        @if (!string.IsNullOrWhiteSpace(result.Description))
+                        {
+                            <p class="small">@result.Description</p>
+                        }
+                        <div class="skill-catalog-meta">
+                            <span><i class="bi bi-pc-display"></i> @OsLabel(result.Advisory)</span>
+                            <span><i class="bi bi-phone"></i> @DeviceClassLabel(result.Advisory)</span>
+                            <span><i class="bi bi-terminal"></i> @CliLabel(result.Advisory)</span>
+                        </div>
+                        @if (verdict.Reasons.Count > 0)
+                        {
+                            <div class="muted small">@string.Join(" ", verdict.Reasons)</div>
+                        }
+                        <div class="skill-catalog-actions">
+                            <button class="primary"
+                                    @onclick="() => InstallCatalogSkillAsync(result)"
+                                    disabled="@(busy || installed || !verdict.CanInstall)">
+                                @if (busy)
+                                {
+                                    <i class="bi bi-arrow-repeat spin"></i> <span>Checking package</span>
+                                }
+                                else if (installed)
+                                {
+                                    <i class="bi bi-check-lg"></i> <span>Installed</span>
+                                }
+                                else
+                                {
+                                    <i class="bi bi-download"></i> <span>Install</span>
+                                }
+                            </button>
+                        </div>
+                    </article>
+                }
+            </div>
+        }
     </div>
 
     <div class="card-panel">
@@ -196,30 +295,41 @@
                 <button class="kn-hint-close" @onclick="() => skillHintDismissed = true" aria-label="Dismiss tip"><i class="bi bi-x-lg"></i></button>
             </div>
         }
-        @foreach (var s in State.Profile.Skills)
+        @foreach (var s in AssetPagePolicy.Take(State.Profile.Skills, visibleCount))
         {
             <div class="kn-card">
                 @if (editingId == s.Id)
                 {
+                    @if (editLoading)
+                    {
+                        <div class="muted small" role="status" aria-live="polite"><i class="bi bi-arrow-repeat spin"></i> Loading skill…</div>
+                    }
+                    else if (editError is not null)
+                    {
+                        <div class="err-text" role="alert">@editError</div>
+                        <div class="kn-row">
+                            <button class="ghost" @onclick="CancelEdit"><i class="bi bi-x-lg"></i> Close</button>
+                        </div>
+                    }
                     <div class="field">
                         <label>Name</label>
-                        <input class="full" @bind="editName" />
+                        <input class="full" @bind="editName" disabled="@(!editLoaded)" />
                     </div>
                     <div class="field">
                         <label>Description</label>
-                        <input class="full" @bind="editDescription" />
+                        <input class="full" @bind="editDescription" disabled="@(!editLoaded)" />
                     </div>
                     <div class="field">
                         <label>Instructions <span class="muted">(how the agent performs it)</span></label>
-                        <textarea class="full" rows="6" @bind="editInstructions"></textarea>
+                        <textarea class="full" rows="6" @bind="editInstructions" disabled="@(!editLoaded)"></textarea>
                     </div>
                     <div class="kn-row">
                         <AudiencePicker @bind-Value="editVisibility"
                                         Circles="@State.Profile.Circles"
                                         Class="grow"
                                         AriaLabel="Who can use this skill" />
-                        <button class="primary" @onclick="() => SaveEdit(s)"><i class="bi bi-check-lg"></i> Save</button>
-                        <button class="ghost" @onclick="() => editingId = null"><i class="bi bi-x-lg"></i> Cancel</button>
+                        <button class="primary" @onclick="() => SaveEdit(s)" disabled="@(!editLoaded)"><i class="bi bi-check-lg"></i> Save</button>
+                        <button class="ghost" @onclick="CancelEdit"><i class="bi bi-x-lg"></i> Cancel</button>
                     </div>
                 }
                 else
@@ -245,6 +355,12 @@
                 }
             </div>
         }
+        @if (AssetPagePolicy.HasMore(State.Profile.Skills.Count, visibleCount))
+        {
+            <button class="ghost load-more" @onclick="LoadMore" aria-label="Load more skills">
+                <i class="bi bi-chevron-down"></i> Load more (@AssetPagePolicy.Remaining(State.Profile.Skills.Count, visibleCount) more)
+            </button>
+        }
         @if (State.Profile.Skills.Count == 0)
         {
             <EmptyState Icon="bi-lightning-charge"
@@ -261,37 +377,220 @@
     string editName = "", editDescription = "", editInstructions = "", editVisibility = "private";
     bool skillHintDismissed;
 
+    // Mesh 1.17 bounded paging over summary metadata: never render the whole corpus at once.
+    int visibleCount = AssetPagePolicy.PageSize;
+
+    string catalogQuery = "";
+    string? catalogStatus;
+    bool catalogError;
+    bool catalogSearching;
+    string? installingCatalogKey;
+    IReadOnlyList<SkillCatalogResult> catalogResults = Array.Empty<SkillCatalogResult>();
+    CancellationTokenSource? catalogCts;
+
+    // Lazy-body edit state: a summary carries blank Instructions, so the full skill is loaded on demand.
+    bool editLoading;
+    bool editLoaded;
+    string? editError;
+    CancellationTokenSource? editCts;
+
     protected override void OnInitialized() => State.Changed += Refresh;
     void Refresh() => InvokeAsync(StateHasChanged);
+
+    void LoadMore() => visibleCount = AssetPagePolicy.NextVisible(visibleCount, State.Profile.Skills.Count);
+
+    async Task OnCatalogKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await SearchCatalogAsync();
+    }
+
+    async Task SearchCatalogAsync()
+    {
+        if (catalogSearching || string.IsNullOrWhiteSpace(catalogQuery)) return;
+        catalogCts?.Cancel();
+        catalogCts?.Dispose();
+        catalogCts = new CancellationTokenSource();
+        catalogSearching = true;
+        catalogError = false;
+        catalogStatus = null;
+        try
+        {
+            catalogResults = await Catalog.SearchAsync(
+                catalogQuery.Trim(),
+                maxResults: 20,
+                forCurrentDevice: false,
+                catalogCts.Token);
+            catalogStatus = catalogResults.Count == 0
+                ? "No matching skills found."
+                : $"{catalogResults.Count} skill{(catalogResults.Count == 1 ? "" : "s")} found.";
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            catalogError = true;
+            catalogStatus = "Could not search the skill catalog: " + ex.Message;
+            catalogResults = Array.Empty<SkillCatalogResult>();
+        }
+        finally
+        {
+            catalogSearching = false;
+        }
+    }
+
+    async Task InstallCatalogSkillAsync(SkillCatalogResult result)
+    {
+        var key = CatalogKey(result);
+        if (installingCatalogKey is not null || IsCatalogSkillInstalled(result)) return;
+        installingCatalogKey = key;
+        catalogError = false;
+        catalogStatus = $"Checking {result.Name} for this device...";
+        try
+        {
+            var package = await Catalog.DownloadPackageAsync(result);
+            var install = await State.InstallSkillPackageAsync(
+                package,
+                result.Name,
+                result.Description,
+                visibility: "private",
+                sourceMarketplaceId: "catalog:" + result.Source,
+                sourceSkillId: result.Id);
+            if (!install.Success)
+            {
+                catalogError = true;
+                catalogStatus = install.Error ?? "This skill cannot be installed on this device.";
+                return;
+            }
+
+            catalogStatus = install.Compatibility.CanRun
+                ? $"{result.Name} was installed."
+                : $"{result.Name} was installed but disabled. {string.Join(" ", install.Compatibility.Reasons)}";
+        }
+        catch (Exception ex)
+        {
+            catalogError = true;
+            catalogStatus = $"Could not install {result.Name}: {ex.Message}";
+        }
+        finally
+        {
+            installingCatalogKey = null;
+        }
+    }
+
+    SkillCompatibilityResult CatalogVerdict(SkillCatalogResult result)
+        => State.CheckSkillCompatibility(new Skill { Compatibility = result.Advisory });
+
+    bool IsCatalogSkillInstalled(SkillCatalogResult result)
+        => State.Profile.Skills.Any(skill =>
+            string.Equals(skill.SourceMarketplaceId, "catalog:" + result.Source, StringComparison.Ordinal)
+            && string.Equals(skill.SourceSkillId, result.Id, StringComparison.Ordinal));
+
+    static string CatalogKey(SkillCatalogResult result) => result.Source + "\u001f" + result.Id;
+
+    static string CompatibilityLabel(SkillCompatibilityResult verdict) => verdict.Level switch
+    {
+        SkillCompatibilityLevel.Compatible => "Compatible",
+        SkillCompatibilityLevel.Warning => "Needs tools",
+        _ => "Not supported"
+    };
+
+    static string CompatibilityClass(SkillCompatibilityLevel level) => level switch
+    {
+        SkillCompatibilityLevel.Compatible => "skill-compatible",
+        SkillCompatibilityLevel.Warning => "skill-warning",
+        _ => "skill-incompatible"
+    };
+
+    static string OsLabel(SkillCompatibility? compatibility)
+        => compatibility is null || compatibility.OperatingSystems == SkillOperatingSystems.None
+            ? "OS checked on install"
+            : compatibility.OperatingSystems.ToString().Replace("IOS", "iOS");
+
+    static string DeviceClassLabel(SkillCompatibility? compatibility)
+        => compatibility?.DeviceClass.ToString() ?? "Device type checked on install";
+
+    static string CliLabel(SkillCompatibility? compatibility)
+        => compatibility is null
+            ? "Tools checked on install"
+            : compatibility.RequiredCliTools.Count == 0
+                ? "No CLI required"
+                : string.Join(", ", compatibility.RequiredCliTools);
 
     void Add()
     {
         if (string.IsNullOrWhiteSpace(name)) return;
-        State.Mutate(p => p.Skills.Add(new Skill
+        var skill = new Skill
         {
             Name = name.Trim(), Description = description.Trim(), Instructions = instructions.Trim(), Visibility = visibility
-        }));
+        };
+        AssetMutations.Apply(State, AssetEdit.Create, AssetKind.Skill, skill.Id, p => p.Skills.Add(skill));
         name = ""; description = ""; instructions = ""; visibility = "private";
     }
 
-    void BeginEdit(Skill s)
+    async Task BeginEdit(Skill s)
     {
-        editingId = s.Id; editName = s.Name; editDescription = s.Description;
-        editInstructions = s.Instructions; editVisibility = s.Visibility;
+        editCts?.Cancel();
+        editCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        editCts = cts;
+
+        editingId = s.Id;
+        editName = s.Name; editDescription = s.Description; editVisibility = s.Visibility;
+        editInstructions = "";
+        editLoaded = false; editError = null; editLoading = true;
+
+        try
+        {
+            // Only the selected asset's full body is loaded; never overwrite the stored body with blank.
+            var full = await State.LoadFullSkillAsync(s.Id, cts.Token);
+            if (cts.IsCancellationRequested || editingId != s.Id) return;
+            if (full is null)
+            {
+                editError = "This skill could not be loaded - it may have been deleted.";
+            }
+            else
+            {
+                editName = full.Name; editDescription = full.Description;
+                editInstructions = full.Instructions; editVisibility = full.Visibility;
+                editLoaded = true;
+            }
+        }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex)
+        {
+            if (editingId == s.Id) editError = "Could not load this skill: " + ex.Message;
+        }
+        finally
+        {
+            if (editCts == cts) { editLoading = false; StateHasChanged(); }
+        }
     }
 
     void SaveEdit(Skill s)
     {
-        State.Mutate(_ =>
+        // Guard: persist the body only once the full asset has actually loaded.
+        if (!AssetPagePolicy.CanPersistBody(editLoaded)) return;
+        AssetMutations.Apply(State, AssetEdit.EditBody, AssetKind.Skill, s.Id, _ =>
         {
             s.Name = editName.Trim(); s.Description = editDescription.Trim();
             s.Instructions = editInstructions.Trim(); s.Visibility = editVisibility;
         });
-        editingId = null;
+        CancelEdit();
     }
 
-    void Toggle(Skill s, ChangeEventArgs e) => State.Mutate(_ => s.Enabled = (bool)(e.Value ?? false));
-    void Remove(Skill s) => State.Mutate(p => p.Skills.Remove(s));
+    void CancelEdit()
+    {
+        editCts?.Cancel();
+        editCts?.Dispose();
+        editCts = null;
+        editingId = null;
+        editLoading = false; editLoaded = false; editError = null;
+    }
+
+    void Toggle(Skill s, ChangeEventArgs e)
+        => AssetMutations.Apply(State, AssetEdit.ToggleEnabled, AssetKind.Skill, s.Id, _ => s.Enabled = (bool)(e.Value ?? false));
+
+    void Remove(Skill s)
+        => AssetMutations.Apply(State, AssetEdit.Delete, AssetKind.Skill, s.Id, p => p.Skills.Remove(s));
 
     static string VisClass(string visibility) => AudiencePolicy.CssClass(visibility);
 
@@ -394,5 +693,12 @@
     static string HostOf(string url)
         => Uri.TryCreate(url, UriKind.Absolute, out var u) ? u.Host : url;
 
-    public void Dispose() => State.Changed -= Refresh;
+    public void Dispose()
+    {
+        State.Changed -= Refresh;
+        editCts?.Cancel();
+        editCts?.Dispose();
+        catalogCts?.Cancel();
+        catalogCts?.Dispose();
+    }
 }

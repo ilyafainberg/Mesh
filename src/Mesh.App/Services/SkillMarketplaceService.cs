@@ -459,29 +459,41 @@ public sealed class SkillMarketplaceService
         var wanted = new HashSet<string>(skillIds ?? Enumerable.Empty<string>());
         if (wanted.Count == 0) return;
 
-        state.Mutate(p =>
+        // Decide what to add from the summary catalog (SourceMarketplaceId/SourceSkillId are metadata),
+        // then persist the new bodies as an explicit bounded content batch. This never scans the corpus.
+        var toAdd = new List<Skill>();
+        foreach (var ms in index.Skills)
         {
-            foreach (var ms in index.Skills)
+            if (!wanted.Contains(ms.Id)) continue;
+            var alreadyImported = state.Profile.Skills.Any(s =>
+                s.SourceMarketplaceId == marketplaceId && s.SourceSkillId == ms.Id);
+            if (alreadyImported) continue;
+
+            toAdd.Add(new Skill
             {
-                if (!wanted.Contains(ms.Id)) continue;
+                Name = ms.Name,
+                Description = ms.Description,
+                Instructions = ms.Instructions,
+                Visibility = "private",
+                Enabled = true,
+                SourceMarketplaceId = marketplaceId,
+                SourceSkillId = ms.Id,
+                Version = string.IsNullOrWhiteSpace(ms.Version) ? null : ms.Version
+            });
+        }
+        if (toAdd.Count == 0) return;
 
-                var alreadyImported = p.Skills.Any(s =>
-                    s.SourceMarketplaceId == marketplaceId && s.SourceSkillId == ms.Id);
-                if (alreadyImported) continue;
-
-                p.Skills.Add(new Skill
-                {
-                    Name = ms.Name,
-                    Description = ms.Description,
-                    Instructions = ms.Instructions,
-                    Visibility = "private",
-                    Enabled = true,
-                    SourceMarketplaceId = marketplaceId,
-                    SourceSkillId = ms.Id,
-                    Version = string.IsNullOrWhiteSpace(ms.Version) ? null : ms.Version
-                });
-            }
-        });
+        // Persist the new bodies as bounded content batches. Chunking guarantees a single mutation
+        // never materialises more than AssetPagePolicy.BulkBatchSize bodies at once, and every hint
+        // is AssetChange.Content so both the summary and body are written for each imported skill.
+        foreach (var batch in AssetPagePolicy.Chunk(toAdd))
+        {
+            var ids = batch.Select(s => (AssetKind.Skill, s.Id)).ToList();
+            state.SaveAssetsContent(ids, p =>
+            {
+                foreach (var skill in batch) p.Skills.Add(skill);
+            });
+        }
     }
 
     /// <summary>
@@ -505,30 +517,72 @@ public sealed class SkillMarketplaceService
                 continue;
             }
 
+            // Marketplace name + LastSyncedAt are ordinary profile fields: update them without
+            // touching the asset corpus.
             state.Mutate(p =>
             {
                 var live = p.SkillMarketplaces.FirstOrDefault(m => m.Id == market.Id);
-                if (live is null) return; // removed while syncing
-
-                if (!string.IsNullOrWhiteSpace(index.Name))
-                    live.Name = index.Name;
-
-                foreach (var skill in p.Skills)
-                {
-                    if (skill.SourceMarketplaceId != live.Id) continue;
-
-                    var ms = index.Skills.FirstOrDefault(x => x.Id == skill.SourceSkillId);
-                    if (ms is null) continue; // no longer offered; leave the local copy intact
-
-                    skill.Name = ms.Name;
-                    skill.Description = ms.Description;
-                    skill.Instructions = ms.Instructions;
-                    skill.Version = string.IsNullOrWhiteSpace(ms.Version) ? null : ms.Version;
-                    // Enabled and Visibility are the user's choices: preserve them.
-                }
-
+                if (live is null) return;
+                if (!string.IsNullOrWhiteSpace(index.Name)) live.Name = index.Name;
                 live.LastSyncedAt = DateTimeOffset.UtcNow;
             });
+
+            // Refresh each imported skill's body from the marketplace as bounded content batches.
+            // We match on SourceSkillId (metadata carried by the summary catalog), so no bodies are
+            // scanned to decide the set, and chunking bounds each mutation. Enabled and Visibility
+            // are the user's choices and are never touched here.
+            var toRefresh = state.Profile.Skills
+                .Where(s => s.SourceMarketplaceId == market.Id
+                            && index.Skills.Any(x => x.Id == s.SourceSkillId))
+                .ToList();
+            if (toRefresh.Count == 0) continue;
+
+            foreach (var batch in AssetPagePolicy.Chunk(toRefresh))
+            {
+                var ids = batch.Select(s => (AssetKind.Skill, s.Id)).ToList();
+                state.SaveAssetsContent(ids, _ =>
+                {
+                    foreach (var skill in batch)
+                    {
+                        var ms = index.Skills.FirstOrDefault(x => x.Id == skill.SourceSkillId);
+                        if (ms is null) continue; // no longer offered; leave the local copy intact
+
+                        skill.Name = ms.Name;
+                        skill.Description = ms.Description;
+                        skill.Instructions = ms.Instructions;
+                        skill.Version = string.IsNullOrWhiteSpace(ms.Version) ? null : ms.Version;
+                        // Enabled and Visibility are the user's choices: preserve them.
+                    }
+                });
+            }
         }
     }
+}
+
+/// <summary>
+/// AppState-coupled routing that applies a classified <see cref="AssetPagePolicy"/> edit through the
+/// matching explicit per-asset AppState API. Kept out of the pure <see cref="AssetPagePolicy"/> so the
+/// paging/classification policy stays unit-testable without a MAUI render host or a live AppState.
+/// </summary>
+public static class AssetMutations
+{
+    /// <summary>Routes a classified mutation to the matching explicit per-asset AppState API.</summary>
+    public static void Write(
+        AppState state, AssetMutation mutation, AssetKind kind, string id, Action<MeshProfile> change)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ArgumentNullException.ThrowIfNull(change);
+        switch (mutation)
+        {
+            case AssetMutation.Content: state.SaveAssetContent(kind, id, change); break;
+            case AssetMutation.Metadata: state.SaveAssetMetadata(kind, id, change); break;
+            case AssetMutation.Delete: state.RemoveAsset(kind, id, change); break;
+            default: throw new ArgumentOutOfRangeException(nameof(mutation), mutation, "Unknown mutation.");
+        }
+    }
+
+    /// <summary>Convenience: classify the edit via <see cref="AssetPagePolicy.Classify"/> and route it in one call.</summary>
+    public static void Apply(
+        AppState state, AssetEdit edit, AssetKind kind, string id, Action<MeshProfile> change)
+        => Write(state, AssetPagePolicy.Classify(edit), kind, id, change);
 }

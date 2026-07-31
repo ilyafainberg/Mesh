@@ -20,6 +20,45 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         || state.Profile.Model.Provider == ModelProvider.FoundryLocal
         || !string.IsNullOrWhiteSpace(state.Profile.Model.Endpoint); // local endpoints need no key
 
+    private int _askUserResumeRegistered;
+
+    /// <summary>
+    /// Registers, exactly once, the ask-user continuation that runs when a prompt is resolved after
+    /// its original run no longer exists (for example following a restart). The UI calls this on load
+    /// and the owner turn calls it lazily, so a restored bubble can always be answered even before any
+    /// new owner turn has started this session. The continuation appends a hidden context line carrying
+    /// the owner's answer and runs ONE fresh owner turn, so the model produces a single, non-duplicated
+    /// reply. Exactly-once execution is fenced by the durable suspended-context store.
+    /// </summary>
+    public void EnsureAskUserResumeRegistered()
+    {
+        if (Interlocked.CompareExchange(ref _askUserResumeRegistered, 1, 0) != 0) return;
+        state.SetAskUserResumeHandler(async (context, resolved, token) =>
+        {
+            var selected = resolved.Options.FirstOrDefault(o =>
+                string.Equals(o.Id, resolved.Selection, StringComparison.Ordinal));
+            var resumeText = resolved.State switch
+            {
+                AskUserState.Resolved =>
+                    $"[ask_user resolved] The owner answered \"{selected?.Title ?? resolved.Selection}\""
+                    + $" (id: {resolved.Selection}) to: {resolved.Question}",
+                AskUserState.Expired =>
+                    $"[ask_user expired] The owner did not answer before the deadline: {resolved.Question}. "
+                    + "Continue without that decision.",
+                _ =>
+                    $"[ask_user cancelled] The question was cancelled: {resolved.Question}. "
+                    + "Continue without that decision."
+            };
+            state.AddOwnChatLine(context.ThreadId, new ChatLine
+            {
+                Role = "user",
+                Internal = true,
+                Text = resumeText
+            });
+            await ContinueAsOwnerAsync(context.ThreadId, token);
+        });
+    }
+
     /// <summary>Owner chat: the user talking to their own agent with full access.</summary>
     public async Task<string> AskAsOwnerAsync(string threadId, string userText,
         IReadOnlyList<ChatAttachment>? attachments = null, CancellationToken ct = default)
@@ -69,6 +108,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         IProgress<AgentDelta>? deltaProgress,
         CancellationToken ct)
     {
+        EnsureAskUserResumeRegistered();
         var thread = state.GetOrCreateOwnThread(threadId);
         var p = state.Profile;
         IReadOnlyList<ChatLine> sourceHistory = thread.Lines;
@@ -100,8 +140,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             .ToHashSet(StringComparer.Ordinal);
         agentTools.RemoveAll(tool => memoryToolNames.Contains(tool.Name));
         agentTools.AddRange(memoryTurn.Tools);
-        var sys = BuildOwnerSystemPrompt(
-                      p, agentTools, IsSmall(p.Model.Provider), memoryTrigger?.Text ?? "")
+        var sys = (await BuildOwnerSystemPromptAsync(
+                      p, agentTools, IsSmall(p.Model.Provider), memoryTrigger?.Text ?? "", ct))
                   + memoryTurn.BuildSystemPrompt();
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
@@ -116,6 +156,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var startedAt = requestedStartedAt != default
             ? requestedStartedAt
             : previousRun?.StartedAt ?? DateTimeOffset.UtcNow;
+
+        // Owner-only: an internal ask_user tool bound to THIS run. When the model calls it, the run
+        // suspends on a durable prompt and resumes in place with the owner's choice. It is never added
+        // for guest or service agents, keeping human decisions on the owner path only.
+        agentTools.Add(new AskUserAgentTool(state, thread.Id, runId, triggerLineId));
         if (p.PlanBeforeActing)
         {
             var planning = new AgentRunState(
@@ -219,7 +264,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             }
 
             var (reasoning, finalAnswer) = ReasoningExtract.FromText(answer);
-            finalAnswer = ExpandWidgets(finalAnswer, p.Widgets);
+            finalAnswer = await ExpandWidgetsAsync(finalAnswer, p.Widgets, ct);
             finalAnswer = AppendImages(finalAnswer, images);
             state.AddOwnChatLine(thread.Id, new ChatLine
             {
@@ -378,7 +423,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         var p = state.Profile;
         var agentTools = tools.OwnerTools(p.Sources, p.LocalTools).ToList();
         agentTools.AddRange(await tools.McpToolsAsync(p.McpServers, p.CustomMcpServers, owner: true, circles: null, ct));
-        var sys = BuildOwnerSystemPrompt(p, agentTools, IsSmall(p.Model.Provider), userText)
+        var sys = (await BuildOwnerSystemPromptAsync(p, agentTools, IsSmall(p.Model.Provider), userText, ct))
             + "\nYou are answering your owner remotely from another of their devices. Be concise.";
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
@@ -388,7 +433,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         using (media.BeginScope(out var images))
         {
             answer = await model.CompleteWithToolsAsync(sys, history, agentTools, ct: ct);
-            answer = ExpandWidgets(answer, p.Widgets);
+            answer = await ExpandWidgetsAsync(answer, p.Widgets, ct);
             answer = AppendImages(answer, images);
         }
         return answer;
@@ -556,8 +601,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
 
         var currentRequest = agentHistory.LastOrDefault(line =>
             string.Equals(line.Role, "user", StringComparison.Ordinal))?.Text ?? "";
-        var sys = BuildGuestSystemPrompt(
-            p, fromHandle, circles, agentTools, widgets, currentRequest);
+        var sys = await BuildGuestSystemPromptAsync(
+            p, fromHandle, circles, agentTools, widgets, currentRequest, ct);
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
         // Attribute the tokens this reply costs to the requesting contact (in addition to the
@@ -565,7 +610,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         string reply;
         using (meter.BeginScope((pt, cc) => state.AddContactTokens(fromHandle, pt, cc)))
             reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct: ct);
-        return ExpandWidgets(reply, widgets);
+        return await ExpandWidgetsAsync(reply, widgets, ct);
     }
 
     /// <summary>
@@ -604,8 +649,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             if (lastInbound is not null) agentHistory.Add(lastInbound);
         }
         var currentRequest = agentHistory.LastOrDefault(line => line.Role == "user")?.Text ?? "";
-        var sys = BuildServiceSystemPrompt(
-            p, svc, knowledge, skills, widgets, currentRequest);
+        var sys = await BuildServiceSystemPromptAsync(
+            p, svc, knowledge, skills, widgets, currentRequest, ct);
         var cfg = await ResolveModelConfigAsync(p.Model, ct);
         var model = factory.Create(cfg);
 
@@ -623,7 +668,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         {
             reply = await model.CompleteWithToolsAsync(sys, Window(agentHistory, p.Model.Provider), agentTools, ct: ct);
         }
-        return new ServiceReply(ExpandWidgets(reply, widgets), spent);
+        return new ServiceReply(await ExpandWidgetsAsync(reply, widgets, ct), spent);
     }
 
     // ---- history windowing (keeps small local models under their context limit) ----
@@ -647,16 +692,147 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         return picked;
     }
 
-    /// <summary>Replaces [[widget:Name]] placeholders with the stored widget's runnable app block.</summary>
-    private static string ExpandWidgets(string text, IReadOnlyList<Widget> widgets)
+    // ---- lazy asset hydration (Mesh 1.17) -------------------------------
+    // After startup Profile.Skills/Knowledge/Widgets are metadata-only summaries whose body fields
+    // (Instructions/Content/Html) are blank. Before every prompt build we filter the summaries
+    // (enabled / audience / service ids), rank the survivors with TokenOptimizer, then bounded-load
+    // ONLY those bodies through the core lazy APIs. A single request therefore never hydrates the
+    // whole corpus, and rendering uses loaded bodies only so a blank summary is never mistaken for a
+    // real (empty) asset.
+
+    /// <summary>
+    /// Explicit metadata bound: never rank or list more than this many summaries per category, so a
+    /// pathological catalogue (e.g. 100k items) is never fully scored, joined into an omission note,
+    /// or dumped into the prompt. The far smaller <see cref="AssetLoadBudget.Default"/> then caps how
+    /// many of the selected bodies are actually loaded.
+    /// </summary>
+    private const int MetadataSelectionCap = 200;
+
+    /// <summary>A category's relevant, fully loaded bodies plus what selection and the budget left out.</summary>
+    private sealed record HydratedAssets<T>(
+        IReadOnlyList<T> Loaded,
+        IReadOnlyList<string> OmittedNames,
+        int DroppedByBudget,
+        int TotalCandidates);
+
+    private async Task<HydratedAssets<KnowledgeItem>> HydrateKnowledgeAsync(
+        IReadOnlyList<KnowledgeItem> candidates,
+        TokenOptimizationLevel optimization,
+        string query,
+        CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(text) || widgets.Count == 0) return text;
+        var total = candidates.Count;
+        if (total == 0)
+            return new HydratedAssets<KnowledgeItem>(Array.Empty<KnowledgeItem>(), Array.Empty<string>(), 0, 0);
+        var pool = total <= MetadataSelectionCap
+            ? candidates
+            : candidates.OrderByDescending(k => k.UpdatedAt).Take(MetadataSelectionCap).ToList();
+        var selection = TokenOptimizer.SelectKnowledge(pool, query, optimization);
+        var includedIds = selection.Included.Select(k => k.Id).ToList();
+        var loaded = includedIds.Count == 0
+            ? (IReadOnlyList<KnowledgeItem>)Array.Empty<KnowledgeItem>()
+            : await state.LoadKnowledgeAsync(includedIds, AssetLoadBudget.Default, ct).ConfigureAwait(false);
+        return new HydratedAssets<KnowledgeItem>(
+            loaded,
+            selection.Omitted.Select(k => k.Title).ToList(),
+            selection.Included.Count - loaded.Count,
+            total);
+    }
+
+    private async Task<HydratedAssets<Skill>> HydrateSkillsAsync(
+        IReadOnlyList<Skill> candidates,
+        TokenOptimizationLevel optimization,
+        string query,
+        CancellationToken ct)
+    {
+        var total = candidates.Count;
+        if (total == 0)
+            return new HydratedAssets<Skill>(Array.Empty<Skill>(), Array.Empty<string>(), 0, 0);
+        var pool = total <= MetadataSelectionCap
+            ? candidates
+            : candidates.Take(MetadataSelectionCap).ToList();
+        var selection = TokenOptimizer.SelectSkills(pool, query, optimization);
+        var includedIds = selection.Included.Select(s => s.Id).ToList();
+        var loaded = includedIds.Count == 0
+            ? (IReadOnlyList<Skill>)Array.Empty<Skill>()
+            : await state.LoadSkillsAsync(includedIds, AssetLoadBudget.Default, ct).ConfigureAwait(false);
+        return new HydratedAssets<Skill>(
+            loaded,
+            selection.Omitted.Select(s => s.Name).ToList(),
+            selection.Included.Count - loaded.Count,
+            total);
+    }
+
+    /// <summary>An honest, compact note when the per-request asset budget dropped selected bodies.</summary>
+    private static string BudgetNote(string noun, int dropped)
+        => $"Note: {dropped} more relevant {noun}{(dropped == 1 ? "" : "s")} matched but "
+           + $"{(dropped == 1 ? "was" : "were")} not loaded to stay within this request's asset budget of "
+           + $"{AssetLoadBudget.Default.MaxCount} items and {AssetLoadBudget.Default.MaxBytes / (1024 * 1024)} MiB.";
+
+    /// <summary>
+    /// Replaces [[widget:Name]] placeholders by bounded-loading ONLY the widgets actually referenced,
+    /// mapped against the caller's already-authorized candidate set (owner / audience / service ids),
+    /// so security is preserved and unreferenced bodies are never read. An unresolved or budget-dropped
+    /// placeholder is left verbatim, exactly like the prior synchronous behaviour.
+    /// </summary>
+    private async Task<string> ExpandWidgetsAsync(string text, IReadOnlyList<Widget> candidates, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(text) || candidates.Count == 0) return text;
+        var referencedIds = new List<string>();
+        var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(text, @"\[\[widget:\s*(.+?)\]\]"))
+        {
+            var name = m.Groups[1].Value.Trim();
+            if (!seenNames.Add(name)) continue;
+            var w = candidates.FirstOrDefault(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (w is not null) referencedIds.Add(w.Id);
+        }
+        if (referencedIds.Count == 0) return text;
+        var loaded = await state.LoadWidgetsAsync(referencedIds, AssetLoadBudget.Default, ct).ConfigureAwait(false);
+        var htmlById = loaded.ToDictionary(w => w.Id, w => w.Html, StringComparer.Ordinal);
         return System.Text.RegularExpressions.Regex.Replace(text, @"\[\[widget:\s*(.+?)\]\]", m =>
         {
             var name = m.Groups[1].Value.Trim();
-            var w = widgets.FirstOrDefault(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
-            return w is null ? m.Value : $"\n```html-app\n{w.Html}\n```\n";
+            var w = candidates.FirstOrDefault(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
+            return w is not null && htmlById.TryGetValue(w.Id, out var html)
+                ? $"\n```html-app\n{html}\n```\n"
+                : m.Value;
         });
+    }
+
+    private async Task<string> BuildOwnerSystemPromptAsync(
+        MeshProfile p, IReadOnlyList<IAgentTool> agentTools, bool compact, string query, CancellationToken ct)
+    {
+        var knowledge = await HydrateKnowledgeAsync(p.Knowledge, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        var skills = await HydrateSkillsAsync(
+            p.Skills.Where(s => s.Enabled).ToList(), p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        return BuildOwnerSystemPrompt(p, agentTools, compact, knowledge, skills);
+    }
+
+    private async Task<string> BuildGuestSystemPromptAsync(
+        MeshProfile p, string fromHandle, List<string> circles, IReadOnlyList<IAgentTool> agentTools,
+        IReadOnlyList<Widget> widgets, string query, CancellationToken ct)
+    {
+        // Only items shared with at least one matching circle, or all allowed contacts. Audience is a
+        // metadata field, so this filter runs on summaries WITHOUT loading any body: an unauthorized
+        // asset is never even a load candidate.
+        var knowledgeCandidates = p.Knowledge.Where(k => AudiencePolicy.CanAccess(k.Visibility, circles)).ToList();
+        var skillCandidates = p.Skills.Where(s => s.Enabled && AudiencePolicy.CanAccess(s.Visibility, circles)).ToList();
+        var knowledge = await HydrateKnowledgeAsync(knowledgeCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        var skills = await HydrateSkillsAsync(skillCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        return BuildGuestSystemPrompt(p, fromHandle, agentTools, widgets, knowledge, skills, IsSmall(p.Model.Provider));
+    }
+
+    private async Task<string> BuildServiceSystemPromptAsync(
+        MeshProfile p, PublishedService svc, IReadOnlyList<KnowledgeItem> knowledgeCandidates,
+        IReadOnlyList<Skill> skillCandidates, IReadOnlyList<Widget> widgets, string query, CancellationToken ct)
+    {
+        // The candidate lists are already restricted to exactly the service's own attached ids, so the
+        // bounded load can only ever touch those bodies.
+        var knowledge = await HydrateKnowledgeAsync(knowledgeCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        var skills = await HydrateSkillsAsync(skillCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        return BuildServiceSystemPrompt(p, svc, widgets, knowledge, skills, IsSmall(p.Model.Provider));
     }
 
     /// <summary>
@@ -735,7 +911,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         MeshProfile p,
         IReadOnlyList<IAgentTool> agentTools,
         bool compact,
-        string query)
+        HydratedAssets<KnowledgeItem> knowledge,
+        HydratedAssets<Skill> skills)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"You are the personal AI agent for {p.DisplayName} (@{p.Handle}), speaking privately with your owner.");
@@ -751,24 +928,15 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         AppendAppCapability(sb, compact);
         AppendTools(sb, agentTools, compact);
         AppendWidgets(sb, p.Widgets, "insert");
-        AppendKnowledge(sb, p.Knowledge, compact, p.Model.TokenOptimization, query, includeAudienceLabels: true);
-        AppendSkills(
-            sb,
-            p.Skills.Where(s => s.Enabled).ToList(),
-            p.Model.TokenOptimization,
-            query,
-            includeAudienceLabels: true);
+        AppendKnowledge(sb, knowledge, compact, p.Model.TokenOptimization, includeAudienceLabels: true);
+        AppendSkills(sb, skills, p.Model.TokenOptimization, includeAudienceLabels: true);
         return sb.ToString();
     }
 
-    private static string BuildGuestSystemPrompt(MeshProfile p, string fromHandle, List<string> circles,
-        IReadOnlyList<IAgentTool> agentTools, IReadOnlyList<Widget> widgets, string query)
+    private static string BuildGuestSystemPrompt(MeshProfile p, string fromHandle,
+        IReadOnlyList<IAgentTool> agentTools, IReadOnlyList<Widget> widgets,
+        HydratedAssets<KnowledgeItem> knowledge, HydratedAssets<Skill> skills, bool compact)
     {
-        // Only items shared with at least one matching circle, or all allowed contacts.
-        var knowledge = p.Knowledge.Where(k => AudiencePolicy.CanAccess(k.Visibility, circles)).ToList();
-        var skills = p.Skills.Where(s => s.Enabled && AudiencePolicy.CanAccess(s.Visibility, circles)).ToList();
-        var compact = IsSmall(p.Model.Provider);
-
         var sb = new StringBuilder();
         sb.AppendLine($"You are the agent for {p.DisplayName} (@{p.Handle}), representing them to @{fromHandle}.");
         sb.AppendLine($"@{fromHandle} is an approved contact. Everything below has already been cleared by your owner");
@@ -782,23 +950,21 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         AppendAppCapability(sb, compact);
         AppendTools(sb, agentTools, compact);
         AppendWidgets(sb, widgets, "send");
-        if (knowledge.Count == 0)
+        if (knowledge.TotalCandidates == 0)
             sb.AppendLine("(No specific knowledge exposed to this contact. Share only general, public-safe info.)");
         else
-            AppendKnowledge(
-                sb, knowledge, compact, p.Model.TokenOptimization, query);
-        AppendSkills(sb, skills, p.Model.TokenOptimization, query);
+            AppendKnowledge(sb, knowledge, compact, p.Model.TokenOptimization);
+        AppendSkills(sb, skills, p.Model.TokenOptimization);
         return sb.ToString();
     }
 
     /// <summary>System prompt for a hard-sandboxed public service agent (public-listed items only, no tools).</summary>
     private static string BuildServiceSystemPrompt(MeshProfile p, PublishedService svc,
-        IReadOnlyList<KnowledgeItem> knowledge,
-        IReadOnlyList<Skill> skills,
         IReadOnlyList<Widget> widgets,
-        string query)
+        HydratedAssets<KnowledgeItem> knowledge,
+        HydratedAssets<Skill> skills,
+        bool compact)
     {
-        var compact = IsSmall(p.Model.Provider);
         var sb = new StringBuilder();
         sb.AppendLine($"You are \"{svc.Name}\", a PUBLIC service published by @{p.Handle} to the Community directory.");
         if (!string.IsNullOrWhiteSpace(svc.Description)) sb.AppendLine($"Service description: {svc.Description}");
@@ -813,12 +979,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         sb.AppendLine("- Be brief, warm and helpful.");
         AppendAppCapability(sb, compact);
         AppendWidgets(sb, widgets, "send");
-        if (knowledge.Count == 0)
+        if (knowledge.TotalCandidates == 0)
             sb.AppendLine("\n(No public knowledge attached. Answer only from the service description and skills.)");
         else
-            AppendKnowledge(
-                sb, knowledge, compact, p.Model.TokenOptimization, query);
-        AppendSkills(sb, skills, p.Model.TokenOptimization, query);
+            AppendKnowledge(sb, knowledge, compact, p.Model.TokenOptimization);
+        AppendSkills(sb, skills, p.Model.TokenOptimization);
         return sb.ToString();
     }
 
@@ -892,8 +1057,17 @@ Widget runtime restrictions:
         if (widgets.Count == 0) return;
         sb.AppendLine();
         sb.AppendLine($"Saved widgets you can {verb} when relevant. To use one, put its placeholder on its own line, e.g. [[widget:Name]], it expands into a runnable mini-app. Available:");
+        // Metadata-only listing (widget summaries carry Name/Prompt; Html is loaded lazily on use).
+        // Cap the listing so a pathological catalogue is never fully enumerated into the prompt.
+        var shown = 0;
         foreach (var w in widgets)
+        {
+            if (shown >= MetadataSelectionCap) break;
             sb.AppendLine($"- {w.Name}" + (string.IsNullOrWhiteSpace(w.Prompt) ? "" : $": {Truncate(w.Prompt, 100)}"));
+            shown++;
+        }
+        if (widgets.Count > shown)
+            sb.AppendLine($"...and {widgets.Count - shown} more saved widgets not listed here.");
     }
 
     /// <summary>Tells the agent how to emit an interactive mini-app.</summary>
@@ -913,18 +1087,17 @@ Widget runtime restrictions:
 
     private static void AppendKnowledge(
         StringBuilder sb,
-        IReadOnlyList<KnowledgeItem> items,
+        HydratedAssets<KnowledgeItem> knowledge,
         bool compact,
         TokenOptimizationLevel optimization,
-        string query,
         bool includeAudienceLabels = false)
     {
-        if (items.Count == 0) { sb.AppendLine(); sb.AppendLine("(No knowledge items yet.)"); return; }
-        var selection = TokenOptimizer.SelectKnowledge(items, query, optimization);
+        if (knowledge.TotalCandidates == 0) { sb.AppendLine(); sb.AppendLine("(No knowledge items yet.)"); return; }
         sb.AppendLine();
         sb.AppendLine("=== Knowledge ===");
+        // Render only bodies that were actually loaded; a blank summary is never emitted as real content.
         var perItem = TokenOptimizer.KnowledgeContentLimit(optimization, compact);
-        foreach (var k in selection.Included)
+        foreach (var k in knowledge.Loaded)
         {
             var audienceLabel = includeAudienceLabels
                 ? $" [{AudiencePolicy.DisplayLabel(k.Visibility)}]"
@@ -934,24 +1107,24 @@ Widget runtime restrictions:
                 ? Truncate(k.Content, perItem)
                 : TokenOptimizer.FitContextText(k.Content, perItem));
         }
-        if (selection.Omitted.Count > 0)
+        if (knowledge.OmittedNames.Count > 0)
             sb.AppendLine("Other saved knowledge not included in this optimized request: "
-                + Truncate(string.Join(", ", selection.Omitted.Select(item => item.Title)), 600));
+                + Truncate(string.Join(", ", knowledge.OmittedNames), 600));
+        if (knowledge.DroppedByBudget > 0)
+            sb.AppendLine(BudgetNote("knowledge item", knowledge.DroppedByBudget));
     }
 
     private static void AppendSkills(
         StringBuilder sb,
-        IReadOnlyList<Skill> skills,
+        HydratedAssets<Skill> skills,
         TokenOptimizationLevel optimization,
-        string query,
         bool includeAudienceLabels = false)
     {
-        if (skills.Count == 0) return;
-        var selection = TokenOptimizer.SelectSkills(skills, query, optimization);
+        if (skills.TotalCandidates == 0) return;
         var instructionLimit = TokenOptimizer.SkillInstructionLimit(optimization);
         sb.AppendLine();
         sb.AppendLine("=== Skills you can offer ===");
-        foreach (var s in selection.Included)
+        foreach (var s in skills.Loaded)
         {
             var audienceLabel = includeAudienceLabels
                 ? $" [{AudiencePolicy.DisplayLabel(s.Visibility)}]"
@@ -963,9 +1136,11 @@ Widget runtime restrictions:
                     ? s.Instructions
                     : TokenOptimizer.FitContextText(s.Instructions, instructionLimit)));
         }
-        if (selection.Omitted.Count > 0)
+        if (skills.OmittedNames.Count > 0)
             sb.AppendLine("Other saved skills not included in this optimized request: "
-                + Truncate(string.Join(", ", selection.Omitted.Select(item => item.Name)), 400));
+                + Truncate(string.Join(", ", skills.OmittedNames), 400));
+        if (skills.DroppedByBudget > 0)
+            sb.AppendLine(BudgetNote("skill", skills.DroppedByBudget));
     }
 
     private static string Truncate(string s, int max)

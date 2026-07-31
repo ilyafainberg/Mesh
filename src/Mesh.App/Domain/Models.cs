@@ -402,6 +402,134 @@ public sealed class MemoryItem
     public DateTimeOffset? LastRecalledAt { get; set; }
 }
 
+/// <summary>
+/// The concrete operating systems a Mesh 1.17 skill package declares support for. This is a
+/// deliberately explicit set (never inferred at run time) so an incompatible install/enable/run can
+/// be refused with a precise reason. Modeled as flags because a package usually supports several
+/// systems at once.
+/// </summary>
+[Flags]
+public enum SkillOperatingSystems
+{
+    None = 0,
+    Windows = 1 << 0,
+    MacOS = 1 << 1,
+    Linux = 1 << 2,
+    IOS = 1 << 3,
+    Android = 1 << 4,
+
+    /// <summary>Every desktop operating system Mesh runs on.</summary>
+    AllDesktop = Windows | MacOS | Linux,
+    /// <summary>Every mobile operating system Mesh runs on.</summary>
+    AllMobile = IOS | Android,
+    /// <summary>Every operating system Mesh runs on.</summary>
+    All = AllDesktop | AllMobile
+}
+
+/// <summary>The broad device class a skill targets. Universal runs on both desktop and mobile.</summary>
+public enum SkillDeviceClass { Desktop, Mobile, Universal }
+
+/// <summary>The role a single file plays inside a skill package folder.</summary>
+public enum SkillFileRole
+{
+    /// <summary>The single required <c>Skill.md</c> instruction file. Exactly one per package.</summary>
+    SkillMarkdown,
+    /// <summary>An executable script (e.g. a shell/python helper) the skill may run on desktop.</summary>
+    Script,
+    /// <summary>A supporting resource (template, data, asset) the skill reads.</summary>
+    Resource,
+    /// <summary>A configuration file (JSON/YAML/etc.).</summary>
+    Config
+}
+
+/// <summary>
+/// Explicit, self-contained compatibility declaration for a skill or skill package. It is the single
+/// authority both install-time gating and run-time gating consult, so nothing platform-specific is
+/// inferred later. Immutable once built.
+/// </summary>
+public sealed class SkillCompatibility
+{
+    /// <summary>The operating systems this skill explicitly supports.</summary>
+    public SkillOperatingSystems OperatingSystems { get; set; } = SkillOperatingSystems.None;
+
+    /// <summary>The device class this skill targets (Desktop, Mobile, or Universal).</summary>
+    public SkillDeviceClass DeviceClass { get; set; } = SkillDeviceClass.Desktop;
+
+    /// <summary>CLI tools that must be present for the skill to run (probed on desktop).</summary>
+    public List<string> RequiredCliTools { get; set; } = new();
+
+    public SkillCompatibility Clone() => new()
+    {
+        OperatingSystems = OperatingSystems,
+        DeviceClass = DeviceClass,
+        RequiredCliTools = new List<string>(RequiredCliTools)
+    };
+}
+
+/// <summary>
+/// Manifest for a single validated file inside a skill package. The path is already normalized
+/// (forward slashes, relative, no traversal); the hash is the lowercase SHA-256 hex of the bytes.
+/// <see cref="Executable"/> is an advisory only - materialization never sets an executable bit.
+/// </summary>
+public sealed class SkillFileManifest
+{
+    /// <summary>Normalized, package-relative path (forward slashes, no drive/root/<c>..</c>).</summary>
+    public string Path { get; set; } = "";
+    /// <summary>Lowercase SHA-256 hex of the file bytes.</summary>
+    public string Sha256 { get; set; } = "";
+    /// <summary>Uncompressed size in bytes.</summary>
+    public long Size { get; set; }
+    /// <summary>The role this file plays in the package.</summary>
+    public SkillFileRole Role { get; set; } = SkillFileRole.Resource;
+    /// <summary>Advisory only: the source archive marked this entry executable.</summary>
+    public bool Executable { get; set; }
+}
+
+/// <summary>How much a skill package's provenance is trusted.</summary>
+public enum SkillPackageTrust
+{
+    /// <summary>Sideloaded/unknown source - treat as untrusted.</summary>
+    Untrusted,
+    /// <summary>Fetched from a recognised community catalog (skills.sh / agentskill.sh / GitHub).</summary>
+    Community,
+    /// <summary>Authored by the local user.</summary>
+    UserAuthored
+}
+
+/// <summary>
+/// The complete, validated manifest of a Mesh 1.17 skill package: its canonical content hash, version,
+/// source and trust, its explicit <see cref="SkillCompatibility"/>, and every file it contains. There
+/// is always exactly one <see cref="SkillFileRole.SkillMarkdown"/> file. The manifest carries no bytes;
+/// file bytes are stored separately (desktop DB) or discarded (mobile keeps only the Skill.md body).
+/// </summary>
+public sealed class SkillPackageManifest
+{
+    /// <summary>
+    /// Canonical package hash: SHA-256 over the sorted (path, file-hash) pairs, NOT over the raw ZIP
+    /// bytes, so two archives with identical content but different compression hash identically.
+    /// </summary>
+    public string PackageHash { get; set; } = "";
+    /// <summary>Package version string, if the source declared one.</summary>
+    public string? Version { get; set; }
+    /// <summary>Where the package came from (catalog URL, repo URL, or a local marker).</summary>
+    public string? Source { get; set; }
+    /// <summary>Provenance trust level.</summary>
+    public SkillPackageTrust Trust { get; set; } = SkillPackageTrust.Untrusted;
+    /// <summary>The package's explicit compatibility declaration.</summary>
+    public SkillCompatibility Compatibility { get; set; } = new();
+    /// <summary>Every validated file in the package (exactly one is the Skill.md).</summary>
+    public List<SkillFileManifest> Files { get; set; } = new();
+
+    /// <summary>The single required Skill.md file manifest.</summary>
+    [JsonIgnore]
+    public SkillFileManifest SkillMarkdown
+        => Files.Single(f => f.Role == SkillFileRole.SkillMarkdown);
+
+    /// <summary>Total uncompressed size across all files.</summary>
+    [JsonIgnore]
+    public long TotalSize => Files.Sum(f => f.Size);
+}
+
 /// <summary>A capability the agent can offer, exposed by visibility like knowledge.</summary>
 public sealed class Skill
 {
@@ -419,6 +547,22 @@ public sealed class Skill
     public string? SourceSkillId { get; set; }
     /// <summary>Version string reported by the marketplace, if any.</summary>
     public string? Version { get; set; }
+
+    /// <summary>
+    /// Explicit compatibility for a Mesh 1.17 package-backed skill. Null for a legacy/plain skill that
+    /// carries no compatibility metadata (treated as Skill.md-only, universal instructions).
+    /// </summary>
+    public SkillCompatibility? Compatibility { get; set; }
+
+    /// <summary>
+    /// Canonical hash of the skill package this skill was installed from, when it is package-backed.
+    /// Desktop keeps the full package rows keyed by this hash; mobile stores only the Skill.md body but
+    /// still records the hash so the two devices agree on identity.
+    /// </summary>
+    public string? PackageHash { get; set; }
+
+    /// <summary>Package version string (may differ from <see cref="Version"/> for legacy marketplaces).</summary>
+    public string? PackageVersion { get; set; }
 }
 
 /// <summary>A remote catalog of importable skills, addressed by a JSON index URL.</summary>

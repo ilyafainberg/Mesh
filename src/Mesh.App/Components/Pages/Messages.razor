@@ -830,6 +830,15 @@
         var toSend = text;
         if (widget is not null)
         {
+            // The picker hands us a body-less summary after a restart; load the stored body before
+            // attaching so we never transmit blank widget HTML to the peer.
+            if (WidgetConsumerPolicy.RequiresBodyLoad(widget))
+            {
+                var full = await State.LoadFullWidgetAsync(widget.Id);
+                if (full is not null) widget = full;
+            }
+            if (!WidgetConsumerPolicy.HasSendableBody(widget))
+                throw new InvalidOperationException("The selected widget has no content to send.");
             line.WidgetPrompt = widget.Prompt;
             var widgetHtml = WidgetForSend(widget.Html);
             toSend = string.IsNullOrWhiteSpace(toSend) ? widgetHtml : $"{toSend.TrimEnd()}\n\n{widgetHtml}";
@@ -993,14 +1002,15 @@
             pinError = $"A widget named \"{name}\" already exists. Choose a different name.";
             return;
         }
-        State.Mutate(p => p.Widgets.Add(new Widget
+        var widget = new Widget
         {
             Name = name,
             Html = pinHtml!,
             Prompt = pinPrompt ?? "Pinned from conversation",
             Visibility = "private",
             ModifiedAt = DateTimeOffset.UtcNow,
-        }));
+        };
+        State.SaveAssetContent(AssetKind.Widget, widget.Id, p => p.Widgets.Add(widget));
         pinHtml = null; pinName = ""; pinPrompt = null; pinError = null;
     }
 

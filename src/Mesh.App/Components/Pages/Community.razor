@@ -135,7 +135,7 @@
                     <div class="cap-group">
                         <h4><i class="bi bi-journal-text"></i> Knowledge</h4>
                         <div class="chip-row">
-                            @foreach (var k in State.Profile.Knowledge)
+                            @foreach (var k in AssetPagePolicy.Take(State.Profile.Knowledge, newKnVisible))
                             {
                                 <label class="chip @(newKnowledgeIds.Contains(k.Id) ? "on" : "")" @key="k.Id">
                                     <input type="checkbox" checked="@newKnowledgeIds.Contains(k.Id)"
@@ -147,13 +147,18 @@
                             {
                                 <span class="empty-mini">No knowledge items yet.</span>
                             }
+                            @if (AssetPagePolicy.HasMore(State.Profile.Knowledge.Count, newKnVisible))
+                            {
+                                <button class="chip-more" type="button" @onclick="() => newKnVisible = AssetPagePolicy.NextVisible(newKnVisible, State.Profile.Knowledge.Count)"
+                                        aria-label="Show more knowledge items">Show more (@AssetPagePolicy.Remaining(State.Profile.Knowledge.Count, newKnVisible))</button>
+                            }
                         </div>
                     </div>
 
                     <div class="cap-group">
                         <h4><i class="bi bi-lightning-charge"></i> Skills</h4>
                         <div class="chip-row">
-                            @foreach (var s in State.Profile.Skills)
+                            @foreach (var s in AssetPagePolicy.Take(State.Profile.Skills, newSkVisible))
                             {
                                 <label class="chip @(newSkillIds.Contains(s.Id) ? "on" : "")" @key="s.Id">
                                     <input type="checkbox" checked="@newSkillIds.Contains(s.Id)"
@@ -165,13 +170,18 @@
                             {
                                 <span class="empty-mini">No skills yet.</span>
                             }
+                            @if (AssetPagePolicy.HasMore(State.Profile.Skills.Count, newSkVisible))
+                            {
+                                <button class="chip-more" type="button" @onclick="() => newSkVisible = AssetPagePolicy.NextVisible(newSkVisible, State.Profile.Skills.Count)"
+                                        aria-label="Show more skills">Show more (@AssetPagePolicy.Remaining(State.Profile.Skills.Count, newSkVisible))</button>
+                            }
                         </div>
                     </div>
 
                     <div class="cap-group">
                         <h4><i class="bi bi-window-stack"></i> Widgets</h4>
                         <div class="chip-row">
-                            @foreach (var w in State.Profile.Widgets)
+                            @foreach (var w in AssetPagePolicy.Take(State.Profile.Widgets, newWgVisible))
                             {
                                 <label class="chip @(newWidgetIds.Contains(w.Id) ? "on" : "")" @key="w.Id">
                                     <input type="checkbox" checked="@newWidgetIds.Contains(w.Id)"
@@ -182,6 +192,11 @@
                             @if (State.Profile.Widgets.Count == 0)
                             {
                                 <span class="empty-mini">No widgets yet.</span>
+                            }
+                            @if (AssetPagePolicy.HasMore(State.Profile.Widgets.Count, newWgVisible))
+                            {
+                                <button class="chip-more" type="button" @onclick="() => newWgVisible = AssetPagePolicy.NextVisible(newWgVisible, State.Profile.Widgets.Count)"
+                                        aria-label="Show more widgets">Show more (@AssetPagePolicy.Remaining(State.Profile.Widgets.Count, newWgVisible))</button>
                             }
                         </div>
                     </div>
@@ -284,7 +299,7 @@
                                     <div class="cap-group">
                                         <h4><i class="bi bi-journal-text"></i> Knowledge</h4>
                                         <div class="chip-row">
-                                            @foreach (var k in State.Profile.Knowledge)
+                                            @foreach (var k in AssetPagePolicy.Take(State.Profile.Knowledge, editKnVisible))
                                             {
                                                 <label class="chip @(editKnowledgeIds.Contains(k.Id) ? "on" : "")" @key="k.Id">
                                                     <input type="checkbox" checked="@editKnowledgeIds.Contains(k.Id)"
@@ -296,13 +311,18 @@
                                             {
                                                 <span class="empty-mini">No knowledge items yet.</span>
                                             }
+                                            @if (AssetPagePolicy.HasMore(State.Profile.Knowledge.Count, editKnVisible))
+                                            {
+                                                <button class="chip-more" type="button" @onclick="() => editKnVisible = AssetPagePolicy.NextVisible(editKnVisible, State.Profile.Knowledge.Count)"
+                                                        aria-label="Show more knowledge items">Show more (@AssetPagePolicy.Remaining(State.Profile.Knowledge.Count, editKnVisible))</button>
+                                            }
                                         </div>
                                     </div>
 
                                     <div class="cap-group">
                                         <h4><i class="bi bi-lightning-charge"></i> Skills</h4>
                                         <div class="chip-row">
-                                            @foreach (var s in State.Profile.Skills)
+                                            @foreach (var s in AssetPagePolicy.Take(State.Profile.Skills, editSkVisible))
                                             {
                                                 <label class="chip @(editSkillIds.Contains(s.Id) ? "on" : "")" @key="s.Id">
                                                     <input type="checkbox" checked="@editSkillIds.Contains(s.Id)"
@@ -314,13 +334,18 @@
                                             {
                                                 <span class="empty-mini">No skills yet.</span>
                                             }
+                                            @if (AssetPagePolicy.HasMore(State.Profile.Skills.Count, editSkVisible))
+                                            {
+                                                <button class="chip-more" type="button" @onclick="() => editSkVisible = AssetPagePolicy.NextVisible(editSkVisible, State.Profile.Skills.Count)"
+                                                        aria-label="Show more skills">Show more (@AssetPagePolicy.Remaining(State.Profile.Skills.Count, editSkVisible))</button>
+                                            }
                                         </div>
                                     </div>
 
                                     <div class="cap-group">
                                         <h4><i class="bi bi-window-stack"></i> Widgets</h4>
                                         <div class="chip-row">
-                                            @foreach (var w in State.Profile.Widgets)
+                                            @foreach (var w in AssetPagePolicy.Take(State.Profile.Widgets, editWgVisible))
                                             {
                                                 <label class="chip @(editWidgetIds.Contains(w.Id) ? "on" : "")" @key="w.Id">
                                                     <input type="checkbox" checked="@editWidgetIds.Contains(w.Id)"
@@ -331,6 +356,11 @@
                                             @if (State.Profile.Widgets.Count == 0)
                                             {
                                                 <span class="empty-mini">No widgets yet.</span>
+                                            }
+                                            @if (AssetPagePolicy.HasMore(State.Profile.Widgets.Count, editWgVisible))
+                                            {
+                                                <button class="chip-more" type="button" @onclick="() => editWgVisible = AssetPagePolicy.NextVisible(editWgVisible, State.Profile.Widgets.Count)"
+                                                        aria-label="Show more widgets">Show more (@AssetPagePolicy.Remaining(State.Profile.Widgets.Count, editWgVisible))</button>
                                             }
                                         </div>
                                     </div>
@@ -399,6 +429,15 @@
     readonly HashSet<string> newKnowledgeIds = new(StringComparer.Ordinal);
     readonly HashSet<string> newSkillIds = new(StringComparer.Ordinal);
     readonly HashSet<string> newWidgetIds = new(StringComparer.Ordinal);
+
+    // Mesh 1.17 bounded rendering of the capability chip groups: never render the whole asset corpus.
+    // These count only summary metadata (Title/Name/Id); no bodies are loaded to draw the checklists.
+    int newKnVisible = AssetPagePolicy.PageSize;
+    int newSkVisible = AssetPagePolicy.PageSize;
+    int newWgVisible = AssetPagePolicy.PageSize;
+    int editKnVisible = AssetPagePolicy.PageSize;
+    int editSkVisible = AssetPagePolicy.PageSize;
+    int editWgVisible = AssetPagePolicy.PageSize;
 
     // Inline edit state (null when no service is being edited).
     string? editingId;
@@ -525,6 +564,9 @@
         editSkillIds.UnionWith(svc.SkillIds);
         editWidgetIds.Clear();
         editWidgetIds.UnionWith(svc.WidgetIds);
+        editKnVisible = AssetPagePolicy.PageSize;
+        editSkVisible = AssetPagePolicy.PageSize;
+        editWgVisible = AssetPagePolicy.PageSize;
         StateHasChanged();
     }
 
@@ -556,6 +598,9 @@
         newKnowledgeIds.Clear();
         newSkillIds.Clear();
         newWidgetIds.Clear();
+        newKnVisible = AssetPagePolicy.PageSize;
+        newSkVisible = AssetPagePolicy.PageSize;
+        newWgVisible = AssetPagePolicy.PageSize;
     }
 
     async Task SaveEdit(PublishedService svc)

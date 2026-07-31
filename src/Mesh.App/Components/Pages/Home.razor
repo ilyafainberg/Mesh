@@ -441,6 +441,57 @@
                         }
                     }
                 }
+                @if (Active is not null)
+                {
+                    @foreach (var bubble in State.AskUserPromptsFor(Active.Id))
+                    {
+                        <div class="ask-user-bubble @(bubble.Status == AskUserBubbleStatus.Pending ? "is-pending" : "is-settled") @(bubble.PromptId == State.FocusedAskUserPromptId ? "is-focused" : "")"
+                             role="group" aria-label="Assistant question" id="@($"ask-{bubble.PromptId}")">
+                            <div class="ask-user-head">
+                                <i class="bi bi-patch-question"></i>
+                                <span class="ask-user-question">@bubble.Question</span>
+                            </div>
+                            <div class="ask-user-options">
+                                @foreach (var option in bubble.Options)
+                                {
+                                    <button type="button"
+                                            class="ask-user-option @(option.IsSelected ? "is-selected" : "") @(option.IsRecommended ? "is-recommended" : "")"
+                                            disabled="@(!bubble.IsInteractive || askResolving.Contains(bubble.PromptId))"
+                                            aria-pressed="@(option.IsSelected ? "true" : "false")"
+                                            aria-label="@AskOptionLabel(option)"
+                                            @onclick="() => ResolveAskAsync(bubble.PromptId, option.Id)">
+                                        <span class="ask-user-option-title">@option.Title</span>
+                                        @if (option.IsRecommended)
+                                        {
+                                            <span class="ask-user-badge" aria-hidden="true">Recommended</span>
+                                        }
+                                        @if (!string.IsNullOrWhiteSpace(option.Description))
+                                        {
+                                            <span class="ask-user-option-desc">@option.Description</span>
+                                        }
+                                    </button>
+                                }
+                            </div>
+                            <div class="ask-user-status" aria-live="polite">
+                                @switch (bubble.Status)
+                                {
+                                    case AskUserBubbleStatus.Pending:
+                                        <span class="muted">Waiting for your choice…</span>
+                                        break;
+                                    case AskUserBubbleStatus.Answered:
+                                        <span class="ask-user-answered"><i class="bi bi-check-circle"></i> You chose @bubble.SelectedOptionTitle</span>
+                                        break;
+                                    case AskUserBubbleStatus.Expired:
+                                        <span class="muted">This question expired.</span>
+                                        break;
+                                    case AskUserBubbleStatus.Cancelled:
+                                        <span class="muted">This question was cancelled.</span>
+                                        break;
+                                }
+                            </div>
+                        </div>
+                    }
+                }
                 </div>
             </div>
             <button type="button" class="scroll-to-latest" @ref="scrollToLatestEl" hidden aria-hidden="true"
@@ -475,7 +526,18 @@
                         <i class="bi bi-window-stack"></i>
                         <span class="widget-chip-name">@selectedWidget.Name</span>
                         <button class="chip-x" @onclick="ClearWidgetMode" title="Remove widget" aria-label="Remove selected widget"><i class="bi bi-x"></i></button>
-                        <span class="mode-hint">send to use, or describe changes</span>
+                        @if (widgetLoading)
+                        {
+                            <span class="mode-hint">loading widget…</span>
+                        }
+                        else if (widgetLoadError is not null)
+                        {
+                            <span class="mode-hint err-text" role="alert">@widgetLoadError</span>
+                        }
+                        else
+                        {
+                            <span class="mode-hint">send to use, or describe changes</span>
+                        }
                     </div>
                 }
                 @if (attachments.Count > 0)
@@ -587,6 +649,8 @@
     bool widgetMode;
     bool widgetPickerOpen;
     Widget? selectedWidget;
+    bool widgetLoading;
+    string? widgetLoadError;
     bool confirmDelete;
     bool renaming;
     string renameText = "";
@@ -781,7 +845,36 @@
         if (activeThread is not null) State.MarkThreadSeen(activeThread);
     }
 
-    protected override async Task OnInitializedAsync() => await LoadDevicesAsync();
+    protected override async Task OnInitializedAsync()
+    {
+        Agent.EnsureAskUserResumeRegistered();
+        await State.RecoverPendingAskUserPromptsAsync();
+        await LoadDevicesAsync();
+    }
+
+    readonly HashSet<string> askResolving = new(StringComparer.Ordinal);
+
+    async Task ResolveAskAsync(string promptId, string optionId)
+    {
+        if (!askResolving.Add(promptId)) return; // one click wins; ignore re-entrancy
+        try
+        {
+            await State.ResolveAskUserPromptAsync(promptId, optionId);
+        }
+        finally
+        {
+            askResolving.Remove(promptId);
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    static string AskOptionLabel(AskUserOptionView option)
+    {
+        var label = option.Title;
+        if (option.IsRecommended) label += " (recommended)";
+        if (!string.IsNullOrWhiteSpace(option.Description)) label += ". " + option.Description;
+        return label;
+    }
 
     static string? ParseQueryValue(string queryString, string key)
     {
@@ -1114,11 +1207,39 @@
         widgetMode = true;
     }
 
-    void SelectWidget(Widget widget)
+    async Task SelectWidget(Widget widget)
     {
         widgetPickerOpen = false;
         widgetMode = false;
         selectedWidget = widget;
+        widgetLoadError = null;
+        await HydrateSelectedWidgetAsync(widget.Id);
+    }
+
+    // The picker lists body-less summaries; hydrate only the one the user selected so its HTML is
+    // ready to use, refine, or preview. Never loads other widgets' bodies.
+    async Task HydrateSelectedWidgetAsync(string id)
+    {
+        if (!WidgetConsumerPolicy.RequiresBodyLoad(selectedWidget)) return;
+        widgetLoading = true;
+        try
+        {
+            var full = await State.LoadFullWidgetAsync(id);
+            if (selectedWidget is not null && string.Equals(selectedWidget.Id, id, StringComparison.Ordinal))
+            {
+                if (full is null) widgetLoadError = "Could not load this widget.";
+                else selectedWidget = full;
+            }
+        }
+        catch (Exception ex)
+        {
+            widgetLoadError = ex.Message;
+        }
+        finally
+        {
+            widgetLoading = false;
+            await InvokeAsync(StateHasChanged);
+        }
     }
 
     void ClearWidgetMode()
@@ -1126,6 +1247,8 @@
         widgetPickerOpen = false;
         widgetMode = false;
         selectedWidget = null;
+        widgetLoading = false;
+        widgetLoadError = null;
     }
 
     async Task ResetComposer()
@@ -1232,10 +1355,20 @@
         widgetMode = false;
         widgetPickerOpen = false;
         selectedWidget = null;
+        widgetLoading = false;
+        widgetLoadError = null;
         if (clearedVisibleDraft) _ = ResetComposer();
 
         // Paint the persisted prompt before dispatch can classify it as queued or start streaming.
         await InvokeAsync(StateHasChanged);
+
+        // A selected widget from the picker is a body-less summary; hydrate its body before it is
+        // sent so the widget context never carries blank HTML.
+        if (WidgetConsumerPolicy.RequiresBodyLoad(chosenWidget))
+        {
+            var full = await State.LoadFullWidgetAsync(chosenWidget!.Id);
+            if (full is not null) chosenWidget = full;
+        }
 
         var widgetContext = BuildWidgetContext(chosenWidget, wasWidget, text);
         var draft = new TopicTurnDraft(
@@ -1358,14 +1491,15 @@
             pinError = $"A widget named \"{name}\" already exists. Choose a different name.";
             return;
         }
-        State.Mutate(p => p.Widgets.Add(new Widget
+        var widget = new Widget
         {
             Name = name,
             Html = pinHtml!,
             Prompt = pinPrompt ?? "Pinned from conversation",
             Visibility = "private",
             ModifiedAt = DateTimeOffset.UtcNow,
-        }));
+        };
+        State.SaveAssetContent(AssetKind.Widget, widget.Id, p => p.Widgets.Add(widget));
         pinHtml = null;
         pinName = "";
         pinPrompt = null;

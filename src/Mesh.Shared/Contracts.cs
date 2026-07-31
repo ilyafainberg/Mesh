@@ -588,7 +588,8 @@ public static class DeviceSyncKinds
             or EnvelopeSnapshotRequest
             or EnvelopeSnapshotManifest
             or EnvelopeSnapshotChunk
-            or EnvelopeSnapshotComplete;
+            or EnvelopeSnapshotComplete
+            or Mesh117SyncKinds.Envelope117Operation;
 }
 
 public static class DeviceSyncEntityIds

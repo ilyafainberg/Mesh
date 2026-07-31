@@ -1,4 +1,4 @@
-﻿@page "/widgets"
+@page "/widgets"
 @inject AppState State
 @inject AgentService Agent
 @inject IJSRuntime JS
@@ -225,9 +225,10 @@
                     <i class="bi bi-window-stack" aria-hidden="true"></i> Saved widgets
                 </h3>
                 <div class="wgt-list">
-                    @foreach (var w in State.Profile.Widgets)
+                    @foreach (var w in AssetPagePolicy.Take(State.Profile.Widgets, visibleCount))
                     {
                         var isEditing = selectedWidget?.Id == w.Id;
+                        var full = FullOf(w);
                         <div class="wgt-card @(isEditing ? "wgt-card--active" : "")">
                             <div class="wgt-card-head">
                                 <span class="wgt-card-name">@w.Name</span>
@@ -239,7 +240,7 @@
                                         <i class="bi @(isEditing ? "bi-pencil-fill" : "bi-pencil")" aria-hidden="true"></i>
                                         @(isEditing ? "Editing inline" : "Edit")
                                     </button>
-                                    @if (w.PreviousHtml is not null)
+                                    @if (full?.PreviousHtml is not null)
                                     {
                                         <button class="ghost small" type="button" @onclick="() => UndoSavedWidget(w)"
                                                 aria-label="@($"Undo last save for {w.Name}")">
@@ -366,6 +367,12 @@
                         </div>
                     }
                 </div>
+                @if (AssetPagePolicy.HasMore(State.Profile.Widgets.Count, visibleCount))
+                {
+                    <button class="ghost load-more" @onclick="LoadMore" aria-label="Load more widgets">
+                        <i class="bi bi-chevron-down"></i> Load more (@AssetPagePolicy.Remaining(State.Profile.Widgets.Count, visibleCount) more)
+                    </button>
+                }
             </div>
         }
         else if (draftHtml is null && phase == PagePhase.Ready)
@@ -414,6 +421,14 @@
     readonly Dictionary<string, ElementReference> widgetFrameRefs = new();
     readonly Dictionary<string, string> widgetMountedHtmls = new();
 
+    // ---- Mesh 1.17 bounded paging + lazy widget bodies ----
+    // Summaries carry blank Html/PreviousHtml, so each visible widget's full body is loaded on demand
+    // and cached here. Iframes and the Undo affordance read from loadedWidgets, never a blank summary.
+    int visibleCount = AssetPagePolicy.PageSize;
+    readonly Dictionary<string, Widget> loadedWidgets = new();
+    readonly HashSet<string> bodyLoading = new();
+    readonly HashSet<string> bodyMissing = new();
+
     // ---- Cancellation ----
     CancellationTokenSource _cts = new();
 
@@ -457,11 +472,41 @@
             catch { /* frame not in DOM yet; retry on the next render */ }
         }
 
-        // Mount or remount each saved widget iframe when its HTML changes.
-        foreach (var w in State.Profile.Widgets)
+        // Mount each VISIBLE saved widget's iframe. Only the bounded page is iterated, and each body is
+        // lazily loaded once; a blank summary body is never mounted.
+        var newlyLoaded = false;
+        foreach (var w in AssetPagePolicy.Take(State.Profile.Widgets, visibleCount))
         {
             if (!widgetFrameRefs.TryGetValue(w.Id, out var el)) continue;
-            var html = selectedWidget?.Id == w.Id && draftHtml is not null ? draftHtml : w.Html;
+
+            string? html;
+            if (selectedWidget?.Id == w.Id && draftHtml is not null)
+            {
+                html = draftHtml;
+            }
+            else if (loadedWidgets.TryGetValue(w.Id, out var full))
+            {
+                html = full.Html;
+            }
+            else
+            {
+                // Lazy-load only this visible widget's full body, once; mount on a later render.
+                if (!bodyMissing.Contains(w.Id) && bodyLoading.Add(w.Id))
+                {
+                    try
+                    {
+                        var loaded = await State.LoadFullWidgetAsync(w.Id, _cts.Token);
+                        if (loaded is not null) { loadedWidgets[w.Id] = loaded; newlyLoaded = true; }
+                        else { bodyMissing.Add(w.Id); }
+                    }
+                    catch (OperationCanceledException) { }
+                    catch { }
+                    finally { bodyLoading.Remove(w.Id); }
+                }
+                continue;
+            }
+
+            if (html is null) continue;
             if (widgetMountedHtmls.TryGetValue(w.Id, out var mounted) && mounted == html) continue;
             try
             {
@@ -470,6 +515,26 @@
             }
             catch { /* retry on next render */ }
         }
+
+        // A newly loaded body may reveal the Undo affordance, so request one more render.
+        if (newlyLoaded) StateHasChanged();
+    }
+
+    void LoadMore() => visibleCount = AssetPagePolicy.NextVisible(visibleCount, State.Profile.Widgets.Count);
+
+    Widget? FullOf(Widget w) => loadedWidgets.TryGetValue(w.Id, out var f) ? f : null;
+
+    async Task<Widget?> GetOrLoadBodyAsync(string id)
+    {
+        if (loadedWidgets.TryGetValue(id, out var cached)) return cached;
+        try
+        {
+            var full = await State.LoadFullWidgetAsync(id, _cts.Token);
+            if (full is not null) { loadedWidgets[id] = full; bodyMissing.Remove(id); }
+            return full;
+        }
+        catch (OperationCanceledException) { return null; }
+        catch { return null; }
     }
 
     // ---- Ctrl+Enter shortcut on description textarea ----
@@ -703,26 +768,38 @@
                 CreatedAt = DateTimeOffset.UtcNow,
                 ModifiedAt = DateTimeOffset.UtcNow
             };
-            State.Mutate(p => p.Widgets.Add(newWidget));
+            AssetMutations.Apply(State, AssetEdit.Create, AssetKind.Widget, newWidget.Id, p => p.Widgets.Add(newWidget));
             selectedWidget = newWidget;
+            // The new widget's full body is already in memory: cache it so it renders without a reload.
+            loadedWidgets[newWidget.Id] = newWidget;
+            bodyMissing.Remove(newWidget.Id);
         }
         else
         {
             var w = selectedWidget;
-            State.Mutate(_ =>
+            // Guard: the full body must have loaded before we persist, so we never write blank content
+            // and we compute PreviousHtml from the real prior body (not the blank summary).
+            if (!AssetPagePolicy.CanPersistBody(loadedWidgets.TryGetValue(w.Id, out var full))) return;
+            AssetMutations.Apply(State, AssetEdit.EditBody, AssetKind.Widget, w.Id, _ =>
             {
-                if (w.Html != draftHtml || w.Prompt != draftPrompt)
+                if (full!.Html != draftHtml || full.Prompt != draftPrompt)
                 {
-                    w.PreviousHtml = w.Html;
-                    w.PreviousPrompt = w.Prompt;
+                    w.PreviousHtml = full.Html;
+                    w.PreviousPrompt = full.Prompt;
+                }
+                else
+                {
+                    w.PreviousHtml = full.PreviousHtml;
+                    w.PreviousPrompt = full.PreviousPrompt;
                 }
                 w.Html = draftHtml!;
                 w.Prompt = draftPrompt;
                 w.Name = nameToSave;
                 w.ModifiedAt = DateTimeOffset.UtcNow;
             });
-            // Force the saved list iframe to remount with the new HTML.
-            widgetMountedHtmls.Remove(selectedWidget.Id);
+            // Refresh the lazy cache with the saved body and force the iframe to remount.
+            loadedWidgets[w.Id] = w;
+            widgetMountedHtmls.Remove(w.Id);
         }
 
         prevDraftHtml = null;
@@ -735,10 +812,11 @@
     // ---- Undo saved widget (restore PreviousHtml) ----
     async Task UndoSavedWidget(Widget w)
     {
-        if (w.PreviousHtml is null) return;
+        // The Undo affordance only shows when the full body is loaded and has a previous version.
+        if (!loadedWidgets.TryGetValue(w.Id, out var full) || full.PreviousHtml is null) return;
 
-        var prevHtml = w.PreviousHtml;
-        var prevPrompt = w.PreviousPrompt ?? w.Prompt;
+        var prevHtml = full.PreviousHtml;
+        var prevPrompt = full.PreviousPrompt ?? full.Prompt;
 
         // Revoke the current blob URL before changing the HTML.
         if (widgetFrameRefs.TryGetValue(w.Id, out var el))
@@ -746,7 +824,8 @@
             try { await JS.InvokeVoidAsync("sandboxFrame.revokeFrame", el); } catch { }
         }
 
-        State.Mutate(_ =>
+        // Restoring the previous body is a content change.
+        AssetMutations.Apply(State, AssetEdit.EditBody, AssetKind.Widget, w.Id, _ =>
         {
             w.Html = prevHtml;
             w.Prompt = prevPrompt;
@@ -755,7 +834,8 @@
             w.ModifiedAt = DateTimeOffset.UtcNow;
         });
 
-        widgetMountedHtmls.Remove(w.Id); // force remount with restored HTML
+        loadedWidgets[w.Id] = w;          // cache now reflects the restored body (Undo hides)
+        widgetMountedHtmls.Remove(w.Id);  // force remount with restored HTML
 
         // Sync the in-editor preview if this widget is currently selected.
         if (selectedWidget?.Id == w.Id)
@@ -772,14 +852,23 @@
     }
 
     // ---- Open saved widget in editor ----
-    void SelectWidget(Widget w)
+    async Task SelectWidget(Widget w)
     {
         if (selectedWidget?.Id == w.Id) return; // already editing this one
+
+        // Load the full body before editing so the draft is the real content, never a blank summary.
+        var full = await GetOrLoadBodyAsync(w.Id);
+        if (full is null)
+        {
+            error = "This widget could not be loaded - it may have been deleted.";
+            return;
+        }
+
         selectedWidget = w;
-        draftHtml = w.Html;
-        draftPrompt = w.Prompt;
-        widgetName = w.Name;
-        desc = w.Prompt;
+        draftHtml = full.Html;
+        draftPrompt = full.Prompt;
+        widgetName = full.Name;
+        desc = full.Prompt;
         prevDraftHtml = null;
         prevDraftPrompt = null;
         error = null;
@@ -812,14 +901,23 @@
         await ClearEditorState();
     }
 
-    bool HasUnsavedWork =>
-        draftHtml is not null && (
-            selectedWidget is null ||
-            draftHtml != selectedWidget.Html ||
-            draftPrompt != selectedWidget.Prompt ||
-            widgetName.Trim() != selectedWidget.Name ||
-            desc.Trim() != draftPrompt
-        );
+    bool HasUnsavedWork
+    {
+        get
+        {
+            if (draftHtml is null) return false;
+            if (selectedWidget is null) return true;
+            // Compare against the loaded full body, not the blank summary.
+            var full = FullOf(selectedWidget);
+            var baseHtml = full?.Html ?? selectedWidget.Html;
+            var basePrompt = full?.Prompt ?? selectedWidget.Prompt;
+            var baseName = full?.Name ?? selectedWidget.Name;
+            return draftHtml != baseHtml ||
+                   draftPrompt != basePrompt ||
+                   widgetName.Trim() != baseName ||
+                   desc.Trim() != draftPrompt;
+        }
+    }
 
     async Task ClearEditorState()
     {
@@ -860,17 +958,21 @@
             widgetFrameRefs.Remove(w.Id);
         }
         widgetMountedHtmls.Remove(w.Id);
+        loadedWidgets.Remove(w.Id);
+        bodyMissing.Remove(w.Id);
+        bodyLoading.Remove(w.Id);
 
         // If removing the currently selected widget, clear the editor first.
         if (selectedWidget?.Id == w.Id)
             await ClearEditorState();
 
-        State.Mutate(p => p.Widgets.Remove(w));
+        AssetMutations.Apply(State, AssetEdit.Delete, AssetKind.Widget, w.Id, p => p.Widgets.Remove(w));
     }
 
     // ---- Visibility ----
     void SetVisibility(Widget w, string visibility)
-        => State.Mutate(_ => w.Visibility = CapabilityAudience.Parse(visibility).ToVisibility());
+        => AssetMutations.Apply(State, AssetEdit.ChangeVisibility, AssetKind.Widget, w.Id,
+            _ => w.Visibility = CapabilityAudience.Parse(visibility).ToVisibility());
 
     // ---- Helpers ----
     bool IsDuplicateName(string name, string? excludeId)

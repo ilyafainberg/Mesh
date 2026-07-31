@@ -536,6 +536,24 @@ public sealed class Mesh117FoundationTests
         Assert.AreEqual("network timeout", remaining[0].LastError);
     }
 
+    [TestMethod]
+    public void Asset_Outbox_DeadLetter_RemovesRetryAndPreservesError()
+    {
+        using var db = MeshDb.Open(databasePath, key);
+        var store = new AssetStore(db);
+        store.UpsertAsync(MakeSkillRecord("oq-dead-1", 1), [], createOutboxEntry: true)
+            .GetAwaiter().GetResult();
+
+        var item = store.DequeueOutboxAsync(1).GetAwaiter().GetResult()[0];
+        store.DeadLetterOutboxAsync(item.OperationId, "permanent envelope overflow")
+            .GetAwaiter().GetResult();
+
+        Assert.AreEqual(0, store.ListOutboxAsync(5).GetAwaiter().GetResult().Count);
+        Assert.AreEqual(
+            "permanent envelope overflow",
+            db.GetAssetOutboxDeadLetterError(item.OperationId));
+    }
+
     // ------------------------------------------------------------------
     // AssetSyncPolicy matrix
     // ------------------------------------------------------------------

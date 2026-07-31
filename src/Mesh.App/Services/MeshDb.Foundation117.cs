@@ -85,6 +85,18 @@ public sealed partial class MeshDb
             CREATE INDEX IF NOT EXISTS ix_asset_outbox_created
                 ON asset_outbox(created_at, operation_id);
 
+            CREATE TABLE IF NOT EXISTS asset_outbox_dead_letters(
+                operation_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                source_device_id TEXT,
+                attempts INTEGER NOT NULL,
+                error TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                failed_at TEXT NOT NULL);
+
             INSERT OR IGNORE INTO meta(k, v) VALUES('foundation_117_schema_version', '1');
             """);
 
@@ -133,6 +145,35 @@ public sealed partial class MeshDb
             ORDER BY created_at, prompt_id;
             """;
         cmd.Parameters.AddWithValue("$tid", threadId);
+        using var r = cmd.ExecuteReader();
+        var result = new List<AskUserPrompt>();
+        while (r.Read()) result.Add(ReadAskUserPrompt(r));
+        return result;
+    }
+
+    public IReadOnlyList<AskUserPrompt> ListAllPendingAskUserPrompts()
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT * FROM ask_user_prompts
+            WHERE state = 'pending'
+            ORDER BY created_at, prompt_id;
+            """;
+        using var r = cmd.ExecuteReader();
+        var result = new List<AskUserPrompt>();
+        while (r.Read()) result.Add(ReadAskUserPrompt(r));
+        return result;
+    }
+
+    public IReadOnlyList<AskUserPrompt> ListResolvedAskUserPrompts(string resolutionDeviceId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT * FROM ask_user_prompts
+            WHERE state = 'resolved' AND resolution_device_id = $device
+            ORDER BY resolved_at, prompt_id;
+            """;
+        cmd.Parameters.AddWithValue("$device", resolutionDeviceId);
         using var r = cmd.ExecuteReader();
         var result = new List<AskUserPrompt>();
         while (r.Read()) result.Add(ReadAskUserPrompt(r));
@@ -778,6 +819,45 @@ public sealed partial class MeshDb
             cmd.Parameters.AddWithValue("$error", (object?)error ?? DBNull.Value);
         }
         cmd.ExecuteNonQuery();
+    }
+
+    public void DeadLetterAssetOutbox(string operationId, string error)
+    {
+        using var tx = conn.BeginTransaction(deferred: false);
+        using (var insert = conn.CreateCommand())
+        {
+            insert.Transaction = tx;
+            insert.CommandText = """
+                INSERT OR REPLACE INTO asset_outbox_dead_letters(
+                    operation_id, kind, asset_id, operation, version, source_device_id,
+                    attempts, error, created_at, failed_at)
+                SELECT operation_id, kind, asset_id, operation, version, source_device_id,
+                       attempts, $error, created_at, $failedAt
+                FROM asset_outbox
+                WHERE operation_id = $id;
+                """;
+            insert.Parameters.AddWithValue("$id", operationId);
+            insert.Parameters.AddWithValue("$error", error);
+            insert.Parameters.AddWithValue("$failedAt", DateTimeOffset.UtcNow.ToString("O"));
+            insert.ExecuteNonQuery();
+        }
+        using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = tx;
+            delete.CommandText = "DELETE FROM asset_outbox WHERE operation_id = $id;";
+            delete.Parameters.AddWithValue("$id", operationId);
+            delete.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    public string? GetAssetOutboxDeadLetterError(string operationId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT error FROM asset_outbox_dead_letters WHERE operation_id = $id;";
+        cmd.Parameters.AddWithValue("$id", operationId);
+        return cmd.ExecuteScalar() as string;
     }
 
     private const string AssetOutboxSelect = """

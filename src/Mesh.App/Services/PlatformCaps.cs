@@ -48,6 +48,10 @@ public static class LocalToolKindExtensions
         LocalToolKind.Browser => true,
         LocalToolKind.HeadlessBrowser => true,
         LocalToolKind.WorkIq => true,
+        // Files (FileSystem) requires unrestricted filesystem access that the Android/iOS
+        // sandbox does not permit. Profile data from a migrated or synced desktop profile
+        // may have FileSystem enabled; the policy must fail closed at catalog construction.
+        LocalToolKind.FileSystem => true,
         _ => false
     };
 }

@@ -108,7 +108,11 @@ public sealed partial class MeshDb : IDisposable
         connection.Open();
         ApplyKey(connection, key);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "PRAGMA busy_timeout = 10000;";
+        cmd.CommandText = """
+            PRAGMA busy_timeout = 10000;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            """;
         cmd.ExecuteNonQuery();
         return connection;
     }
@@ -331,6 +335,7 @@ public sealed partial class MeshDb : IDisposable
         AddColumnIfMissing("conversations", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
         MigrateConversationActivity();
         CreateFoundation117Schema();
+        CreateSkillPackagesSchema();
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)
@@ -829,6 +834,20 @@ public sealed partial class MeshDb : IDisposable
         IReadOnlyList<SyncTombstoneWrite> tombstones,
         Action? beforeCommit = null,
         IReadOnlyList<SyncCircleRenameWrite>? circleRenames = null)
+        => SaveProfileAndSyncState(
+            SerializeProfileForStorage(profile), versions, tombstones, beforeCommit, circleRenames);
+
+    /// <summary>
+    /// Atomic sync-transaction variant that accepts a pre-serialized, already-bounded profile blob
+    /// (see <see cref="SerializeProfileForStorage"/>). Used by the asynchronous persistence worker so
+    /// the profile is serialized off the transaction.
+    /// </summary>
+    internal bool SaveProfileAndSyncState(
+        string profileJson,
+        IReadOnlyList<SyncVersionWrite> versions,
+        IReadOnlyList<SyncTombstoneWrite> tombstones,
+        Action? beforeCommit = null,
+        IReadOnlyList<SyncCircleRenameWrite>? circleRenames = null)
     {
         using var transaction = conn.BeginTransaction(deferred: false);
         var acceptedVersions = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -870,7 +889,7 @@ public sealed partial class MeshDb : IDisposable
         using (var profileCommand = conn.CreateCommand())
         {
             profileCommand.Transaction = transaction;
-            SaveProfile(profileCommand, profile);
+            SaveProfileJson(profileCommand, profileJson);
         }
         foreach (var version in versions)
             UpsertSyncVersion(transaction, version.EntityKey, version.Version);
@@ -922,16 +941,44 @@ public sealed partial class MeshDb : IDisposable
     }
 
     private static void SaveProfile(SqliteCommand cmd, MeshProfile profile)
+        => SaveProfileJson(cmd, SerializeProfileForStorage(profile));
+
+    /// <summary>
+    /// Serializes a profile into the bounded on-disk blob. The scalable, append-only collections
+    /// (conversations, own-chat, own-threads, memories) live in their own row tables, and the
+    /// capability assets (skills, knowledge, widgets) live in the Mesh 1.17 asset tables; all of
+    /// them are stripped here so the profile row stays small no matter how much data the identity
+    /// accumulates. Marketplace configuration (skillMarketplaces) is bounded and is retained.
+    /// </summary>
+    public static string SerializeProfileForStorage(MeshProfile profile)
     {
         var node = JsonSerializer.SerializeToNode(profile, JsonOpts)!.AsObject();
         node.Remove("conversations");
         node.Remove("ownChat");
         node.Remove("ownThreads");
         node.Remove("memories");
-        var json = node.ToJsonString(JsonOpts);
+        node.Remove("skills");
+        node.Remove("knowledge");
+        node.Remove("widgets");
+        return node.ToJsonString(JsonOpts);
+    }
+
+    private static void SaveProfileJson(SqliteCommand cmd, string json)
+    {
         cmd.CommandText = "INSERT INTO profile(id, json) VALUES(1, $j) ON CONFLICT(id) DO UPDATE SET json = $j;";
         cmd.Parameters.AddWithValue("$j", json);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Persists a pre-serialized, already-bounded profile blob (produced by
+    /// <see cref="SerializeProfileForStorage"/>). Used by the asynchronous persistence coordinator
+    /// so the potentially expensive serialization happens off the database worker.
+    /// </summary>
+    public void SaveProfileJson(string json)
+    {
+        using var cmd = conn.CreateCommand();
+        SaveProfileJson(cmd, json);
     }
 
     // ---- device sync merge state -------------------------------------------

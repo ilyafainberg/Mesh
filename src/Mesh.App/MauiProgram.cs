@@ -62,6 +62,9 @@ public static class MauiProgram
 			c.Timeout = TimeSpan.FromMinutes(30);
 			c.DefaultRequestHeaders.UserAgent.ParseAdd("Mesh-Updater");
 		});
+		// The built-in skill catalog adapter fans one client out over skills.sh, agentskill.sh and
+		// GitHub, setting per-request headers itself. A 12s timeout keeps search responsive.
+		builder.Services.AddHttpClient("skillcatalog", c => c.Timeout = TimeSpan.FromSeconds(12));
 #if IOS
 		builder.Services.AddSingleton<ISecretStore, Mesh.App.Platforms.iOS.AppleSecretStore>();
 #else
@@ -117,6 +120,13 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ITopicTurnRunner>(services =>
 			services.GetRequiredService<TopicTurnRunner>());
 		builder.Services.AddSingleton<SkillMarketplaceService>();
+		builder.Services.AddSingleton<SkillCatalogOptions>();
+		builder.Services.AddSingleton<ISkillCatalogService>(services =>
+		{
+			var factory = services.GetRequiredService<System.Net.Http.IHttpClientFactory>();
+			var options = services.GetRequiredService<SkillCatalogOptions>();
+			return new SkillCatalogService(factory.CreateClient("skillcatalog"), options);
+		});
 		builder.Services.AddSingleton<ModelSetupService>();
 		builder.Services.AddSingleton<UpdateService>();
 		builder.Services.AddSingleton<MeshClient>();

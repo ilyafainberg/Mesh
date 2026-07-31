@@ -92,17 +92,36 @@ public sealed class DeviceSyncProfileStateTests
     }
 
     [TestMethod]
-    public void CapabilityAudience_ProfileStorageRoundTripsEveryVisibilitySurface()
+    public void CapabilityAudience_SplitStorageRoundTripsEveryVisibilitySurface()
     {
         var visibility = CapabilityAudience.ForCircles(["Friends", "Work"]).ToVisibility();
         var profile = Profile();
         AddVisibilitySurfaces(profile, visibility);
 
         using (var db = MeshDb.Open(databasePath, key))
+        {
+            var skill = AssetPersistenceModels.ToRecord(
+                profile.Skills[0], "test-device", localOnly: false, version: 1);
+            var knowledge = AssetPersistenceModels.ToRecord(
+                profile.Knowledge[0], "test-device", localOnly: false, version: 1);
+            var widget = AssetPersistenceModels.ToRecord(
+                profile.Widgets[0], "test-device", localOnly: false, version: 1);
+            db.UpsertAsset(skill.Record, skill.Content, createOutboxEntry: false);
+            db.UpsertAsset(knowledge.Record, knowledge.Content, createOutboxEntry: false);
+            db.UpsertAsset(widget.Record, widget.Content, createOutboxEntry: false);
             db.SaveProfile(profile);
+        }
         using var reopened = MeshDb.Open(databasePath, key);
+        var stored = reopened.LoadProfile()!;
+        var skillAsset = reopened.GetFullAsset(AssetKind.Skill, profile.Skills[0].Id)!.Value;
+        var knowledgeAsset = reopened.GetFullAsset(AssetKind.Knowledge, profile.Knowledge[0].Id)!.Value;
+        var widgetAsset = reopened.GetFullAsset(AssetKind.Widget, profile.Widgets[0].Id)!.Value;
+        stored.Skills.Add(AssetPersistenceModels.ToSkill(skillAsset.Summary, skillAsset.Content));
+        stored.Knowledge.Add(AssetPersistenceModels.ToKnowledge(
+            knowledgeAsset.Summary, knowledgeAsset.Content));
+        stored.Widgets.Add(AssetPersistenceModels.ToWidget(widgetAsset.Summary, widgetAsset.Content));
 
-        AssertVisibilities(reopened.LoadProfile()!, visibility);
+        AssertVisibilities(stored, visibility);
     }
 
     [TestMethod]

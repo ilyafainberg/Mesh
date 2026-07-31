@@ -149,10 +149,10 @@
                 bytes = ms.ToArray();
             }
 
-            MeshProfile profile;
+            MeshExportBundle bundle;
             try
             {
-                profile = MeshExport.Open(bytes, restorePass);
+                bundle = MeshExport.OpenBundle(bytes, restorePass);
             }
             catch (System.Security.Cryptography.CryptographicException)
             {
@@ -165,8 +165,8 @@
                 return;
             }
 
-            profile.RelayUrl = restoreRelay.Trim();
-            State.ImportProfile(profile);
+            bundle.Profile.RelayUrl = restoreRelay.Trim();
+            State.ImportProfile(bundle);
             restoreImported = true;
         }
         catch (Exception ex) { restoreError = ex.Message; }

@@ -117,6 +117,18 @@ namespace Mesh.App.Services
         public void UpdateAgentRun(string threadId, AgentRunPhase phase) { }
         public void EndThreadTurn(string threadId) => Busy = false;
         public void Mutate(Action<MeshProfile> change) => change(Profile);
+        public void MutateAssets(Action<MeshProfile> change) => change(Profile);
+        public void SaveAssetContent(
+            AssetKind kind,
+            string id,
+            Action<MeshProfile> change)
+            => change(Profile);
+        public Task<Widget?> LoadFullWidgetAsync(
+            string id,
+            CancellationToken ct = default)
+            => Task.FromResult(
+                Profile.Widgets.FirstOrDefault(widget =>
+                    string.Equals(widget.Id, id, StringComparison.Ordinal)));
     }
 
     public sealed class AgentService

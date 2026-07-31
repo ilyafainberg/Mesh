@@ -46,21 +46,30 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
                 minimum = 1,
                 maximum = 50,
                 description = "Maximum results to return. Defaults to 20."
+            },
+            search_content = new
+            {
+                type = "boolean",
+                description = "When true, also search inside knowledge and skill bodies (loads a bounded, most-recent "
+                    + "candidate set of full items, not the whole store; truncation is reported). Defaults to false "
+                    + "(fast metadata-only search over titles, names, sources and visibility)."
             }
         }
     };
 
-    public Task<string> ExecuteAsync(JsonElement args, CancellationToken ct = default)
+    public async Task<string> ExecuteAsync(JsonElement args, CancellationToken ct = default)
     {
         var query = ToolArgs.GetString(args, "query").Trim();
         var scope = ToolArgs.GetString(args, "scope", "all").Trim().ToLowerInvariant();
         var maxResults = Math.Clamp(ToolArgs.GetInt(args, "max_results", 20), 1, 50);
+        var searchContent = GetBool(args, "search_content");
 
         if (!ValidScopes.Contains(scope))
-            return Task.FromResult($"ERROR: Unknown scope '{scope}'. Use: {string.Join(", ", ValidScopes.OrderBy(x => x))}.");
+            return $"ERROR: Unknown scope '{scope}'. Use: {string.Join(", ", ValidScopes.OrderBy(x => x))}.";
 
         var terms = query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var results = new List<SearchResult>(maxResults);
+        var contentTruncationNotes = new List<string>();
 
         bool Wants(string name) => scope == "all" || scope == name;
         bool Full() => results.Count >= maxResults;
@@ -149,25 +158,69 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
 
         if (Wants("knowledge") && !Full())
         {
-            foreach (var item in profile.Knowledge.OrderByDescending(k => k.UpdatedAt))
+            if (searchContent && terms.Length > 0)
             {
-                ct.ThrowIfCancellationRequested();
-                if (!Matches(item.Title, item.Content, item.SourceRef, AudiencePolicy.DetailedLabel(item.Visibility))) continue;
-                Add("knowledge", item.Id, item.Title,
-                    $"{item.Content}; source: {item.Source}; visibility: {AudiencePolicy.DetailedLabel(item.Visibility)}", item.UpdatedAt);
-                if (Full()) break;
+                // Bounded content search: load ONLY a recent candidate window of full items, never the
+                // whole store, then match against the hydrated bodies.
+                var candidates = profile.Knowledge.OrderByDescending(k => k.UpdatedAt).Take(ContentSearchCandidateCap).ToList();
+                var loaded = await state.LoadKnowledgeAsync(
+                    candidates.Select(k => k.Id), AssetLoadBudget.Default, ct).ConfigureAwait(false);
+                foreach (var item in loaded)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (!Matches(item.Title, item.Content, item.SourceRef, AudiencePolicy.DetailedLabel(item.Visibility))) continue;
+                    Add("knowledge", item.Id, item.Title,
+                        $"{item.Content}; source: {item.Source}; visibility: {AudiencePolicy.DetailedLabel(item.Visibility)}", item.UpdatedAt);
+                    if (Full()) break;
+                }
+                if (profile.Knowledge.Count > candidates.Count)
+                    contentTruncationNotes.Add(
+                        $"knowledge content search scanned the {candidates.Count} most recently updated of {profile.Knowledge.Count} items");
+            }
+            else
+            {
+                foreach (var item in profile.Knowledge.OrderByDescending(k => k.UpdatedAt))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    // Metadata-only: summaries carry blank Content, so match/preview from title/source/visibility.
+                    if (!Matches(item.Title, item.SourceRef, item.Source.ToString(), AudiencePolicy.DetailedLabel(item.Visibility))) continue;
+                    Add("knowledge", item.Id, item.Title,
+                        $"source: {item.Source}; ref: {item.SourceRef}; visibility: {AudiencePolicy.DetailedLabel(item.Visibility)}", item.UpdatedAt);
+                    if (Full()) break;
+                }
             }
         }
 
         if (Wants("skills") && !Full())
         {
-            foreach (var skill in profile.Skills.OrderBy(s => s.Name))
+            if (searchContent && terms.Length > 0)
             {
-                ct.ThrowIfCancellationRequested();
-                if (!Matches(skill.Name, skill.Description, skill.Instructions, AudiencePolicy.DetailedLabel(skill.Visibility))) continue;
-                Add("skill", skill.Id, skill.Name,
-                    $"{skill.Description}; enabled: {skill.Enabled}; visibility: {AudiencePolicy.DetailedLabel(skill.Visibility)}");
-                if (Full()) break;
+                var candidates = profile.Skills.OrderBy(s => s.Name).Take(ContentSearchCandidateCap).ToList();
+                var loaded = await state.LoadSkillsAsync(
+                    candidates.Select(s => s.Id), AssetLoadBudget.Default, ct).ConfigureAwait(false);
+                foreach (var skill in loaded)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (!Matches(skill.Name, skill.Description, skill.Instructions, AudiencePolicy.DetailedLabel(skill.Visibility))) continue;
+                    Add("skill", skill.Id, skill.Name,
+                        $"{skill.Description}; enabled: {skill.Enabled}; visibility: {AudiencePolicy.DetailedLabel(skill.Visibility)}");
+                    if (Full()) break;
+                }
+                if (profile.Skills.Count > candidates.Count)
+                    contentTruncationNotes.Add(
+                        $"skill content search scanned the {candidates.Count} most recently updated of {profile.Skills.Count} skills");
+            }
+            else
+            {
+                foreach (var skill in profile.Skills.OrderBy(s => s.Name))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    // Metadata-only: summaries carry blank Instructions, so match/preview from name/description/visibility.
+                    if (!Matches(skill.Name, skill.Description, AudiencePolicy.DetailedLabel(skill.Visibility))) continue;
+                    Add("skill", skill.Id, skill.Name,
+                        $"{skill.Description}; enabled: {skill.Enabled}; visibility: {AudiencePolicy.DetailedLabel(skill.Visibility)}");
+                    if (Full()) break;
+                }
             }
         }
 
@@ -249,10 +302,27 @@ public sealed class SearchMeshDataTool(AppState state) : IAgentTool
         {
             query,
             scope,
+            search_content = searchContent,
+            content_search_truncation = contentTruncationNotes.Count == 0 ? null : string.Join("; ", contentTruncationNotes),
             count = results.Count,
             results
         };
-        return Task.FromResult(JsonSerializer.Serialize(payload, JsonOptions));
+        return JsonSerializer.Serialize(payload, JsonOptions);
+    }
+
+    /// <summary>Recent-item candidate window scanned when search_content is requested (bounds body loads).</summary>
+    private const int ContentSearchCandidateCap = 30;
+
+    /// <summary>Parses a boolean tool arg inline (ToolArgs exposes only GetString/GetInt).</summary>
+    private static bool GetBool(JsonElement args, string name, bool fallback = false)
+    {
+        if (args.ValueKind == JsonValueKind.Object && args.TryGetProperty(name, out var el))
+        {
+            if (el.ValueKind == JsonValueKind.True) return true;
+            if (el.ValueKind == JsonValueKind.False) return false;
+            if (el.ValueKind == JsonValueKind.String && bool.TryParse(el.GetString(), out var b)) return b;
+        }
+        return fallback;
     }
 
     private static string CleanPreview(string value)

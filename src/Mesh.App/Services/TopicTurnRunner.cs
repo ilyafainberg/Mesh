@@ -316,7 +316,10 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             return;
         }
 
-        var saved = FindWidget(FirstNonBlank(turn.WidgetId));
+        // Refine operates on the widget's CURRENT stored body. After a restart Profile.Widgets holds
+        // only summaries with blank Html, so load the full selected widget on demand before comparing
+        // the base the client refined from or generating the refinement.
+        var saved = await LoadFullWidgetForRefineAsync(FirstNonBlank(turn.WidgetId), cancellationToken);
         var originalPrompt = FirstNonBlank(turn.BasePrompt);
         var originalHtml = FirstNonBlank(turn.BaseHtml);
         if (!string.Equals(saved.Prompt, originalPrompt, StringComparison.Ordinal)
@@ -328,17 +331,20 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         var refinedHtml = ExtractWidgetHtml(refined);
         if (refinedHtml is null) throw new InvalidOperationException(refined);
 
+        // A refine produces a new full body, so persist it through the explicit content API
+        // (SaveAssetContent) rather than a blanket profile mutation.
         var updated = false;
-        state.Mutate(profile =>
+        state.SaveAssetContent(AssetKind.Widget, saved.Id, profile =>
         {
             var current = profile.Widgets.FirstOrDefault(widget =>
                 string.Equals(widget.Id, saved.Id, StringComparison.Ordinal));
+            // The in-memory row is a body-less summary; re-check the metadata we can see (Prompt) for
+            // a concurrent edit. The body itself was already verified against the loaded full widget.
             if (current is null
-                || !string.Equals(current.Prompt, originalPrompt, StringComparison.Ordinal)
-                || !string.Equals(current.Html, originalHtml, StringComparison.Ordinal))
+                || !string.Equals(current.Prompt, saved.Prompt, StringComparison.Ordinal))
                 return;
-            current.PreviousPrompt = current.Prompt;
-            current.PreviousHtml = current.Html;
+            current.PreviousPrompt = saved.Prompt;
+            current.PreviousHtml = saved.Html;
             current.Prompt = $"{originalPrompt}\n\nChange request: {change}";
             current.Html = refinedHtml;
             current.ModifiedAt = DateTimeOffset.UtcNow;
@@ -351,12 +357,12 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             draft.ThreadId, draft.TriggerLineId, refinedHtml, $"{originalPrompt}\n\nChange request: {change}");
     }
 
-    private Widget FindWidget(string? widgetId)
+    private async Task<Widget> LoadFullWidgetForRefineAsync(
+        string? widgetId, CancellationToken cancellationToken)
     {
         if (!TopicRunProtocol.IsValidIdentifier(widgetId))
             throw new InvalidWidgetContextException("A valid saved widget ID is required.");
-        return state.Profile.Widgets.FirstOrDefault(widget =>
-                   string.Equals(widget.Id, widgetId, StringComparison.Ordinal))
+        return await state.LoadFullWidgetAsync(widgetId!, cancellationToken).ConfigureAwait(false)
                ?? throw new InvalidWidgetContextException("The saved widget was not found.");
     }
 
@@ -588,4 +594,40 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         public InvalidWidgetContextException(string message) : base(message) { }
         public InvalidWidgetContextException(string message, Exception inner) : base(message, inner) { }
     }
+}
+
+/// <summary>How a widget-producing/rendering consumer must persist a widget change under the
+/// Mesh 1.17 explicit-asset-mutation contract.</summary>
+public enum WidgetPersistKind
+{
+    /// <summary>A brand new widget body: persist with <c>SaveAssetContent</c>.</summary>
+    NewContent,
+    /// <summary>An existing widget whose body changed (a refine): persist with <c>SaveAssetContent</c>.</summary>
+    RefinedContent,
+    /// <summary>Only metadata (name/visibility) changed: persist with <c>SaveAssetMetadata</c> so the
+    /// stored body is preserved.</summary>
+    MetadataOnly
+}
+
+/// <summary>
+/// Pure decisions shared by every widget consumer (desktop and mobile) migrated to the Mesh 1.17
+/// on-demand widget-body contract. Restarted profiles expose widgets as summaries with blank Html,
+/// so a reference with no materialised body must be hydrated before it is sent, attached, or
+/// refined - and each mutation must route through the explicit asset API its change classifies to.
+/// </summary>
+public static class WidgetConsumerPolicy
+{
+    /// <summary>Chooses the explicit AppState asset API a widget change must route through.</summary>
+    public static WidgetPersistKind Classify(bool isNewWidget, bool bodyChanged)
+        => isNewWidget ? WidgetPersistKind.NewContent
+            : bodyChanged ? WidgetPersistKind.RefinedContent
+            : WidgetPersistKind.MetadataOnly;
+
+    /// <summary>True when a widget carries a materialised body and is safe to send/attach as-is.</summary>
+    public static bool HasSendableBody(Widget? widget)
+        => widget is not null && !string.IsNullOrEmpty(widget.Html);
+
+    /// <summary>True when a widget reference is a body-less summary that must be hydrated first.</summary>
+    public static bool RequiresBodyLoad(Widget? widget)
+        => widget is not null && string.IsNullOrEmpty(widget.Html);
 }

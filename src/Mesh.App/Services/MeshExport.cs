@@ -29,19 +29,35 @@ public static class MeshExport
         WriteIndented = false
     };
 
+    private sealed class Payload
+    {
+        public int FormatVersion { get; set; } = 2;
+        public MeshProfile Profile { get; set; } = new();
+        public List<MeshExportSkillPackage> SkillPackages { get; set; } = new();
+    }
+
     /// <summary>Serializes and encrypts a profile (device keys stripped) into a portable bundle.</summary>
     public static byte[] Create(MeshProfile profile, string passphrase)
+        => Create(new MeshExportBundle { Profile = profile }, passphrase);
+
+    public static byte[] Create(MeshExportBundle bundle, string passphrase)
     {
+        ArgumentNullException.ThrowIfNull(bundle);
         if (string.IsNullOrWhiteSpace(passphrase))
             throw new ArgumentException("A passphrase is required to protect the export.", nameof(passphrase));
 
         // Round-trip clone so we can blank the device keys without touching the live profile.
         var clone = JsonSerializer.Deserialize<MeshProfile>(
-            JsonSerializer.Serialize(profile, JsonOpts), JsonOpts)!;
+            JsonSerializer.Serialize(bundle.Profile, JsonOpts), JsonOpts)!;
         clone.PrivateKey = "";
         clone.PublicKey = "";
 
-        var plaintext = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(clone, JsonOpts));
+        var payload = new Payload
+        {
+            Profile = clone,
+            SkillPackages = bundle.SkillPackages.Select(package => package.Clone()).ToList()
+        };
+        var plaintext = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload, JsonOpts));
 
         var salt = RandomNumberGenerator.GetBytes(SaltLen);
         var nonce = RandomNumberGenerator.GetBytes(NonceLen);
@@ -67,6 +83,9 @@ public static class MeshExport
     /// not a Mesh export at all.
     /// </summary>
     public static MeshProfile Open(byte[] blob, string passphrase)
+        => OpenBundle(blob, passphrase).Profile;
+
+    public static MeshExportBundle OpenBundle(byte[] blob, string passphrase)
     {
         var header = Magic.Length + SaltLen + NonceLen + TagLen;
         if (blob.Length < header || !blob.AsSpan(0, Magic.Length).SequenceEqual(Magic))
@@ -83,12 +102,31 @@ public static class MeshExport
         using (var gcm = new AesGcm(key, TagLen))
             gcm.Decrypt(nonce, cipher, tag, plaintext); // throws on wrong passphrase / tamper
 
-        var profile = JsonSerializer.Deserialize<MeshProfile>(Encoding.UTF8.GetString(plaintext), JsonOpts)
-            ?? throw new FormatException("The export did not contain a valid profile.");
+        var json = Encoding.UTF8.GetString(plaintext);
+        MeshProfile profile;
+        List<MeshExportSkillPackage> packages;
+        using (var document = JsonDocument.Parse(json))
+        {
+            if (document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("formatVersion", out _)
+                && document.RootElement.TryGetProperty("profile", out _))
+            {
+                var payload = JsonSerializer.Deserialize<Payload>(json, JsonOpts)
+                    ?? throw new FormatException("The export did not contain a valid payload.");
+                profile = payload.Profile;
+                packages = payload.SkillPackages ?? new();
+            }
+            else
+            {
+                profile = JsonSerializer.Deserialize<MeshProfile>(json, JsonOpts)
+                    ?? throw new FormatException("The export did not contain a valid profile.");
+                packages = new();
+            }
+        }
         // Device keys are never carried in an export; a new device mints its own on import.
         profile.PrivateKey = "";
         profile.PublicKey = "";
-        return profile;
+        return new MeshExportBundle { Profile = profile, SkillPackages = packages };
     }
 
     private static byte[] DeriveKey(string passphrase, byte[] salt)
@@ -102,4 +140,28 @@ public static class MeshExport
         };
         return argon.GetBytes(KeyLen);
     }
+}
+
+public sealed class MeshExportBundle
+{
+    public MeshProfile Profile { get; set; } = new();
+    public List<MeshExportSkillPackage> SkillPackages { get; set; } = new();
+}
+
+public sealed class MeshExportSkillPackage
+{
+    public string SkillId { get; set; } = "";
+    public SkillPackageManifest Manifest { get; set; } = new();
+    public Dictionary<string, byte[]> Files { get; set; } = new(StringComparer.Ordinal);
+
+    internal MeshExportSkillPackage Clone() => new()
+    {
+        SkillId = SkillId,
+        Manifest = JsonSerializer.Deserialize<SkillPackageManifest>(
+            JsonSerializer.Serialize(Manifest)) ?? new SkillPackageManifest(),
+        Files = Files.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToArray(),
+            StringComparer.Ordinal)
+    };
 }

@@ -253,6 +253,15 @@ else
             return;
         }
 
+        // mesh://ask/<promptId> focuses the Me thread that owns the prompt and highlights its bubble.
+        // Parsed manually because the shared DeepLink contract has no ask kind; pairing stays first.
+        if (TryParseAskLink(uri, out var promptId))
+        {
+            AppControl.ShowMainWindow();
+            _ = FocusAskPromptAsync(promptId);
+            return;
+        }
+
         var link = DeepLink.TryParse(uri);
         string? key = null;
         if (link.Kind == DeepLink.Kind.Service && !string.IsNullOrEmpty(link.Handle) && !string.IsNullOrEmpty(link.ServiceId))
@@ -264,6 +273,29 @@ else
         AppControl.ShowMainWindow();
         State.RequestOpenConversation(key);
         Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone ? "/m/messages" : "/messages");
+    }
+
+    private static bool TryParseAskLink(string uri, out string promptId)
+    {
+        promptId = "";
+        if (string.IsNullOrWhiteSpace(uri)) return false;
+        const string prefix = "mesh://ask/";
+        if (!uri.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+        var rest = uri.Substring(prefix.Length).Trim();
+        var cut = rest.IndexOfAny(new[] { '/', '?', '#' });
+        if (cut >= 0) rest = rest.Substring(0, cut);
+        promptId = Uri.UnescapeDataString(rest);
+        return !string.IsNullOrWhiteSpace(promptId);
+    }
+
+    private async Task FocusAskPromptAsync(string promptId)
+    {
+        var prompt = await State.LoadAskUserPromptAsync(promptId);
+        if (prompt is null) return;
+        State.FocusAskUserPrompt(promptId);
+        Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone
+            ? $"/m/me?thread={Uri.EscapeDataString(prompt.ThreadId)}"
+            : $"/?thread={Uri.EscapeDataString(prompt.ThreadId)}");
     }
 
     public void Dispose()

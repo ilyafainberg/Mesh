@@ -61,6 +61,10 @@ public interface IAssetStore
     /// <summary>Records the outcome of an outbox dispatch: success removes the item, failure stores the error.</summary>
     Task MarkOutboxAttemptAsync(
         string operationId, bool success, string? error, CancellationToken ct = default);
+
+    /// <summary>Moves a permanently unsendable operation out of the retry queue with its error.</summary>
+    Task DeadLetterOutboxAsync(
+        string operationId, string error, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -148,6 +152,15 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
         {
             RequireNonBlank(operationId, nameof(operationId));
             db.MarkAssetOutboxAttempt(operationId, success, error);
+        }, ct);
+
+    public Task DeadLetterOutboxAsync(
+        string operationId, string error, CancellationToken ct = default)
+        => _scheduler.RunAsync(() =>
+        {
+            RequireNonBlank(operationId, nameof(operationId));
+            RequireNonBlank(error, nameof(error));
+            db.DeadLetterAssetOutbox(operationId, error);
         }, ct);
 
     private static void RequireNonBlank(string? value, string name)

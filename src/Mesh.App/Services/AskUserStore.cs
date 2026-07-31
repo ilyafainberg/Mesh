@@ -51,6 +51,11 @@ public interface IAskUserStore
     Task<IReadOnlyList<AskUserPrompt>> ListPendingAsync(
         string threadId, CancellationToken ct = default);
 
+    Task<IReadOnlyList<AskUserPrompt>> ListAllPendingAsync(CancellationToken ct = default);
+
+    Task<IReadOnlyList<AskUserPrompt>> ListResolvedByDeviceAsync(
+        string resolutionDeviceId, CancellationToken ct = default);
+
     /// <summary>
     /// Atomically resolves the prompt. The underlying transaction first expires an
     /// at-or-past-deadline pending prompt, then resolves only a still-pending row via a
@@ -109,6 +114,17 @@ public sealed class AskUserStore(MeshDb db, IStoreScheduler? scheduler = null) :
     public Task<IReadOnlyList<AskUserPrompt>> ListPendingAsync(
         string threadId, CancellationToken ct = default)
         => _scheduler.RunAsync(() => db.ListPendingAskUserPrompts(threadId), ct);
+
+    public Task<IReadOnlyList<AskUserPrompt>> ListAllPendingAsync(CancellationToken ct = default)
+        => _scheduler.RunAsync(db.ListAllPendingAskUserPrompts, ct);
+
+    public Task<IReadOnlyList<AskUserPrompt>> ListResolvedByDeviceAsync(
+        string resolutionDeviceId, CancellationToken ct = default)
+        => _scheduler.RunAsync(() =>
+        {
+            RequireNonBlank(resolutionDeviceId, nameof(resolutionDeviceId));
+            return db.ListResolvedAskUserPrompts(resolutionDeviceId);
+        }, ct);
 
     public Task<AskUserPrompt> ResolveAsync(
         string promptId,

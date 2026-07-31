@@ -1,4 +1,4 @@
-﻿@page "/knowledge"
+@page "/knowledge"
 @inject AppState State
 @inject FileImporter Files
 @inject MsalAuthService Msal
@@ -327,20 +327,28 @@
                 <button class="kn-hint-close" @onclick="() => hintDismissed = true" aria-label="Dismiss tip"><i class="bi bi-x-lg"></i></button>
             </div>
         }
-        @foreach (var k in State.Profile.Knowledge)
+        @foreach (var k in AssetPagePolicy.Take(State.Profile.Knowledge, visibleCount))
         {
             <div class="kn-card">
                 @if (editingId == k.Id)
                 {
-                    <input class="full" @bind="editTitle" aria-label="Title" />
-                    <textarea class="full" rows="4" @bind="editContent" aria-label="Content"></textarea>
+                    @if (editLoading)
+                    {
+                        <div class="muted small" role="status" aria-live="polite"><i class="bi bi-arrow-repeat spin"></i> Loading item…</div>
+                    }
+                    else if (editError is not null)
+                    {
+                        <div class="err-text" role="alert">@editError</div>
+                    }
+                    <input class="full" @bind="editTitle" aria-label="Title" disabled="@(!editLoaded)" />
+                    <textarea class="full" rows="4" @bind="editContent" aria-label="Content" disabled="@(!editLoaded)"></textarea>
                     <div class="kn-row">
                         <AudiencePicker @bind-Value="editVisibility"
                                         Circles="@State.Profile.Circles"
                                         Class="grow"
                                         AriaLabel="Who can use this knowledge" />
-                        <button class="primary" @onclick="() => SaveEdit(k)"><i class="bi bi-check-lg"></i> Save</button>
-                        <button class="ghost" @onclick="() => editingId = null"><i class="bi bi-x-lg"></i> Cancel</button>
+                        <button class="primary" @onclick="() => SaveEdit(k)" disabled="@(!editLoaded)"><i class="bi bi-check-lg"></i> Save</button>
+                        <button class="ghost" @onclick="CancelEdit"><i class="bi bi-x-lg"></i> Cancel</button>
                     </div>
                 }
                 else
@@ -353,15 +361,24 @@
                         <button class="icon-btn" title="Edit" @onclick="() => BeginEdit(k)" aria-label="Edit"><i class="bi bi-pencil"></i></button>
                         <button class="icon-btn" title="Delete" @onclick="() => Remove(k)" aria-label="Delete"><i class="bi bi-trash"></i></button>
                     </div>
-                    <div class="kn-body @(expandedItems.Contains(k.Id) ? "expanded" : "")">@k.Content</div>
-                    @if (k.Content.Length > 240)
+                    @if (!string.IsNullOrEmpty(k.Content))
                     {
-                        <button class="kn-more" @onclick="() => ToggleExpand(k.Id)">
-                            @(expandedItems.Contains(k.Id) ? "Show less" : "Show more")
-                        </button>
+                        <div class="kn-body @(expandedItems.Contains(k.Id) ? "expanded" : "")">@k.Content</div>
+                        @if (k.Content.Length > 240)
+                        {
+                            <button class="kn-more" @onclick="() => ToggleExpand(k.Id)">
+                                @(expandedItems.Contains(k.Id) ? "Show less" : "Show more")
+                            </button>
+                        }
                     }
                 }
             </div>
+        }
+        @if (AssetPagePolicy.HasMore(State.Profile.Knowledge.Count, visibleCount))
+        {
+            <button class="ghost load-more" @onclick="LoadMore" aria-label="Load more knowledge">
+                <i class="bi bi-chevron-down"></i> Load more (@AssetPagePolicy.Remaining(State.Profile.Knowledge.Count, visibleCount) more)
+            </button>
         }
         @if (State.Profile.Knowledge.Count == 0)
         {
@@ -389,6 +406,15 @@
     string? editingId;
     string editTitle = "", editContent = "", editVisibility = "private";
     bool busy;
+
+    // Mesh 1.17 bounded paging over summary metadata.
+    int visibleCount = AssetPagePolicy.PageSize;
+
+    // Lazy-body edit state: a summary carries blank Content, so the full item is loaded on demand.
+    bool editLoading;
+    bool editLoaded;
+    string? editError;
+    CancellationTokenSource? editCts;
     CancellationTokenSource? connectCts;
     string? sourceError;
     string? sourceNote;
@@ -662,29 +688,77 @@
     void AddItem()
     {
         if (string.IsNullOrWhiteSpace(title)) return;
-        State.Mutate(p => p.Knowledge.Add(new KnowledgeItem
+        var item = new KnowledgeItem
         {
             Title = title.Trim(), Content = content.Trim(), Visibility = visibility, Source = KnowledgeSource.Manual
-        }));
+        };
+        AssetMutations.Apply(State, AssetEdit.Create, AssetKind.Knowledge, item.Id, p => p.Knowledge.Add(item));
         title = ""; content = ""; visibility = "private";
     }
 
-    void BeginEdit(KnowledgeItem k)
+    void LoadMore() => visibleCount = AssetPagePolicy.NextVisible(visibleCount, State.Profile.Knowledge.Count);
+
+    async Task BeginEdit(KnowledgeItem k)
     {
-        editingId = k.Id; editTitle = k.Title; editContent = k.Content; editVisibility = k.Visibility;
+        editCts?.Cancel();
+        editCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        editCts = cts;
+
+        editingId = k.Id;
+        editTitle = k.Title; editVisibility = k.Visibility;
+        editContent = "";
+        editLoaded = false; editError = null; editLoading = true;
+
+        try
+        {
+            // Only the selected item's full body is loaded; never overwrite the stored body with blank.
+            var full = await State.LoadFullKnowledgeAsync(k.Id, cts.Token);
+            if (cts.IsCancellationRequested || editingId != k.Id) return;
+            if (full is null)
+            {
+                editError = "This item could not be loaded - it may have been deleted.";
+            }
+            else
+            {
+                editTitle = full.Title; editContent = full.Content; editVisibility = full.Visibility;
+                editLoaded = true;
+            }
+        }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex)
+        {
+            if (editingId == k.Id) editError = "Could not load this item: " + ex.Message;
+        }
+        finally
+        {
+            if (editCts == cts) { editLoading = false; StateHasChanged(); }
+        }
     }
 
     void SaveEdit(KnowledgeItem k)
     {
-        State.Mutate(_ =>
+        // Guard: persist the body only once the full asset has actually loaded.
+        if (!AssetPagePolicy.CanPersistBody(editLoaded)) return;
+        AssetMutations.Apply(State, AssetEdit.EditBody, AssetKind.Knowledge, k.Id, _ =>
         {
             k.Title = editTitle.Trim(); k.Content = editContent.Trim(); k.Visibility = editVisibility;
             k.UpdatedAt = DateTimeOffset.UtcNow;
         });
-        editingId = null;
+        CancelEdit();
     }
 
-    void Remove(KnowledgeItem k) => State.Mutate(p => p.Knowledge.Remove(k));
+    void CancelEdit()
+    {
+        editCts?.Cancel();
+        editCts?.Dispose();
+        editCts = null;
+        editingId = null;
+        editLoading = false; editLoaded = false; editError = null;
+    }
+
+    void Remove(KnowledgeItem k)
+        => AssetMutations.Apply(State, AssetEdit.Delete, AssetKind.Knowledge, k.Id, p => p.Knowledge.Remove(k));
 
     async Task Browse()
     {
@@ -704,7 +778,13 @@
         {
             var result = await Files.ImportAsync(importRef, visibility);
             if (!result.Ok) { importError = result.Error; return; }
-            State.Mutate(p => p.Knowledge.AddRange(result.Items));
+            // Bounded bulk import: persist new bodies as bounded content batches, never as one giant write.
+            var items = result.Items as IReadOnlyList<KnowledgeItem> ?? result.Items.ToList();
+            foreach (var batch in AssetPagePolicy.Chunk(items))
+            {
+                var ids = batch.Select(i => (AssetKind.Knowledge, i.Id)).ToList();
+                State.SaveAssetsContent(ids, p => p.Knowledge.AddRange(batch));
+            }
             importRef = "";
         }
         finally { importing = false; }
@@ -732,5 +812,7 @@
         State.Changed -= Refresh;
         Msal.Changed -= Refresh;
         Catalog.Changed -= Refresh;
+        editCts?.Cancel();
+        editCts?.Dispose();
     }
 }
