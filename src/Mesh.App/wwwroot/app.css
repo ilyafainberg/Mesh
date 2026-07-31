@@ -496,15 +496,6 @@ input[type=checkbox]:not(.switch input):checked::after {
 .bubble.user .text.md th, .bubble.user .text.md td { border-color: rgba(255,255,255,.35); }
 .bubble.user .text.md th { background: rgba(255,255,255,.15); }
 
-/* composer live preview */
-.composer-preview { display: flex; gap: 8px; align-items: flex-start; background: var(--bg-2);
-  border: 1px dashed var(--stroke-2); border-radius: var(--radius-m); padding: 8px 12px; margin-bottom: 8px; }
-.composer-preview .preview-label { color: var(--fg-3); font-size: .7rem; font-weight: 600;
-  text-transform: uppercase; white-space: nowrap; padding-top: 2px; display: inline-flex; align-items: center; gap: 4px; }
-.composer-preview .text.md { flex: 1; min-width: 0; font-size: .9rem; }
-.composer-preview .text.md > :first-child { margin-top: 0; }
-.composer-preview .text.md > :last-child { margin-bottom: 0; }
-
 /* ============================================================
    Interactive mini-apps
    ============================================================ */

@@ -241,6 +241,165 @@ window.meshUI = {
     } catch (e) { console.error('downloadFile failed', e); }
   },
 
+  initImagePreview: function (viewport, image) {
+    if (!viewport || !image || viewport._meshImagePreview) return;
+    var state = {
+      scale: 1, x: 0, y: 0, pointers: new Map(), pinch: null, dragging: false
+    };
+    viewport._meshImagePreview = state;
+    state.image = image;
+    state.zoomLabel = viewport.closest('.image-preview')
+      .querySelector('[data-image-preview-zoom]');
+
+    function clamp() {
+      if (state.scale <= 1) {
+        state.x = 0;
+        state.y = 0;
+        return;
+      }
+      var imageWidth = image.clientWidth * state.scale;
+      var imageHeight = image.clientHeight * state.scale;
+      var maxX = Math.max(0, (imageWidth - viewport.clientWidth) / 2);
+      var maxY = Math.max(0, (imageHeight - viewport.clientHeight) / 2);
+      state.x = Math.max(-maxX, Math.min(maxX, state.x));
+      state.y = Math.max(-maxY, Math.min(maxY, state.y));
+    }
+
+    function apply() {
+      clamp();
+      image.style.transform = 'translate3d(' + state.x + 'px,' + state.y +
+        'px,0) scale(' + state.scale + ')';
+      viewport.classList.toggle('image-preview-zoomed', state.scale > 1);
+      viewport.classList.toggle('image-preview-dragging', state.dragging);
+      if (state.zoomLabel) state.zoomLabel.textContent = Math.round(state.scale * 100) + '%';
+    }
+
+    function setScale(value, centerX, centerY) {
+      var oldScale = state.scale;
+      var next = Math.max(1, Math.min(8, value));
+      if (next === oldScale) return;
+      if (centerX != null && centerY != null && oldScale > 0) {
+        var rect = viewport.getBoundingClientRect();
+        var dx = centerX - (rect.left + rect.width / 2);
+        var dy = centerY - (rect.top + rect.height / 2);
+        var ratio = next / oldScale;
+        state.x = dx - (dx - state.x) * ratio;
+        state.y = dy - (dy - state.y) * ratio;
+      }
+      state.scale = next;
+      apply();
+    }
+
+    function distance(a, b) {
+      var dx = a.x - b.x;
+      var dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    state.wheel = function (event) {
+      event.preventDefault();
+      setScale(state.scale * (event.deltaY < 0 ? 1.15 : 1 / 1.15),
+        event.clientX, event.clientY);
+    };
+    state.pointerDown = function (event) {
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      event.preventDefault();
+      state.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      try { viewport.setPointerCapture(event.pointerId); } catch (_) { }
+      if (state.pointers.size === 1) {
+        state.lastX = event.clientX;
+        state.lastY = event.clientY;
+        state.dragging = state.scale > 1;
+      } else if (state.pointers.size === 2) {
+        var points = Array.from(state.pointers.values());
+        state.pinch = {
+          distance: distance(points[0], points[1]),
+          scale: state.scale
+        };
+        state.dragging = false;
+      }
+      apply();
+    };
+    state.pointerMove = function (event) {
+      if (!state.pointers.has(event.pointerId)) return;
+      event.preventDefault();
+      state.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (state.pointers.size === 2 && state.pinch) {
+        var points = Array.from(state.pointers.values());
+        var midpointX = (points[0].x + points[1].x) / 2;
+        var midpointY = (points[0].y + points[1].y) / 2;
+        setScale(state.pinch.scale * distance(points[0], points[1]) /
+          Math.max(1, state.pinch.distance), midpointX, midpointY);
+      } else if (state.pointers.size === 1 && state.scale > 1) {
+        state.x += event.clientX - state.lastX;
+        state.y += event.clientY - state.lastY;
+        state.lastX = event.clientX;
+        state.lastY = event.clientY;
+        state.dragging = true;
+        apply();
+      }
+    };
+    state.pointerUp = function (event) {
+      state.pointers.delete(event.pointerId);
+      try { viewport.releasePointerCapture(event.pointerId); } catch (_) { }
+      state.pinch = null;
+      state.dragging = false;
+      if (state.pointers.size === 1) {
+        var remaining = Array.from(state.pointers.values())[0];
+        state.lastX = remaining.x;
+        state.lastY = remaining.y;
+      }
+      apply();
+    };
+    state.doubleClick = function (event) {
+      event.preventDefault();
+      setScale(state.scale > 1 ? 1 : 2, event.clientX, event.clientY);
+    };
+    state.resize = function () { apply(); };
+    state.command = function (command) {
+      if (command === 'in') setScale(state.scale * 1.25);
+      else if (command === 'out') setScale(state.scale / 1.25);
+      else if (command === 'reset') {
+        state.scale = 1; state.x = 0; state.y = 0; apply();
+      } else {
+        var step = 48;
+        if (command === 'left') state.x -= step;
+        if (command === 'right') state.x += step;
+        if (command === 'up') state.y -= step;
+        if (command === 'down') state.y += step;
+        apply();
+      }
+    };
+
+    viewport.addEventListener('wheel', state.wheel, { passive: false });
+    viewport.addEventListener('pointerdown', state.pointerDown);
+    viewport.addEventListener('pointermove', state.pointerMove);
+    viewport.addEventListener('pointerup', state.pointerUp);
+    viewport.addEventListener('pointercancel', state.pointerUp);
+    viewport.addEventListener('dblclick', state.doubleClick);
+    window.addEventListener('resize', state.resize);
+    apply();
+  },
+
+  imagePreviewCommand: function (viewport, command) {
+    var state = viewport && viewport._meshImagePreview;
+    if (state && state.command) state.command(command);
+  },
+
+  disposeImagePreview: function (viewport) {
+    var state = viewport && viewport._meshImagePreview;
+    if (!state) return;
+    viewport.removeEventListener('wheel', state.wheel);
+    viewport.removeEventListener('pointerdown', state.pointerDown);
+    viewport.removeEventListener('pointermove', state.pointerMove);
+    viewport.removeEventListener('pointerup', state.pointerUp);
+    viewport.removeEventListener('pointercancel', state.pointerUp);
+    viewport.removeEventListener('dblclick', state.doubleClick);
+    window.removeEventListener('resize', state.resize);
+    if (state.image) state.image.style.transform = '';
+    delete viewport._meshImagePreview;
+  },
+
   // WebView engines can reject file:// navigation before MAUI raises UrlLoading.
   // Intercept local links in the DOM and pass them to the native host explicitly.
   initFileLinks: function (dotnetRef) {

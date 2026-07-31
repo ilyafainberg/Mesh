@@ -268,37 +268,6 @@
     flex: 0 0 auto;
 }
 
-.m-sheet-quit {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    width: 100%;
-    margin-top: 10px;
-    min-height: 48px;
-    padding: 12px 10px;
-    background: transparent;
-    border: none;
-    border-top: 1px solid var(--stroke-1);
-    border-radius: 0 0 var(--radius-l) var(--radius-l);
-    color: var(--danger);
-    font-family: inherit;
-    font-size: .95rem;
-    font-weight: 600;
-    text-align: left;
-    cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-}
-
-.m-sheet-quit:hover,
-.m-sheet-quit:active { background: rgba(177, 14, 28, .08); }
-
-.m-sheet-quit i {
-    font-size: 22px;
-    width: 22px;
-    text-align: center;
-    flex: 0 0 auto;
-}
-
 @keyframes m-slide-up {
     from { transform: translateY(100%); }
     to { transform: translateY(0); }

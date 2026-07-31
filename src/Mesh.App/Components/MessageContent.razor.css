@@ -34,6 +34,27 @@
     color: #8a1520;
 }
 
+.image-preview-trigger {
+    display: inline-block;
+    max-width: 100%;
+    margin: 0;
+    border: 0;
+    padding: 0;
+    cursor: zoom-in;
+    background: transparent;
+    vertical-align: top;
+}
+
+.image-preview-trigger:focus-visible {
+    border-radius: 8px;
+    outline: 3px solid var(--bs-primary, #0d6efd);
+    outline-offset: 3px;
+}
+
+.image-preview-trigger .msg-img {
+    display: block;
+}
+
 @media (max-width: 600px) {
     .widget-frame-host {
         height: min(70vh, 560px);

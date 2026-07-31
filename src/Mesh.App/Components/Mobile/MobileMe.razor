@@ -409,13 +409,6 @@ else
                         <span class="mode-hint">send to use, or describe changes</span>
                     </div>
                 }
-                else if (ShowPreview)
-                {
-                    <div class="composer-preview">
-                        <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
-                        <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
-                    </div>
-                }
                 @if (attachments.Count > 0)
                 {
                     <div class="attach-bar">
@@ -744,8 +737,6 @@ else
         .GroupBy(d => d.DeviceId, StringComparer.Ordinal)
         .Select(g => g.First())
         .ToList();
-
-    bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
     // The free model returns a friendly limit message when the daily token budget is spent.
     bool QuotaExhausted

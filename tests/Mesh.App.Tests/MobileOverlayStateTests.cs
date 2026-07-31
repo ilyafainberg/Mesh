@@ -61,6 +61,18 @@ public sealed class MobileOverlayStateTests
         StringAssert.Contains(audiencePicker, "<MobileOverlayScope Active=\"@open\" />");
     }
 
+    [TestMethod]
+    public void MobileShell_HasNoQuitActionWhileDesktopNavigationRetainsQuit()
+    {
+        var mobileShell = ReadRepoFile("src", "Mesh.App", "Components", "Mobile", "MobileShell.razor");
+        var desktopNav = ReadRepoFile("src", "Mesh.App", "Components", "Layout", "NavMenu.razor");
+
+        Assert.IsFalse(mobileShell.Contains("Quit", StringComparison.Ordinal));
+        Assert.IsFalse(mobileShell.Contains("IAppControl", StringComparison.Ordinal));
+        StringAssert.Contains(desktopNav, "@onclick=\"Quit\"");
+        StringAssert.Contains(desktopNav, "AppControl.Quit();");
+    }
+
     static string ReadRepoFile(params string[] parts)
     {
         var relativePath = Path.Combine(parts);

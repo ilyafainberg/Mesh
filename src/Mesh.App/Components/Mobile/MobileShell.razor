@@ -3,7 +3,6 @@
 @inject NavigationManager Nav
 @inject AppState State
 @inject MeshClient Mesh
-@inject IAppControl AppControl
 @inject ModelSetupService Setup
 @inject UpdateService Updater
 @inject MemoryService Memories
@@ -123,7 +122,6 @@
                 <button class="m-sheet-link" @onclick='() => Go("/backup")'><i class="bi bi-shield-lock"></i><span>Backup</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/about")'><i class="bi bi-info-circle"></i><span>About</span></button>
             </div>
-            <button class="m-sheet-quit" @onclick="Quit"><i class="bi bi-power"></i><span>Quit</span></button>
         </div>
     }
 </div>
@@ -168,12 +166,6 @@
     void ToggleMore() => moreOpen = !moreOpen;
 
     void CloseMore() => moreOpen = false;
-
-    void Quit()
-    {
-        moreOpen = false;
-        AppControl.Quit();
-    }
 
     protected override void OnInitialized()
     {
