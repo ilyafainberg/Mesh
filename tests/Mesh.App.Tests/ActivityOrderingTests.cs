@@ -221,24 +221,24 @@ public sealed class ActivityOrderingTests
     }
 
     [TestMethod]
-    public void RemoteRunActivity_AuthoritativeStateRequiresProtocol7ExecutionDevice()
+    public void RemoteRunActivity_AuthoritativeStateRequiresCurrentProtocolExecutionDevice()
     {
         Mesh.Shared.DeviceInfo[] devices =
         [
-            new("legacy", "Legacy", true, Mesh.Shared.DevicePlatforms.Windows, true,
-                ProtocolVersion: 6),
-            new("modern", "Modern", true, Mesh.Shared.DevicePlatforms.Windows, true,
-                ProtocolVersion: 7)
+            new("unsupported", "Unsupported", true, Mesh.Shared.DevicePlatforms.Windows, true,
+                ProtocolVersion: Mesh.Shared.MeshProtocol.Version - 1),
+            new("current", "Current", true, Mesh.Shared.DevicePlatforms.Windows, true,
+                ProtocolVersion: Mesh.Shared.MeshProtocol.Version)
         ];
 
         Assert.IsFalse(RemoteRunActivity.UsesAuthoritativeState(
-            false, "modern", "current", devices));
+            false, "current", "this-device", devices));
         Assert.IsTrue(RemoteRunActivity.UsesAuthoritativeState(
-            true, "current", "current", devices));
+            true, "this-device", "this-device", devices));
         Assert.IsFalse(RemoteRunActivity.UsesAuthoritativeState(
-            true, "legacy", "current", devices));
+            true, "unsupported", "this-device", devices));
         Assert.IsTrue(RemoteRunActivity.UsesAuthoritativeState(
-            true, "modern", "current", devices));
+            true, "current", "this-device", devices));
     }
 
     [TestMethod]

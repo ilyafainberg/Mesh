@@ -970,7 +970,7 @@ public static class RemoteRunActivity
             return true;
         return devices.Any(device =>
             string.Equals(device.DeviceId, executionDeviceId, StringComparison.Ordinal)
-            && device.ProtocolVersion >= 7);
+            && device.ProtocolVersion == MeshProtocol.Version);
     }
 
     public static bool IsProjectionActive(

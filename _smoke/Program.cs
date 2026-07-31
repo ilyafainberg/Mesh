@@ -781,13 +781,13 @@ var syncKindResult = await p8Owner.conn.InvokeAsync<MeshSendResult>(
 Check(!syncKindResult.Accepted && syncKindResult.Code == "device_sync_use_queue",
     "8h: SendEnvelope with DeviceSyncKinds kind is rejected with device_sync_use_queue");
 
-// --- 8i: Protocol 7 handshake returns VersionMismatch rejection ---
-var (p7mmPriv, p7mmPub) = Gen();
-var p7mmHandle = "p7mm" + Guid.NewGuid().ToString("n")[..8];
-await Register(p7mmHandle, p7mmPub, p7mmPriv, "Protocol 7 Mismatch Test");
+// --- 8i: Unsupported protocol handshake returns VersionMismatch rejection ---
+var (unsupportedPriv, unsupportedPub) = Gen();
+var unsupportedHandle = "unsupported" + Guid.NewGuid().ToString("n")[..8];
+await Register(unsupportedHandle, unsupportedPub, unsupportedPriv, "Unsupported Protocol Test");
 var mismatchReadyTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 var mmConn = new HubConnectionBuilder()
-    .WithUrl($"{relay}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(p7mmHandle)}&deliveryAck=0&protocolVersion=7")
+    .WithUrl($"{relay}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(unsupportedHandle)}&deliveryAck=0&protocolVersion={MeshProtocol.Version - 1}")
     .Build();
 connections.Add(mmConn);
 mmConn.On<HandshakeResponse>(MeshHubProtocol.Handshake, response =>
@@ -800,12 +800,12 @@ mmConn.On<HandshakeResponse>(MeshHubProtocol.Handshake, response =>
 });
 await mmConn.StartAsync();
 Check(await Within(mismatchReadyTcs.Task, 5000),
-    "8i: connecting with protocol version 7 is rejected with VersionMismatch");
+    "8i: connecting with an unsupported protocol is rejected with VersionMismatch");
 // Clean up the mismatch handle immediately.
-await http.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"{relay}/handles/{p7mmHandle}")
+await http.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"{relay}/handles/{unsupportedHandle}")
 {
     Content = JsonContent.Create(new DeleteHandleRequest(
-        p7mmHandle, p7mmPub, Sign(p7mmPriv, DeleteProtocol.Message(p7mmHandle))))
+        unsupportedHandle, unsupportedPub, Sign(unsupportedPriv, DeleteProtocol.Message(unsupportedHandle))))
 });
 
 // ---- Connection teardown -------------------------------------------------
