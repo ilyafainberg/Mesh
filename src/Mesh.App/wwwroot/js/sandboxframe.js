@@ -51,22 +51,13 @@ window.sandboxFrame = (function () {
     return Date.now().toString(36) + Math.random().toString(36).slice(2);
   }
 
-  function clearBlob(iframe, state) {
-    var url = state && state.blobUrl;
-    if (!url) url = iframe && iframe.dataset ? iframe.dataset.blobUrl : null;
-    if (!url) return;
-    URL.revokeObjectURL(url);
-    if (state) state.blobUrl = null;
-    if (iframe.dataset.blobUrl === url) delete iframe.dataset.blobUrl;
-  }
-
   function clearTimer(state) {
     if (!state || !state.timer) return;
     clearTimeout(state.timer);
     state.timer = null;
   }
 
-  function clearAttempt(iframe, state, revokeBlob) {
+  function clearAttempt(iframe, state) {
     if (!state) return;
     clearTimer(state);
     if (state.loadHandler) {
@@ -77,7 +68,6 @@ window.sandboxFrame = (function () {
       iframe.removeEventListener('error', state.errorHandler);
       state.errorHandler = null;
     }
-    if (revokeBlob) clearBlob(iframe, state);
   }
 
   function statusElement(iframe) {
@@ -132,21 +122,36 @@ window.sandboxFrame = (function () {
     };
   }
 
+  function diagnose(iframe, state, stage, extra) {
+    if (!isCurrent(iframe, state)) return;
+    var eventDetail = detail(state, 'mesh-widget-diagnostic');
+    eventDetail.stage = stage;
+    if (extra) {
+      Object.keys(extra).forEach(function (key) {
+        eventDetail[key] = extra[key];
+      });
+    }
+    iframe.dispatchEvent(new CustomEvent('mesh-widget-diagnostic', { detail: eventDetail }));
+    console.info('Widget diagnostic', eventDetail);
+  }
+
   function failFrame(iframe, state) {
     if (!isCurrent(iframe, state)) return;
-    clearAttempt(iframe, state, true);
+    clearAttempt(iframe, state);
     iframe.dataset.widgetError = 'rendering-failed';
     iframe.dataset.widgetStage = 'failed';
     showStatus(iframe, 'Widget could not load securely. Renderers attempted: ' +
       state.modes.join(', ') + '. Platform: ' + platformLabel() + '.', true);
     var eventDetail = detail(state, 'mesh-widget-render-error');
+    diagnose(iframe, state, 'failed', { reason: 'renderers-exhausted' });
     iframe.dispatchEvent(new CustomEvent('mesh-widget-error', { detail: eventDetail }));
     console.error('Widget rendering failed', eventDetail);
   }
 
   function acceptLoadedFrame(iframe, state) {
     if (!isCurrent(iframe, state) || iframe.dataset.widgetReady === 'true') return;
-    clearAttempt(iframe, state, false);
+    clearAttempt(iframe, state);
+    diagnose(iframe, state, 'confirmation-timeout');
     iframe.dataset.widgetReady = 'unconfirmed';
     iframe.dataset.widgetStage = 'loaded-unconfirmed';
     showStatus(iframe, 'Widget document loaded with ' + state.mode +
@@ -158,7 +163,7 @@ window.sandboxFrame = (function () {
 
   function tryNext(iframe, state) {
     if (!isCurrent(iframe, state)) return;
-    clearAttempt(iframe, state, true);
+    clearAttempt(iframe, state);
     state.attempt++;
     if (state.attempt >= state.modes.length) {
       failFrame(iframe, state);
@@ -174,15 +179,23 @@ window.sandboxFrame = (function () {
     delete iframe.dataset.widgetReady;
     showStatus(iframe, 'Loading widget securely with ' + state.mode + ' (' +
       (state.attempt + 1) + ' of ' + state.modes.length + ')...', false);
+    diagnose(iframe, state, 'attempt');
 
     state.errorHandler = function () {
-      if (isCurrent(iframe, state)) tryNext(iframe, state);
+      if (isCurrent(iframe, state)) {
+        diagnose(iframe, state, 'fallback', {
+          reason: 'navigation-error',
+          nextMode: state.modes[state.attempt + 1] || 'none'
+        });
+        tryNext(iframe, state);
+      }
     };
     iframe.addEventListener('error', state.errorHandler);
 
     state.loadHandler = function () {
       if (!isCurrent(iframe, state)) return;
       iframe.dataset.widgetStage = 'document-loaded';
+      diagnose(iframe, state, 'load');
       if (state.mode === 'host') return;
       clearTimer(state);
       state.timer = setTimeout(function () {
@@ -192,29 +205,35 @@ window.sandboxFrame = (function () {
     iframe.addEventListener('load', state.loadHandler);
 
     state.timer = setTimeout(function () {
-      if (isCurrent(iframe, state)) tryNext(iframe, state);
+      if (isCurrent(iframe, state)) {
+        diagnose(iframe, state, 'navigation-timeout');
+        diagnose(iframe, state, 'fallback', {
+          reason: 'navigation-timeout',
+          nextMode: state.modes[state.attempt + 1] || 'none'
+        });
+        tryNext(iframe, state);
+      }
     }, navigationTimeoutMs);
 
     try {
+      diagnose(iframe, state, 'navigation-requested');
       if (state.mode === 'host') {
         iframe.removeAttribute('srcdoc');
         iframe.src = new URL('widget-host.html', document.baseURI).href + '#' + encodeURIComponent(nonce);
       } else if (state.mode === 'srcdoc') {
         iframe.removeAttribute('src');
         iframe.srcdoc = state.content;
-      } else if (state.mode === 'blob') {
-        iframe.removeAttribute('srcdoc');
-        var blob = new Blob([state.content], { type: 'text/html' });
-        state.blobUrl = URL.createObjectURL(blob);
-        iframe.dataset.blobUrl = state.blobUrl;
-        iframe.src = state.blobUrl;
       } else {
-        iframe.removeAttribute('srcdoc');
-        iframe.src = 'data:text/html;charset=utf-8,' + encodeURIComponent(state.content);
+        throw new Error('Unsupported widget renderer');
       }
     } catch (e) {
+      diagnose(iframe, state, 'navigation-blocked', { reason: 'navigation-exception' });
       console.warn('Widget renderer navigation failed',
         detail(state, 'mesh-widget-navigation-error'));
+      diagnose(iframe, state, 'fallback', {
+        reason: 'navigation-exception',
+        nextMode: state.modes[state.attempt + 1] || 'none'
+      });
       tryNext(iframe, state);
     }
   }
@@ -235,6 +254,7 @@ window.sandboxFrame = (function () {
       if (data.type === 'mesh-widget-host-ready') {
         if (state.mode !== 'host') continue;
         clearTimer(state);
+        diagnose(frame, state, 'host-ready');
         try {
           frame.contentWindow.postMessage({
             type: 'mesh-widget-render',
@@ -242,16 +262,24 @@ window.sandboxFrame = (function () {
             html: state.content
           }, '*');
           frame.dataset.widgetStage = 'host-injected';
+          diagnose(frame, state, 'host-injected');
           state.timer = setTimeout(function () {
-            if (isCurrent(frame, state)) tryNext(frame, state);
+            if (isCurrent(frame, state)) {
+              diagnose(frame, state, 'ready-timeout');
+              tryNext(frame, state);
+            }
           }, navigationTimeoutMs);
         } catch (e) {
+          diagnose(frame, state, 'fallback', {
+            reason: 'host-injection-error',
+            nextMode: state.modes[state.attempt + 1] || 'none'
+          });
           tryNext(frame, state);
         }
         break;
       }
 
-      clearAttempt(frame, state, false);
+      clearAttempt(frame, state);
       if (data.type === 'mesh-widget-error') {
         frame.dataset.widgetError = 'script-error';
         frame.dataset.widgetStage = 'script-error';
@@ -267,6 +295,7 @@ window.sandboxFrame = (function () {
         var wasReady = frame.dataset.widgetReady === 'true';
         frame.dataset.widgetReady = 'true';
         frame.dataset.widgetStage = 'ready';
+        diagnose(frame, state, 'ready');
         if (!frame.dataset.widgetError) hideStatus(frame);
         if (!wasReady) {
           frame.dispatchEvent(new CustomEvent('mesh-widget-ready', {
@@ -285,7 +314,7 @@ window.sandboxFrame = (function () {
       if (!iframe) return;
       try {
         var previous = frameStates.get(iframe);
-        clearAttempt(iframe, previous, true);
+        clearAttempt(iframe, previous);
         generation++;
         var ios = isIOSWebView();
         var state = {
@@ -293,19 +322,19 @@ window.sandboxFrame = (function () {
           html: html || '',
           // Inline documents avoid MAUI's app:// handler in the nested frame.
           // The hosted page is only the final iOS compatibility fallback.
-          modes: ios ? ['srcdoc', 'data', 'blob', 'host'] : ['srcdoc'],
+          modes: ios ? ['srcdoc', 'host'] : ['srcdoc'],
           attempt: -1,
           mode: '',
           content: '',
           timer: null,
           loadHandler: null,
-          errorHandler: null,
-          blobUrl: null
+          errorHandler: null
         };
         frameStates.set(iframe, state);
         iframe.dataset.widgetGeneration = String(state.generation);
         delete iframe.dataset.widgetError;
         delete iframe.dataset.widgetReady;
+        diagnose(iframe, state, 'configured', { modes: state.modes.join(',') });
         tryNext(iframe, state);
       } catch (e) {
         showStatus(iframe, 'Widget loader failed before navigation on ' +
@@ -319,7 +348,7 @@ window.sandboxFrame = (function () {
       if (!iframe) return;
       try {
         var state = frameStates.get(iframe);
-        clearAttempt(iframe, state, true);
+        clearAttempt(iframe, state);
         frameStates.delete(iframe);
         iframe.removeAttribute('src');
         iframe.removeAttribute('srcdoc');
