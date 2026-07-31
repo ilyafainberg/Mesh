@@ -28,6 +28,8 @@
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Durable.cs" Link="MeshDb.Durable.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.DeviceSync.cs" Link="MeshDb.DeviceSync.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Foundation117.cs" Link="MeshDb.Foundation117.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.OnlineReplication.cs" Link="MeshDb.OnlineReplication.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\OnlineReplicationState.cs" Link="OnlineReplicationState.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.SkillPackages.cs" Link="MeshDb.SkillPackages.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\SkillPackageArchive.cs" Link="SkillPackageArchive.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\SkillCompatibilityChecker.cs" Link="SkillCompatibilityChecker.cs" />

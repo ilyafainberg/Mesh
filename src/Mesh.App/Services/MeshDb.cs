@@ -336,6 +336,7 @@ public sealed partial class MeshDb : IDisposable
         MigrateConversationActivity();
         CreateFoundation117Schema();
         CreateSkillPackagesSchema();
+        CreateOnlineReplicationSchema();
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)

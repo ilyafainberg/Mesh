@@ -15,7 +15,7 @@ namespace Mesh.Shared;
 /// </summary>
 public static class MeshProtocol
 {
-    public const int Version = 8;
+    public const int Version = 9;
 }
 
 public record RegisterHandleRequest(
