@@ -1,6 +1,7 @@
 @inject AppState State
 @inject IJSRuntime JS
 @implements IAsyncDisposable
+@using Mesh.App.Components.Shared
 
 @if (renderedAttachments.Count > 0)
 {
@@ -8,11 +9,15 @@
         @foreach (var rendered in renderedAttachments)
         {
             var attachment = rendered.Attachment;
-            <img class="msg-img attached-preview"
-                 src="@rendered.DataUri"
-                 alt="@attachment.Name"
-                 title="@attachment.Name"
-                 @onclick="() => Download(attachment)" />
+            <button type="button"
+                    class="image-preview-trigger"
+                    title="Preview @attachment.Name"
+                    aria-label="Preview @attachment.Name"
+                    @onclick="() => Preview(attachment.Name, attachment.MimeType, rendered.Base64Data)">
+                <img class="msg-img attached-preview"
+                     src="@rendered.DataUri"
+                     alt="@attachment.Name" />
+            </button>
         }
     </div>
 }
@@ -24,9 +29,13 @@
     {
         @if (seg.FileMime is not null && seg.FileMime.StartsWith("image/"))
         {
-            <img class="msg-img" src="@rendered.DataUri"
-                 alt="@seg.FileName" title="@seg.FileName (click to save)"
-                 @onclick="() => Download(seg)" />
+            <button type="button"
+                    class="image-preview-trigger"
+                    title="Preview @seg.FileName"
+                    aria-label="Preview @seg.FileName"
+                    @onclick="() => Preview(seg.FileName, seg.FileMime, seg.Content)">
+                <img class="msg-img" src="@rendered.DataUri" alt="@seg.FileName" />
+            </button>
         }
         else
         {
@@ -94,6 +103,14 @@
     }
 }
 
+@if (preview is not null)
+{
+    <ImagePreview FileName="@preview.FileName"
+                  MimeType="@preview.MimeType"
+                  Base64Data="@preview.Base64Data"
+                  OnClose="ClosePreview" />
+}
+
 @code {
     [Parameter] public string Text { get; set; } = "";
     [Parameter] public IReadOnlyList<ChatAttachment>? Attachments { get; set; }
@@ -101,13 +118,15 @@
     [Parameter] public EventCallback<string> OnPin { get; set; }
 
     private sealed record RenderedSegment(int Id, MessageSegment Segment, string Html, string? DataUri);
-    private sealed record RenderedAttachment(ChatAttachment Attachment, string DataUri);
+    private sealed record RenderedAttachment(ChatAttachment Attachment, string Base64Data, string DataUri);
+    private sealed record PreviewImage(string FileName, string MimeType, string Base64Data);
 
     private IReadOnlyList<RenderedSegment> renderedSegments = Array.Empty<RenderedSegment>();
     private IReadOnlyList<RenderedAttachment> renderedAttachments = Array.Empty<RenderedAttachment>();
     private string? renderedText;
     private readonly HashSet<int> running = new();
     private readonly HashSet<int> expanded = new();
+    private PreviewImage? preview;
 
     // Per-app iframe element (keyed by the app id) plus the HTML to load into it
     // and the set of frames whose content has already been set.
@@ -146,7 +165,14 @@
             renderedAttachmentSignature = signature;
             renderedAttachments = Attachments?
                 .Where(attachment => attachment.IsImage)
-                .Select(attachment => new RenderedAttachment(attachment, DataUri(attachment)))
+                .Select(attachment =>
+                {
+                    var base64 = Convert.ToBase64String(attachment.Data);
+                    return new RenderedAttachment(
+                        attachment,
+                        base64,
+                        $"data:{attachment.MimeType};base64,{base64}");
+                })
                 .ToArray()
                 ?? Array.Empty<RenderedAttachment>();
             attachmentsInitialized = true;
@@ -174,6 +200,11 @@
     }
 
     private void Start(int id) => running.Add(id);
+
+    private void Preview(string fileName, string mimeType, string base64Data)
+        => preview = new(fileName, mimeType, base64Data);
+
+    private void ClosePreview() => preview = null;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -210,19 +241,6 @@
         try { await JS.InvokeVoidAsync("meshUI.downloadFile", seg.FileName, seg.FileMime, seg.Content); }
         catch { /* ignore download failures */ }
     }
-
-    private async Task Download(ChatAttachment attachment)
-    {
-        try
-        {
-            await JS.InvokeVoidAsync("meshUI.downloadFile", attachment.Name, attachment.MimeType,
-                Convert.ToBase64String(attachment.Data));
-        }
-        catch { /* ignore download failures */ }
-    }
-
-    private static string DataUri(ChatAttachment attachment)
-        => $"data:{attachment.MimeType};base64,{Convert.ToBase64String(attachment.Data)}";
 
     private static string SizeLabel(string base64)
     {

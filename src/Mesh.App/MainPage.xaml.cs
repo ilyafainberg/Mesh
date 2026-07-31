@@ -125,16 +125,27 @@ public partial class MainPage : ContentPage
             var fromSubframe = !navigationAction.SourceFrame.MainFrame;
             var toSubframe = navigationAction.TargetFrame is { MainFrame: false };
             var requestedUrl = navigationAction.Request.Url;
-            var blocked = fromSubframe
-                ? !IsSameDocumentFragmentNavigation(navigationAction.SourceFrame.Request.Url, requestedUrl)
-                : toSubframe && !IsAllowedWidgetNavigation(requestedUrl);
-            if (blocked)
+            var navigationKind = GetAllowedWidgetNavigationKind(
+                navigationAction.SourceFrame.Request.Url,
+                requestedUrl,
+                fromSubframe,
+                toSubframe);
+
+            if (navigationKind is not null)
             {
-                RecordBlockedWidgetNavigation(requestedUrl?.Scheme, requestedUrl?.Host);
+                RecordWidgetNavigation("allowed", requestedUrl, navigationKind);
+                decisionHandler(WKNavigationActionPolicy.Allow);
+                return;
+            }
+
+            if (fromSubframe || toSubframe)
+            {
+                RecordWidgetNavigation("blocked", requestedUrl, "external-subframe");
                 decisionHandler(WKNavigationActionPolicy.Cancel);
                 return;
             }
 
+            // Main-frame navigation remains owned by MAUI.
             inner.DecidePolicy(webView, navigationAction, decisionHandler);
         }
 
@@ -161,13 +172,29 @@ public partial class MainPage : ContentPage
         public override void DidFinishNavigation(WKWebView webView, WKNavigation navigation)
             => inner.DidFinishNavigation(webView, navigation);
 
-        private static bool IsAllowedWidgetNavigation(NSUrl? url)
+        private static string? GetAllowedWidgetNavigationKind(
+            NSUrl? current,
+            NSUrl? requested,
+            bool fromSubframe,
+            bool toSubframe)
         {
-            var scheme = url?.Scheme?.ToLowerInvariant();
-            if (scheme is "about" or "data" or "blob")
-                return true;
-            return scheme == "app"
-                   && string.Equals(url?.Path, "/widget-host.html", StringComparison.Ordinal);
+            if (fromSubframe && IsSameDocumentFragmentNavigation(current, requested))
+                return "same-document-fragment";
+            if (!toSubframe)
+                return null;
+
+            var value = requested?.AbsoluteString;
+            if (string.Equals(value, "about:blank", StringComparison.OrdinalIgnoreCase))
+                return "about-blank";
+            if (string.Equals(value, "about:srcdoc", StringComparison.OrdinalIgnoreCase))
+                return "about-srcdoc";
+            if (string.Equals(requested?.Scheme, "app", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(requested?.Host, "0.0.0.1", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(requested?.Path, "/widget-host.html", StringComparison.Ordinal)
+                && string.IsNullOrEmpty(requested?.Query))
+                return "widget-host";
+
+            return null;
         }
 
         private static bool IsSameDocumentFragmentNavigation(NSUrl? current, NSUrl? requested)
@@ -217,8 +244,17 @@ public partial class MainPage : ContentPage
     }
 #endif
 
+#if IOS || MACCATALYST
+    private static void RecordWidgetNavigation(string outcome, NSUrl? url, string kind)
+        => RuntimeDiagnostics.Current?.RecordEvent(
+            $"widget-navigation-{outcome}",
+            $"kind={kind}; scheme={url?.Scheme ?? "unknown"}; host={url?.Host ?? "none"}");
+#endif
+
+#if ANDROID || WINDOWS
     private static void RecordBlockedWidgetNavigation(string? scheme, string? host)
         => RuntimeDiagnostics.Current?.RecordEvent(
             "widget-navigation-blocked",
             $"scheme={scheme ?? "unknown"}; host={host ?? "none"}");
+#endif
 }

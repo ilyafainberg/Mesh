@@ -55,11 +55,12 @@ public sealed class WidgetRenderingSecurityTests
     }
 
     [TestMethod]
-    public void IOSRenderer_PrefersInlineDocumentsAndRetainsLoadedFrame()
+    public void IOSRenderer_UsesOnlySrcdocThenTrustedHost()
     {
         var script = Script();
-        StringAssert.Contains(script, "ios ? ['srcdoc', 'data', 'blob', 'host']");
+        StringAssert.Contains(script, "ios ? ['srcdoc', 'host']");
         StringAssert.Contains(script, ": ['srcdoc']");
+        Assert.IsFalse(script.Contains("['srcdoc', 'data'", StringComparison.Ordinal));
         StringAssert.Contains(script, "acceptLoadedFrame(iframe, state)");
         StringAssert.Contains(script, "iframe.dataset.widgetReady = 'unconfirmed'");
         StringAssert.Contains(script, "startup confirmation was not received");
@@ -78,16 +79,63 @@ public sealed class WidgetRenderingSecurityTests
     public void NativeHosts_BlockExternalSubframeNavigation()
     {
         var page = Read("src", "Mesh.App", "MainPage.xaml.cs");
-        StringAssert.Contains(page, "var blocked = fromSubframe");
+        StringAssert.Contains(page, "if (fromSubframe || toSubframe)");
         StringAssert.Contains(page, "WKNavigationActionPolicy.Cancel");
-        StringAssert.Contains(page, "scheme is \"about\" or \"data\" or \"blob\"");
-        StringAssert.Contains(page, "url?.Path, \"/widget-host.html\"");
+        StringAssert.Contains(page, "requested?.Host, \"0.0.0.1\"");
+        StringAssert.Contains(page, "requested?.Path, \"/widget-host.html\"");
         StringAssert.Contains(page, "IsSameDocumentFragmentNavigation");
         StringAssert.Contains(page, "requestedValue.IndexOf('#') < 0");
         StringAssert.Contains(page, "inner.DecidePolicy(webView, navigationAction, decisionHandler)");
         StringAssert.Contains(page, "request is { IsForMainFrame: false }");
         StringAssert.Contains(page, "widgetWebView2.FrameNavigationStarting += OnFrameNavigationStarting");
         StringAssert.Contains(page, "about:srcdoc");
+    }
+
+    [TestMethod]
+    public void IOSPolicy_BypassesMauiOnlyForTrustedSyntheticSubframeNavigation()
+    {
+        var page = Read("src", "Mesh.App", "MainPage.xaml.cs");
+        StringAssert.Contains(page, "navigationKind is not null");
+        StringAssert.Contains(page, "decisionHandler(WKNavigationActionPolicy.Allow)");
+        StringAssert.Contains(page, "\"about:blank\"");
+        StringAssert.Contains(page, "\"about:srcdoc\"");
+        StringAssert.Contains(page, "return \"same-document-fragment\"");
+        StringAssert.Contains(page, "return \"widget-host\"");
+        StringAssert.Contains(page, "string.IsNullOrEmpty(requested?.Query)");
+
+        var directAllow = page.IndexOf(
+            "decisionHandler(WKNavigationActionPolicy.Allow)", StringComparison.Ordinal);
+        var innerDelegate = page.IndexOf(
+            "inner.DecidePolicy(webView, navigationAction, decisionHandler)", StringComparison.Ordinal);
+        Assert.IsTrue(directAllow >= 0 && directAllow < innerDelegate);
+
+        Assert.IsFalse(page.Contains("scheme is \"about\" or \"data\" or \"blob\"", StringComparison.Ordinal));
+        Assert.IsFalse(page.Contains("return \"data\"", StringComparison.Ordinal));
+        Assert.IsFalse(page.Contains("return \"blob\"", StringComparison.Ordinal));
+        Assert.IsFalse(page.Contains("return \"javascript\"", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void WidgetDiagnostics_CoverLifecycleWithoutGeneratedHtml()
+    {
+        var script = Script();
+        foreach (var stage in new[]
+                 {
+                     "configured", "attempt", "navigation-requested", "navigation-blocked",
+                     "load", "ready", "confirmation-timeout", "navigation-timeout", "fallback"
+                 })
+        {
+            StringAssert.Contains(script, $"'{stage}'");
+        }
+
+        StringAssert.Contains(script, "console.info('Widget diagnostic', eventDetail)");
+        Assert.IsFalse(script.Contains("eventDetail.html", StringComparison.Ordinal));
+        Assert.IsFalse(script.Contains("console.info('Widget diagnostic', state", StringComparison.Ordinal));
+
+        var page = Read("src", "Mesh.App", "MainPage.xaml.cs");
+        StringAssert.Contains(page, "widget-navigation-{outcome}");
+        StringAssert.Contains(page, "RecordWidgetNavigation(\"allowed\"");
+        StringAssert.Contains(page, "RecordWidgetNavigation(\"blocked\"");
     }
 
     [TestMethod]

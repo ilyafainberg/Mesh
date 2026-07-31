@@ -57,7 +57,15 @@ public sealed class UpdateService : IDisposable
     private const string Owner = "MeshRelayAI";
     private const string Repo = "Mesh";
     private const string InstallerPrefix = "Mesh-Setup";
-    private const string PublisherCommonName = "Quonkel";
+    private static readonly IReadOnlyDictionary<string, string> TrustedPublisherAttributes =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CN"] = "Feincraft",
+            ["O"] = "Feincraft",
+            ["L"] = "Woluwe-Saint-Lambert",
+            ["S"] = "Bruxelles/Brusell",
+            ["C"] = "BE"
+        };
     private static readonly Regex ReleaseTagPattern =
         new(@"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$", RegexOptions.CultureInvariant);
     private static readonly Regex Sha256Pattern =
@@ -442,29 +450,32 @@ public sealed class UpdateService : IDisposable
         if (string.IsNullOrWhiteSpace(subject)) return false;
         try
         {
-            var distinguishedName = new X500DistinguishedName(subject);
-            var decoded = distinguishedName.Decode(
-                X500DistinguishedNameFlags.UseNewLines | X500DistinguishedNameFlags.DoNotUseQuotes);
-            var commonNames = new List<string>();
-            var organizations = new List<string>();
-            foreach (var line in decoded.Split(
-                new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                var separator = line.IndexOf('=');
-                if (separator <= 0) continue;
-                var key = line[..separator].Trim();
-                var value = line[(separator + 1)..].Trim();
-                if (string.Equals(key, "CN", StringComparison.OrdinalIgnoreCase)) commonNames.Add(value);
-                if (string.Equals(key, "O", StringComparison.OrdinalIgnoreCase)) organizations.Add(value);
-            }
-            return commonNames.Count == 1 && organizations.Count == 1 &&
-                   string.Equals(commonNames[0], PublisherCommonName, StringComparison.Ordinal) &&
-                   string.Equals(organizations[0], PublisherCommonName, StringComparison.Ordinal);
+            return IsMeshPublisher(new X500DistinguishedName(subject));
         }
         catch (CryptographicException)
         {
         }
         return false;
+    }
+
+    private static bool IsMeshPublisher(X500DistinguishedName subject)
+    {
+        var decoded = subject.Decode(
+            X500DistinguishedNameFlags.UseNewLines | X500DistinguishedNameFlags.DoNotUseQuotes);
+        var matchedAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var line in decoded.Split(
+            new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separator = line.IndexOf('=');
+            if (separator <= 0) return false;
+            var key = line[..separator].Trim();
+            var value = line[(separator + 1)..].Trim();
+            if (!TrustedPublisherAttributes.TryGetValue(key, out var trustedValue) ||
+                !string.Equals(value, trustedValue, StringComparison.Ordinal) ||
+                !matchedAttributes.Add(key))
+                return false;
+        }
+        return matchedAttributes.Count == TrustedPublisherAttributes.Count;
     }
 
     private static void VerifySignedInstaller(string path)
@@ -476,8 +487,9 @@ public sealed class UpdateService : IDisposable
 #pragma warning disable SYSLIB0057
         using var certificate = new X509Certificate2(X509Certificate.CreateFromSignedFile(path));
 #pragma warning restore SYSLIB0057
-        if (!IsMeshPublisher(certificate.Subject))
-            throw new CryptographicException("The installer publisher is not Mesh.");
+        if (!IsMeshPublisher(certificate.SubjectName))
+            throw new CryptographicException(
+                "The installer publisher is not an approved Mesh publisher (expected Feincraft).");
     }
 
     private static int WinVerifyTrustFile(string path)

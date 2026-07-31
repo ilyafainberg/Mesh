@@ -267,13 +267,6 @@
                             <button class="chip-x" @onclick="RemoveSelectedWidget" title="Remove widget" aria-label="Remove @selectedWidget.Name"><i class="bi bi-x"></i></button>
                         </div>
                     }
-                    @if (ShowPreview)
-                    {
-                        <div class="composer-preview">
-                            <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
-                            <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
-                        </div>
-                    }
                     @if (attachments.Count > 0)
                     {
                         <div class="attach-bar">
@@ -425,8 +418,6 @@
     {
         public string SizeLabel => Human(Size);
     }
-
-    bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
     bool ActiveIsService => active is not null && State.FindConversation(active)?.IsService == true;
     bool ActiveIsGroup => active is not null && State.FindConversation(active)?.IsGroup == true;

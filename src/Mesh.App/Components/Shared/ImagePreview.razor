@@ -1,0 +1,141 @@
+@inject IImageShareService ImageShare
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div class="image-preview-backdrop"
+     role="presentation"
+     @onclick="CloseAsync">
+    <div class="image-preview"
+         role="dialog"
+         aria-modal="true"
+         aria-label="Image preview"
+         tabindex="-1"
+         @ref="dialog"
+         @onclick:stopPropagation="true"
+         @onkeydown="HandleKeyDown"
+         @onkeydown:stopPropagation="true">
+        <div class="image-preview-toolbar">
+            <span class="image-preview-name">@FileName</span>
+            <div class="image-preview-zoom-controls" role="group" aria-label="Image zoom controls">
+                <button type="button"
+                        class="image-preview-zoom"
+                        @onclick='() => PreviewCommandAsync("out")'
+                        aria-label="Zoom out">
+                    <i class="bi bi-dash-lg" aria-hidden="true"></i>
+                </button>
+                <button type="button"
+                        class="image-preview-zoom image-preview-zoom-level"
+                        @onclick='() => PreviewCommandAsync("reset")'
+                        aria-label="Reset zoom">
+                    <span data-image-preview-zoom>100%</span>
+                </button>
+                <button type="button"
+                        class="image-preview-zoom"
+                        @onclick='() => PreviewCommandAsync("in")'
+                        aria-label="Zoom in">
+                    <i class="bi bi-plus-lg" aria-hidden="true"></i>
+                </button>
+            </div>
+            <button type="button"
+                    class="image-preview-action"
+                    disabled="@saving"
+                    @onclick="SaveOrShareAsync"
+                    aria-label="@($"{ImageShare.ActionLabel} {FileName}")">
+                <i class="bi @(ImageShare.ActionLabel == "Save" ? "bi-download" : "bi-share")" aria-hidden="true"></i>
+                @ImageShare.ActionLabel
+            </button>
+            <button type="button"
+                    class="image-preview-close"
+                    @onclick="CloseAsync"
+                    aria-label="Close image preview">
+                <i class="bi bi-x-lg" aria-hidden="true"></i>
+            </button>
+        </div>
+        <div class="image-preview-canvas"
+             @ref="canvas"
+             aria-label="Zoomable image. Pinch, use the mouse wheel, or use the zoom controls. Drag to pan when zoomed.">
+            <img @ref="image" src="@DataUri" alt="@FileName" draggable="false" />
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public string FileName { get; set; } = "";
+    [Parameter, EditorRequired] public string MimeType { get; set; } = "";
+    [Parameter, EditorRequired] public string Base64Data { get; set; } = "";
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private ElementReference dialog;
+    private ElementReference canvas;
+    private ElementReference image;
+    private bool saving;
+    private bool previewInitialized;
+    private string DataUri => $"data:{MimeType};base64,{Base64Data}";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await dialog.FocusAsync();
+            await JS.InvokeVoidAsync("meshUI.initImagePreview", canvas, image);
+            previewInitialized = true;
+        }
+    }
+
+    private Task CloseAsync() => OnClose.InvokeAsync();
+
+    private async Task HandleKeyDown(KeyboardEventArgs args)
+    {
+        if (args.Key == "Escape")
+        {
+            await CloseAsync();
+            return;
+        }
+
+        var command = args.Key switch
+        {
+            "+" or "=" => "in",
+            "-" or "_" => "out",
+            "0" => "reset",
+            "ArrowLeft" => "left",
+            "ArrowRight" => "right",
+            "ArrowUp" => "up",
+            "ArrowDown" => "down",
+            _ => null
+        };
+        if (command is not null)
+            await PreviewCommandAsync(command);
+    }
+
+    private ValueTask PreviewCommandAsync(string command)
+        => JS.InvokeVoidAsync("meshUI.imagePreviewCommand", canvas, command);
+
+    private async Task SaveOrShareAsync()
+    {
+        if (saving)
+            return;
+
+        saving = true;
+        try
+        {
+            await ImageShare.SaveOrShareAsync(new(FileName, MimeType, Base64Data));
+        }
+        finally
+        {
+            saving = false;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (!previewInitialized)
+            return;
+        try
+        {
+            await JS.InvokeVoidAsync("meshUI.disposeImagePreview", canvas);
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+    }
+}

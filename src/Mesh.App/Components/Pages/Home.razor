@@ -478,13 +478,6 @@
                         <span class="mode-hint">send to use, or describe changes</span>
                     </div>
                 }
-                else if (ShowPreview)
-                {
-                    <div class="composer-preview">
-                        <span class="preview-label"><i class="bi bi-eye"></i> preview</span>
-                        <div class="text md">@((MarkupString)Markdown.ToHtml(input))</div>
-                    </div>
-                }
                 @if (attachments.Count > 0)
                 {
                     <div class="attach-bar">
@@ -755,8 +748,6 @@
     string ActiveDeviceStatus => Active is null ? "" : Active.ExecutionDeviceId is null
         ? "This device on next send"
         : $"{ThreadDeviceName(Active)} ({(ActiveDeviceOnline ? "online" : "offline")})";
-
-    bool ShowPreview => !string.IsNullOrWhiteSpace(input) && Markdown.LooksLikeMarkdown(input);
 
     // The free model returns a friendly limit message when the daily token budget is spent.
     bool QuotaExhausted
