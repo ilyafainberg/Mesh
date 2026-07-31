@@ -152,13 +152,29 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
-        public void PublisherPredicateRequiresExactMeshPublisher()
+        public void PublisherPredicateAcceptsTrustedFeincraftSigner()
         {
-            Assert.IsTrue(UpdateService.IsMeshPublisher("CN=Quonkel, O=Quonkel"));
-            Assert.IsFalse(UpdateService.IsMeshPublisher("CN=Quonkel Malware, O=Quonkel"));
-            Assert.IsFalse(UpdateService.IsMeshPublisher("CN=Quonkel, O=Different Publisher"));
-            Assert.IsFalse(UpdateService.IsMeshPublisher("CN=Quonkel"));
-            Assert.IsFalse(UpdateService.IsMeshPublisher("CN=MeshRelayAI, O=MeshRelayAI"));
+            Assert.IsTrue(UpdateService.IsMeshPublisher(
+                "CN=Feincraft, O=Feincraft, L=Woluwe-Saint-Lambert, S=Bruxelles/Brusell, C=BE"));
+            Assert.IsTrue(UpdateService.IsMeshPublisher(
+                "C=BE, S=Bruxelles/Brusell, L=Woluwe-Saint-Lambert, O=Feincraft, CN=Feincraft"));
+        }
+
+        [TestMethod]
+        [DataRow("CN=Feincraft Malware, O=Feincraft, L=Woluwe-Saint-Lambert, S=Bruxelles/Brusell, C=BE")]
+        [DataRow("CN=Feincraft, O=Different Publisher, L=Woluwe-Saint-Lambert, S=Bruxelles/Brusell, C=BE")]
+        [DataRow("CN=Feincraft, O=Feincraft, L=Woluwe-Saint-Lambert, S=Bruxelles/Brusell, C=US")]
+        [DataRow("CN=Feincraft, O=Feincraft")]
+        [DataRow("CN=Quonkel, O=Quonkel")]
+        [DataRow("CN=Feincraft, O=Feincraft, OU=Malware, L=Woluwe-Saint-Lambert, S=Bruxelles/Brusell, C=BE")]
+        public void PublisherPredicateRejectsLookalikesAndWrongPublishers(string subject)
+        {
+            Assert.IsFalse(UpdateService.IsMeshPublisher(subject));
+        }
+
+        [TestMethod]
+        public void PublisherPredicateRejectsMissingPublisher()
+        {
             Assert.IsFalse(UpdateService.IsMeshPublisher(null));
         }
 
