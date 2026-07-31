@@ -330,6 +330,7 @@ public sealed partial class MeshDb : IDisposable
         AddColumnIfMissing("conversations", "last_activity_at", "TEXT");
         AddColumnIfMissing("conversations", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
         MigrateConversationActivity();
+        CreateFoundation117Schema();
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)
