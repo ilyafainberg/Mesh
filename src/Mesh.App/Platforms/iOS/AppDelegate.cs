@@ -92,11 +92,11 @@ public class AppDelegate : MauiUIApplicationDelegate
     {
         try
         {
-            var result = await BackgroundSyncBridge.SynchronizePendingAsync().ConfigureAwait(false);
+            var result = await OnlineReplicationWakeBridge.SynchronizePendingAsync().ConfigureAwait(false);
             completionHandler(result.Outcome switch
             {
-                BackgroundSyncOutcome.NewData => UIBackgroundFetchResult.NewData,
-                BackgroundSyncOutcome.NoData => UIBackgroundFetchResult.NoData,
+                OnlineReplicationWakeOutcome.NewData => UIBackgroundFetchResult.NewData,
+                OnlineReplicationWakeOutcome.NoData => UIBackgroundFetchResult.NoData,
                 _ => UIBackgroundFetchResult.Failed
             });
         }
@@ -153,9 +153,9 @@ public class AppDelegate : MauiUIApplicationDelegate
         task.ExpirationHandler = expired.Cancel;
         try
         {
-            var result = await BackgroundSyncBridge.SynchronizePendingAsync(
+            var result = await OnlineReplicationWakeBridge.SynchronizePendingAsync(
                 TimeSpan.FromSeconds(20), expired.Token).ConfigureAwait(false);
-            task.SetTaskCompleted(result.Outcome != BackgroundSyncOutcome.Failed);
+            task.SetTaskCompleted(result.Outcome != OnlineReplicationWakeOutcome.Failed);
         }
         catch (Exception ex)
         {

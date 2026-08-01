@@ -377,7 +377,7 @@ public static class MemoryOrigins
 }
 
 /// <summary>
-/// Owner-only durable memory used exclusively by Me topics. Memories never have visibility or
+/// Owner-only reliable memory used exclusively by Me topics. Memories never have visibility or
 /// publishing fields, so they cannot be exposed to Messages, contacts, circles, or Community services.
 /// </summary>
 public sealed class MemoryItem
@@ -1300,7 +1300,7 @@ public sealed class QueuedTopicRunState
 /// <summary>
 /// Decides whether a committed assistant answer that just synced in from the executing device should
 /// finalize a lingering LIVE remote-run projection on a viewing device. Terminal updates and committed
-/// lines travel independently, so the durable answer can arrive first. The durable answer is the
+/// lines travel independently, so the reliable answer can arrive first. The reliable answer is the
 /// terminal truth.
 /// </summary>
 public static class RemoteRunReconciliation
@@ -1317,7 +1317,7 @@ public static class RemoteRunReconciliation
 
     /// <summary>
     /// Resolves the run completed by a committed assistant answer. An exact reply-to match against a
-    /// durable queued run is authoritative even when the live projection was missed or lost on restart.
+    /// reliable queued run is authoritative even when the live projection was missed or lost on restart.
     /// Legacy uncorrelated answers retain the timestamp-based projection fallback.
     /// </summary>
     public static string? RunIdForAnswer(
@@ -1340,7 +1340,7 @@ public static class RemoteRunReconciliation
             : null;
     }
 
-    /// <summary>True once a trigger line has a durable, user-visible assistant answer.</summary>
+    /// <summary>True once a trigger line has a reliable, user-visible assistant answer.</summary>
     public static bool HasCommittedAnswer(IEnumerable<ChatLine> lines, string? triggerLineId)
         => TopicRunProtocol.IsValidIdentifier(triggerLineId)
            && lines.Any(line =>
@@ -1378,7 +1378,6 @@ public sealed class PendingApproval
     public string RequestBody { get; set; } = "";
     public string DraftReply { get; set; } = "";
     public string? AgentRequestId { get; set; }
-    public string? AgentDispatchToken { get; set; }
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
 }
 

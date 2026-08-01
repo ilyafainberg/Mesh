@@ -13,11 +13,12 @@ public interface IAssetStore
 {
     /// <summary>
     /// Inserts or updates a local asset. The content hash and byte count are recomputed from
-    /// <paramref name="content"/>; a caller-supplied mismatch is rejected. An outbox entry is
-    /// enqueued only when requested and the asset is not <see cref="AssetRecord.LocalOnly"/>.
+    /// <paramref name="content"/>; a caller-supplied mismatch is rejected. Replicated (non
+    /// local-only) mutations are written by the replication journal transaction instead, so this
+    /// path carries no outbox of its own.
     /// </summary>
     Task UpsertAsync(
-        AssetRecord summary, byte[] content, bool createOutboxEntry, CancellationToken ct = default);
+        AssetRecord summary, byte[] content, CancellationToken ct = default);
 
     /// <summary>Returns a bounded page of summaries (no content). <paramref name="pageSize"/> must be 1..500.</summary>
     Task<IReadOnlyList<AssetRecord>> PageSummariesAsync(
@@ -29,12 +30,10 @@ public interface IAssetStore
 
     /// <summary>
     /// Tombstones a local asset. Returns the generated tombstone record (existing version + 1,
-    /// preserved <see cref="AssetRecord.LocalOnly"/>). Content rows are removed. An outbox entry
-    /// built from the tombstone is enqueued only when requested and not local-only.
+    /// preserved <see cref="AssetRecord.LocalOnly"/>). Content rows are removed.
     /// </summary>
     Task<AssetRecord> DeleteAsync(
-        AssetKind kind, string id, string sourceDeviceId, bool createOutboxEntry,
-        CancellationToken ct = default);
+        AssetKind kind, string id, string sourceDeviceId, CancellationToken ct = default);
 
     /// <summary>
     /// Applies a remote upsert. Returns true when the deterministic comparer accepts the
@@ -49,22 +48,6 @@ public interface IAssetStore
     /// </summary>
     Task<bool> ApplyRemoteDeleteAsync(AssetRecord tombstone, CancellationToken ct = default);
 
-    /// <summary>Lists pending outbox items (up to <paramref name="max"/>, which must be 1..500).</summary>
-    Task<IReadOnlyList<AssetOutboxItem>> ListOutboxAsync(int max, CancellationToken ct = default);
-
-    /// <summary>
-    /// Atomically selects up to <paramref name="max"/> pending outbox items and increments their
-    /// attempt counters within a single transaction. <paramref name="max"/> must be 1..500.
-    /// </summary>
-    Task<IReadOnlyList<AssetOutboxItem>> DequeueOutboxAsync(int max, CancellationToken ct = default);
-
-    /// <summary>Records the outcome of an outbox dispatch: success removes the item, failure stores the error.</summary>
-    Task MarkOutboxAttemptAsync(
-        string operationId, bool success, string? error, CancellationToken ct = default);
-
-    /// <summary>Moves a permanently unsendable operation out of the retry queue with its error.</summary>
-    Task DeadLetterOutboxAsync(
-        string operationId, string error, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -79,13 +62,13 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
     private readonly IStoreScheduler _scheduler = scheduler ?? TaskRunStoreScheduler.Shared;
 
     public Task UpsertAsync(
-        AssetRecord summary, byte[] content, bool createOutboxEntry, CancellationToken ct = default)
+        AssetRecord summary, byte[] content, CancellationToken ct = default)
         => _scheduler.RunAsync(() =>
         {
             ArgumentNullException.ThrowIfNull(summary);
             ArgumentNullException.ThrowIfNull(content);
             summary.EnsureValidForUpsert();
-            db.UpsertAsset(summary, content, createOutboxEntry);
+            db.UpsertAsset(summary, content);
         }, ct);
 
     public Task<IReadOnlyList<AssetRecord>> PageSummariesAsync(
@@ -105,13 +88,12 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
         }, ct);
 
     public Task<AssetRecord> DeleteAsync(
-        AssetKind kind, string id, string sourceDeviceId, bool createOutboxEntry,
-        CancellationToken ct = default)
+        AssetKind kind, string id, string sourceDeviceId, CancellationToken ct = default)
         => _scheduler.RunAsync(() =>
         {
             RequireNonBlank(id, nameof(id));
             RequireNonBlank(sourceDeviceId, nameof(sourceDeviceId));
-            return db.DeleteAsset(kind, id, sourceDeviceId, createOutboxEntry);
+            return db.DeleteAsset(kind, id, sourceDeviceId);
         }, ct);
 
     public Task<bool> ApplyRemoteUpsertAsync(
@@ -130,37 +112,6 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
             ArgumentNullException.ThrowIfNull(tombstone);
             tombstone.EnsureValidTombstone();
             return db.ApplyRemoteAssetDelete(tombstone);
-        }, ct);
-
-    public Task<IReadOnlyList<AssetOutboxItem>> ListOutboxAsync(int max, CancellationToken ct = default)
-        => _scheduler.RunAsync(() =>
-        {
-            RequirePageBound(max, nameof(max));
-            return db.ListAssetOutbox(max);
-        }, ct);
-
-    public Task<IReadOnlyList<AssetOutboxItem>> DequeueOutboxAsync(int max, CancellationToken ct = default)
-        => _scheduler.RunAsync(() =>
-        {
-            RequirePageBound(max, nameof(max));
-            return db.DequeueAssetOutbox(max);
-        }, ct);
-
-    public Task MarkOutboxAttemptAsync(
-        string operationId, bool success, string? error, CancellationToken ct = default)
-        => _scheduler.RunAsync(() =>
-        {
-            RequireNonBlank(operationId, nameof(operationId));
-            db.MarkAssetOutboxAttempt(operationId, success, error);
-        }, ct);
-
-    public Task DeadLetterOutboxAsync(
-        string operationId, string error, CancellationToken ct = default)
-        => _scheduler.RunAsync(() =>
-        {
-            RequireNonBlank(operationId, nameof(operationId));
-            RequireNonBlank(error, nameof(error));
-            db.DeadLetterAssetOutbox(operationId, error);
         }, ct);
 
     private static void RequireNonBlank(string? value, string name)

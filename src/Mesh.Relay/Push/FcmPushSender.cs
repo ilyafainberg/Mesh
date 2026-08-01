@@ -47,15 +47,16 @@ public sealed class FcmPushSender : IPushSender, IDisposable
         key.ImportFromPem(pem);
     }
 
-    public async Task<PushSendResult> SendAsync(string token, PushAlert alert, CancellationToken ct = default)
+    public async Task<PushSendResult> SendWakeAsync(string token, CancellationToken ct = default)
     {
         var access = await GetAccessTokenAsync(ct).ConfigureAwait(false);
+        // Contentless wake: data-only, no notification/title/body, no sender or frame id.
         var message = new
         {
             message = new
             {
                 token,
-                notification = new { title = alert.Title, body = alert.Body },
+                data = new { mesh = $"{{\"type\":\"sync\",\"v\":{MeshProtocol.Version}}}" },
                 android = new { priority = "high" },
             },
         };
@@ -71,7 +72,9 @@ public sealed class FcmPushSender : IPushSender, IDisposable
 
         var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         logger.LogWarning("FCM push rejected {Status}: {Body}", (int)resp.StatusCode, body);
-        return PushSendResult.Rejected((int)resp.StatusCode, body);
+        return (int)resp.StatusCode is 404 or 400 && body.Contains("UNREGISTERED", StringComparison.OrdinalIgnoreCase)
+            ? PushSendResult.InvalidToken((int)resp.StatusCode, body)
+            : PushSendResult.Rejected((int)resp.StatusCode, body);
     }
 
     // OAuth2 service-account flow: sign an RS256 JWT bearer assertion and exchange it for an access token.

@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <RootNamespace>Mesh.App.Tests</RootNamespace>
-    <DefineConstants>$(DefineConstants);DEVICE_TOPIC_EXECUTION_TESTS;MESH117_ASKUSER_TESTS</DefineConstants>
+    <DefineConstants>$(DefineConstants);DEVICE_TOPIC_EXECUTION_TESTS</DefineConstants>
     <NoWarn>$(NoWarn);NETSDK1150</NoWarn>
   </PropertyGroup>
 
@@ -16,20 +16,28 @@
          Microsoft.Extensions.Logging.Abstractions. -->
     <Compile Include="..\..\src\Mesh.App\Services\UiModeService.cs" Link="UiModeService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\UpdateService.cs" Link="UpdateService.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\BackgroundSync.cs" Link="BackgroundSync.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\OnlineReplicationWakeCoordinator.cs" Link="OnlineReplicationWakeCoordinator.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\IPushService.cs" Link="IPushService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\StorageProtection.cs" Link="StorageProtection.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\DeviceSyncActivityTracker.cs" Link="DeviceSyncActivityTracker.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReplicationActivityTracker.cs" Link="ReplicationActivityTracker.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AsyncWorkerPool.cs" Link="AsyncWorkerPool.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\CopilotAcpPipeWriter.cs" Link="CopilotAcpPipeWriter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ModelCallDispatcher.cs" Link="ModelCallDispatcher.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\CopilotAcpProtocol.cs" Link="CopilotAcpProtocol.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.cs" Link="MeshDb.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Durable.cs" Link="MeshDb.Durable.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.DeviceSync.cs" Link="MeshDb.DeviceSync.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Foundation117.cs" Link="MeshDb.Foundation117.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.TopicExecution.cs" Link="MeshDb.TopicExecution.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Protocol9ReadModels.cs" Link="MeshDb.Protocol9ReadModels.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.AssetsInteractions.cs" Link="MeshDb.AssetsInteractions.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.OnlineReplication.cs" Link="MeshDb.OnlineReplication.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\OnlineReplicationState.cs" Link="OnlineReplicationState.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReplicationPayloadCodec.cs" Link="ReplicationPayloadCodec.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReplicationDomainStore.cs" Link="ReplicationDomainStore.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Protocol9Domain.cs" Link="MeshDb.Protocol9Domain.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReplicationDomainMaterializer.cs" Link="ReplicationDomainMaterializer.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReplicationProfileMaterializer.cs" Link="ReplicationProfileMaterializer.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.ReplicationJournal.cs" Link="MeshDb.ReplicationJournal.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReplicationJournal.cs" Link="ReplicationJournal.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\OnlineReplicationEngine.cs" Link="OnlineReplicationEngine.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.SkillPackages.cs" Link="MeshDb.SkillPackages.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\SkillPackageArchive.cs" Link="SkillPackageArchive.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\SkillCompatibilityChecker.cs" Link="SkillCompatibilityChecker.cs" />
@@ -63,7 +71,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\MemoryPolicy.cs" Link="MemoryPolicy.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MemoryService.cs" Link="MemoryService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshExport.cs" Link="MeshExport.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\ProfileSyncState.cs" Link="ProfileSyncState.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ProfileProjection.cs" Link="ProfileProjection.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionContracts.cs" Link="TopicExecutionContracts.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionRouter.cs" Link="TopicExecutionRouter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicTurnRunner.cs" Link="TopicTurnRunner.cs" />
@@ -79,6 +87,13 @@
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="9.0.0" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlcipher" Version="2.1.11" />
     <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0" />
+  </ItemGroup>
+
+  <!-- Host the real Protocol 9 relay hub in-process (Kestrel) so a live SignalR
+       HubConnection can exercise the actual Deliver serialization contract. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>
@@ -86,8 +101,5 @@
     <ProjectReference Include="..\..\src\Mesh.Relay\Mesh.Relay.csproj" />
   </ItemGroup>
 
-  <ItemGroup Condition="'$(UpdaterFocusedTests)' == 'true'">
-    <Compile Remove="DurableRelayDeliveryTests.cs" />
-  </ItemGroup>
 
 </Project>

@@ -100,7 +100,7 @@ public sealed class MemoryDbTests
             remote,
             SyncKey(remote.Id),
             Version(20, "remote"),
-            DeviceSyncKinds.MemoryDelete));
+            DomainProjectionKinds.MemoryDelete));
 
         var loaded = db.LoadProfile()!.Memories.Single();
         Assert.AreEqual("Remote content", loaded.Content);
@@ -120,12 +120,12 @@ public sealed class MemoryDbTests
             newer,
             SyncKey(newer.Id),
             Version(20, "newer"),
-            DeviceSyncKinds.MemoryDelete));
+            DomainProjectionKinds.MemoryDelete));
         Assert.IsFalse(db.TryApplyMemoryUpsert(
             stale,
             SyncKey(stale.Id),
             Version(10, "stale"),
-            DeviceSyncKinds.MemoryDelete));
+            DomainProjectionKinds.MemoryDelete));
 
         Assert.AreEqual("Newer", db.LoadProfile()!.Memories.Single().Content);
         Assert.AreEqual(Version(20, "newer"), db.GetSyncVersion(SyncKey(newer.Id)));
@@ -142,24 +142,24 @@ public sealed class MemoryDbTests
             original,
             SyncKey(original.Id),
             Version(10, "original"),
-            DeviceSyncKinds.MemoryDelete));
+            DomainProjectionKinds.MemoryDelete));
         Assert.IsTrue(db.TryApplyMemoryDelete(
             original.Id,
-            DeviceSyncKinds.MemoryDelete,
+            DomainProjectionKinds.MemoryDelete,
             Version(20, "delete"),
             SyncKey(original.Id)));
         Assert.IsFalse(db.TryApplyMemoryUpsert(
             CreateMemory(original.Id, "Stale resurrection"),
             SyncKey(original.Id),
             Version(15, "stale"),
-            DeviceSyncKinds.MemoryDelete));
+            DomainProjectionKinds.MemoryDelete));
         Assert.AreEqual(0, db.LoadProfile()!.Memories.Count);
 
         Assert.IsTrue(db.TryApplyMemoryUpsert(
             CreateMemory(original.Id, "Recreated"),
             SyncKey(original.Id),
             Version(30, "recreated"),
-            DeviceSyncKinds.MemoryDelete));
+            DomainProjectionKinds.MemoryDelete));
         Assert.AreEqual("Recreated", db.LoadProfile()!.Memories.Single().Content);
     }
 
@@ -190,10 +190,10 @@ public sealed class MemoryDbTests
     }
 
     private static string SyncKey(string id)
-        => DeviceSyncKinds.MemoryUpsert + "\u001f" + id;
+        => DomainProjectionKinds.MemoryUpsert + "\u001f" + id;
 
     private static string Version(int ticks, string operation)
-        => DeviceSyncVersion.Create(
+        => ProjectionVersion.Create(
             new DateTimeOffset(2026, 3, 1, 0, 0, 0, TimeSpan.Zero).AddTicks(ticks),
             "device-a",
             operation);

@@ -554,7 +554,7 @@
             </div>
             <div class="field">
                 <label>Primary agent response device</label>
-                @if (!Mesh.SupportsAtomicAgentDispatch)
+                @if (!Mesh.SupportsAgentHost)
                 {
                     <div class="field-hint">This relay does not support single-device agent responses. Update the relay to configure this setting.</div>
                 }
@@ -582,7 +582,7 @@
                     </div>
                 }
             </div>
-            @if (Mesh.SupportsAtomicAgentDispatch)
+            @if (Mesh.SupportsAgentHost)
             {
                 <div class="field">
                     <label>Failover response device</label>
@@ -858,7 +858,7 @@
     string? diagnosticsStatus;
 
     IReadOnlyList<Mesh.Shared.DeviceInfo> AgentRoutingDevices => agentDevices
-        .Where(device => device.IsDesktop && device.AtomicAgentDispatchEnabled)
+        .Where(device => device.IsDesktop && device.AgentHostEnabled)
         .ToList();
 
     string BudgetUsageLabel => replyBudget <= 0
@@ -1179,7 +1179,7 @@
     {
         if (Mesh.Connected && !linkedDevicesAttempted && !loadingLinkedDevices)
             _ = LoadLinkedDevicesAsync();
-        if (Mesh.SupportsAtomicAgentDispatch && !agentRoutingAttempted && !loadingAgentRouting)
+        if (Mesh.SupportsAgentHost && !agentRoutingAttempted && !loadingAgentRouting)
             _ = LoadAgentRoutingAsync();
         // Keep the dropdown in sync if the startup preload finishes while Settings is open.
         if (foundryModels.Count == 0 && Foundry.CachedModels.Count > 0)
@@ -1491,7 +1491,7 @@
 
     async Task LoadAgentRoutingAsync()
     {
-        if (!Mesh.SupportsAtomicAgentDispatch || loadingAgentRouting) return;
+        if (!Mesh.SupportsAgentHost || loadingAgentRouting) return;
         agentRoutingAttempted = true;
         loadingAgentRouting = true;
         agentRoutingError = null;

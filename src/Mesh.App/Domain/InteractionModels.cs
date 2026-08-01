@@ -1,5 +1,3 @@
-using System.Security.Cryptography;
-using System.Text;
 
 namespace Mesh.App.Domain;
 
@@ -215,40 +213,3 @@ public static class AssetConflict
         return false;
     }
 }
-
-/// <summary>
-/// Deterministic identity for an asset sync operation. The same logical operation
-/// (kind + id + operation + version + source) always yields the same id, which makes
-/// outbox insertion idempotent, while a newer revision yields a fresh id.
-/// </summary>
-public static class AssetOperationId
-{
-    public static string Create(
-        AssetKind kind, string assetId, string operation, int version, string? sourceDeviceId)
-    {
-        // Canonical, unambiguous layout: each variable-length field is length-prefixed so
-        // that no combination of values can collide by concatenation.
-        var canonical = new StringBuilder()
-            .Append(kind).Append('\u001f')
-            .Append(assetId.Length).Append(':').Append(assetId).Append('\u001f')
-            .Append(operation.Length).Append(':').Append(operation).Append('\u001f')
-            .Append(version).Append('\u001f')
-            .Append((sourceDeviceId ?? string.Empty).Length).Append(':')
-            .Append(sourceDeviceId ?? string.Empty)
-            .ToString();
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
-        return Convert.ToHexString(hash).ToLowerInvariant();
-    }
-}
-
-/// <summary>Durable outbox entry for a pending asset sync operation.</summary>
-public sealed record AssetOutboxItem(
-    string OperationId,
-    AssetKind Kind,
-    string AssetId,
-    string Operation,
-    int Version,
-    string? SourceDeviceId,
-    int Attempts,
-    string? LastError,
-    DateTimeOffset CreatedAt);

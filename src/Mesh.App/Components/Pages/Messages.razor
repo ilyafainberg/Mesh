@@ -1,4 +1,4 @@
-﻿@page "/messages"
+@page "/messages"
 @inject AppState State
 @inject MeshClient Mesh
 @inject IJSRuntime JS
@@ -53,9 +53,9 @@
             }
         </div>
         <div class="conversation-order-list">
-            @if (Mesh.IsDeviceSnapshotSyncing)
+            @if (Mesh.IsReplicationActive)
             {
-                <DeviceSyncPlaceholder Text="More chats are syncing..." />
+                <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> More chats are syncing...</div>
             }
             @foreach (var section in ConversationSections)
             {
@@ -84,7 +84,7 @@
                 </section>
             }
         </div>
-        @if (!FilteredConversations.Any() && !Mesh.IsDeviceSnapshotSyncing)
+        @if (!FilteredConversations.Any() && !Mesh.IsReplicationActive)
         {
             <div class="empty conv-empty">@FilterEmptyText</div>
         }
@@ -434,7 +434,7 @@
     {
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
-        Mesh.DeviceSyncStateChanged += Refresh;
+        Mesh.ReplicationStateChanged += Refresh;
 
         // Deep-link: /messages?to=handle opens that conversation (used by Search).
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
@@ -1053,7 +1053,7 @@
     {
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
-        Mesh.DeviceSyncStateChanged -= Refresh;
+        Mesh.ReplicationStateChanged -= Refresh;
         selfRef?.Dispose();
     }
 }

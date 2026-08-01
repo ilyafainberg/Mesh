@@ -67,7 +67,7 @@ public sealed class MemoryPolicyTests
         Assert.AreEqual(source.Content, roundTrip.Content);
         Assert.AreEqual(0, roundTrip.RecallCount);
         Assert.IsNull(roundTrip.LastRecalledAt);
-        Assert.IsNull(typeof(DeviceSyncMemory).GetProperty(nameof(MemoryItem.RecallCount)));
+        Assert.IsNull(typeof(MemoryProjection).GetProperty(nameof(MemoryItem.RecallCount)));
         Assert.IsTrue(MemoryPolicy.IsValid(dto));
     }
 
@@ -233,7 +233,7 @@ public sealed class MemoryPolicyTests
         var valid = MemoryPolicy.ToSync(CreateMemory(
             "valid",
             "Valid",
-            "A valid durable preference.",
+            "A valid reliable preference.",
             MemoryCategories.Preference,
             MemoryOrigins.Explicit));
         var invalidScore = valid with { Importance = 1.1 };

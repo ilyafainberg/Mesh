@@ -1,0 +1,970 @@
+using Mesh.App.Domain;
+using Mesh.App.Services;
+using Mesh.Shared;
+using Microsoft.Data.Sqlite;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace Mesh.App.Tests;
+
+[TestClass]
+[DoNotParallelize]
+public sealed class DeviceTopicDbTests
+{
+    private string directory = null!;
+    private string databasePath = null!;
+    private byte[] key = null!;
+
+    [TestInitialize]
+    public void Initialize()
+    {
+        directory = Path.Combine(
+            AppContext.BaseDirectory,
+            "mesh-device-topic-tests",
+            Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(directory);
+        databasePath = Path.Combine(directory, "profile.meshdb");
+        key = Enumerable.Range(1, 32).Select(v => (byte)v).ToArray();
+    }
+
+    [TestCleanup]
+    public void Cleanup()
+    {
+        SqliteConnection.ClearAllPools();
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+
+    [TestMethod]
+    public void DesktopSelectionState_PersistsAndCanBeCleared()
+    {
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.SetLastDesktopTopicId("topic-42");
+            db.SetLastDesktopConversationKey("group:project");
+        }
+        SqliteConnection.ClearAllPools();
+
+        using (var reopened = MeshDb.Open(databasePath, key))
+        {
+            Assert.AreEqual("topic-42", reopened.GetLastDesktopTopicId());
+            Assert.AreEqual("group:project", reopened.GetLastDesktopConversationKey());
+            reopened.SetLastDesktopTopicId(null);
+            reopened.SetLastDesktopConversationKey(null);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var cleared = MeshDb.Open(databasePath, key);
+        Assert.IsNull(cleared.GetLastDesktopTopicId());
+        Assert.IsNull(cleared.GetLastDesktopConversationKey());
+    }
+
+    [TestMethod]
+    public void DesktopSelectionState_IsIndependentForEachIdentityDatabase()
+    {
+        var otherPath = Path.Combine(directory, "other.meshdb");
+        using (var db = MeshDb.Open(databasePath, key))
+            db.SetLastDesktopTopicId("first-topic");
+        using (var other = MeshDb.Open(otherPath, key))
+            other.SetLastDesktopTopicId("second-topic");
+
+        using var first = MeshDb.Open(databasePath, key);
+        using var second = MeshDb.Open(otherPath, key);
+        Assert.AreEqual("first-topic", first.GetLastDesktopTopicId());
+        Assert.AreEqual("second-topic", second.GetLastDesktopTopicId());
+    }
+
+    [TestMethod]
+    public void Migration_SetsLastActivityAt_FromNewestChatLine()
+    {
+        var older = DateTimeOffset.UtcNow.AddHours(-2);
+        var newer = DateTimeOffset.UtcNow.AddHours(-1);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("t1", "Test", older);
+            db.AppendOwnChat("t1", new ChatLine { Id = "l1", Role = "user", Text = "hello", Via = "agent", At = older });
+            db.AppendOwnChat("t1", new ChatLine { Id = "l2", Role = "assistant", Text = "hi", Via = "agent", At = newer });
+            SaveProfile(db);
+        }
+
+        SqliteConnection.ClearAllPools();
+        ClearOwnThreadActivity();
+        SqliteConnection.ClearAllPools();
+
+        using var db2 = MeshDb.Open(databasePath, key);
+        var thread = db2.LoadProfile()!.OwnThreads.FirstOrDefault(t => t.Id == "t1");
+        Assert.IsNotNull(thread);
+        Assert.IsNotNull(thread.LastActivityAt);
+        Assert.AreEqual(newer.UtcTicks, thread.LastActivityAt!.Value.UtcTicks);
+        Assert.IsTrue(thread.LastActivityAt > older, "Migration should use newest line, not created_at");
+    }
+
+    [TestMethod]
+    public void Migration_OrdersOffsetTimestampsByInstant()
+    {
+        var older = new DateTimeOffset(2026, 1, 2, 2, 0, 0, TimeSpan.FromHours(14));
+        var newer = new DateTimeOffset(2026, 1, 1, 1, 0, 0, TimeSpan.FromHours(-12));
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("offsets", "Offsets", older);
+            db.AppendOwnChat("offsets", new ChatLine { Id = "old", At = older });
+            db.AppendOwnChat("offsets", new ChatLine { Id = "new", At = newer });
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+        ClearOwnThreadActivity();
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var thread = reopened.LoadProfile()!.OwnThreads.Single(t => t.Id == "offsets");
+        Assert.AreEqual(newer.UtcTicks, thread.LastActivityAt!.Value.UtcTicks);
+    }
+
+    [TestMethod]
+    public void Migration_SetsLastActivityAt_ToCreatedAt_WhenNoLines()
+    {
+        var created = DateTimeOffset.UtcNow.AddDays(-1);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("t2", "Empty Thread", created);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+        ClearOwnThreadActivity();
+        SqliteConnection.ClearAllPools();
+
+        using var db2 = MeshDb.Open(databasePath, key);
+        var thread = db2.LoadProfile()!.OwnThreads.FirstOrDefault(t => t.Id == "t2");
+        Assert.IsNotNull(thread?.LastActivityAt, "Empty thread should get created_at as activity");
+        Assert.AreEqual(created.UtcTicks, thread!.LastActivityAt!.Value.UtcTicks);
+    }
+
+    [TestMethod]
+    public void SetOwnThreadPin_PersistsAndLoads()
+    {
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("t3", "Pin Test", DateTimeOffset.UtcNow);
+            db.SetOwnThreadPin("t3", true);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var db2 = MeshDb.Open(databasePath, key);
+        var thread = db2.LoadProfile()!.OwnThreads.FirstOrDefault(t => t.Id == "t3");
+        Assert.IsTrue(thread?.IsPinned, "Pinned flag should persist across reopen");
+    }
+
+    [TestMethod]
+    public void SetOwnThreadActivity_PersistsAndLoads()
+    {
+        var at = new DateTimeOffset(2026, 1, 15, 10, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("t4", "Activity Test", at.AddDays(-1));
+            db.SetOwnThreadActivity("t4", at);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var db2 = MeshDb.Open(databasePath, key);
+        var thread = db2.LoadProfile()!.OwnThreads.FirstOrDefault(t => t.Id == "t4");
+        Assert.IsNotNull(thread?.LastActivityAt);
+        Assert.AreEqual(at.UtcTicks, thread!.LastActivityAt!.Value.UtcTicks);
+    }
+
+    [TestMethod]
+    public void TopicReplyCorrelation_PersistsAndLoads()
+    {
+        var at = new DateTimeOffset(2026, 7, 25, 10, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("reply-order", "Reply order", at);
+            db.AppendOwnChat("reply-order", new ChatLine
+            {
+                Id = "answer-1",
+                Role = "assistant",
+                Text = "done",
+                ReplyToLineId = "prompt-1",
+                At = at
+            });
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var answer = reopened.LoadProfile()!.OwnThreads
+            .Single(thread => thread.Id == "reply-order")
+            .Lines.Single();
+        Assert.AreEqual("prompt-1", answer.ReplyToLineId);
+    }
+
+    [TestMethod]
+    public void ModelAttribution_PersistsAcrossChatStorageAndUpserts()
+    {
+        var at = new DateTimeOffset(2026, 7, 25, 11, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("model-topic", "Model", at);
+            var topicLine = new ChatLine
+            {
+                Id = "topic-model-line",
+                Role = "assistant",
+                Text = "answer",
+                At = at,
+                ModelId = "deepseek/deepseek-chat"
+            };
+            db.AppendOwnChat("model-topic", topicLine);
+            topicLine.ModelId = "moonshotai/kimi-k2";
+            db.UpsertOwnChat("model-topic", topicLine);
+
+            db.EnsureConversation("model-conversation");
+            var conversationLine = new ChatLine
+            {
+                Id = "conversation-model-line",
+                Role = "assistant",
+                Text = "answer",
+                At = at,
+                ModelId = "deepseek/deepseek-r1"
+            };
+            db.AppendChatLine("model-conversation", conversationLine);
+            conversationLine.ModelId = "moonshotai/kimi-k2";
+            db.UpsertChatLine("model-conversation", conversationLine);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var profile = reopened.LoadProfile()!;
+        Assert.AreEqual(
+            "moonshotai/kimi-k2",
+            profile.OwnThreads.Single(thread => thread.Id == "model-topic").Lines.Single().ModelId);
+        Assert.AreEqual(
+            "moonshotai/kimi-k2",
+            profile.Conversations.Single(conversation => conversation.Handle == "model-conversation").Lines.Single().ModelId);
+    }
+
+    [TestMethod]
+    public void SetOwnThreadExecution_PersistsAndLoads()
+    {
+        var execAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureOwnThread("t5", "Exec Test", DateTimeOffset.UtcNow);
+            db.SetOwnThreadExecution("t5", "device123", execAt, "run-abc");
+            SaveProfile(db);
+        }
+
+        SqliteConnection.ClearAllPools();
+
+        using var db2 = MeshDb.Open(databasePath, key);
+        var thread = db2.LoadProfile()!.OwnThreads.FirstOrDefault(t => t.Id == "t5");
+        Assert.AreEqual("device123", thread?.ExecutionDeviceId);
+        Assert.AreEqual(execAt.UtcTicks, thread?.ExecutionAt?.UtcTicks);
+        Assert.AreEqual("run-abc", thread?.ExecutionRunId);
+    }
+
+    [TestMethod]
+    public void UpsertOwnThread_CanAuthoritativelyClearExecution()
+    {
+        var created = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread(
+                "clear-execution", "Run", created, 0, created, false,
+                "device123", created, "run-abc", replaceExecutionMetadata: true);
+            db.UpsertOwnThread(
+                "clear-execution", "Run", created, 0, created, false,
+                null, null, null, replaceExecutionMetadata: true);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var thread = reopened.LoadProfile()!.OwnThreads.Single(t => t.Id == "clear-execution");
+        Assert.IsNull(thread.ExecutionDeviceId);
+        Assert.IsNull(thread.ExecutionAt);
+        Assert.IsNull(thread.ExecutionRunId);
+    }
+
+    [TestMethod]
+    public void Migration_ConversationActivity_FromNewestLine()
+    {
+        var older = DateTimeOffset.UtcNow.AddHours(-3);
+        var newer = DateTimeOffset.UtcNow.AddHours(-1);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureConversation("alice");
+            db.AppendChatLine("alice", new ChatLine { Id = "c1", Role = "user", Text = "hi", Via = "agent", At = older });
+            db.AppendChatLine("alice", new ChatLine { Id = "c2", Role = "assistant", Text = "hey", Via = "agent", At = newer });
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+        ClearConversationActivity();
+        SqliteConnection.ClearAllPools();
+
+        using var db2 = MeshDb.Open(databasePath, key);
+        var conv = db2.LoadProfile()!.Conversations.FirstOrDefault(c => c.Handle == "alice");
+        Assert.IsNotNull(conv?.LastActivityAt);
+        Assert.AreEqual(newer.UtcTicks, conv!.LastActivityAt!.Value.UtcTicks);
+        Assert.IsTrue(conv.LastActivityAt > older, "Should use newest line timestamp");
+    }
+
+    [TestMethod]
+    public void SetConversationPin_PersistsAndLoads()
+    {
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.EnsureConversation("bob");
+            db.SetConversationPin("bob", true);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var db2 = MeshDb.Open(databasePath, key);
+        var conv = db2.LoadProfile()!.Conversations.FirstOrDefault(c => c.Handle == "bob");
+        Assert.IsTrue(conv?.IsPinned, "Pin should persist");
+    }
+
+    [TestMethod]
+    public void FirstLines_InitializeAndPersistNullableActivity()
+    {
+        var created = new DateTimeOffset(2026, 7, 20, 8, 0, 0, TimeSpan.Zero);
+        var topicLineAt = created.AddHours(1);
+        var conversationLineAt = created.AddHours(2);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread("first-topic", "First", created, 0);
+            db.UpsertConversation(
+                "first-conversation", 0, null, null, null, null, null, null, [], 0);
+            db.AppendOwnChat("first-topic", new ChatLine { Id = "topic-line", At = topicLineAt });
+            db.AppendChatLine(
+                "first-conversation",
+                new ChatLine { Id = "conversation-line", At = conversationLineAt });
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var profile = reopened.LoadProfile()!;
+        Assert.AreEqual(
+            topicLineAt.UtcTicks,
+            profile.OwnThreads.Single(t => t.Id == "first-topic").LastActivityAt?.UtcTicks);
+        Assert.AreEqual(
+            conversationLineAt.UtcTicks,
+            profile.Conversations.Single(c => c.Handle == "first-conversation")
+                .LastActivityAt?.UtcTicks);
+    }
+
+    [TestMethod]
+    public void ExecutionDeviceMetadata_BindMoveAndRunPersist()
+    {
+        var created = new DateTimeOffset(2026, 7, 20, 8, 0, 0, TimeSpan.Zero);
+        var moved = created.AddHours(1);
+        var runAt = moved.AddMinutes(5);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread("targeted", "Targeted", created, 0);
+            Assert.IsTrue(db.TryBindOwnThreadDevice(
+                "targeted", "phone-id", "Phone", "android"));
+            Assert.IsFalse(db.TryBindOwnThreadDevice(
+                "targeted", "other-id", "Other", "windows"));
+            Assert.IsTrue(db.MoveOwnThreadToDevice(
+                "targeted", "desktop-id", "Desktop", "windows", moved));
+            Assert.IsTrue(db.SetOwnThreadExecutionAndActivity(
+                "targeted", "desktop-id", "Desktop", "windows",
+                runAt, "run-1", runAt));
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var thread = reopened.LoadProfile()!.OwnThreads.Single(t => t.Id == "targeted");
+        Assert.AreEqual("desktop-id", thread.ExecutionDeviceId);
+        Assert.AreEqual("Desktop", thread.ExecutionDeviceName);
+        Assert.AreEqual("windows", thread.ExecutionDevicePlatform);
+        Assert.AreEqual("run-1", thread.ExecutionRunId);
+        Assert.AreEqual(runAt.UtcTicks, thread.ExecutionAt?.UtcTicks);
+        Assert.AreEqual(runAt.UtcTicks, thread.LastActivityAt?.UtcTicks);
+    }
+
+    [TestMethod]
+    public void UpsertConversation_NewerMetadataReplacesCreatedAt_LegacyDoesNot()
+    {
+        var original = new DateTimeOffset(2026, 7, 20, 8, 0, 0, TimeSpan.Zero);
+        var accepted = original.AddDays(-10);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertConversation(
+                "created", 0, null, null, null, null, null, null, [], 0,
+                original, original, replaceCreatedAt: true);
+            db.UpsertConversation(
+                "created", 0, null, null, null, null, null, null, [], 0,
+                accepted, original, replaceCreatedAt: true);
+            db.UpsertConversation(
+                "created", 0, null, null, null, null, null, null, [], 0);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var conversation = reopened.LoadProfile()!.Conversations.Single(c => c.Handle == "created");
+        Assert.AreEqual(accepted.UtcTicks, conversation.CreatedAt?.UtcTicks);
+    }
+
+    [TestMethod]
+    public void MetadataUpserts_CannotRegressActivityAcrossOffsets()
+    {
+        var newest = new DateTimeOffset(2026, 1, 1, 1, 0, 0, TimeSpan.FromHours(-12));
+        var stale = new DateTimeOffset(2026, 1, 2, 2, 0, 0, TimeSpan.FromHours(14));
+        Assert.IsTrue(newest > stale);
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread("monotonic-topic", "Topic", stale, 0, newest);
+            db.UpsertOwnThread("monotonic-topic", "Topic", stale, 0, stale);
+            db.UpsertConversation(
+                "monotonic-conversation", 0, null, null, null, null, null, null, [], 0,
+                stale, newest);
+            db.UpsertConversation(
+                "monotonic-conversation", 0, null, null, null, null, null, null, [], 0,
+                stale, stale);
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var profile = reopened.LoadProfile()!;
+        Assert.AreEqual(
+            newest.UtcTicks,
+            profile.OwnThreads.Single(t => t.Id == "monotonic-topic").LastActivityAt?.UtcTicks);
+        Assert.AreEqual(
+            newest.UtcTicks,
+            profile.Conversations.Single(c => c.Handle == "monotonic-conversation")
+                .LastActivityAt?.UtcTicks);
+    }
+
+    [TestMethod]
+    public void InvalidSyncLine_HasZeroSideEffects_AndLaterOlderVersionApplies()
+    {
+        const string threadId = "sync-parent";
+        const string versionKey = "topic.line.upsert\u001fsync-parent\u001fline";
+        var parentAt = DateTimeOffset.UtcNow.AddDays(2);
+        var invalidVersion = ProjectionVersion.Create(
+            DateTimeOffset.UtcNow.AddMinutes(2), "remote", "invalid");
+        var validVersion = ProjectionVersion.Create(
+            DateTimeOffset.UtcNow.AddMinutes(1), "remote", "valid");
+
+        using var db = MeshDb.Open(databasePath, key);
+        db.UpsertOwnThread(threadId, "Parent", parentAt.AddDays(-1), 0, parentAt, true);
+        SaveProfile(db);
+        var invalid = new ChatLine
+        {
+            Id = "line",
+            Role = "user",
+            Text = "invalid",
+            Via = "device",
+            Status = "sent",
+            At = default
+        };
+
+        Assert.IsFalse(db.TryApplyOwnSyncLine(
+            threadId, invalid, versionKey, invalidVersion));
+        var unchanged = db.LoadProfile()!.OwnThreads.Single(t => t.Id == threadId);
+        Assert.AreEqual("Parent", unchanged.Title);
+        Assert.AreEqual(parentAt.UtcTicks, unchanged.LastActivityAt?.UtcTicks);
+        Assert.IsTrue(unchanged.IsPinned);
+        Assert.AreEqual(0, unchanged.Lines.Count);
+        Assert.IsNull(db.GetSyncVersion(versionKey));
+
+        var valid = new ChatLine
+        {
+            Id = "line",
+            Role = "user",
+            Text = "valid",
+            Via = "device",
+            Status = "sent",
+            At = parentAt.AddDays(-1),
+            ModelId = "deepseek/deepseek-chat"
+        };
+        Assert.IsTrue(db.TryApplyOwnSyncLine(
+            threadId, valid, versionKey, validVersion));
+        var applied = db.LoadProfile()!.OwnThreads.Single(t => t.Id == threadId);
+        Assert.HasCount(1, applied.Lines);
+        Assert.AreEqual("valid", applied.Lines[0].Text);
+        Assert.AreEqual("deepseek/deepseek-chat", applied.Lines[0].ModelId);
+        Assert.AreEqual(parentAt.UtcTicks, applied.LastActivityAt?.UtcTicks);
+        Assert.AreEqual(validVersion, db.GetSyncVersion(versionKey));
+
+        var newerVersion = ProjectionVersion.Create(
+            DateTimeOffset.UtcNow.AddMinutes(3), "remote", "newer");
+        valid.Text = "updated by older client";
+        valid.ModelId = null;
+        Assert.IsTrue(db.TryApplyOwnSyncLine(
+            threadId, valid, versionKey, newerVersion));
+        var updated = db.LoadProfile()!.OwnThreads.Single(t => t.Id == threadId).Lines.Single();
+        Assert.AreEqual("updated by older client", updated.Text);
+        Assert.AreEqual("deepseek/deepseek-chat", updated.ModelId);
+    }
+
+    [TestMethod]
+    public void TopicLineDelete_RemovesPromptAndRepliesAndBlocksResurrection()
+    {
+        const string threadId = "topic-delete-parent";
+        const string otherThreadId = "topic-delete-other";
+        const string lineId = "cancelled-line";
+        const string versionKey = "topic.line.upsert\u001ftopic-delete-parent\u001fcancelled-line";
+        var at = new DateTimeOffset(2026, 7, 27, 12, 0, 0, TimeSpan.Zero);
+        var upsertVersion = ProjectionVersion.Create(at, "mobile", "upsert");
+        var deleteVersion = ProjectionVersion.Create(at.AddMinutes(1), "mobile", "delete");
+        var deleteEntityId = DomainProjectionEntityIds.TopicLine(threadId, lineId);
+
+        using var db = MeshDb.Open(databasePath, key);
+        SaveProfile(db);
+        db.UpsertOwnThread(threadId, "Topic", at.AddDays(-1), 0, at, false);
+        db.UpsertOwnThread(otherThreadId, "Other", at.AddDays(-1), 1, at, false);
+        var prompt = new ChatLine
+        {
+            Id = lineId,
+            Role = "user",
+            Text = "Do not run this",
+            At = at
+        };
+        Assert.IsTrue(db.TryApplyOwnSyncLine(
+            threadId, prompt, versionKey, upsertVersion, DomainProjectionKinds.TopicLineDelete));
+        db.AppendOwnChat(threadId, new ChatLine
+        {
+            Id = "reply",
+            Role = "assistant",
+            Text = "late answer",
+            ReplyToLineId = lineId,
+            At = at.AddSeconds(1)
+        });
+        db.AppendOwnChat(threadId, new ChatLine
+        {
+            Id = "keep",
+            Role = "user",
+            Text = "keep me",
+            At = at.AddSeconds(2)
+        });
+        db.AppendOwnChat(otherThreadId, new ChatLine
+        {
+            Id = lineId,
+            Role = "user",
+            Text = "same id, other topic",
+            At = at.AddSeconds(3)
+        });
+
+        db.ApplyTopicLineDelete(
+            threadId, lineId, deleteEntityId, DomainProjectionKinds.TopicLineDelete, deleteVersion);
+
+        var profile = db.LoadProfile()!;
+        var remaining = profile.OwnThreads.Single(thread => thread.Id == threadId).Lines;
+        Assert.HasCount(1, remaining);
+        Assert.AreEqual("keep", remaining[0].Id);
+        Assert.HasCount(
+            1,
+            profile.OwnThreads.Single(thread => thread.Id == otherThreadId).Lines);
+        Assert.AreEqual(
+            deleteVersion,
+            db.GetSyncTombstoneVersion(DomainProjectionKinds.TopicLineDelete, deleteEntityId));
+
+        prompt.Text = "resurrected";
+        Assert.IsFalse(db.TryApplyOwnSyncLine(
+            threadId,
+            prompt,
+            versionKey,
+            ProjectionVersion.Create(at.AddMinutes(2), "desktop", "resurrect"),
+            DomainProjectionKinds.TopicLineDelete));
+    }
+
+    [TestMethod]
+    public void ComposerDrafts_PersistIndependentlyAndClear()
+    {
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.SetConversationDraft("alice", "message draft");
+            db.SetConversationDraft("bob", "other message draft");
+            db.SetTopicDraft("alice", "topic draft");
+        }
+        SqliteConnection.ClearAllPools();
+
+        using (var reopened = MeshDb.Open(databasePath, key))
+        {
+            Assert.AreEqual("message draft", reopened.GetConversationDraft("alice"));
+            Assert.AreEqual("other message draft", reopened.GetConversationDraft("bob"));
+            Assert.AreEqual("topic draft", reopened.GetTopicDraft("alice"));
+            Assert.AreEqual("", reopened.GetTopicDraft("missing"));
+            reopened.SetConversationDraft("alice", "");
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var cleared = MeshDb.Open(databasePath, key);
+        Assert.AreEqual("", cleared.GetConversationDraft("alice"));
+        Assert.AreEqual("other message draft", cleared.GetConversationDraft("bob"));
+        Assert.AreEqual("topic draft", cleared.GetTopicDraft("alice"));
+    }
+
+    [TestMethod]
+    public void DeletingConversationOrTopic_RemovesOnlyItsComposerDraft()
+    {
+        using var db = MeshDb.Open(databasePath, key);
+        db.EnsureConversation("shared");
+        db.EnsureOwnThread("shared", "Topic", DateTimeOffset.UtcNow);
+        db.SetConversationDraft("shared", "message draft");
+        db.SetTopicDraft("shared", "topic draft");
+
+        db.DeleteConversation("shared");
+
+        Assert.AreEqual("", db.GetConversationDraft("shared"));
+        Assert.AreEqual("topic draft", db.GetTopicDraft("shared"));
+
+        db.DeleteOwnThread("shared");
+
+        Assert.AreEqual("", db.GetTopicDraft("shared"));
+    }
+
+    [TestMethod]
+    public void ReliableTopicState_PersistsAcrossRestartAndDeduplicatesInboundRuns()
+    {
+        var created = new DateTimeOffset(2026, 7, 26, 9, 0, 0, TimeSpan.Zero);
+        var request = new TopicRunRequestPayload(
+            "run-reliable",
+            "thread-reliable",
+            "line-reliable",
+            "owner",
+            "Do reliable work",
+            created,
+            "laptop-device",
+            TopicTurnMode.Single);
+        var attachment = new ChatAttachment("note.txt", "text/plain", [1, 2, 3]);
+        var topic = new MeshDb.TopicOutboxItem(
+            request.RunId,
+            request.ThreadId,
+            request.TriggerLineId,
+            request.TargetDeviceId,
+            request,
+            [attachment],
+            TopicOutboxStates.Pending,
+            created,
+            created);
+        var inbound = new MeshDb.InboundTopicRunItem(
+            request.RunId,
+            "phone-device",
+            request,
+            InboundTopicRunStates.Accepted,
+            created,
+            created);
+        var terminalUpdate = new TopicRunUpdatePayload(
+            request.RunId,
+            request.ThreadId,
+            TopicRunPhase.Completed,
+            Timestamp: created.AddMinutes(1));
+        var envelope = new MeshDb.DeviceEnvelopeOutboxItem(
+            "terminal-envelope",
+            "phone-device",
+            MeshKinds.TopicRunUpdate,
+            TopicRunProtocol.UpdateBody(terminalUpdate),
+            PushHintProtocol.TopicResponse,
+            created.AddMinutes(1));
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertTopicOutbox(topic);
+            Assert.IsTrue(db.TryAddInboundTopicRun(inbound));
+            Assert.IsFalse(db.TryAddInboundTopicRun(inbound));
+            db.UpsertDeviceEnvelopeOutbox(envelope);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using (var reopened = MeshDb.Open(databasePath, key))
+        {
+            var restoredTopic = reopened.GetTopicOutbox(request.RunId);
+            Assert.IsNotNull(restoredTopic);
+            Assert.AreEqual(3, restoredTopic.Attachments.Single().Data.Length);
+            Assert.AreEqual(TopicOutboxStates.Pending, restoredTopic.State);
+
+            var restoredInbound = reopened.GetInboundTopicRun(request.RunId);
+            Assert.IsNotNull(restoredInbound);
+            Assert.AreEqual("phone-device", restoredInbound.SourceDeviceId);
+            Assert.IsFalse(reopened.TryAddInboundTopicRun(inbound));
+
+            var restoredEnvelope = reopened.ListDeviceEnvelopeOutbox().Single();
+            Assert.AreEqual("terminal-envelope", restoredEnvelope.EnvelopeId);
+            Assert.AreEqual(PushHintProtocol.TopicResponse, restoredEnvelope.PushHint);
+
+            reopened.SetTopicOutboxState(request.RunId, TopicOutboxStates.RelayQueued);
+            Assert.IsTrue(reopened.SetInboundTopicRunState(request.RunId, InboundTopicRunStates.Running));
+            Assert.IsTrue(reopened.SetInboundTopicRunTerminal(
+                request.RunId, InboundTopicRunStates.Completed, terminalUpdate));
+            Assert.IsTrue(reopened.SetInboundTopicRunTerminal(
+                request.RunId,
+                InboundTopicRunStates.Failed,
+                terminalUpdate with { Phase = TopicRunPhase.Failed, Error = "conflict" }));
+            Assert.IsFalse(reopened.SetInboundTopicRunState(
+                request.RunId, InboundTopicRunStates.Running));
+            reopened.DeleteDeviceEnvelopeOutbox(envelope.EnvelopeId);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var final = MeshDb.Open(databasePath, key);
+        Assert.AreEqual(TopicOutboxStates.RelayQueued, final.GetTopicOutbox(request.RunId)!.State);
+        var finalInbound = final.GetInboundTopicRun(request.RunId)!;
+        Assert.AreEqual(InboundTopicRunStates.Completed, finalInbound.State);
+        Assert.IsTrue(TopicRunProtocol.TryParseUpdate(
+            finalInbound.TerminalUpdateJson, out var persistedTerminal));
+        Assert.AreEqual(TopicRunPhase.Completed, persistedTerminal.Phase);
+        Assert.HasCount(0, final.ListDeviceEnvelopeOutbox());
+    }
+
+    [TestMethod]
+    public void InboundRejection_PersistsMetadataAndDeduplicatesAcrossRestart()
+    {
+        var rejectedAt = new DateTimeOffset(2026, 8, 2, 7, 0, 0, TimeSpan.Zero);
+        var rejection = new MeshDb.InboundRejectionItem(
+            "relay:delivery-1",
+            "envelope-1",
+            "delivery-1",
+            MeshKinds.TopicRunRequest,
+            "owner",
+            "source-device",
+            "topic_request_payload_invalid",
+            rejectedAt);
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertInboundRejection(rejection);
+            db.UpsertInboundRejection(rejection with
+            {
+                Reason = "topic_request_identity_conflict",
+                RejectedAt = rejectedAt.AddMinutes(1)
+            });
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var persisted = reopened.ListInboundRejections();
+        Assert.HasCount(1, persisted);
+        Assert.AreEqual(rejection.EnvelopeId, persisted[0].EnvelopeId);
+        Assert.AreEqual("topic_request_identity_conflict", persisted[0].Reason);
+        Assert.AreEqual(1, reopened.PruneInboundRejections(rejectedAt.AddMinutes(2)));
+        Assert.HasCount(0, reopened.ListInboundRejections());
+    }
+    [TestMethod]
+    public void InboundTerminalAndEnvelopeOutbox_CommitAsOneWinner()
+    {
+        var created = new DateTimeOffset(2026, 8, 2, 8, 0, 0, TimeSpan.Zero);
+        var request = new TopicRunRequestPayload(
+            "run-target-atomic",
+            "thread-target-atomic",
+            "line-target-atomic",
+            "owner",
+            "Do target work",
+            created,
+            "desktop-device",
+            TopicTurnMode.Single);
+        var inbound = new MeshDb.InboundTopicRunItem(
+            request.RunId,
+            "phone-device",
+            request,
+            InboundTopicRunStates.Running,
+            created,
+            created);
+        var completed = new TopicRunUpdatePayload(
+            request.RunId,
+            request.ThreadId,
+            TopicRunPhase.Completed,
+            Timestamp: created.AddMinutes(1));
+        var completedOutbox = new MeshDb.DeviceEnvelopeOutboxItem(
+            "terminal-completed",
+            inbound.SourceDeviceId,
+            MeshKinds.TopicRunUpdate,
+            TopicRunProtocol.UpdateBody(completed),
+            PushHintProtocol.TopicResponse,
+            completed.Timestamp);
+        var failed = completed with
+        {
+            Phase = TopicRunPhase.Failed,
+            Error = "late failure",
+            Timestamp = created.AddMinutes(2)
+        };
+        var failedOutbox = completedOutbox with
+        {
+            EnvelopeId = "terminal-failed",
+            Plaintext = TopicRunProtocol.UpdateBody(failed),
+            CreatedAt = failed.Timestamp
+        };
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            Assert.IsTrue(db.TryAddInboundTopicRun(inbound));
+            Assert.IsTrue(db.SetInboundTopicRunTerminalAndQueue(
+                request.RunId,
+                InboundTopicRunStates.Completed,
+                completed,
+                completedOutbox));
+            Assert.IsTrue(db.SetInboundTopicRunTerminalAndQueue(
+                request.RunId,
+                InboundTopicRunStates.Failed,
+                failed,
+                failedOutbox));
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var persisted = reopened.GetInboundTopicRun(request.RunId)!;
+        Assert.AreEqual(InboundTopicRunStates.Completed, persisted.State);
+        Assert.IsTrue(TopicRunProtocol.TryParseUpdate(persisted.TerminalUpdateJson, out var winner));
+        Assert.AreEqual(TopicRunPhase.Completed, winner.Phase);
+        Assert.HasCount(0, reopened.ListInboundTopicRuns(
+            InboundTopicRunStates.Accepted,
+            InboundTopicRunStates.Running));
+        var queued = reopened.ListDeviceEnvelopeOutbox();
+        Assert.HasCount(1, queued);
+        Assert.AreEqual(completedOutbox.EnvelopeId, queued[0].EnvelopeId);
+    }
+
+    [TestMethod]
+    public void InboundCancellationTombstone_PersistsFirstIdentityAcrossRestart()
+    {
+        var created = new DateTimeOffset(2026, 8, 2, 8, 30, 0, TimeSpan.Zero);
+        var terminal = new TopicRunUpdatePayload(
+            "run-cancel-first",
+            "thread-cancel-first",
+            TopicRunPhase.Cancelled,
+            Status: "Cancelled",
+            Timestamp: created);
+        var item = new MeshDb.InboundTopicCancellationItem(
+            terminal.RunId,
+            "phone-device",
+            terminal.ThreadId,
+            TopicRunProtocol.UpdateBody(terminal),
+            created);
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            Assert.IsTrue(db.TryAddInboundTopicCancellation(item));
+            Assert.IsFalse(db.TryAddInboundTopicCancellation(item with
+            {
+                SourceDeviceId = "conflicting-device"
+            }));
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var persisted = reopened.GetInboundTopicCancellation(item.RunId)!;
+        Assert.AreEqual(item.SourceDeviceId, persisted.SourceDeviceId);
+        Assert.AreEqual(item.ThreadId, persisted.ThreadId);
+        Assert.AreEqual(item.TerminalUpdateJson, persisted.TerminalUpdateJson);
+    }
+    [TestMethod]
+    public void CompleteOwnThreadRunAndDeleteTopicOutbox_CommitsTogether()
+    {
+        var created = new DateTimeOffset(2026, 8, 2, 9, 0, 0, TimeSpan.Zero);
+        var completed = created.AddMinutes(5);
+        var request = new TopicRunRequestPayload(
+            "run-atomic",
+            "thread-atomic",
+            "line-atomic",
+            "owner",
+            "Do atomic work",
+            created,
+            "desktop-device",
+            TopicTurnMode.Single);
+        var outbox = new MeshDb.TopicOutboxItem(
+            request.RunId,
+            request.ThreadId,
+            request.TriggerLineId,
+            request.TargetDeviceId,
+            request,
+            [],
+            TopicOutboxStates.RelayQueued,
+            created,
+            created);
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread(request.ThreadId, "Atomic", created, 0, created);
+            Assert.IsTrue(db.SetOwnThreadExecutionAndActivity(
+                request.ThreadId,
+                request.TargetDeviceId,
+                "Desktop",
+                DevicePlatforms.Windows,
+                created,
+                request.RunId,
+                created));
+            db.UpsertTopicOutbox(outbox);
+
+            Assert.IsFalse(db.CompleteOwnThreadRunAndDeleteTopicOutbox(
+                request.ThreadId,
+                "different-run",
+                request.TargetDeviceId,
+                "Desktop",
+                DevicePlatforms.Windows,
+                created,
+                completed));
+            Assert.IsNotNull(db.GetTopicOutbox(request.RunId));
+
+            Assert.IsTrue(db.CompleteOwnThreadRunAndDeleteTopicOutbox(
+                request.ThreadId,
+                request.RunId,
+                request.TargetDeviceId,
+                "Desktop",
+                DevicePlatforms.Windows,
+                created,
+                completed));
+            Assert.IsNull(db.GetTopicOutbox(request.RunId));
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var thread = reopened.LoadProfile()!.OwnThreads.Single(item => item.Id == request.ThreadId);
+        Assert.IsNull(thread.ExecutionRunId);
+        Assert.AreEqual(completed.UtcTicks, thread.LastActivityAt?.UtcTicks);
+        Assert.IsNull(reopened.GetTopicOutbox(request.RunId));
+    }
+    [TestMethod]
+    public void LegacyReorder_DoesNotChangeActivity()
+    {
+        var activity = DateTimeOffset.UtcNow.AddDays(1);
+        using var db = MeshDb.Open(databasePath, key);
+        db.UpsertOwnThread("first", "First", activity.AddDays(-2), 0, activity);
+        db.UpsertOwnThread("second", "Second", activity.AddDays(-1), 1, activity.AddHours(-1));
+        SaveProfile(db);
+
+        db.ReorderOwnThreads(["second", "first"], "first", DateTimeOffset.UtcNow);
+
+        var reordered = db.LoadProfile()!.OwnThreads;
+        Assert.AreEqual("second", reordered[0].Id);
+        Assert.AreEqual(activity.UtcTicks, reordered.Single(t => t.Id == "first").LastActivityAt?.UtcTicks);
+    }
+
+    private void ClearOwnThreadActivity()
+    {
+        using var raw = new SqliteConnection($"Data Source={databasePath}");
+        raw.Open();
+        ApplyKey(raw);
+        using var cmd = raw.CreateCommand();
+        cmd.CommandText = "UPDATE own_threads SET last_activity_at = NULL;";
+        cmd.ExecuteNonQuery();
+    }
+
+    private void ClearConversationActivity()
+    {
+        using var raw = new SqliteConnection($"Data Source={databasePath}");
+        raw.Open();
+        ApplyKey(raw);
+        using var cmd = raw.CreateCommand();
+        cmd.CommandText = "UPDATE conversations SET last_activity_at = NULL;";
+        cmd.ExecuteNonQuery();
+    }
+
+    private void ApplyKey(SqliteConnection connection)
+    {
+        var hex = Convert.ToHexString(key);
+        using var pragma = connection.CreateCommand();
+        pragma.CommandText = $"PRAGMA key = \"x'{hex}'\";";
+        pragma.ExecuteNonQuery();
+    }
+
+    private static void SaveProfile(MeshDb db) => db.SaveProfile(new MeshProfile());
+}

@@ -37,7 +37,7 @@
             </button>
         </div>
 
-        @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsDeviceSnapshotSyncing)
+        @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsReplicationActive)
         {
             <div class="list-empty">
                 <i class="bi bi-chat-heart"></i>
@@ -48,9 +48,9 @@
         else
         {
             <div class="thread-rows" @ref="threadRowsEl">
-                @if (Mesh.IsDeviceSnapshotSyncing)
+                @if (Mesh.IsReplicationActive)
                 {
-                    <DeviceSyncPlaceholder Text="More chats are syncing..." />
+                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> More chats are syncing...</div>
                 }
                 @foreach (var section in ThreadSections)
                 {
@@ -816,7 +816,7 @@ else
     protected override void OnInitialized()
     {
         State.Changed += Refresh;
-        Mesh.DeviceSyncStateChanged += Refresh;
+        Mesh.ReplicationStateChanged += Refresh;
         Agent.EnsureAskUserResumeRegistered();
         _ = State.RecoverPendingAskUserPromptsAsync();
         // Deep-link: /m/me?thread=id opens that topic (used by Search). Otherwise land on the LIST
@@ -1561,7 +1561,7 @@ else
         _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
         State.Changed -= Refresh;
         Mesh.StateChanged -= OnMeshStateChanged;
-        Mesh.DeviceSyncStateChanged -= Refresh;
+        Mesh.ReplicationStateChanged -= Refresh;
         selfRef?.Dispose();
     }
 }

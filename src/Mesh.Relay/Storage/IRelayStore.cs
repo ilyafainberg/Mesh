@@ -7,6 +7,12 @@ namespace Mesh.Relay.Storage;
 /// A persisted handle registration: the handle, its display name, and the set of
 /// device public keys authorized to act as it. Serializable so it can live in a
 /// durable store (Cosmos) or in memory. Device keys are base64 SubjectPublicKeyInfo.
+///
+/// Protocol 9: this record is metadata only. The relay is an online-only opaque
+/// forwarder and never persists message, sync, attachment, or agent payloads, so this
+/// store holds identity/authorization metadata exclusively (handles, device and recovery
+/// keys, auth generation, custody head, push token metadata, invites, service directory,
+/// and administrative rate policy).
 /// </summary>
 public sealed class StoredHandle
 {
@@ -16,16 +22,18 @@ public sealed class StoredHandle
     public List<string> DevicePublicKeys { get; set; } = new();
 
     /// <summary>
-    /// Opaque epoch for ordinary inbox admission. A reclaimed handle receives a fresh epoch, so an
-    /// enqueue admitted by the previous owner cannot be delivered to the new owner.
+    /// Monotonic authorization generation for the handle's custody chain. A device revocation or
+    /// custody append advances this value so a client can prove it is presenting current authority
+    /// during the Protocol 9 connect handshake. Strictly non-decreasing.
     /// </summary>
-    public string InboxGeneration { get; set; } = "";
+    public long AuthGeneration { get; set; }
 
     /// <summary>
-    /// Opaque per-device epochs used by the durable queue admission fence. A relink receives a
-    /// fresh epoch, so work authorized by an earlier registration cannot enter the new queue.
+    /// The current head hash of the handle's custody chain (Protocol 9). Presented by a client at
+    /// connect so the relay can reject a device that is not operating against current custody.
+    /// Empty until the first custody entry is recorded.
     /// </summary>
-    public Dictionary<string, string> DeviceQueueGenerations { get; set; } = new();
+    public string CustodyHead { get; set; } = "";
 
     /// <summary>
     /// The handle's recovery public key, captured at registration. Used to authorize a brand-new
@@ -49,12 +57,12 @@ public sealed class StoredHandle
     public Dictionary<string, bool> DeviceRemoteAgentEnabled { get; set; } = new();
 
     /// <summary>Atomic agent-dispatch protocol support keyed by stable device id.</summary>
-    public Dictionary<string, bool> DeviceAtomicAgentDispatchEnabled { get; set; } = new();
+    public Dictionary<string, bool> DeviceAgentHostEnabled { get; set; } = new();
 
     /// <summary>Mesh protocol version keyed by stable device id.</summary>
     public Dictionary<string, int> DeviceProtocolVersions { get; set; } = new();
 
-    /// <summary>The owner's selected device for answering agent-addressed Messages.</summary>
+    /// <summary>The owner's selected device for answering agent-addressed messages.</summary>
     public string? AgentPrimaryDeviceId { get; set; }
 
     /// <summary>An optional second device used only while the primary is unavailable.</summary>
@@ -65,7 +73,7 @@ public sealed class StoredHandle
 
     /// <summary>
     /// Push tokens keyed by stable device id, used to wake a backgrounded device via APNs/FCM.
-    /// The relay only sends a content-free/metadata alert; it never puts message contents here.
+    /// The relay only sends a content-free wake; it never puts message contents here.
     /// </summary>
     public Dictionary<string, DevicePushToken> DevicePushTokens { get; set; } = new();
 }
@@ -90,204 +98,17 @@ public sealed class StoredInvite
     public DateTimeOffset ExpiresAt { get; set; }
 }
 
-/// <summary>An enqueue-first envelope awaiting acknowledgement or legacy delivery.</summary>
-public sealed class StoredEnvelope
-{
-    public string Id { get; set; } = "";
-    public string EnvelopeId { get; set; } = "";
-    public string From { get; set; } = "";
-    public string To { get; set; } = "";
-    public string Json { get; set; } = "";
-    public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
-    public DateTimeOffset? ExpiresAt { get; set; }
-    public string? LeaseOwner { get; set; }
-    public DateTimeOffset? LeaseUntil { get; set; }
-    public int DeliveryAttempts { get; set; }
-    public int Priority { get; set; } = RelayInboxPriority.Normal;
-    public bool RequiresForeground { get; set; }
-}
-
-public static class RelayInboxPriority
-{
-    public const int Critical = 400;
-    public const int Bulk = 0;
-    public const int Sync = 100;
-    public const int Normal = 200;
-    public const int Control = 300;
-
-    public static int ForKind(string? kind) => kind switch
-    {
-        MeshKinds.TopicRunCancel or DeviceSyncKinds.EnvelopeSnapshotComplete => Critical,
-        MeshKinds.TopicRunRequest or MeshKinds.TopicRunUpdate => Control,
-        DeviceSyncKinds.EnvelopeSnapshotRequest => Control,
-        DeviceSyncKinds.EnvelopeSnapshotManifest => Sync,
-        DeviceSyncKinds.EnvelopeSnapshotChunk => Bulk,
-        DeviceSyncKinds.EnvelopeOperation => Sync,
-        _ => Normal
-    };
-}
-
-public sealed record DeviceRevocationResult(bool Revoked, int PurgedEnvelopes);
-
-public static class RelayInboxPolicy
-{
-    public static readonly TimeSpan Retention = TimeSpan.FromDays(14);
-    public static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(30);
-    public static readonly TimeSpan PriorityAgingThreshold = TimeSpan.FromMinutes(2);
-    // Cosmos acquires leases sequentially before sending the first envelope. Keep the batch small
-    // enough to make progress well inside SignalR and iOS background execution timeouts.
-    public const int DeliveryWindow = 4;
-
-    public static bool UsesClientInitiatedDrain(bool supportsDurableDelivery)
-        => supportsDurableDelivery;
-
-
-    public static bool NeverExpires(string inboxKey)
-    {
-        var separator = inboxKey.IndexOf('\u001f');
-        var handle = separator < 0 ? inboxKey : inboxKey[..separator];
-        return Mesh.Shared.ReservedHandles.IsReserved(handle);
-    }
-}
-
-public sealed record InboxEnqueueResult(
-    string DeliveryId,
-    bool Accepted,
-    bool Created,
-    string? Error = null);
-
-public sealed record RelayInboxStats(long QueuedItems, DateTimeOffset? OldestQueuedAt);
-
-public sealed class StoredDeviceQueueItem
-{
-    public string EntryId { get; set; } = "";
-    public string Handle { get; set; } = "";
-    public string SourceDeviceId { get; set; } = "";
-    public string SourceGeneration { get; set; } = "";
-    public string TargetDeviceId { get; set; } = "";
-    public string OperationId { get; set; } = "";
-    public string Payload { get; set; } = "";
-    public DateTimeOffset EnqueuedAt { get; set; } = DateTimeOffset.UtcNow;
-    public DateTimeOffset ExpiresAt { get; set; }
-    public string? LeaseOwner { get; set; }
-    public DateTimeOffset? LeaseUntil { get; set; }
-}
-
-public static class RelayDeviceQueueKey
-{
-    public static string Create(string handle, string deviceId)
-        => LinkProtocol.Normalize(handle) + "\u001fqueue\u001f" + deviceId.Trim();
-}
-
-public static class RelayInboxKey
-{
-    public static string Device(string handle, string deviceId)
-        => LinkProtocol.Normalize(handle) + "\u001f" + deviceId.Trim();
-}
-
-public static class InboxDeliveryId
-{
-    public static string Create(string fromHandle, string envelopeId)
-    {
-        var material = $"{LinkProtocol.Normalize(fromHandle)}\u001f{envelopeId}";
-        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(material))).ToLowerInvariant();
-    }
-}
-
-public static class AgentDispatchStates
-{
-    public const string Pending = "pending";
-    public const string Assigned = "assigned";
-    public const string Delivering = "delivering";
-    public const string Delivered = "delivered";
-    public const string ResponsePending = "response-pending";
-    public const string Completed = "completed";
-}
+/// <summary>The outcome of revoking one device from a handle's authorized set.</summary>
+public sealed record DeviceRevocationResult(bool Revoked, long AuthGeneration);
 
 /// <summary>
-/// Durable relay-side metadata for one opaque, end-to-end encrypted agent request. The relay stores
-/// ciphertext plus routing state only. It never reads the question or answer.
-/// </summary>
-public sealed class StoredAgentDispatch
-{
-    public string Id { get; set; } = "";
-    public string RequestId { get; set; } = "";
-    public string From { get; set; } = "";
-    public string To { get; set; } = "";
-    public string EnvelopeJson { get; set; } = "";
-    public string EnvelopeHash { get; set; } = "";
-    public List<string> RecipientDeviceIds { get; set; } = new();
-    public string DispatchToken { get; set; } = "";
-    public string State { get; set; } = AgentDispatchStates.Pending;
-    public string? AssignedDeviceId { get; set; }
-    public string? DeliveryLeaseOwner { get; set; }
-    public DateTimeOffset? DeliveryLeaseUntil { get; set; }
-    public DateTimeOffset QueuedAt { get; set; } = DateTimeOffset.UtcNow;
-    public DateTimeOffset? AssignedAt { get; set; }
-    public DateTimeOffset? DeliveredAt { get; set; }
-    public string? ResponseId { get; set; }
-    public string? ResponseJson { get; set; }
-    public string? ResponseHash { get; set; }
-    public DateTimeOffset? ResponseStagedAt { get; set; }
-    public DateTimeOffset? CompletedAt { get; set; }
-}
-
-public enum AgentDispatchCreateStatus
-{
-    Created,
-    Duplicate,
-    Conflict
-}
-
-public sealed record AgentDispatchCreateResult(
-    AgentDispatchCreateStatus Status,
-    string State,
-    string? AssignedDeviceId);
-
-public sealed record AgentDispatchResponseStageResult(
-    bool Accepted,
-    bool Created,
-    bool Completed,
-    string? ResponseJson);
-
-public static class AgentDispatchKey
-{
-    public static string Create(string fromHandle, string requestId)
-    {
-        var material = $"{LinkProtocol.Normalize(fromHandle)}\u001f{requestId}";
-        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(material))).ToLowerInvariant();
-    }
-}
-
-public static class AgentDispatchRecipientPolicy
-{
-    public static string? ChooseDevice(
-        IEnumerable<string>? recipientDeviceIds,
-        IEnumerable<string> candidateDeviceIds)
-    {
-        ArgumentNullException.ThrowIfNull(candidateDeviceIds);
-        var recipients = recipientDeviceIds?
-            .Where(deviceId => !string.IsNullOrWhiteSpace(deviceId))
-            .ToHashSet(StringComparer.Ordinal) ?? new HashSet<string>(StringComparer.Ordinal);
-        foreach (var candidate in candidateDeviceIds.Where(deviceId => !string.IsNullOrWhiteSpace(deviceId)))
-        {
-            // Empty recipient metadata is accepted only for records written before this field existed.
-            if (recipients.Count == 0 || recipients.Contains(candidate))
-                return candidate;
-        }
-        return null;
-    }
-}
-
-/// <summary>
-/// Durable state for the relay: the handle registry, pending link invites, and the
-/// offline inbox. Presence (who is connected right now) is intentionally NOT here,
-/// because live sockets cannot be persisted; that is the backplane's job.
+/// Metadata store for the relay. Protocol 9 is online-only: the relay never persists message,
+/// sync, attachment, or agent payloads, so this seam holds identity and authorization metadata
+/// exclusively. Presence (who is connected right now) is intentionally NOT here, because live
+/// sockets cannot be persisted; that is the backplane's job.
 ///
-/// Implementations must be safe for concurrent use. All methods are async so a
-/// network-backed store (Cosmos) fits behind the same seam as the in-memory default.
+/// Implementations must be safe for concurrent use. All methods are async so a network-backed
+/// store (Cosmos) fits behind the same seam as the in-memory default.
 /// </summary>
 public interface IRelayStore
 {
@@ -311,8 +132,8 @@ public interface IRelayStore
 
     /// <summary>
     /// Removes a handle registration entirely, freeing the name to be claimed again. Also drops the
-    /// handle's pending invites and offline inbox. Returns false if the handle did not exist.
-    /// Callers must authenticate the request before calling this.
+    /// handle's pending invites and administrative rate policy. Returns false if the handle did not
+    /// exist. Callers must authenticate the request before calling this.
     /// </summary>
     Task<bool> DeleteHandleAsync(string handle, CancellationToken ct = default);
 
@@ -332,14 +153,32 @@ public interface IRelayStore
         string? name,
         string platform,
         bool remoteAgentEnabled,
-        bool atomicAgentDispatchEnabled,
+        bool agentHostEnabled,
         int protocolVersion = MeshProtocol.Version,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// Revokes one device from a handle's authorized set, advancing the handle's auth generation so
+    /// any presented authority for the removed device is stale. Returns whether a device was removed
+    /// and the resulting auth generation. Refuses to remove the handle's last device.
+    /// </summary>
     Task<DeviceRevocationResult> RevokeDeviceAsync(
         string handle,
         string targetDeviceId,
         string? authorizingPublicKey = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Advances the handle's custody head and auth generation after a validated custody append.
+    /// The update is strict: <paramref name="expectedAuthGeneration"/> must match the stored value
+    /// or the update is refused (optimistic custody progression). Returns false if the handle is
+    /// missing or the expected generation did not match.
+    /// </summary>
+    Task<bool> AdvanceCustodyAsync(
+        string handle,
+        long expectedAuthGeneration,
+        long newAuthGeneration,
+        string newCustodyHead,
         CancellationToken ct = default);
 
     Task<bool> SetAgentRoutingAsync(
@@ -349,11 +188,6 @@ public interface IRelayStore
         string expectedVersion,
         CancellationToken ct = default);
 
-    /// <summary>
-    /// Sets the handle's recovery public key, but only if one is not already stored (first writer
-    /// wins). This prevents a later attacker who has gained a device key from overwriting the
-    /// recovery key. No-op if the handle is missing or already has a recovery key.
-    /// </summary>
     /// <summary>Registers or refreshes a device's push token (APNs/FCM) under a handle. No-op if the handle is missing.</summary>
     Task SetDevicePushTokenAsync(
         string handle, string deviceId, string platform, string token, bool alertsEnabled,
@@ -372,6 +206,11 @@ public interface IRelayStore
     /// <summary>Removes a device's push token (for example on sign-out). No-op if absent.</summary>
     Task RemoveDevicePushTokenAsync(string handle, string deviceId, CancellationToken ct = default);
 
+    /// <summary>
+    /// Sets the handle's recovery public key, but only if one is not already stored (first writer
+    /// wins). This prevents a later attacker who has gained a device key from overwriting the
+    /// recovery key. No-op if the handle is missing or already has a recovery key.
+    /// </summary>
     Task SetRecoveryKeyAsync(string handle, string recoveryPublicKey, CancellationToken ct = default);
 
     /// <summary>Stores a single-use invite. Expired invites are cleaned up opportunistically.</summary>
@@ -382,149 +221,6 @@ public interface IRelayStore
     /// unexpired invite existed and was removed (single use).
     /// </summary>
     Task<bool> ConsumeInviteAsync(string handle, string codeHash, CancellationToken ct = default);
-
-    /// <summary>Durably enqueues an idempotent envelope and returns its relay delivery id.</summary>
-    Task<InboxEnqueueResult> EnqueueAsync(
-        string toHandle,
-        string envelopeId,
-        string fromHandle,
-        string envelopeJson,
-        int priority = RelayInboxPriority.Normal,
-        bool requiresForeground = false,
-        CancellationToken ct = default);
-
-    /// <summary>Leases queued envelopes without removing them. The receiver must acknowledge each item.</summary>
-    Task<IReadOnlyList<StoredEnvelope>> LeaseInboxAsync(
-        string toHandle,
-        string leaseOwner,
-        int maxItems = RelayInboxPolicy.DeliveryWindow,
-        TimeSpan? leaseDuration = null,
-        bool includeForeground = true,
-        CancellationToken ct = default);
-
-    Task<StoredEnvelope?> AcknowledgeInboxAsync(
-        string toHandle,
-        string deliveryId,
-        string leaseOwner,
-        CancellationToken ct = default);
-
-    Task<bool> TryLeaseInboxItemAsync(
-        string toHandle,
-        string deliveryId,
-        string leaseOwner,
-        TimeSpan? leaseDuration = null,
-        CancellationToken ct = default);
-
-    /// <summary>Releases a confirmed not-delivered lease and rolls back its tentative attempt.</summary>
-    Task ReleaseInboxLeaseAsync(
-        string toHandle,
-        string deliveryId,
-        string leaseOwner,
-        CancellationToken ct = default);
-
-    Task<bool> CancelInboxAsync(
-        string toHandle,
-        string deliveryId,
-        string fromHandle,
-        CancellationToken ct = default);
-
-    Task ReleaseInboxLeasesAsync(
-        string toHandle,
-        string leaseOwner,
-        CancellationToken ct = default);
-
-    /// <summary>Legacy destructive drain used only by clients that do not support acknowledgements.</summary>
-    Task<IReadOnlyList<string>> DrainInboxAsync(string toHandle, CancellationToken ct = default);
-    Task<RelayInboxStats> GetInboxStatsAsync(CancellationToken ct = default);
-
-    Task<QueueEnqueueResult> EnqueueDeviceQueueAsync(
-        string handle,
-        QueueEnqueue request,
-        CancellationToken ct = default);
-
-    Task<QueueDrainResponse> DrainDeviceQueueAsync(
-        string handle,
-        string deviceId,
-        string leaseOwner,
-        int maxEntries = DeviceQueueProtocol.DeliveryWindow,
-        CancellationToken ct = default);
-
-    Task<bool> AcknowledgeDeviceQueueAsync(
-        string handle,
-        string deviceId,
-        string entryId,
-        string leaseOwner,
-        CancellationToken ct = default);
-
-    Task ReleaseDeviceQueueLeasesAsync(
-        string handle,
-        string deviceId,
-        string leaseOwner,
-        CancellationToken ct = default);
-
-    Task<int> GetDeviceQueueSizeAsync(
-        string handle,
-        string deviceId,
-        CancellationToken ct = default);
-
-    Task<AgentDispatchCreateResult> CreateAgentDispatchAsync(
-        StoredAgentDispatch dispatch,
-        CancellationToken ct = default);
-
-    Task<StoredAgentDispatch?> GetAgentDispatchAsync(
-        string toHandle,
-        string dispatchId,
-        CancellationToken ct = default);
-
-    /// <summary>Assigns each pre-delivery request to the first candidate with an encrypted key slot.</summary>
-    Task AssignPendingAgentDispatchesAsync(
-        string toHandle,
-        IReadOnlyList<string> candidateDeviceIds,
-        CancellationToken ct = default);
-
-    /// <summary>Atomically claims at most one assigned request for a delivery attempt.</summary>
-    Task<IReadOnlyList<StoredAgentDispatch>> TakeAssignedAgentDispatchesAsync(
-        string toHandle,
-        string deviceId,
-        string leaseOwner,
-        TimeSpan? leaseDuration = null,
-        CancellationToken ct = default);
-
-    Task<bool> MarkAgentDispatchDeliveredAsync(
-        string toHandle,
-        string dispatchId,
-        string deviceId,
-        string leaseOwner,
-        CancellationToken ct = default);
-
-    Task<bool> ReleaseAgentDispatchAsync(
-        string toHandle,
-        string dispatchId,
-        string deviceId,
-        string leaseOwner,
-        string? nextDeviceId = null,
-        CancellationToken ct = default);
-
-    Task<AgentDispatchResponseStageResult> StageAgentDispatchResponseAsync(
-        string toHandle,
-        string dispatchId,
-        string fromHandle,
-        string dispatchToken,
-        string respondingDeviceId,
-        string responseId,
-        string responseJson,
-        string responseHash,
-        CancellationToken ct = default);
-
-    Task<bool> CompleteAgentDispatchResponseAsync(
-        string toHandle,
-        string dispatchId,
-        string responseId,
-        CancellationToken ct = default);
-
-    Task<IReadOnlyList<StoredAgentDispatch>> GetPendingAgentResponsesAsync(
-        int maxItems = 100,
-        CancellationToken ct = default);
 
     /// <summary>Loads an administrative per-handle rate-policy override, or null for defaults.</summary>
     Task<HandleRatePolicy?> GetHandleRatePolicyAsync(string handle, CancellationToken ct = default);

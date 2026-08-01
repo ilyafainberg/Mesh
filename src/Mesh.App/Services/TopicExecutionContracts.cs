@@ -31,9 +31,18 @@ public sealed record TopicDispatchResult(
         => new(false, runId, code, error);
 }
 
+public static class TopicExecutionStatus
+{
+    public const string Delivered = "delivered";
+    public const string PendingLocal = "pending_local";
+    public const string LocalQueued = "local_queued";
+    public const string RelayAccepted = "relay_accepted";
+}
+
 public static class TopicOutboxStates
 {
     public const string Pending = "pending";
+    public const string RelayAccepted = "relay_accepted";
     public const string RelayQueued = "relay_queued";
     public const string DeviceQueued = "device_queued";
     public const string Running = "running";

@@ -664,6 +664,8 @@ public sealed partial class MeshDb
     public ReplicationAppendResult AppendCustodyEntry(CustodyEntry entry)
     {
         ArgumentNullException.ThrowIfNull(entry);
+        if (!OnlineReplicationProtocol.VerifyCustodyEntry(entry, entry.SignerKey))
+            throw new ArgumentException("The custody entry signature is invalid.", nameof(entry));
         using var tx = conn.BeginTransaction(deferred: false);
 
         var existing = GetCustodyEntryCore(entry.Handle, entry.Generation, tx);
@@ -683,6 +685,56 @@ public sealed partial class MeshDb
                 $"Custody entry at generation {entry.Generation} for {entry.Handle} forks the chain.");
         if (validation != CustodyValidationResult.Valid)
             throw new ArgumentException($"Custody entry is invalid: {validation}.", nameof(entry));
+
+        var chain = GetCustodyChainCore(entry.Handle, tx);
+        var authorized = new HashSet<string>(StringComparer.Ordinal);
+        string? recoveryKey = null;
+        foreach (var prior in chain)
+        {
+            switch (prior.Action)
+            {
+                case CustodyAction.Genesis:
+                case CustodyAction.AddDevice:
+                    authorized.Add(prior.SubjectDeviceKey);
+                    if (prior.Action == CustodyAction.Genesis)
+                        recoveryKey = prior.RecoveryPublicKey;
+                    break;
+                case CustodyAction.RemoveDevice:
+                    authorized.Remove(prior.SubjectDeviceKey);
+                    break;
+                case CustodyAction.RekeyRecovery:
+                    recoveryKey = prior.RecoveryPublicKey;
+                    break;
+            }
+        }
+        var authorizedSigner = entry.Action switch
+        {
+            CustodyAction.Genesis =>
+                head is null
+                && string.Equals(
+                    entry.SignerKey,
+                    entry.SubjectDeviceKey,
+                    StringComparison.Ordinal),
+            CustodyAction.AddDevice =>
+                authorized.Contains(entry.SignerKey)
+                && !authorized.Contains(entry.SubjectDeviceKey),
+            CustodyAction.RemoveDevice =>
+                authorized.Contains(entry.SignerKey)
+                && OnlineReplicationProtocol.CanRemoveDevice(
+                    authorized,
+                    entry.SubjectDeviceKey),
+            CustodyAction.RekeyRecovery =>
+                !string.IsNullOrWhiteSpace(recoveryKey)
+                && string.Equals(
+                    entry.SignerKey,
+                    recoveryKey,
+                    StringComparison.Ordinal),
+            _ => false
+        };
+        if (!authorizedSigner)
+            throw new ArgumentException(
+                "The custody entry signer is not authorized for this action.",
+                nameof(entry));
 
         using (var cmd = conn.CreateCommand())
         {
@@ -707,6 +759,20 @@ public sealed partial class MeshDb
         }
         tx.Commit();
         return ReplicationAppendResult.Inserted;
+    }
+
+    private IReadOnlyList<CustodyEntry> GetCustodyChainCore(
+        string handle,
+        SqliteTransaction tx)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = CustodySelect + " WHERE handle = $handle ORDER BY generation ASC;";
+        cmd.Parameters.AddWithValue("$handle", handle);
+        var chain = new List<CustodyEntry>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) chain.Add(ReadCustody(reader));
+        return chain;
     }
 
     /// <summary>Returns the highest-generation custody entry for a handle, or null.</summary>

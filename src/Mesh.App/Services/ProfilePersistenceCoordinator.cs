@@ -48,7 +48,7 @@ public sealed class ProfilePersistenceCoordinator<T> : IAsyncDisposable
         if (_disposeTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(
                 nameof(disposeTimeout), "Dispose timeout must be positive.");
-        _worker = Task.Run(RunWorkerAsync);
+        _worker = Task.Factory.StartNew(RunWorkerAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
     }
 
     /// <summary>The last save failure, or null once a subsequent revision has been saved.</summary>

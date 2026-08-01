@@ -130,9 +130,9 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ModelSetupService>();
 		builder.Services.AddSingleton<UpdateService>();
 		builder.Services.AddSingleton<MeshClient>();
-		builder.Services.AddSingleton<IBackgroundSyncTransport>(services =>
+		builder.Services.AddSingleton<IOnlineReplicationWakeTransport>(services =>
 			services.GetRequiredService<MeshClient>());
-		builder.Services.AddSingleton<BackgroundSyncCoordinator>();
+		builder.Services.AddSingleton<OnlineReplicationWakeCoordinator>();
 		builder.Services.AddSingleton<IDeviceTopicTransport>(services =>
 			services.GetRequiredService<MeshClient>());
 		builder.Services.AddSingleton<TopicExecutionRouter>();
@@ -150,7 +150,7 @@ public static class MauiProgram
 		// Bind the singleton service to the static bridge so the Windows platform layer
 		// can forward --ui-mode args from a second launch without a service-locator call.
 		UiModeActivationBridge.Register(app.Services.GetRequiredService<IUiModeService>());
-		BackgroundSyncBridge.Register(app.Services.GetRequiredService<BackgroundSyncCoordinator>());
+		OnlineReplicationWakeBridge.Register(app.Services.GetRequiredService<OnlineReplicationWakeCoordinator>());
 
 		// Auto-update marketplace-imported skills in the background at startup (never blocks launch).
 		_ = Task.Run(async () =>

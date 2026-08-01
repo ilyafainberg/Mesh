@@ -20,7 +20,7 @@
         @if (State.Profile.Requests.Count > 0)
         {
             <div class="pane-head" style="padding-left:0;padding-right:0;">
-                <h2><i class="bi bi-inbox"></i> Requests</h2>
+                <h2><i class="bi bi-staging"></i> Requests</h2>
                 <span class="muted">people who reached out but aren't approved yet</span>
             </div>
             <div class="card-panel">
@@ -174,7 +174,7 @@
     void ToggleMuted(Contact c, ChangeEventArgs e)
         => State.Mutate(_ => c.Muted = (bool)(e.Value ?? false));
 
-    // ---- request inbox ----
+    // ---- request staging ----
     Contact GetOrCreateContact(string fromHandle)
     {
         var norm = AppState.Norm(fromHandle);

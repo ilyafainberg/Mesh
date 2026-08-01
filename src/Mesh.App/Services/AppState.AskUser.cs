@@ -1,23 +1,20 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Mesh.App.Domain;
+using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
 /// <summary>
 /// Ask-user surface of <see cref="AppState"/>. Owns the durable store access around the private
-/// <c>activeDb</c>, the in-process <see cref="AskUserInteractionCoordinator"/>, the in-memory view of
-/// pending/resolved prompts, and the outbound events that a later device-sync workstream consumes.
+/// <c>activeDb</c>, the in-process <see cref="AskUserInteractionCoordinator"/> and the in-memory
+/// view of pending/resolved prompts. Every locally originated prompt, resolution, expiry and
+/// cancellation is committed by the replication journal, so the actual <c>ask_user_prompts</c> row
+/// and the signed event with its outbox references are made durable in ONE transaction.
 /// All durable work runs off the caller thread through <see cref="AskUserStore"/>.
 /// </summary>
 public sealed partial class AppState
 {
-    /// <summary>Raised after a prompt is created locally so device-sync can queue and push it.</summary>
-    public event Action<AskUserPrompt>? AskUserPromptCreated;
-
-    /// <summary>Raised after a prompt reaches its resolved state so device-sync can broadcast it.</summary>
-    public event Action<AskUserPrompt>? AskUserPromptResolved;
-
     private readonly AskUserInteractionCoordinator askUserCoordinator = new();
     private readonly ConcurrentDictionary<string, AskUserPrompt> askUserPrompts = new(StringComparer.Ordinal);
 
@@ -113,8 +110,6 @@ public sealed partial class AppState
             ResolvedAt: null,
             Revision: 1,
             Version: 1);
-        await store.CreateAsync(prompt, ct).ConfigureAwait(false);
-
         var contextId = ContextIdFor(promptId);
         var contextJson = JsonSerializer.Serialize(new AskUserResumePayload(
             request.ThreadId, request.RunId, request.TriggerLineId, request.Question));
@@ -127,10 +122,9 @@ public sealed partial class AppState
             now,
             request.ExpiresAt?.AddDays(7),
             null);
-        await store.SaveSuspendedContextAsync(context, ct).ConfigureAwait(false);
+        await EmitAskUserPromptAsync(prompt, context, ct).ConfigureAwait(false);
 
         UpsertAskUserView(prompt);
-        AskUserPromptCreated?.Invoke(prompt);
         NotifyChanged();
 
         // Await the durable resolution. Cancellation (Stop button / shutdown) propagates so the run
@@ -144,8 +138,9 @@ public sealed partial class AppState
                 if (await Task.WhenAny(wait, expiry).ConfigureAwait(false) == expiry)
                 {
                     await expiry.ConfigureAwait(false);
-                    var expired = await store.ExpireAsync(promptId, ct).ConfigureAwait(false);
-                    await ApplyAskUserResolvedAsync(expired, ct).ConfigureAwait(false);
+                    var expired = await ExpireAskUserPromptAsync(promptId, ct).ConfigureAwait(false);
+                    if (expired is not null)
+                        await ApplyAskUserResolvedAsync(expired, ct).ConfigureAwait(false);
                 }
             }
 
@@ -177,16 +172,151 @@ public sealed partial class AppState
         if (store is null) return false;
 
         var deviceId = LocalDeviceId() ?? "local";
-        var idempotencyToken = promptId + ":" + optionId;
-        var resolved = await store
-            .ResolveAsync(promptId, optionId, deviceId, idempotencyToken, ct)
-            .ConfigureAwait(false);
+        var resolved = await EmitAskUserResolutionAsync(
+            promptId, AskUserState.Resolved, optionId, deviceId, ct).ConfigureAwait(false);
+        if (resolved is null) return false;
 
         await ApplyAskUserResolvedAsync(resolved, ct).ConfigureAwait(false);
         return resolved.State == AskUserState.Resolved
             && string.Equals(resolved.Selection, optionId, StringComparison.Ordinal)
             && string.Equals(resolved.ResolutionDeviceId, deviceId, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// Cancels a pending prompt locally. The actual table transition and the signed event commit in
+    /// one transaction; the committed winner is returned (null when no prompt row exists).
+    /// </summary>
+    public async Task<bool> CancelAskUserPromptAsync(string promptId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(promptId)) return false;
+        var deviceId = LocalDeviceId() ?? "local";
+        var cancelled = await EmitAskUserResolutionAsync(
+            promptId, AskUserState.Cancelled, null, deviceId, ct).ConfigureAwait(false);
+        if (cancelled is null) return false;
+        await ApplyAskUserResolvedAsync(cancelled, ct).ConfigureAwait(false);
+        return cancelled.State == AskUserState.Cancelled;
+    }
+
+    /// <summary>
+    /// Expires a pending prompt locally through the same atomic first-writer path as a resolution.
+    /// </summary>
+    public Task<AskUserPrompt?> ExpireAskUserPromptAsync(string promptId, CancellationToken ct = default)
+        => EmitAskUserResolutionAsync(promptId, AskUserState.Expired, null, LocalDeviceId() ?? "local", ct);
+
+    // ---- atomic journal emission -----------------------------------------------------------------
+
+    /// <summary>
+    /// Writes the actual <c>ask_user_prompts</c> row and the signed prompt event (plus its outbox
+    /// references and the sequence bump) in ONE journal transaction.
+    /// </summary>
+    private Task EmitAskUserPromptAsync(
+        AskUserPrompt prompt,
+        SuspendedAgentContext context,
+        CancellationToken ct)
+        => EmitAskUserAsync(
+            ReplicationPayloadCodec.DomainAction.AskUserPrompt,
+            prompt.PromptId,
+            prompt.ThreadId,
+            AskPromptBodyJson(prompt),
+            ct,
+            (conn, tx, evt) =>
+            {
+                var envelope = new ReplicationPayloadCodec.DomainEnvelope(
+                    ReplicationOpKinds.AskUser,
+                    ReplicationPayloadCodec.DomainAction.AskUserPrompt,
+                    prompt.PromptId,
+                    prompt.ThreadId,
+                    evt.CausalVersion,
+                    AskPromptBodyJson(prompt));
+                ReplicationPayloadCodec.Project(
+                    conn,
+                    tx,
+                    evt,
+                    envelope,
+                    deviceIsDesktop: !PlatformCaps.IsMobile);
+                Protocol9DomainTables.UpsertAskUserContext(conn, tx, context);
+            });
+
+    /// <summary>
+    /// Transitions a prompt to a terminal state atomically: the fenced first-writer UPDATE on the
+    /// actual table, the signed resolution event and its outbox references share one transaction.
+    /// The committed winner is then read back, so a losing caller observes the winning answer.
+    /// </summary>
+    private async Task<AskUserPrompt?> EmitAskUserResolutionAsync(
+        string promptId, AskUserState state, string? selection, string deviceId, CancellationToken ct)
+    {
+        var store = ResolveAskUserStore();
+        if (store is null) return null;
+
+        var snapshot = await store.GetAsync(promptId, ct).ConfigureAwait(false);
+        var body = JsonSerializer.Serialize(
+            new ReplicationDomainMaterializer.AskResolveBody(
+                promptId,
+                state switch
+                {
+                    AskUserState.Resolved => "resolved",
+                    AskUserState.Expired => "expired",
+                    _ => "cancelled"
+                },
+                selection,
+                deviceId,
+                DateTimeOffset.UtcNow,
+                snapshot is null ? null : PromptBody(snapshot)),
+            ReplicationJson);
+
+        await EmitAskUserAsync(
+            ReplicationPayloadCodec.DomainAction.AskUserResolve,
+            promptId, snapshot?.ThreadId, body, ct).ConfigureAwait(false);
+
+        // The committed row is the single source of truth for who won.
+        return await store.GetAsync(promptId, ct).ConfigureAwait(false);
+    }
+
+    private async Task EmitAskUserAsync(
+        ReplicationPayloadCodec.DomainAction action,
+        string entityId,
+        string? conversationId,
+        string bodyJson,
+        CancellationToken ct,
+        Action<Microsoft.Data.Sqlite.SqliteConnection,
+            Microsoft.Data.Sqlite.SqliteTransaction,
+            ReplicationEvent>? domainWork = null)
+    {
+        MeshDb? db;
+        lock (profileSyncGate) db = activeDb;
+        if (db is null) throw new InvalidOperationException("No active profile database for ask_user.");
+
+        var targets = TargetsForOwnerState();
+        var envelope = new ReplicationPayloadCodec.DomainEnvelope(
+            Mesh.Shared.ReplicationOpKinds.AskUser, action, entityId, conversationId,
+            NewReplicationVersion(), bodyJson);
+
+        await ReplicateLocalAsync(
+            envelope.Kind, envelope.Action, envelope.EntityId, envelope.ConversationId,
+            envelope.CausalVersion, envelope.BodyJson, targets, ct: ct, domainWork: domainWork)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>The canonical wire shape of a prompt, carrying every option id/title/description.</summary>
+    private static ReplicationDomainMaterializer.AskPromptBody PromptBody(AskUserPrompt prompt)
+        => new(
+            prompt.PromptId,
+            prompt.ThreadId,
+            prompt.RunId,
+            prompt.Question,
+            prompt.Options
+                .Select(o => new ReplicationDomainMaterializer.AskOptionBody(o.Id, o.Title, o.Description))
+                .ToList(),
+            prompt.RecommendedIndex,
+            prompt.OriginDeviceId,
+            prompt.CreatedAt,
+            prompt.ExpiresAt,
+            prompt.Revision,
+            prompt.Version,
+            prompt.State != AskUserState.Pending);
+
+    private static string AskPromptBodyJson(AskUserPrompt prompt)
+        => JsonSerializer.Serialize(PromptBody(prompt), ReplicationJson);
 
     /// <summary>
     /// Reloads pending prompts for every Me thread from the durable store so restored bubbles appear
@@ -203,8 +333,9 @@ public sealed partial class AppState
         {
             if (prompt.ExpiresAt is { } deadline && deadline <= now)
             {
-                var expired = await store.ExpireAsync(prompt.PromptId, ct).ConfigureAwait(false);
-                await ApplyAskUserResolvedAsync(expired, ct).ConfigureAwait(false);
+                var expired = await ExpireAskUserPromptAsync(prompt.PromptId, ct).ConfigureAwait(false);
+                if (expired is not null)
+                    await ApplyAskUserResolvedAsync(expired, ct).ConfigureAwait(false);
             }
             else
             {
@@ -276,7 +407,6 @@ public sealed partial class AppState
 
         var created = await store.CreateAsync(prompt, ct).ConfigureAwait(false);
         UpsertAskUserView(created);
-        AskUserPromptCreated?.Invoke(created);
         NotifyChanged();
         return true;
     }
@@ -308,14 +438,12 @@ public sealed partial class AppState
     }
 
     /// <summary>
-    /// Shared post-resolution application: refresh the view, raise the outbound event, hand the result
-    /// to a live in-process waiter, or otherwise take the durable exactly-once resume path.
+    /// Shared post-resolution application: refresh the view, hand the result to a live in-process
+    /// waiter, or otherwise take the durable exactly-once resume path.
     /// </summary>
     private async Task ApplyAskUserResolvedAsync(AskUserPrompt resolved, CancellationToken ct)
     {
         UpsertAskUserView(resolved);
-        if (resolved.State == AskUserState.Resolved)
-            AskUserPromptResolved?.Invoke(resolved);
         NotifyChanged();
 
         // A live waiter (the suspended run) consumes the context itself once it wakes.

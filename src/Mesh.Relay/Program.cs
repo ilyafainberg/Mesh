@@ -22,7 +22,7 @@ builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.W
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 512 * 1024);
 
 // ---- Durable storage + directed backplane (config-gated, in-memory by default) ------
-// Cosmos connection => durable handle registry / invites / enqueue-first inbox.
+// Cosmos connection => durable handle registry / invites / service directory (metadata only).
 // Redis connection  => multi-replica presence + directed per-node message forwarding.
 var cosmosConn = Config(builder.Configuration, "COSMOS_CONNECTION", "Cosmos:Connection");
 var redisConn = Config(builder.Configuration, "REDIS_CONNECTION", "Redis:Connection");
@@ -38,15 +38,9 @@ IRelayStore store = string.IsNullOrWhiteSpace(cosmosConn)
     ? new InMemoryRelayStore()
     : new CosmosRelayStore(cosmosConn, Config(builder.Configuration, "COSMOS_DB", "Cosmos:Database") ?? "mesh");
 
-// Blob attachment storage (config-gated). When BLOB_CONNECTION is set, the relay issues short-lived SAS
-// URLs so clients upload/download end-to-end-encrypted attachment ciphertext directly to blob storage; the
-// envelope then carries only a pointer. Unset => attachments disabled (endpoints report not configured).
-var blobConn = Config(builder.Configuration, "BLOB_CONNECTION", "Blob:Connection");
-var attachmentsContainer = Config(builder.Configuration, "BLOB_ATTACHMENTS_CONTAINER", "Blob:AttachmentsContainer") ?? AttachmentProtocol.Container;
-IAttachmentStore attachmentStore = string.IsNullOrWhiteSpace(blobConn)
-    ? new DisabledAttachmentStore()
-    : new AzureBlobAttachmentStore(blobConn, attachmentsContainer, MessageLimits.MaxAttachmentBytes,
-        TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(10));
+// Protocol 9 is online-only: attachments are opaque end-to-end-encrypted frames forwarded over the
+// hub exactly like any other payload. The relay never persists attachment ciphertext, so there is no
+// blob store here and no SAS-issuing endpoints.
 
 IBackplane backplane = string.IsNullOrWhiteSpace(redisConn)
     ? new InMemoryBackplane()
@@ -79,7 +73,6 @@ IMessageRateLimiter messageRateLimiter = new PerHandleRateLimiter(ratePolicyProv
 var adminKey = Config(builder.Configuration, "MESH_ADMIN_KEY", "Mesh:AdminKey");
 
 builder.Services.AddSingleton(store);
-builder.Services.AddSingleton(attachmentStore);
 builder.Services.AddSingleton(backplane);
 builder.Services.AddSingleton(quota);
 builder.Services.AddSingleton<IRateLimitStore>(rateLimitStore);
@@ -87,8 +80,7 @@ builder.Services.AddSingleton<IHandleRatePolicyProvider>(ratePolicyProvider);
 builder.Services.AddSingleton<IMessageRateLimiter>(messageRateLimiter);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
-builder.Services.AddSingleton<AgentDispatchCoordinator>();
-builder.Services.AddHostedService<AgentDispatchCoordinator.AgentResponseOutboxWorker>();
+builder.Services.AddSingleton<RelayFrameDedup>();
 builder.Services.AddMeshPush(builder.Configuration);
 builder.Services.AddSingleton<Mesh.Relay.RelayConnectorCatalog>();
 builder.Services.AddHostedService<PresenceRenewer>();
@@ -102,11 +94,9 @@ builder.Services.AddSingleton(metrics);
 // so we do NOT call AddStackExchangeRedis here on purpose.
 builder.Services.AddSignalR(o =>
 {
-    // Transport must accept legacy inline snapshots long enough for MeshHub to return the structured
-    // message_too_large result. A 2 MB frame cap aborts old clients before the hub runs, which makes
-    // every device reconnect and resend forever. Persistence remains protected by the stricter
-    // MessageLimits.MaxEnvelopeBodyBytes check inside SendEnvelope and SendFanout.
-    o.MaximumReceiveMessageSize = MessageLimits.MaxTransportMessageBytes;
+    // The relay forwards opaque frames; the ciphertext ceiling is the protocol transport limit.
+    // A small headroom covers SignalR/JSON envelope overhead around the frame itself.
+    o.MaximumReceiveMessageSize = OnlineReplicationLimits.MaxTransportBytes + 64 * 1024;
     o.EnableDetailedErrors = false;
 });
 
@@ -137,76 +127,26 @@ var modelHttp = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
 
 app.UseRateLimiter();
 
-// When another instance forwards a message to this one, deliver it to the local hub connections.
+// When another instance forwards an in-flight frame to this one, deliver it to the local sockets.
 var router = app.Services.GetRequiredService<MeshRouter>();
 var registry = app.Services.GetRequiredService<ConnectionRegistry>();
-var agentDispatch = app.Services.GetRequiredService<AgentDispatchCoordinator>();
 var connectorCatalog = app.Services.GetRequiredService<Mesh.Relay.RelayConnectorCatalog>();
-await backplane.StartAsync(async (toHandle, envelopeJson) =>
-{
-    // A cross-instance forward may target one specific device (MeshEnvelope.ToDevice). Parse it out of
-    // the envelope JSON so the owning instance re-applies the same per-device filter on local delivery.
-    MeshEnvelope? envelope;
-    try
-    {
-        envelope = JsonSerializer.Deserialize<MeshEnvelope>(envelopeJson, json);
-    }
-    catch (JsonException)
-    {
-        return BackplaneDeliveryReceipt.NotDelivered;
-    }
-    if (envelope is null) return BackplaneDeliveryReceipt.NotDelivered;
-    if (string.Equals(envelope.Kind, MeshHubProtocol.DeviceQueueAvailable, StringComparison.Ordinal))
-    {
-        if (string.IsNullOrWhiteSpace(envelope.ToDevice))
-            return BackplaneDeliveryReceipt.NotDelivered;
-        var connections = registry.ConnectionsForDevice(
-            toHandle, envelope.ToDevice, includeBackgroundSync: false);
-        if (connections.Count == 0)
-            connections = registry.ConnectionsForDevice(
-                toHandle, envelope.ToDevice, includeBackgroundSync: true);
-        if (connections.Count == 0)
-            return BackplaneDeliveryReceipt.NotDelivered;
-        var hubContext = app.Services.GetRequiredService<Microsoft.AspNetCore.SignalR.IHubContext<MeshHub>>();
-        await hubContext.Clients.Clients(connections).SendAsync(MeshHubProtocol.DeviceQueueAvailable);
-        return new BackplaneDeliveryReceipt(BackplaneDeliveryOutcome.Delivered, false);
-    }
-    if (AgentDispatchProtocol.IsAtomicRequest(envelope.Kind))
-    {
-        var delivered = !string.IsNullOrWhiteSpace(envelope.ToDevice)
-                        && await router.DeliverSingleLocalDeviceAsync(
-                            toHandle,
-                            envelopeJson,
-                            envelope.ToDevice,
-                            includeBackgroundSync: false);
-        return delivered
-            ? new BackplaneDeliveryReceipt(BackplaneDeliveryOutcome.Delivered, false)
-            : BackplaneDeliveryReceipt.NotDelivered;
-    }
-    return await router.DeliverLocalWithReceiptAsync(
-        toHandle,
-        envelopeJson,
-        excludeConnectionId: null,
-        toDevice: envelope.ToDevice,
-        includeBackgroundSync: !BackgroundSyncProtocol.RequiresForeground(envelope.Kind));
-});
+await backplane.StartAsync((toHandle, deliveryJson) =>
+    router.DeliverFromBackplaneAsync(toHandle, deliveryJson));
 
 // ---- Health ---------------------------------------------------------------
 var transportCapabilities = new
 {
     protocolVersion = MeshProtocol.Version,
+    onlineOnly = true,
+    durablePayloadStorage = false,
+    metadataStore = durableStorage,
     sendResults = true,
-    ephemeralDelivery = true,
+    presenceResolution = true,
     fanout = true,
-    deviceSync = true,
-    snapshotTransferV2 = true,
     deviceRevocation = true,
-    processingOutcomes = true,
-    authoritativeTopicState = true,
-    atomicAgentDispatch = true,
-    durableDelivery = true,
-    backgroundSync = true,
-    durableStorage,
+    contentlessPush = true,
+    maxTransportBytes = OnlineReplicationLimits.MaxTransportBytes,
     maxFanoutRecipients = FanoutProtocol.MaxRecipients
 };
 app.MapGet("/", () => Results.Ok(new
@@ -292,31 +232,24 @@ app.MapGet("/oauth/google/callback", (HttpContext context) =>
 
 // ---- Metrics (aggregate counts only, no handles/PII) ----------------------
 // Unauthenticated read so ops can scrape it; exposes only process-wide totals + a live gauge.
-app.MapGet("/metrics", async (CancellationToken ct) =>
+// Online-only relay: there is no queue depth, lease, or ack latency to report.
+app.MapGet("/metrics", () =>
 {
     var s = metrics.Snapshot();
-    var inbox = await store.GetInboxStatsAsync(ct);
     var now = DateTimeOffset.UtcNow;
     return Results.Ok(new
     {
         handlesRegistered = s.HandlesRegistered,
-        messagesRouted = s.MessagesRouted,
+        onlineDelivered = s.OnlineDelivered,
+        offlineNacks = s.OfflineNacks,
+        backplaneForwards = s.BackplaneForwards,
+        pushWakes = s.PushWakes,
         hostedModelCalls = s.HostedModelCalls,
         rateLimitRejections = s.RateLimitRejections,
+        framesRejectedTooLarge = s.FramesRejectedTooLarge,
         connected = s.Connected,
-        queueEnqueued = s.QueueEnqueued,
-        queueDepth = inbox.QueuedItems,
-        oldestQueueItemAgeSeconds = inbox.OldestQueuedAt is null
-            ? 0
-            : Math.Max(0, (long)(now - inbox.OldestQueuedAt.Value).TotalSeconds),
-        deliveryAcknowledged = s.DeliveryAcknowledged,
-        deliveryAckLatencyMsAverage = s.DeliveryAcknowledged == 0
-            ? 0
-            : s.DeliveryAckLatencyMsTotal / (double)s.DeliveryAcknowledged,
-        deliveryAckLatencyMsMax = s.DeliveryAckLatencyMsMax,
-        deliveryRedelivered = s.DeliveryRedelivered,
-        queueCancelled = s.QueueCancelled,
-        durableStorage,
+        onlineOnly = true,
+        durablePayloadStorage = false,
         time = now
     });
 });
@@ -407,9 +340,8 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
             platform,
             // Directory honesty: mobile devices never advertise remote hosting.
             DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, platform),
-            req.AtomicAgentDispatchEnabled,
+            req.AgentHostEnabled,
             MeshProtocol.Version);
-        await agentDispatch.DispatchAvailableAsync(handle);
         metrics.HandleRegistered();
         app.Logger.LogInformation("handle registered: {Handle}", handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), created.RegisteredAt));
@@ -436,10 +368,9 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
                 ? DevicePlatforms.CanHostRemoteAgent(req.RemoteAgentEnabled, platform)
                 : existing.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId),
             hasPlatform
-                ? req.AtomicAgentDispatchEnabled
-                : existing.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId),
+                ? req.AgentHostEnabled
+                : existing.DeviceAgentHostEnabled.GetValueOrDefault(deviceId),
             MeshProtocol.Version);
-        await agentDispatch.DispatchAvailableAsync(handle);
         return Results.Ok(new RegisterHandleResponse(handle, DeviceProtocol.DeviceId(req.DevicePublicKey), existing.RegisteredAt));
     }
 
@@ -693,7 +624,9 @@ app.MapGet("/handles/{handle}", async (string handle) =>
     var rec = await store.GetHandleAsync(key);
     if (rec is null) return Results.NotFound();
     var online = await backplane.GetInstanceForAsync(key) is not null;
-    return Results.Ok(new HandleInfo(rec.Handle, rec.DisplayName, rec.DevicePublicKeys, online, rec.RegisteredAt));
+    return Results.Ok(new HandleInfo(
+        rec.Handle, rec.DisplayName, rec.DevicePublicKeys, online, rec.RegisteredAt,
+        rec.AuthGeneration, rec.CustodyHead));
 });
 
 // Per-device directory: metadata is durable, while online state comes from cross-replica presence.
@@ -716,7 +649,7 @@ app.MapGet("/handles/{handle}/devices", async (string handle) =>
             owners[index] is not null,
             rec.DevicePlatforms.GetValueOrDefault(deviceId, DevicePlatforms.Unknown),
             rec.DeviceRemoteAgentEnabled.GetValueOrDefault(deviceId),
-            rec.DeviceAtomicAgentDispatchEnabled.GetValueOrDefault(deviceId),
+            rec.DeviceAgentHostEnabled.GetValueOrDefault(deviceId),
             rec.DeviceProtocolVersions.GetValueOrDefault(deviceId)))
         .ToArray();
 
@@ -765,17 +698,15 @@ app.MapDelete("/handles/{handle}/devices/{deviceId}", async (
 
     registry.RevokeDevice(key, deviceId);
     await backplane.ClearDevicePresenceAsync(key, deviceId);
-    await backplane.ClearTransientDeviceRouteAsync(key, deviceId);
-    if (registry.ConnectionsFor(key, includeBackgroundSync: false).Count == 0)
+    if (registry.ConnectionsFor(key).Count == 0)
         await backplane.ClearPresenceAsync(key);
     app.Logger.LogInformation(
-        "device revoked: {Handle}/{DeviceId}; purged={Purged}",
+        "device revoked: {Handle}/{DeviceId}",
         key,
-        deviceId,
-        result.PurgedEnvelopes);
+        deviceId);
     return Results.Ok(new RevokeDeviceResponse(
         Revoked: true,
-        result.PurgedEnvelopes,
+        0,
         deviceId));
 });
 app.MapPost("/handles/{handle}/agent-routing/query", async (string handle, AgentRoutingQueryRequest req) =>
@@ -830,7 +761,6 @@ app.MapPut("/handles/{handle}/agent-routing", async (string handle, AgentRouting
             statusCode: StatusCodes.Status409Conflict);
     }
 
-    await agentDispatch.DispatchPendingAsync(key);
     var saved = await store.GetHandleAsync(key);
     return Results.Ok(AgentRoutingPolicy.ToInfo(saved!));
 });
@@ -878,60 +808,6 @@ app.MapDelete("/handles/{handle}/push", async (string handle, [Microsoft.AspNetC
 
     await store.RemoveDevicePushTokenAsync(key, deviceId);
     return Results.Ok(new { cleared = deviceId });
-});
-
-// Issue a short-lived SAS URL to upload one end-to-end-encrypted attachment blob. The relay never sees
-// plaintext: the client encrypts locally and uploads ciphertext; the envelope carries only a pointer.
-// Authenticated by device-key proof of possession, exactly like push registration.
-app.MapPost("/handles/{handle}/attachments", async (string handle, AttachmentUploadRequest req) =>
-{
-    if (!attachmentStore.Enabled)
-        return Results.Json(new { error = "attachments not configured" }, statusCode: StatusCodes.Status501NotImplemented);
-
-    var key = Normalize(handle);
-    var rec = await store.GetHandleAsync(key);
-    if (rec is null
-        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
-        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
-        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
-
-    if (req.Size <= 0 || req.Size > attachmentStore.MaxBytes)
-        return Results.Json(new { error = "attachment_too_large", maxBytes = attachmentStore.MaxBytes },
-            statusCode: StatusCodes.Status413PayloadTooLarge);
-
-    var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
-    var message = AttachmentProtocol.UploadMessage(key, deviceId, req.Size);
-    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
-        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
-
-    var (blobId, uploadUrl, expiresAt) = attachmentStore.IssueUpload(req.Size);
-    return Results.Ok(new AttachmentUploadResponse(blobId, uploadUrl, expiresAt, attachmentStore.MaxBytes));
-});
-
-// Issue a short-lived SAS URL to download one attachment blob by id. The blob id is only ever revealed
-// inside the E2EE envelope body, so a caller must already be an intended recipient to know it. Same
-// device-key proof of possession, under the caller's own handle.
-app.MapPost("/handles/{handle}/attachments/{blobId}", async (string handle, string blobId, AttachmentDownloadRequest req) =>
-{
-    if (!attachmentStore.Enabled)
-        return Results.Json(new { error = "attachments not configured" }, statusCode: StatusCodes.Status501NotImplemented);
-    if (!AttachmentProtocol.IsValidBlobId(blobId))
-        return Results.BadRequest(new { error = "invalid blob id" });
-
-    var key = Normalize(handle);
-    var rec = await store.GetHandleAsync(key);
-    if (rec is null
-        || string.IsNullOrWhiteSpace(req.DevicePublicKey)
-        || !rec.DevicePublicKeys.Contains(req.DevicePublicKey))
-        return Results.Json(new { error = "unknown device for handle" }, statusCode: StatusCodes.Status401Unauthorized);
-
-    var deviceId = DeviceProtocol.DeviceId(req.DevicePublicKey);
-    var message = AttachmentProtocol.DownloadMessage(key, deviceId, blobId);
-    if (string.IsNullOrWhiteSpace(req.Signature) || !MeshCrypto.Verify(req.DevicePublicKey, message, req.Signature))
-        return Results.Json(new { error = "invalid signature" }, statusCode: StatusCodes.Status401Unauthorized);
-
-    var (downloadUrl, expiresAt) = attachmentStore.IssueDownload(blobId);
-    return Results.Ok(new AttachmentDownloadResponse(downloadUrl, expiresAt));
 });
 
 app.MapDelete("/handles/{handle}", async (string handle, [Microsoft.AspNetCore.Mvc.FromBody] DeleteHandleRequest req) =>

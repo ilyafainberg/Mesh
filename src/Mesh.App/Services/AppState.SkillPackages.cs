@@ -101,27 +101,76 @@ public sealed partial class AppState
 
         if (PlatformCaps.IsMobile)
         {
-            // Mobile: Skill.md instructions only, zero package rows, zero materialization.
+            // Mobile: Skill.md instructions only, zero package rows, zero package bytes, zero
+            // materialization and zero package-transfer events. This device permanently rejects the
+            // package transfer surface, so the archive files are never routed anywhere from here.
             SaveAssetContent(AssetKind.Skill, skill.Id, profile => profile.Skills.Add(skill));
             return SkillPackageInstallResult.Installed(skill, verdict);
         }
 
-        // Desktop: write the complete package rows first (transactional in the DB).
+        // Desktop: the package rows and EVERY package-transfer event row (with its outbox
+        // references and sequence allocation) commit in ONE transaction, so an installed package
+        // can never be observable without its durable pending transfer.
         var db = ActiveDbOrThrow();
-        await Task.Run(() => db.InstallSkillPackage(skill.Id, manifest, content.Files), cancellationToken)
-            .ConfigureAwait(false);
+        var payload = SkillPackageTransfer.Serialize(skill, content);
+        var transferHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(payload))
+            .ToLowerInvariant();
+        var chunks = SkillPackageTransfer.Chunk(payload, (int)ReplicationDomainStore.MaxChunkBytes);
+        var targets = TargetsForOwnerState();
 
-        // Then persist the Skill summary/body asset. If that fails synchronously, roll the rows back so
-        // the DB never keeps package rows for a skill the asset store never learned about.
-        try
+        var envelopes = new List<ReplicationPayloadCodec.DomainEnvelope>(chunks.Count);
+        for (var index = 0; index < chunks.Count; index++)
         {
-            SaveAssetContent(AssetKind.Skill, skill.Id, profile => profile.Skills.Add(skill));
+            var body = System.Text.Json.JsonSerializer.Serialize(
+                new ReplicationDomainStore.PackageChunkBody(
+                    index, chunks.Count, payload.LongLength, transferHash,
+                    Convert.ToBase64String(chunks[index]), skill.Name, "application/vnd.mesh.skill-package"),
+                ReplicationJson);
+            envelopes.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                Mesh.Shared.ReplicationOpKinds.Asset,
+                ReplicationPayloadCodec.DomainAction.PackageTransfer,
+                skill.Id, null, NewReplicationVersion(), body));
         }
-        catch
+
+        var (skillRecord, skillContent) = AssetPersistenceModels.ToRecord(
+            skill,
+            LocalDeviceId() ?? throw new ReplicationIdentityMissingException(
+                "No local device identity exists for the skill package."),
+            localOnly: false,
+            version: 1);
+
+        await Task.Run(() =>
         {
-            try { db.DeleteSkillPackage(skill.Id, manifest.PackageHash); } catch { }
-            throw;
+            EnsureLocalJournal().EmitLocalBatch(envelopes, targets, (conn, tx, index) =>
+            {
+                if (index == 0)
+                {
+                    SkillPackageRows.Install(conn, tx, skill.Id, manifest, content.Files);
+                    Protocol9DomainTables.UpsertAsset(
+                        conn,
+                        tx,
+                        AssetKind.Skill,
+                        skill.Id,
+                        skillRecord.Name,
+                        skillRecord.MetadataJson,
+                        skillRecord.ContentMime,
+                        skillContent,
+                        skillRecord.Version,
+                        skillRecord.SourceDeviceId,
+                        skillRecord.UpdatedAt,
+                        localOnly: false);
+                }
+            });
+        }, cancellationToken).ConfigureAwait(false);
+
+        lock (profileSyncGate)
+        {
+            Profile.Skills.RemoveAll(existing =>
+                string.Equals(existing.Id, skill.Id, StringComparison.Ordinal));
+            Profile.Skills.Add(skill);
         }
+        assetContentCache.Set(CacheKey(AssetKind.Skill, skill.Id), skillContent);
+        NotifyChanged();
 
         return SkillPackageInstallResult.Installed(skill, verdict);
     }

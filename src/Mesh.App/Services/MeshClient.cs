@@ -14,13 +14,12 @@ namespace Mesh.App.Services;
 /// keepalive and automatic reconnection; this client adds the device-key auth handshake,
 /// end-to-end encryption, and dispatch of inbound messages to the agent and UI.
 /// </summary>
-public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncTransport
+public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicationWakeTransport
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan GroupKeyCacheLifetime = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan DeviceSyncTargetCacheLifetime = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan DeviceSyncActivityQuietPeriod = TimeSpan.FromSeconds(1.5);
-    private const int DeviceSyncSnapshotBatchSize = 100;
+    private static readonly TimeSpan ReplicationActivityQuietPeriod = TimeSpan.FromSeconds(1.5);
+    private const int ReplicationBatchSize = 100;
     private readonly AppState state;
     private readonly AgentService agent;
     private readonly ITopicTurnRunner topicTurnRunner;
@@ -28,7 +27,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
     private readonly INotifier notifier;
     private readonly IPushService push;
     private readonly IAppLifecycleState lifecycle;
-    private readonly DeviceTopicAttachmentInbox attachmentInbox = new();
+    private readonly TopicAttachmentAssembler attachmentAssembler = new();
     private readonly ConcurrentDictionary<string, ActiveTopicRun> activeTopicRuns = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> topicEnvelopeReplay = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> guestAgentGates = new(StringComparer.OrdinalIgnoreCase);
@@ -39,29 +38,25 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
     private long nextBackgroundTaskId;
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> keyCacheUpdated = new(StringComparer.OrdinalIgnoreCase);
-    private readonly SemaphoreSlim deviceSyncSendGate = new(1, 1);
-    private readonly SemaphoreSlim deviceSyncSnapshotSendGate = new(1, 1);
-    private readonly SemaphoreSlim deviceSyncDrainGate = new(1, 1);
-    private readonly DeviceSyncActivityTracker deviceSyncActivity = new(DeviceSyncActivityQuietPeriod);
+    private readonly SemaphoreSlim replicationSendGate = new(1, 1);
+    private readonly SemaphoreSlim replicationSnapshotSendGate = new(1, 1);
+    private readonly SemaphoreSlim replicationDrainGate = new(1, 1);
+    private readonly ReplicationActivityTracker replicationActivity = new(ReplicationActivityQuietPeriod);
     private HubConnection? hub;
     private volatile bool authenticated;
     private volatile bool supportsSendResults;
     private volatile bool supportsEphemeralDelivery;
     private volatile bool supportsFanout;
-    private volatile bool supportsDeviceSync;
+    private volatile bool supportsReplication;
     private volatile bool supportsDeviceRevocation;
     private volatile bool supportsAuthoritativeTopicState;
-    private volatile bool supportsAtomicAgentDispatch;
-    private volatile bool supportsDurableDelivery;
-    private readonly SemaphoreSlim durableFlushGate = new(1, 1);
+    private volatile bool supportsAgentHost;
+    private readonly SemaphoreSlim onlineFlushGate = new(1, 1);
     private readonly SemaphoreSlim connectionGate = new(1, 1);
-    private volatile DeviceSyncIdentity? authenticatedDeviceSyncIdentity;
+    private volatile ReplicationConnectionIdentity? authenticatedReplicationConnectionIdentity;
     private volatile bool wantConnected;   // the user intends to be connected; drives auto-recovery
     private int reconnectScheduled;         // 0/1 guard so only one recovery loop runs at a time
-    private int durableRetryScheduled;
-    private IReadOnlyList<string> deviceSyncTargetCache = Array.Empty<string>();
-    private DateTimeOffset deviceSyncTargetCacheUpdated;
-    private string deviceSyncTargetCacheIdentity = "";
+    private int onlineRetryScheduled;
 
     public MeshClient(
         AppState state,
@@ -80,13 +75,12 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         this.push = push;
         this.lifecycle = lifecycle;
         lifecycle.ForegroundChanged += OnForegroundChanged;
-        state.DeviceSyncOperationCreated += OnDeviceSyncOperationCreated;
-        InitializeMesh117Sync();
-        deviceSyncActivity.Changed += () => DeviceSyncStateChanged?.Invoke();
+        lifecycle.ForegroundChanged += OnReplicationForegroundChanged;
+        state.ActiveAccountChanging += StopReplication;
+        replicationActivity.Changed += () => ReplicationStateChanged?.Invoke();
         Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged += OnConnectivityChanged;
     }
-
-    private sealed record DeviceSyncIdentity(
+    private sealed record ReplicationConnectionIdentity(
         HubConnection Connection,
         string Handle,
         string NormalizedHandle,
@@ -95,7 +89,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         string PrivateKey,
         string RelayUrl);
 
-    private enum DeviceSyncSendOutcome
+    private enum ReplicationSendOutcome
     {
         Accepted,
         Deferred,
@@ -115,15 +109,15 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
     }
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
-    public bool IsDeviceSnapshotSyncing => deviceSyncActivity.IsActive;
-    public bool SupportsAtomicAgentDispatch => supportsAtomicAgentDispatch;
+    public bool IsReplicationActive => replicationActivity.IsActive;
+    public bool SupportsAgentHost => supportsAgentHost;
     public bool SupportsDeviceRevocation => supportsDeviceRevocation;
     public bool SupportsAuthoritativeTopicState => supportsAuthoritativeTopicState;
-    public string AgentQuestionKind => supportsAtomicAgentDispatch
+    public string AgentQuestionKind => supportsAgentHost
         ? MeshKinds.AtomicAgentRequest
         : MeshKinds.Chat;
     public event Action? StateChanged;
-    public event Action? DeviceSyncStateChanged;
+    public event Action? ReplicationStateChanged;
     public event Action<string>? Log;
 
     /// <summary>
@@ -176,7 +170,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     deviceName,
                     PlatformCaps.DevicePlatform,
                     PlatformCaps.CanRunAgent && agent.IsModelReady,
-                    AtomicAgentDispatchEnabled: true,
+                    AgentHostEnabled: true,
                     ProtocolVersion: MeshProtocol.Version));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
             if (resp.IsSuccessStatusCode) return true;
@@ -381,8 +375,34 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                 return;
             }
 
-            var deliveryQuery = supportsDurableDelivery ? "&deliveryAck=1" : "";
-            var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(AppState.Norm(p.Handle))}{deliveryQuery}&protocolVersion={MeshProtocol.Version}";
+            var normHandle = AppState.Norm(p.Handle);
+            var connectDeviceId = MyDeviceId;
+            // Read this handle's own relay authority so the connect query and the signed connect
+            // challenge both bind the current auth generation and custody head the landed hub verifies
+            // (MeshHub.OnConnectedAsync / Authenticate). A genesis handle legitimately reports 0 / "".
+            long connectAuthGeneration = 0;
+            string connectCustodyHead = "";
+            try
+            {
+                var ownInfo = await ((IReplicationMetadataSource)this)
+                    .FetchHandleAsync(normHandle, CancellationToken.None);
+                if (ownInfo is null)
+                    throw new OnlineReplicationError(
+                        "The relay did not return this account's replication authority.");
+                connectAuthGeneration = ownInfo.AuthGeneration;
+                connectCustodyHead = ownInfo.CustodyHead ?? "";
+            }
+            catch (Exception ex)
+            {
+                Log?.Invoke($"replication authority lookup failed: {ex.Message}");
+                throw new InvalidOperationException(
+                    "Could not establish the account's Protocol 9 authority.",
+                    ex);
+            }
+            this.connectAuthGeneration = connectAuthGeneration;
+            this.connectCustodyHead = connectCustodyHead;
+
+            var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(normHandle)}&protocolVersion={MeshProtocol.Version}&deviceId={Uri.EscapeDataString(connectDeviceId)}&authGeneration={connectAuthGeneration}&custodyHead={Uri.EscapeDataString(connectCustodyHead)}";
             var connection = new HubConnectionBuilder()
                 .WithUrl(url)
                 .WithAutomaticReconnect(new ForeverRetry())
@@ -394,17 +414,26 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     && response.ServerVersion == MeshProtocol.Version)
                     return;
                 authenticated = false;
-                authenticatedDeviceSyncIdentity = null;
+                authenticatedReplicationConnectionIdentity = null;
                 Log?.Invoke(response.Error ?? $"relay protocol mismatch: expected {MeshProtocol.Version}, got {response.ServerVersion}");
                 TrackBackground(connection.StopAsync(), "protocol mismatch disconnect");
             });
 
-            // The relay opens with a nonce challenge; sign it with the device key to authenticate.
+            // The relay opens with a nonce challenge; sign the canonical connect string (nonce bound to
+            // handle, device, protocol version and current custody authority) so the landed hub can
+            // verify current authority, not just replay resistance.
             connection.On<string>(MeshHubProtocol.Challenge, async nonce =>
             {
                 try
                 {
-                    var sig = IdentityService.Sign(state.Profile.PrivateKey, nonce);
+                    var canonical = ReplicationConnectChallenge.Canonical(
+                        nonce,
+                        AppState.Norm(state.Profile.Handle),
+                        MyDeviceId,
+                        MeshProtocol.Version,
+                        this.connectAuthGeneration,
+                        this.connectCustodyHead);
+                    var sig = IdentityService.Sign(state.Profile.PrivateKey, canonical);
                     await connection.SendAsync(MeshHubProtocol.Authenticate, state.Profile.PublicKey, sig);
                 }
                 catch (Exception ex) { Log?.Invoke($"auth failed: {ex.Message}"); }
@@ -413,34 +442,24 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             connection.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, _ =>
             {
                 authenticated = true;
-                var identity = CaptureDeviceSyncIdentity(connection);
-                authenticatedDeviceSyncIdentity = identity;
+                var identity = CaptureReplicationConnectionIdentity(connection);
+                authenticatedReplicationConnectionIdentity = identity;
                 Log?.Invoke("hub connected + authenticated");
                 StateChanged?.Invoke();
                 if (!lifecycle.IsForeground) return;
-                if (identity is not null)
-                    TrackBackground(RunDeviceSyncHandshakeAsync(identity), "device sync handshake");
                 TryRegisterPushToken();
                 if (identity is not null)
                 {
-                    TrackBackground(RecoverDurableDeliveryAsync(identity), "durable delivery recovery");
-                    TrackBackground(MaintainDurableDeliveryAsync(identity), "durable delivery maintenance");
+                    TrackBackground(RecoverOnlineDeliveryAsync(identity), "durable delivery recovery");
+                    TrackBackground(MaintainOnlineDeliveryAsync(identity), "durable delivery maintenance");
                 }
+                // Automatically arm Protocol-9 online replication for the authenticated active profile.
+                // This is the production entry point (never an external configuration call): it builds
+                // the real identity/roster and starts the presence poller. Foreground only; the poller
+                // is paused in the background where the transport itself is suspended.
+                TrackBackground(ArmReplicationAsync(), "online replication arm");
             });
 
-            connection.On(MeshHubProtocol.DeviceQueueAvailable, () =>
-            {
-                var identity = authenticatedDeviceSyncIdentity;
-                if (identity is not null && IsCurrentDeviceSyncIdentity(identity))
-                    TrackBackground(
-                        CoalescedDrainDeviceSyncQueueAsync(
-                            identity,
-                            lifecycle.IsForeground
-                                ? InboundProcessingMode.Foreground
-                                : InboundProcessingMode.Background,
-                            CancellationToken.None),
-                        "device sync queue");
-            });
 
             connection.On<string>(MeshHubProtocol.Receive, async envelopeJson =>
             {
@@ -453,15 +472,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     var mode = lifecycle.IsForeground
                         ? InboundProcessingMode.Foreground
                         : InboundProcessingMode.Background;
-                    var disposition = await ProcessInboundAsync(
-                        env, mode, authenticatedDeviceSyncIdentity, supportsDeviceSync, CancellationToken.None);
-                    if (InboundAcknowledgementPolicy.ShouldAcknowledge(disposition)
-                        && !string.IsNullOrWhiteSpace(env.RelayDeliveryId))
-                    {
-                        // The delivery marker is authoritative even when the health probe was unavailable.
-                        supportsDurableDelivery = true;
-                        await AcknowledgeDeliveryAsync(connection, env);
-                    }
+                    await ProcessInboundAsync(
+                        env, mode, authenticatedReplicationConnectionIdentity, supportsReplication, CancellationToken.None);
                 }
                 catch (Exception ex)
                 {
@@ -474,7 +486,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             connection.Reconnecting += _ =>
             {
                 authenticated = false;
-                authenticatedDeviceSyncIdentity = null;
+                authenticatedReplicationConnectionIdentity = null;
                 StateChanged?.Invoke();
                 return Task.CompletedTask;
             };
@@ -487,7 +499,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             connection.Closed += _ =>
             {
                 authenticated = false;
-                authenticatedDeviceSyncIdentity = null;
+                authenticatedReplicationConnectionIdentity = null;
                 StateChanged?.Invoke();
                 // SignalR's own auto-reconnect has given up by the time Closed fires. If the user still
                 // wants to be connected, keep trying ourselves so a long drop does not strand us offline.
@@ -496,6 +508,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             };
 
             hub = connection;
+            // Protocol-9 online replication: opaque Relay send + Deliver/PresenceChanged/Wake inbound.
+            RegisterOnlineReplicationHandlers(connection);
             try
             {
                 await connection.StartAsync();
@@ -520,13 +534,13 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         bool SendResults,
         bool EphemeralDelivery,
         bool Fanout,
-        bool DeviceSync,
+        bool Replication,
         bool SnapshotTransferV2,
         bool DeviceRevocation,
         bool AuthoritativeTopicState,
-        bool AtomicAgentDispatch,
-        bool DurableDelivery,
-        bool BackgroundSync);
+        bool AgentHost,
+        bool OnlineDelivery,
+        bool WakeConnect);
 
     private async Task<RelayCapabilities> ReadRelayCapabilitiesAsync(
         string relayUrl,
@@ -552,18 +566,18 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                 && ephemeralDelivery.ValueKind == JsonValueKind.True,
             capabilities.TryGetProperty("fanout", out var fanout)
                 && fanout.ValueKind == JsonValueKind.True,
-            capabilities.TryGetProperty("deviceSync", out var deviceSync)
-                && deviceSync.ValueKind == JsonValueKind.True,
+            capabilities.TryGetProperty("replication", out var replication)
+                && replication.ValueKind == JsonValueKind.True,
             true,
             capabilities.TryGetProperty("deviceRevocation", out var deviceRevocation)
                 && deviceRevocation.ValueKind == JsonValueKind.True,
             capabilities.TryGetProperty("authoritativeTopicState", out var authoritativeTopicState)
                 && authoritativeTopicState.ValueKind == JsonValueKind.True,
-            capabilities.TryGetProperty("atomicAgentDispatch", out var atomicDispatch)
-                && atomicDispatch.ValueKind == JsonValueKind.True,
-            capabilities.TryGetProperty("durableDelivery", out var durableDelivery)
-                && durableDelivery.ValueKind == JsonValueKind.True,
-            BackgroundSyncCapabilityPolicy.IsSupported(capabilities));
+            capabilities.TryGetProperty("agentHost", out var agentHostCap)
+                && agentHostCap.ValueKind == JsonValueKind.True,
+            capabilities.TryGetProperty("onlineDelivery", out var onlineDelivery)
+                && onlineDelivery.ValueKind == JsonValueKind.True,
+            OnlineReplicationWakeCapabilityPolicy.IsSupported(capabilities));
     }
 
     private async Task<bool> DetectRelayCapabilitiesAsync(string relayUrl)
@@ -571,11 +585,10 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         supportsSendResults = false;
         supportsEphemeralDelivery = false;
         supportsFanout = false;
-        supportsDeviceSync = false;
+        supportsReplication = false;
         supportsDeviceRevocation = false;
         supportsAuthoritativeTopicState = false;
-        supportsAtomicAgentDispatch = false;
-        supportsDurableDelivery = false;
+        supportsAgentHost = false;
         try
         {
             var capabilities = await ReadRelayCapabilitiesAsync(relayUrl);
@@ -585,21 +598,20 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                 return false;
             }
             if (!capabilities.SendResults
-                || !capabilities.DeviceSync
+                || !capabilities.Replication
                 || !capabilities.SnapshotTransferV2
-                || !capabilities.DurableDelivery)
+                || !capabilities.OnlineDelivery)
             {
-                Log?.Invoke("relay protocol 8 is missing required synchronization capabilities");
+                Log?.Invoke("relay is missing required online replication capabilities");
                 return false;
             }
             supportsSendResults = capabilities.SendResults;
             supportsEphemeralDelivery = capabilities.EphemeralDelivery;
             supportsFanout = capabilities.Fanout;
-            supportsDeviceSync = capabilities.DeviceSync;
+            supportsReplication = capabilities.Replication;
             supportsDeviceRevocation = capabilities.DeviceRevocation;
             supportsAuthoritativeTopicState = capabilities.AuthoritativeTopicState;
-            supportsAtomicAgentDispatch = capabilities.AtomicAgentDispatch;
-            supportsDurableDelivery = capabilities.DurableDelivery;
+            supportsAgentHost = capabilities.AgentHost;
             return true;
         }
         catch (Exception ex)
@@ -649,9 +661,9 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     if (!wantConnected) break;
                     if (Connected)
                     {
-                        var identity = authenticatedDeviceSyncIdentity;
+                        var identity = authenticatedReplicationConnectionIdentity;
                         if (identity is not null)
-                            await RecoverDurableDeliveryAsync(identity);
+                            await RecoverOnlineDeliveryAsync(identity);
                         break;
                     }
                     if (hub?.State is HubConnectionState.Connecting
@@ -691,8 +703,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
     private async Task HandleInboundAsync(
         MeshEnvelope env,
         InboundProcessingMode mode,
-        DeviceSyncIdentity? sessionIdentity,
-        bool sessionSupportsDeviceSync,
+        ReplicationConnectionIdentity? sessionIdentity,
+        bool sessionSupportsReplication,
         CancellationToken ct,
         Action<Func<Task>>? registerPostAcknowledgement = null)
     {
@@ -702,23 +714,23 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             Log?.Invoke($"dropped retired remote-agent envelope {env.Kind}");
             return;
         }
-        if (AgentDispatchProtocol.IsAtomicRequest(env.Kind)
+        if (string.Equals(env.Kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal)
             && (!string.Equals(env.ToDevice, MyDeviceId, StringComparison.Ordinal)
                 || string.IsNullOrWhiteSpace(env.AgentRequestId)
                 || !string.Equals(env.AgentRequestId, env.Id, StringComparison.Ordinal)
-                || string.IsNullOrWhiteSpace(env.AgentDispatchToken)))
+                || false))
         {
             Log?.Invoke("dropped atomic agent request with invalid assignment metadata");
             return;
         }
         var isGroupKind = env.Kind is MeshKinds.GroupControl or MeshKinds.GroupMessage or MeshKinds.Fanout;
-        var isDeviceSync = DeviceSyncKinds.IsEnvelopeKind(env.Kind);
+        var isReplication = false;
         var isTopicKind = env.Kind is MeshKinds.TopicRunRequest
             or MeshKinds.TopicRunUpdate
             or MeshKinds.TopicRunCancel
             or MeshKinds.AttachmentChunk
             or MeshKinds.TopicAttachmentChunk;
-        var isOwnDeviceKind = isDeviceSync
+        var isOwnDeviceKind = isReplication
             || isTopicKind;
         if (env.Kind == MeshKinds.Fanout
             && env.ToDevice is not null
@@ -743,17 +755,16 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         // Client-side verification: check the sender's signature against their pinned signing
         // keys (trust on first use). This defends against a malicious or compromised relay
         // forging or tampering with messages. On first contact we fetch and pin the keys.
-        DeviceSyncIdentity? inboundOwnDeviceIdentity = null;
+        ReplicationConnectionIdentity? inboundOwnDeviceIdentity = null;
         var requireCurrentIdentity = mode == InboundProcessingMode.Foreground;
         List<string> pinned;
         if (isOwnDeviceKind)
         {
-            inboundOwnDeviceIdentity = sessionIdentity ?? authenticatedDeviceSyncIdentity;
+            inboundOwnDeviceIdentity = sessionIdentity ?? authenticatedReplicationConnectionIdentity;
             if (inboundOwnDeviceIdentity is null)
                 throw new InboundRetryException("own_device_identity_unavailable");
-            pinned = (await ResolveOwnDeviceKeysAsync(
-                inboundOwnDeviceIdentity, requireCurrent: requireCurrentIdentity)).ToList();
-            if (!IsDeviceSyncIdentityUsable(inboundOwnDeviceIdentity, requireCurrentIdentity))
+            pinned = (await ResolveDeviceKeysAsync(from)).ToList();
+            if (!IsReplicationConnectionIdentityUsable(inboundOwnDeviceIdentity, requireCurrentIdentity))
                 throw new InboundRetryException("own_device_identity_changed");
             if (isTopicKind)
                 pinned = pinned.Where(key =>
@@ -772,13 +783,12 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         var signatureValid = MeshCrypto.VerifyAny(pinned, env.Body, env.Signature ?? "");
         if (!signatureValid && isOwnDeviceKind && inboundOwnDeviceIdentity is not null)
         {
-            pinned = (await ResolveOwnDeviceKeysAsync(
-                inboundOwnDeviceIdentity, refresh: true, requireCurrent: requireCurrentIdentity)).ToList();
+            pinned = (await ResolveDeviceKeysAsync(from, refresh: true)).ToList();
             if (isTopicKind)
                 pinned = pinned.Where(key =>
                         string.Equals(DeviceProtocol.DeviceId(key), env.FromDevice, StringComparison.Ordinal))
                     .ToList();
-            if (!IsDeviceSyncIdentityUsable(inboundOwnDeviceIdentity, requireCurrentIdentity))
+            if (!IsReplicationConnectionIdentityUsable(inboundOwnDeviceIdentity, requireCurrentIdentity))
                 throw new InboundRetryException("own_device_identity_changed");
             if (pinned.Count == 0)
                 throw new InboundRetryException("own_device_keys_unavailable");
@@ -799,19 +809,6 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             throw new InboundPermanentRejectException("signature_invalid");
         }
 
-        if (isDeviceSync)
-        {
-            await HandleInboundDeviceSyncAsync(
-                env,
-                from,
-                mode,
-                inboundOwnDeviceIdentity,
-                sessionSupportsDeviceSync,
-                ct,
-                registerPostAcknowledgement);
-            return;
-        }
-
         if (isTopicKind)
         {
             await HandleInboundTopicAsync(env, from, mode, ct);
@@ -829,8 +826,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             return;
         }
 
-        var isAtomicAgentEnvelope = AgentDispatchProtocol.IsAtomicRequest(env.Kind)
-                                    || AgentDispatchProtocol.IsAtomicResponse(env.Kind);
+        var isAtomicAgentEnvelope = string.Equals(env.Kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal)
+                                    || string.Equals(env.Kind, MeshKinds.AtomicAgentResponse, StringComparison.Ordinal);
         if (isAtomicAgentEnvelope && !MessageCrypto.IsEncrypted(env.Body))
         {
             Log?.Invoke($"dropped {env.Kind} from @{from}: encryption is required");
@@ -851,7 +848,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         }
 
         // Public service invocation. Handled BEFORE the allow-list gate below: any handle may invoke a
-        // public-listed service, so it must not be dropped into the request inbox for non-contacts.
+        // public-listed service, so it must not be dropped into the request staging for non-contacts.
         // The answer comes from a hard-sandboxed, service-scoped agent (public KB/Skills/Widgets only,
         // no tools of any kind).
         if (env.Kind == MeshKinds.ServiceRequest)
@@ -952,7 +949,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
 
         if (!allowed)
         {
-            // Unknown/!allowed -> drop into request inbox, do NOT engage the agent.
+            // Unknown/!allowed -> drop into request staging, do NOT engage the agent.
             var isNew = false;
             state.Mutate(x =>
             {
@@ -1099,7 +1096,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                 return;
             }
 
-            var atomic = AgentDispatchProtocol.IsAtomicRequest(request.Kind);
+            var atomic = string.Equals(request.Kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal);
             if (state.RequiresApproval(from))
             {
                 state.Mutate(x => x.Approvals.Add(new PendingApproval
@@ -1107,8 +1104,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     From = from,
                     RequestBody = text,
                     DraftReply = reply,
-                    AgentRequestId = atomic ? request.AgentRequestId : null,
-                    AgentDispatchToken = atomic ? request.AgentDispatchToken : null
+                    AgentRequestId = atomic ? request.AgentRequestId : null
                 }));
                 if (!state.Profile.DoNotDisturb)
                     notifier.Notify("Reply needs your approval",
@@ -1124,8 +1120,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                 atomic ? MeshKinds.AtomicAgentResponse : MeshKinds.AgentResponse,
                 reply,
                 line.Id,
-                agentRequestId: atomic ? request.AgentRequestId : null,
-                agentDispatchToken: atomic ? request.AgentDispatchToken : null);
+                agentRequestId: atomic ? request.AgentRequestId : null);
         }
         finally
         {
@@ -1160,7 +1155,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                     Log?.Invoke($"dropped replayed topic envelope {env.Id}");
                     return;
                 }
-                if (!attachmentInbox.TryAdd(env.FromDevice, chunk, out var chunkError))
+                if (!attachmentAssembler.TryAdd(env.FromDevice, chunk, out var chunkError))
                 {
                     if (InboundAttachmentFailurePolicy.ShouldRetry(chunkError))
                         throw new InboundRetryException("topic_attachment_retry:" + chunkError);
@@ -1176,7 +1171,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                 if (!string.Equals(request.TargetDeviceId, MyDeviceId, StringComparison.Ordinal)
                     || !string.Equals(AppState.Norm(request.TriggerHandle), me, StringComparison.Ordinal))
                 {
-                    attachmentInbox.RejectRun(env.FromDevice, request.RunId);
+                    attachmentAssembler.RejectRun(env.FromDevice, request.RunId);
                     throw new InboundPermanentRejectException("topic_request_route_invalid");
                 }
                 if (await TryHandlePreCancelledInboundRequestAsync(request, env.FromDevice, ct))
@@ -1515,7 +1510,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         {
             if (enteredExecutionGate) executionGate.Release();
             activeTopicRuns.TryRemove(active.RunId, out _);
-            attachmentInbox.RejectRun(active.SourceDeviceId, active.RunId);
+            attachmentAssembler.RejectRun(active.SourceDeviceId, active.RunId);
             active.Cancellation.Dispose();
             StartNextInboundTopicRun(active.ThreadId);
         }
@@ -1545,7 +1540,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             return downloaded;
         }
 
-        return await attachmentInbox.WaitForAsync(
+        return await attachmentAssembler.WaitForAsync(
             active.SourceDeviceId,
             request.RunId,
             request.Attachments,
@@ -1598,7 +1593,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             var phaseChanged = active.LastDurablePhase != update.Phase;
             if (phaseChanged)
             {
-                var durable = DurableTopicState(update);
+                var durable = TopicExecutionState(update);
                 if (await SendTargetedTopicEnvelopeAsync(
                         active.SourceDeviceId,
                         MeshKinds.TopicRunUpdate,
@@ -1620,11 +1615,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         ActiveTopicRun active,
         TopicRunUpdatePayload update)
     {
-        var identity = authenticatedDeviceSyncIdentity;
+        var identity = authenticatedReplicationConnectionIdentity;
         if (!supportsEphemeralDelivery
             || identity is null
             || !Connected
-            || !IsCurrentDeviceSyncIdentity(identity))
+            || !IsCurrentReplicationConnectionIdentity(identity))
             return false;
         var result = await TrySendTargetedTopicEnvelopeCoreAsync(
             identity,
@@ -1644,7 +1639,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
            || update.Steps is { Count: > 0 }
            || update.Delta is { Length: > 0 };
 
-    private static TopicRunUpdatePayload DurableTopicState(TopicRunUpdatePayload update)
+    private static TopicRunUpdatePayload TopicExecutionState(TopicRunUpdatePayload update)
         => update with
         {
             Status = update.Phase switch
@@ -1731,7 +1726,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
     {
         if (string.IsNullOrWhiteSpace(id)) return false;
         var now = DateTimeOffset.UtcNow;
-        const int maxReplayEntries = DeviceTopicAttachmentInbox.MaxPendingRuns
+        const int maxReplayEntries = TopicAttachmentAssembler.MaxPendingRuns
                                      * AttachmentChunkProtocol.MaxChunks
                                      * 8;
         if (cache.Count >= maxReplayEntries)
@@ -1757,7 +1752,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    private DeviceSyncIdentity? CaptureDeviceSyncIdentity(HubConnection connection)
+    private ReplicationConnectionIdentity? CaptureReplicationConnectionIdentity(HubConnection connection)
     {
         var p = state.Profile;
         var handle = AppState.Norm(p.Handle);
@@ -1769,7 +1764,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             || string.IsNullOrWhiteSpace(p.PublicKey)
             || string.IsNullOrWhiteSpace(p.PrivateKey))
             return null;
-        return new DeviceSyncIdentity(
+        return new ReplicationConnectionIdentity(
             connection,
             p.Handle,
             handle,
@@ -1779,7 +1774,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             p.RelayUrl.TrimEnd('/'));
     }
 
-    private bool MatchesActiveProfile(DeviceSyncIdentity identity)
+    private bool MatchesActiveProfile(ReplicationConnectionIdentity identity)
     {
         var p = state.Profile;
         return identity.Connection.State == HubConnectionState.Connected
@@ -1790,773 +1785,14 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             && string.Equals(MyDeviceId, identity.DeviceId, StringComparison.Ordinal);
     }
 
-    private bool IsDeviceSyncIdentityUsable(DeviceSyncIdentity identity, bool requireCurrent)
-        => requireCurrent ? IsCurrentDeviceSyncIdentity(identity) : MatchesActiveProfile(identity);
+    private bool IsReplicationConnectionIdentityUsable(ReplicationConnectionIdentity identity, bool requireCurrent)
+        => requireCurrent ? IsCurrentReplicationConnectionIdentity(identity) : MatchesActiveProfile(identity);
 
-    private bool IsCurrentDeviceSyncIdentity(DeviceSyncIdentity identity)
+    private bool IsCurrentReplicationConnectionIdentity(ReplicationConnectionIdentity identity)
         => MatchesActiveProfile(identity)
             && ReferenceEquals(hub, identity.Connection)
             && authenticated
-            && ReferenceEquals(authenticatedDeviceSyncIdentity, identity);
-
-    private void OnDeviceSyncOperationCreated(DeviceSyncOperation operation)
-    {
-        var identity = authenticatedDeviceSyncIdentity;
-        if (identity is null || !Connected || !supportsSendResults || !supportsDeviceSync)
-            return;
-        if (!string.Equals(operation.SourceDeviceId, identity.DeviceId, StringComparison.Ordinal))
-        {
-            Log?.Invoke("device sync live operation dropped: source device did not match current identity");
-            return;
-        }
-        TrackBackground(FanOutDeviceSyncOperationAsync(identity, operation), "device sync fan-out");
-    }
-
-    private async Task FanOutDeviceSyncOperationAsync(
-        DeviceSyncIdentity identity, DeviceSyncOperation operation)
-    {
-        await deviceSyncSendGate.WaitAsync();
-        try
-        {
-            if (!IsCurrentDeviceSyncIdentity(identity)
-                || !supportsSendResults
-                || !supportsDeviceSync)
-                return;
-            var targets = await GetDeviceSyncTargetsAsync(identity, refresh: false);
-            if (!IsCurrentDeviceSyncIdentity(identity)) return;
-            var operations = new[] { operation };
-            var batch = new DeviceSyncBatch(
-                DeviceSyncEnvelopeIdProtocol.LiveBatchId(identity.DeviceId, operations),
-                identity.DeviceId,
-                false,
-                operations);
-            var body = JsonSerializer.Serialize(batch, Json);
-            foreach (var target in targets)
-            {
-                if (!IsCurrentDeviceSyncIdentity(identity)) return;
-                var outcome = await SendDeviceSyncEnvelopeWithOutcomeAsync(
-                    identity, target, DeviceSyncKinds.EnvelopeOperation, body, CancellationToken.None);
-                if (outcome == DeviceSyncSendOutcome.TooLarge)
-                    Log?.Invoke($"device sync operation to {target} exceeded the protocol envelope limit");
-            }
-        }
-        catch (Exception ex)
-        {
-            Log?.Invoke($"device sync live fan-out failed: {ex.Message}");
-        }
-        finally
-        {
-            deviceSyncSendGate.Release();
-        }
-    }
-
-    private async Task RunDeviceSyncHandshakeAsync(DeviceSyncIdentity identity)
-    {
-        await Task.Yield();
-        var result = await DeviceSyncHandshakeCoordinator.RunAsync(
-            async () =>
-            {
-                await deviceSyncDrainGate.WaitAsync();
-                try
-                {
-                    if (!IsCurrentDeviceSyncIdentity(identity)
-                        || !supportsSendResults
-                        || !supportsDeviceSync)
-                        return DeviceSyncQueueDrainResult.Completed(0);
-                    return await DrainDeviceSyncQueueAsync(
-                        identity,
-                        InboundProcessingMode.Foreground,
-                        CancellationToken.None);
-                }
-                finally
-                {
-                    deviceSyncDrainGate.Release();
-                }
-            },
-            () => DiscoverDeviceSyncSnapshotsAsync(identity),
-            () => IsCurrentDeviceSyncIdentity(identity),
-            ex => Log?.Invoke($"device sync handshake failed: {ex.Message}"));
-        if (!result.Succeeded
-            && result.Error?.StartsWith("queue_", StringComparison.Ordinal) == true
-            && IsCurrentDeviceSyncIdentity(identity))
-        {
-            Log?.Invoke($"device sync handshake recovery scheduled: {result.Error}");
-            ScheduleRecovery();
-            TrackBackground(
-                identity.Connection.StopAsync(),
-                "device sync handshake recovery disconnect");
-        }
-    }
-
-    private async Task DiscoverDeviceSyncSnapshotsAsync(DeviceSyncIdentity identity)
-    {
-        if (!IsCurrentDeviceSyncIdentity(identity)
-            || !supportsSendResults
-            || !supportsDeviceSync)
-            return;
-        var targets = await GetDeviceSyncTargetsAsync(identity, refresh: true);
-        if (!IsCurrentDeviceSyncIdentity(identity))
-            return;
-        _ = await ResolveOwnDeviceKeysAsync(identity, refresh: true);
-        if (!IsCurrentDeviceSyncIdentity(identity))
-            return;
-        foreach (var target in targets)
-        {
-            if (!IsCurrentDeviceSyncIdentity(identity))
-                return;
-            var resume = state.GetDeviceSyncSnapshotResumeState(target, identity.DeviceId);
-            if (resume.SnapshotId is not null
-                && resume.MissingChunkIndexes.Count == 0
-                && state.GetDeviceSyncSnapshotTransfer(resume.SnapshotId) is not null)
-            {
-                try
-                {
-                    await TryCompleteDeviceSyncSnapshotAsync(
-                        resume.SnapshotId,
-                        target,
-                        identity,
-                        requireCurrentIdentity: true,
-                        CancellationToken.None);
-                }
-                catch (InvalidDataException ex)
-                {
-                    Log?.Invoke($"discarded corrupt device snapshot {resume.SnapshotId}: {ex.Message}");
-                }
-                resume = state.GetDeviceSyncSnapshotResumeState(target, identity.DeviceId);
-            }
-            var missingChunks = resume.MissingChunkIndexes.OrderBy(index => index).ToArray();
-            var request = new DeviceSyncSnapshotRequest(
-                DeviceSyncEnvelopeIdProtocol.SnapshotRequestId(
-                    identity.DeviceId,
-                    target,
-                    resume.SnapshotId,
-                    missingChunks),
-                identity.DeviceId,
-                DeviceSyncSnapshotProtocol.FormatVersion,
-                resume.SnapshotId,
-                missingChunks);
-            if (await SendDeviceSyncEnvelopeCoreAsync(
-                    identity,
-                    target,
-                    DeviceSyncKinds.EnvelopeSnapshotRequest,
-                    JsonSerializer.Serialize(request, Json),
-                    CancellationToken.None))
-                deviceSyncActivity.ObserveSnapshotActivity();
-        }
-        Drain117OnConnect(identity);
-    }
-
-    private async Task<IReadOnlyList<string>> GetDeviceSyncTargetsAsync(
-        DeviceSyncIdentity identity, bool refresh)
-    {
-        var cacheIdentity = $"{identity.NormalizedHandle}\n{identity.DeviceId}";
-        if (!refresh
-            && string.Equals(deviceSyncTargetCacheIdentity, cacheIdentity, StringComparison.Ordinal)
-            && DateTimeOffset.UtcNow - deviceSyncTargetCacheUpdated < DeviceSyncTargetCacheLifetime)
-            return deviceSyncTargetCache;
-
-        if (!IsCurrentDeviceSyncIdentity(identity)) return Array.Empty<string>();
-        var devices = await ListMyDevicesAsync();
-        if (!IsCurrentDeviceSyncIdentity(identity)) return Array.Empty<string>();
-        var targets = devices
-            .Select(device => device.DeviceId)
-            .Where(deviceId => !string.IsNullOrWhiteSpace(deviceId)
-                && !string.Equals(deviceId, identity.DeviceId, StringComparison.Ordinal))
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-        deviceSyncTargetCache = targets;
-        deviceSyncTargetCacheUpdated = DateTimeOffset.UtcNow;
-        deviceSyncTargetCacheIdentity = cacheIdentity;
-        return targets;
-    }
-
-    private async Task<bool> SendDeviceSyncSnapshotCoreAsync(
-        DeviceSyncIdentity identity,
-        string targetDeviceId,
-        IReadOnlyList<DeviceSyncOperation> snapshot,
-        CancellationToken ct,
-        DeviceSyncSnapshotRequest? request = null)
-    {
-        if (request is not null && request.FormatVersion != DeviceSyncSnapshotProtocol.FormatVersion)
-            return false;
-
-        var transfer = DeviceSyncSnapshotProtocol.Create(identity.DeviceId, snapshot);
-        IReadOnlyList<DeviceSyncSnapshotChunk> chunks = transfer.Chunks;
-        if (string.Equals(request?.KnownSnapshotId, transfer.Manifest.SnapshotId, StringComparison.Ordinal))
-        {
-            var missingChunkIndexes = request?.MissingChunkIndexes;
-            if (missingChunkIndexes is { Count: 0 }) return true;
-            if (missingChunkIndexes is { Count: > 0 })
-            {
-                if (missingChunkIndexes.Any(index => index >= transfer.Manifest.ChunkCount))
-                    throw new InvalidDataException("The snapshot resume request referenced an unknown chunk.");
-                var missing = missingChunkIndexes.ToHashSet();
-                chunks = transfer.Chunks.Where(chunk => missing.Contains(chunk.Index)).ToArray();
-            }
-        }
-
-        if (!await SendDeviceSyncEnvelopeCoreAsync(
-                identity,
-                targetDeviceId,
-                DeviceSyncKinds.EnvelopeSnapshotManifest,
-                JsonSerializer.Serialize(transfer.Manifest, Json),
-                ct))
-            return false;
-        foreach (var chunk in chunks)
-        {
-            if (!IsCurrentDeviceSyncIdentity(identity)) return false;
-            if (!await SendDeviceSyncEnvelopeCoreAsync(
-                    identity,
-                    targetDeviceId,
-                    DeviceSyncKinds.EnvelopeSnapshotChunk,
-                    JsonSerializer.Serialize(chunk, Json),
-                    ct))
-                return false;
-        }
-        return true;
-    }
-
-    private async Task<IReadOnlyList<string>> ResolveOwnDeviceKeysAsync(
-        DeviceSyncIdentity identity, bool refresh = false, bool requireCurrent = true)
-    {
-        if (!IsDeviceSyncIdentityUsable(identity, requireCurrent)) return Array.Empty<string>();
-        if (refresh)
-        {
-            keyCache.TryRemove(identity.NormalizedHandle, out _);
-            keyCacheUpdated.TryRemove(identity.NormalizedHandle, out _);
-        }
-        if (!refresh
-            && keyCache.TryGetValue(identity.NormalizedHandle, out var cached)
-            && keyCacheUpdated.TryGetValue(identity.NormalizedHandle, out var updated)
-            && DateTimeOffset.UtcNow - updated < GroupKeyCacheLifetime)
-            return cached;
-        try
-        {
-            var http = httpFactory.CreateClient("relay");
-            var info = await http.GetFromJsonAsync<HandleInfo>(
-                $"{identity.RelayUrl}/handles/{Uri.EscapeDataString(identity.NormalizedHandle)}");
-            if (!IsDeviceSyncIdentityUsable(identity, requireCurrent)) return Array.Empty<string>();
-            var keys = info?.DevicePublicKeys
-                .Where(key => !string.IsNullOrWhiteSpace(key))
-                .Distinct(StringComparer.Ordinal)
-                .ToArray() ?? Array.Empty<string>();
-            if (keys.Length > 0)
-            {
-                keyCache[identity.NormalizedHandle] = keys;
-                keyCacheUpdated[identity.NormalizedHandle] = DateTimeOffset.UtcNow;
-            }
-            return keys;
-        }
-        catch (Exception ex)
-        {
-            Log?.Invoke($"device sync key resolution failed: {ex.Message}");
-            return Array.Empty<string>();
-        }
-    }
-
-    private async Task<bool> SendDeviceSyncEnvelopeCoreAsync(
-        DeviceSyncIdentity identity,
-        string targetDeviceId,
-        string kind,
-        string plaintext,
-        CancellationToken ct)
-        => await SendDeviceSyncEnvelopeWithOutcomeAsync(
-            identity, targetDeviceId, kind, plaintext, ct) == DeviceSyncSendOutcome.Accepted;
-
-    private async Task<DeviceSyncSendOutcome> SendDeviceSyncEnvelopeWithOutcomeAsync(
-        DeviceSyncIdentity identity,
-        string targetDeviceId,
-        string kind,
-        string plaintext,
-        CancellationToken ct,
-        bool requireCurrentIdentity = true)
-    {
-        if (!supportsSendResults
-            || !supportsDeviceSync
-            || !IsDeviceSyncIdentityUsable(identity, requireCurrentIdentity)
-            || string.IsNullOrWhiteSpace(targetDeviceId)
-            || string.Equals(targetDeviceId, identity.DeviceId, StringComparison.Ordinal))
-            return DeviceSyncSendOutcome.Deferred;
-
-        var keys = await ResolveOwnDeviceKeysAsync(identity);
-        if (!IsDeviceSyncIdentityUsable(identity, requireCurrentIdentity))
-            return DeviceSyncSendOutcome.Deferred;
-        if (keys.Count == 0)
-        {
-            Log?.Invoke($"device sync {kind} to {targetDeviceId} failed: encryption keys unavailable");
-            return DeviceSyncSendOutcome.Deferred;
-        }
-        var ciphertext = MessageCrypto.Encrypt(plaintext, keys);
-        if (ciphertext is null)
-        {
-            Log?.Invoke($"device sync {kind} to {targetDeviceId} failed: encryption failed");
-            return DeviceSyncSendOutcome.Deferred;
-        }
-        if (System.Text.Encoding.UTF8.GetByteCount(ciphertext) > MessageLimits.MaxEnvelopeBodyBytes)
-        {
-            Log?.Invoke($"device sync {kind} to {targetDeviceId} exceeded the envelope limit");
-            return DeviceSyncSendOutcome.TooLarge;
-        }
-
-        var signature = IdentityService.Sign(identity.PrivateKey, ciphertext);
-        var envelope = MeshEnvelope.Create(
-            identity.Handle,
-            identity.NormalizedHandle,
-            kind,
-            ciphertext,
-            signature,
-            fromDevice: identity.DeviceId,
-            toDevice: targetDeviceId,
-            id: DeviceSyncEnvelopeIdProtocol.EnvelopeId(
-                kind, identity.DeviceId, targetDeviceId, plaintext));
-        try
-        {
-            var result = await identity.Connection.InvokeAsync<QueueEnqueueResult>(
-                DeviceSyncTransportPolicy.MethodFor(kind),
-                new QueueEnqueue(
-                    identity.DeviceId,
-                    targetDeviceId,
-                    envelope.Id,
-                    JsonSerializer.Serialize(envelope, Json)),
-                ct);
-            if (result.Accepted) return DeviceSyncSendOutcome.Accepted;
-            Log?.Invoke($"device sync {kind} to {targetDeviceId} rejected: {result.Error ?? "rejected"}");
-            return DeviceSyncSendOutcome.Deferred;
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Log?.Invoke($"device sync {kind} to {targetDeviceId} failed: {ex.Message}");
-            return DeviceSyncSendOutcome.Deferred;
-        }
-    }
-
-    private async Task<DeviceSyncQueueDrainResult> DrainDeviceSyncQueueAsync(
-        DeviceSyncIdentity identity,
-        InboundProcessingMode mode,
-        CancellationToken ct)
-    {
-        var requireCurrent = mode == InboundProcessingMode.Foreground;
-        if ((requireCurrent && !supportsDeviceSync)
-            || !IsDeviceSyncIdentityUsable(identity, requireCurrent))
-            return DeviceSyncQueueDrainResult.Completed(0);
-        var processed = 0;
-        while (IsDeviceSyncIdentityUsable(identity, requireCurrent))
-        {
-            QueueDrainResponse drained;
-            try
-            {
-                drained = await identity.Connection.InvokeAsync<QueueDrainResponse>(
-                    MeshHubProtocol.QueueDrain,
-                    new QueueDrainRequest(identity.DeviceId),
-                    ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                TraceTransport("device-sync-drain-failed", ex.Message);
-                return DeviceSyncQueueDrainResult.Failed("queue_drain_failed", processed);
-            }
-
-            if (drained.Entries.Count == 0)
-                break;
-
-            foreach (var entry in drained.Entries)
-            {
-                MeshEnvelope? envelope;
-                try
-                {
-                    envelope = JsonSerializer.Deserialize<MeshEnvelope>(entry.Payload, Json);
-                }
-                catch (JsonException)
-                {
-                    envelope = null;
-                }
-
-                if (envelope is null)
-                {
-                    var acknowledged = await identity.Connection.InvokeAsync<bool>(
-                        MeshHubProtocol.QueueAck,
-                        new QueueAck(entry.EntryId, identity.DeviceId),
-                        ct);
-                    if (!acknowledged)
-                        return DeviceSyncQueueDrainResult.Failed("queue_ack_rejected", processed);
-                    continue;
-                }
-
-                Func<Task>? postAcknowledgement = null;
-                var disposition = await ProcessInboundAsync(
-                    envelope,
-                    mode,
-                    identity,
-                    true,
-                    ct,
-                    action => postAcknowledgement = action);
-                if (InboundAcknowledgementPolicy.ShouldAcknowledge(disposition))
-                {
-                    var acknowledged = await identity.Connection.InvokeAsync<bool>(
-                        MeshHubProtocol.QueueAck,
-                        new QueueAck(entry.EntryId, identity.DeviceId),
-                        ct);
-                    if (!acknowledged)
-                        return DeviceSyncQueueDrainResult.Failed("queue_ack_rejected", processed);
-                    processed++;
-                    if (postAcknowledgement is not null)
-                    {
-                        TrackBackground(
-                            DeviceSyncSnapshotResponsePolicy.Start(postAcknowledgement),
-                            "device sync snapshot response");
-                    }
-                    continue;
-                }
-
-                if (disposition is InboundDisposition.Retry or InboundDisposition.Defer)
-                    return DeviceSyncQueueDrainPolicy.StopResult(disposition, processed);
-            }
-        }
-        return DeviceSyncQueueDrainResult.Completed(processed);
-    }
-
-    private async Task<DeviceSyncQueueDrainResult> CoalescedDrainDeviceSyncQueueAsync(
-        DeviceSyncIdentity identity,
-        InboundProcessingMode mode,
-        CancellationToken ct)
-    {
-        await deviceSyncDrainGate.WaitAsync(ct);
-        try
-        {
-            return await DrainDeviceSyncQueueAsync(identity, mode, ct);
-        }
-        finally
-        {
-            deviceSyncDrainGate.Release();
-        }
-    }
-
-    private async Task HandleInboundDeviceSyncAsync(
-        MeshEnvelope env,
-        string from,
-        InboundProcessingMode mode,
-        DeviceSyncIdentity? sessionIdentity,
-        bool sessionSupportsDeviceSync,
-        CancellationToken ct,
-        Action<Func<Task>>? registerPostAcknowledgement)
-    {
-        var processingIdentity = sessionIdentity ?? authenticatedDeviceSyncIdentity;
-        var currentHandle = processingIdentity?.NormalizedHandle
-                            ?? AppState.Norm(state.Profile.Handle);
-        var myDeviceId = processingIdentity?.DeviceId ?? MyDeviceId;
-        if (!sessionSupportsDeviceSync
-            || !string.Equals(from, currentHandle, StringComparison.Ordinal)
-            || string.IsNullOrWhiteSpace(env.FromDevice)
-            || string.Equals(env.FromDevice, myDeviceId, StringComparison.Ordinal)
-            || !string.Equals(env.ToDevice, myDeviceId, StringComparison.Ordinal))
-            throw new InboundPermanentRejectException("device_sync_route_invalid");
-        if (!MessageCrypto.IsEncrypted(env.Body))
-            throw new InboundPermanentRejectException("device_sync_encryption_required");
-        var (decrypted, plaintext) = MessageCrypto.TryDecrypt(
-            env.Body,
-            processingIdentity?.PrivateKey ?? state.Profile.PrivateKey,
-            processingIdentity?.PublicKey ?? state.Profile.PublicKey);
-        if (!decrypted || plaintext is null)
-            throw new InboundPermanentRejectException("device_sync_decryption_failed");
-
-        try
-        {
-            switch (env.Kind)
-            {
-                case DeviceSyncKinds.EnvelopeOperation:
-                {
-                    var batch = JsonSerializer.Deserialize<DeviceSyncBatch>(plaintext, Json)
-                        ?? throw new JsonException("Device sync batch was null.");
-                    ValidateDeviceSyncBatch(batch, env.FromDevice);
-                    if (batch.IsSnapshot)
-                        deviceSyncActivity.ObserveSnapshotActivity();
-                    if (!state.DeviceSyncPersistenceAvailable)
-                        throw new InboundRetryException("device_sync_persistence_unavailable");
-                    if (!state.ApplyDeviceSyncBatch(batch))
-                        throw new InvalidDataException("The device sync batch could not be applied.");
-                    return;
-                }
-                case DeviceSyncKinds.EnvelopeSnapshotRequest:
-                {
-                    var request = JsonSerializer.Deserialize<DeviceSyncSnapshotRequest>(plaintext, Json)
-                        ?? throw new JsonException("Device sync snapshot request was null.");
-                    ValidateDeviceSyncSnapshotRequest(request, env.FromDevice);
-                    if (mode == InboundProcessingMode.Background) return;
-                    var identity = sessionIdentity ?? authenticatedDeviceSyncIdentity;
-                    if (identity is null)
-                        throw new InboundRetryException("snapshot_response_identity_unavailable");
-                    if (registerPostAcknowledgement is null)
-                    {
-                        await RespondToDeviceSyncSnapshotRequestWithRetryAsync(
-                            identity,
-                            request,
-                            ct);
-                    }
-                    else
-                    {
-                        registerPostAcknowledgement(() =>
-                            RespondToDeviceSyncSnapshotRequestWithRetryAsync(
-                                identity,
-                                request,
-                                CancellationToken.None));
-                    }
-                    return;
-                }
-                case DeviceSyncKinds.EnvelopeSnapshotManifest:
-                {
-                    var manifest = JsonSerializer.Deserialize<DeviceSyncSnapshotManifest>(plaintext, Json)
-                        ?? throw new JsonException("Device sync snapshot manifest was null.");
-                    DeviceSyncSnapshotProtocol.ValidateManifest(manifest);
-                    if (!string.Equals(manifest.SourceDeviceId, env.FromDevice, StringComparison.Ordinal))
-                        throw new InvalidDataException("Snapshot manifest source did not match the sending device.");
-                    if (state.HasDeviceSyncSnapshotCompletion(
-                            manifest.SnapshotId, env.FromDevice, myDeviceId))
-                        return;
-                    if (!state.SaveDeviceSyncSnapshotManifest(manifest))
-                        throw new InboundRetryException("snapshot_manifest_persistence_failed");
-                    deviceSyncActivity.ObserveSnapshotActivity();
-                    var identity = sessionIdentity ?? authenticatedDeviceSyncIdentity;
-                    if (identity is null)
-                        throw new InboundRetryException("snapshot_completion_identity_unavailable");
-                    await TryCompleteDeviceSyncSnapshotAsync(
-                        manifest.SnapshotId,
-                        env.FromDevice,
-                        identity,
-                        mode == InboundProcessingMode.Foreground,
-                        ct);
-                    return;
-                }
-                case DeviceSyncKinds.EnvelopeSnapshotChunk:
-                {
-                    var chunk = JsonSerializer.Deserialize<DeviceSyncSnapshotChunk>(plaintext, Json)
-                        ?? throw new JsonException("Device sync snapshot chunk was null.");
-                    DeviceSyncSnapshotProtocol.ValidateChunk(chunk);
-                    if (!string.Equals(chunk.SourceDeviceId, env.FromDevice, StringComparison.Ordinal))
-                        throw new InvalidDataException("Snapshot chunk source did not match the sending device.");
-                    if (state.HasDeviceSyncSnapshotCompletion(
-                            chunk.SnapshotId, env.FromDevice, myDeviceId))
-                        return;
-                    if (!state.SaveDeviceSyncSnapshotChunk(chunk))
-                        throw new InboundRetryException("snapshot_manifest_unavailable");
-                    deviceSyncActivity.ObserveSnapshotActivity();
-                    var identity = sessionIdentity ?? authenticatedDeviceSyncIdentity;
-                    if (identity is null)
-                        throw new InboundRetryException("snapshot_completion_identity_unavailable");
-                    await TryCompleteDeviceSyncSnapshotAsync(
-                        chunk.SnapshotId,
-                        env.FromDevice,
-                        identity,
-                        mode == InboundProcessingMode.Foreground,
-                        ct);
-                    return;
-                }
-                case DeviceSyncKinds.EnvelopeSnapshotComplete:
-                {
-                    var completion = JsonSerializer.Deserialize<DeviceSyncSnapshotComplete>(plaintext, Json)
-                        ?? throw new JsonException("Device sync snapshot completion was null.");
-                    DeviceSyncSnapshotProtocol.ValidateComplete(completion);
-                    if (!string.Equals(completion.SourceDeviceId, myDeviceId, StringComparison.Ordinal)
-                        || !string.Equals(completion.TargetDeviceId, env.FromDevice, StringComparison.Ordinal))
-                        throw new InvalidDataException("Snapshot completion did not match its route.");
-                    if (!state.RecordDeviceSyncSnapshotCompletion(completion))
-                        throw new InboundRetryException("snapshot_completion_persistence_failed");
-                    return;
-                }
-                case Mesh117SyncKinds.Envelope117Operation:
-                {
-                    await ApplyInbound117OperationAsync(env, plaintext, myDeviceId, ct);
-                    return;
-                }
-                default:
-                    throw new InvalidDataException("Unknown device sync envelope kind.");
-            }
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (InboundRetryException)
-        {
-            throw;
-        }
-        catch (Exception ex) when (ex is JsonException
-                                   or ArgumentException
-                                   or FormatException
-                                   or InvalidDataException)
-        {
-            throw new InboundPermanentRejectException("device_sync_payload_invalid", ex);
-        }
-    }
-
-    private async Task TryCompleteDeviceSyncSnapshotAsync(
-        string snapshotId,
-        string sourceDeviceId,
-        DeviceSyncIdentity identity,
-        bool requireCurrentIdentity,
-        CancellationToken ct)
-    {
-        var transfer = state.GetDeviceSyncSnapshotTransfer(snapshotId);
-        if (transfer is null || transfer.Chunks.Count < transfer.Manifest.ChunkCount) return;
-        IReadOnlyList<DeviceSyncOperation> operations;
-        try
-        {
-            operations = DeviceSyncSnapshotProtocol.Assemble(transfer.Manifest, transfer.Chunks);
-            ValidateDeviceSyncOperations(operations, sourceDeviceId, allowEmpty: true);
-        }
-        catch (InvalidDataException)
-        {
-            if (!state.DeleteDeviceSyncSnapshotTransfer(snapshotId))
-                throw new InboundRetryException("snapshot_transfer_reset_failed");
-            throw;
-        }
-        if (!state.DeviceSyncPersistenceAvailable)
-            throw new InboundRetryException("device_sync_persistence_unavailable");
-        if (!state.ApplyDeviceSyncBatch(new DeviceSyncBatch(
-                transfer.Manifest.SnapshotId,
-                sourceDeviceId,
-                true,
-                operations)))
-            throw new InvalidDataException("The device snapshot could not be applied.");
-        var completion = new DeviceSyncSnapshotComplete(
-            transfer.Manifest.SnapshotId,
-            sourceDeviceId,
-            MyDeviceId,
-            transfer.Manifest.OperationCount,
-            transfer.Manifest.Sha256);
-        if (await SendDeviceSyncEnvelopeWithOutcomeAsync(
-                identity,
-                sourceDeviceId,
-                DeviceSyncKinds.EnvelopeSnapshotComplete,
-                JsonSerializer.Serialize(completion, Json),
-                ct,
-                requireCurrentIdentity) != DeviceSyncSendOutcome.Accepted)
-            throw new InboundRetryException("snapshot_completion_queue_failed");
-        if (!state.RecordDeviceSyncSnapshotCompletion(completion))
-            throw new InboundRetryException("snapshot_completion_persistence_failed");
-    }
-
-    private async Task RespondToDeviceSyncSnapshotRequestAsync(
-        DeviceSyncIdentity identity,
-        DeviceSyncSnapshotRequest request,
-        CancellationToken ct)
-    {
-        await deviceSyncSnapshotSendGate.WaitAsync(ct);
-        try
-        {
-            if (!IsCurrentDeviceSyncIdentity(identity)
-                || !supportsSendResults
-                || !supportsDeviceSync)
-                throw new InboundRetryException("snapshot_response_transport_unavailable");
-            var targets = await GetDeviceSyncTargetsAsync(identity, refresh: true);
-            if (!targets.Contains(request.RequestingDeviceId, StringComparer.Ordinal))
-                throw new InboundPermanentRejectException("snapshot_requester_revoked");
-            if (!IsCurrentDeviceSyncIdentity(identity))
-                throw new InboundRetryException("snapshot_response_identity_changed");
-            var keys = await ResolveOwnDeviceKeysAsync(identity, refresh: true);
-            if (keys.Count == 0)
-                throw new InboundRetryException("snapshot_response_keys_unavailable");
-            if (!IsCurrentDeviceSyncIdentity(identity))
-                throw new InboundRetryException("snapshot_response_identity_changed");
-            var snapshot = state.CreateDeviceSyncSnapshot();
-            if (!IsCurrentDeviceSyncIdentity(identity)
-                || !await SendDeviceSyncSnapshotCoreAsync(
-                    identity, request.RequestingDeviceId, snapshot, ct, request))
-                throw new InboundRetryException("snapshot_response_delivery_failed");
-        }
-        finally
-        {
-            deviceSyncSnapshotSendGate.Release();
-        }
-    }
-
-    private async Task RespondToDeviceSyncSnapshotRequestWithRetryAsync(
-        DeviceSyncIdentity identity,
-        DeviceSyncSnapshotRequest request,
-        CancellationToken ct)
-    {
-        Exception? failure = null;
-        for (var attempt = 0; attempt < 3 && IsCurrentDeviceSyncIdentity(identity); attempt++)
-        {
-            try
-            {
-                await RespondToDeviceSyncSnapshotRequestAsync(identity, request, ct);
-                return;
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                failure = ex;
-                if (attempt < 2 && IsCurrentDeviceSyncIdentity(identity))
-                    await Task.Delay(TimeSpan.FromSeconds(1 << attempt), ct);
-            }
-        }
-
-        throw new InvalidOperationException(
-            "Snapshot response retries were exhausted. The requester will resume discovery.",
-            failure);
-    }
-
-    private static void ValidateDeviceSyncSnapshotRequest(
-        DeviceSyncSnapshotRequest request,
-        string sourceDeviceId)
-    {
-        if (string.IsNullOrWhiteSpace(request.RequestId)
-            || !string.Equals(request.RequestingDeviceId, sourceDeviceId, StringComparison.Ordinal)
-            || request.FormatVersion != DeviceSyncSnapshotProtocol.FormatVersion
-            || request.KnownSnapshotId is not null && !IsSnapshotId(request.KnownSnapshotId)
-            || request.MissingChunkIndexes is { Count: > DeviceSyncSnapshotProtocol.MaxChunks })
-            throw new JsonException("Device sync snapshot request was invalid.");
-        if (request.MissingChunkIndexes is null) return;
-        var seen = new HashSet<int>();
-        foreach (var index in request.MissingChunkIndexes)
-        {
-            if (index < 0 || index >= DeviceSyncSnapshotProtocol.MaxChunks || !seen.Add(index))
-                throw new JsonException("Device sync snapshot request contained invalid chunk indexes.");
-        }
-    }
-
-    private static bool IsSnapshotId(string value)
-        => value.Length == 64 && value.All(Uri.IsHexDigit);
-
-    private static void ValidateDeviceSyncBatch(DeviceSyncBatch batch, string sourceDeviceId)
-    {
-        if (string.IsNullOrWhiteSpace(batch.BatchId)
-            || !string.Equals(batch.SourceDeviceId, sourceDeviceId, StringComparison.Ordinal)
-            || batch.Operations is null
-            || batch.Operations.Count is < 1 or > DeviceSyncSnapshotBatchSize)
-            throw new JsonException("Device sync batch shape or source was invalid.");
-        ValidateDeviceSyncOperations(batch.Operations, sourceDeviceId, allowEmpty: false);
-    }
-
-    private static void ValidateDeviceSyncOperations(
-        IReadOnlyList<DeviceSyncOperation> operations,
-        string sourceDeviceId,
-        bool allowEmpty)
-    {
-        if (!allowEmpty && operations.Count == 0)
-            throw new JsonException("Device sync operation set was empty.");
-        foreach (var operation in operations)
-        {
-            if (operation is null
-                || string.IsNullOrWhiteSpace(operation.OperationId)
-                || !string.Equals(operation.SourceDeviceId, sourceDeviceId, StringComparison.Ordinal)
-                || string.IsNullOrWhiteSpace(operation.Kind)
-                || string.IsNullOrWhiteSpace(operation.EntityId)
-                || string.IsNullOrWhiteSpace(operation.Version))
-                throw new JsonException("Device sync operation shape or source was invalid.");
-        }
-    }
+            && ReferenceEquals(authenticatedReplicationConnectionIdentity, identity);
 
     private Task HandleInboundGroupAsync(MeshEnvelope env, string from)
     {
@@ -2896,14 +2132,13 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         state.AddChatLine(approval.From, line);
         state.Mutate(x => x.Approvals.RemoveAll(a => a.Id == approvalId));
         var atomic = !string.IsNullOrWhiteSpace(approval.AgentRequestId)
-                     && !string.IsNullOrWhiteSpace(approval.AgentDispatchToken);
+                     && !string.IsNullOrWhiteSpace(approval.AgentRequestId);
         await SendAsync(
             approval.From,
             atomic ? MeshKinds.AtomicAgentResponse : MeshKinds.AgentResponse,
             text,
             line.Id,
-            agentRequestId: approval.AgentRequestId,
-            agentDispatchToken: approval.AgentDispatchToken);
+            agentRequestId: approval.AgentRequestId);
     }
 
     public void RejectDraft(string approvalId)
@@ -2922,11 +2157,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                 "attachment_too_large",
                 request.RunId,
                 $"Each attachment must be at most {MessageLimits.MaxAttachmentBytes} bytes.");
-        if (attachments.Sum(item => item.Data.LongLength) > DeviceTopicAttachmentInbox.MaxRunBytes)
+        if (attachments.Sum(item => item.Data.LongLength) > TopicAttachmentAssembler.MaxRunBytes)
             return TopicDispatchResult.Reject(
                 "attachments_too_large",
                 request.RunId,
-                $"Attachments must total at most {DeviceTopicAttachmentInbox.MaxRunBytes} bytes.");
+                $"Attachments must total at most {TopicAttachmentAssembler.MaxRunBytes} bytes.");
         if (!string.Equals(targetDeviceId, request.TargetDeviceId, StringComparison.Ordinal)
             || string.Equals(targetDeviceId, MyDeviceId, StringComparison.Ordinal)
             || !string.Equals(
@@ -2946,7 +2181,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         var ids = request.AttachmentIds ?? manifest.Select(item => item.Id).ToArray();
         if (manifest.Count != attachments.Count
             || ids.Count != attachments.Count
-            || manifest.Sum(item => item.Length) > DeviceTopicAttachmentInbox.MaxRunBytes
+            || manifest.Sum(item => item.Length) > TopicAttachmentAssembler.MaxRunBytes
             || manifest.Where((item, index) =>
                     !string.Equals(item.Name, attachments[index].Name, StringComparison.Ordinal)
                     || !string.Equals(item.MimeType, attachments[index].MimeType, StringComparison.Ordinal)
@@ -2992,7 +2227,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
 
     public async Task<AgentRoutingInfo?> GetAgentRoutingAsync(CancellationToken ct = default)
     {
-        if (!supportsAtomicAgentDispatch) return null;
+        if (!supportsAgentHost) return null;
         var p = state.Profile;
         var handle = AppState.Norm(p.Handle);
         if (handle.Length == 0) return null;
@@ -3023,7 +2258,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         string? failoverDeviceId,
         CancellationToken ct = default)
     {
-        if (!supportsAtomicAgentDispatch)
+        if (!supportsAgentHost)
             return (false, null, "The connected relay does not support atomic agent routing.");
         var p = state.Profile;
         var handle = AppState.Norm(p.Handle);
@@ -3111,8 +2346,6 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
                      ?? throw new InvalidDataException("The relay returned an empty device revocation response.");
         keyCache.TryRemove(handle, out _);
         keyCacheUpdated.TryRemove(handle, out _);
-        deviceSyncTargetCache = Array.Empty<string>();
-        deviceSyncTargetCacheUpdated = default;
         return result;
     }
     private async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListMyDevicesCoreAsync(CancellationToken ct)
@@ -3365,7 +2598,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         string? lineId = null,
         string? toDevice = null,
         string? agentRequestId = null,
-        string? agentDispatchToken = null)
+        string? remoteAgentToken = null)
     {
         if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
         {
@@ -3386,7 +2619,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             var enc = MessageCrypto.Encrypt(body, keys);
             if (enc is not null) wire = enc;
         }
-        if ((AgentDispatchProtocol.IsAtomicRequest(kind) || AgentDispatchProtocol.IsAtomicResponse(kind))
+        if ((string.Equals(kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal) || string.Equals(kind, MeshKinds.AtomicAgentResponse, StringComparison.Ordinal))
             && !MessageCrypto.IsEncrypted(wire))
         {
             Log?.Invoke("atomic agent send failed: recipient encryption keys are unavailable");
@@ -3412,7 +2645,6 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             sig,
             toDevice: toDevice,
             agentRequestId: agentRequestId,
-            agentDispatchToken: agentDispatchToken,
             id: lineId);
         try
         {
@@ -3430,14 +2662,14 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
             }
             else
             {
-                // Legacy relays route SendEnvelope but return no acknowledgement payload.
+                // Older relays route SendEnvelope but return no result payload.
                 await hub.InvokeAsync(MeshHubProtocol.SendEnvelope, env);
             }
             if (lineId is not null)
             {
-                var status = AgentDispatchProtocol.IsAtomicRequest(kind)
+                var status = string.Equals(kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal)
                              && supportsSendResults
-                             && string.Equals(resultCode, AgentDispatchCodes.Queued, StringComparison.Ordinal)
+                             && string.Equals(resultCode, "queued", StringComparison.Ordinal)
                     ? "agent_queued"
                     : "sent";
                 state.SetLineStatus(lineId, status);
@@ -3707,12 +2939,12 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IBackgroundSyncT
         // ConnectAsync calls this then re-sets wantConnected, so a reconnect is unaffected.
         wantConnected = false;
         authenticated = false;
-        authenticatedDeviceSyncIdentity = null;
+        // Tear online replication down before the transport drops so peer sessions and the roster cache
+        // never outlive the identity/connection they were established under. It re-arms on next auth.
+        StopReplication();
+        authenticatedReplicationConnectionIdentity = null;
         keyCache.Clear();
         keyCacheUpdated.Clear();
-        deviceSyncTargetCache = Array.Empty<string>();
-        deviceSyncTargetCacheUpdated = default;
-        deviceSyncTargetCacheIdentity = "";
         var current = hub;
         hub = null;
         if (current is not null)

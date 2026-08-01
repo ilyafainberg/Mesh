@@ -69,28 +69,24 @@ public sealed class ApnsPushSender : IPushSender, IDisposable
         };
     }
 
-    public async Task<PushSendResult> SendAsync(
+    public async Task<PushSendResult> SendWakeAsync(
         string token,
-        PushAlert alert,
         CancellationToken ct = default)
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, $"/3/device/{token}")
         {
             Version = HttpVersion.Version20,
             VersionPolicy = HttpVersionPolicy.RequestVersionExact,
-            Content = new StringContent(SerializePayload(alert), Encoding.UTF8, "application/json"),
+            Content = new StringContent(SerializeWakePayload(), Encoding.UTF8, "application/json"),
         };
         req.Headers.TryAddWithoutValidation("authorization", "bearer " + GetJwt());
         req.Headers.TryAddWithoutValidation("apns-topic", bundleId);
 
-        var backgroundOnly = alert.Mode == PushDeliveryMode.Background;
-        req.Headers.TryAddWithoutValidation("apns-push-type", backgroundOnly ? "background" : "alert");
-        req.Headers.TryAddWithoutValidation("apns-priority", backgroundOnly ? "5" : "10");
-        if (backgroundOnly)
-        {
-            req.Headers.TryAddWithoutValidation("apns-collapse-id", "mesh-sync");
-            req.Headers.TryAddWithoutValidation("apns-expiration", "0");
-        }
+        // A wake is always a silent, collapsible background notification: no alert, no content.
+        req.Headers.TryAddWithoutValidation("apns-push-type", "background");
+        req.Headers.TryAddWithoutValidation("apns-priority", "5");
+        req.Headers.TryAddWithoutValidation("apns-collapse-id", "mesh-sync");
+        req.Headers.TryAddWithoutValidation("apns-expiration", "0");
 
         using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
         if (resp.IsSuccessStatusCode) return PushSendResult.Sent();
@@ -103,31 +99,18 @@ public sealed class ApnsPushSender : IPushSender, IDisposable
             : PushSendResult.Rejected((int)resp.StatusCode, reason);
     }
 
-    internal static string SerializePayload(PushAlert alert)
+    internal static string SerializeWakePayload()
     {
-        var aps = new Dictionary<string, object?>();
-        if (alert.Mode != PushDeliveryMode.Background)
+        // Contentless wake: silent background push, no alert/sound/category, no sender or frame id.
+        var payload = new Dictionary<string, object?>
         {
-            aps["alert"] = new Dictionary<string, string>
-            {
-                ["title"] = alert.Title,
-                ["body"] = alert.Body
-            };
-            aps["sound"] = "default";
-            aps["category"] = alert.Category;
-        }
-        if (alert.Mode != PushDeliveryMode.Alert)
-            aps["content-available"] = 1;
-
-        var payload = new Dictionary<string, object?> { ["aps"] = aps };
-        if (alert.Mode != PushDeliveryMode.Alert)
-        {
-            payload["mesh"] = new Dictionary<string, object?>
+            ["aps"] = new Dictionary<string, object?> { ["content-available"] = 1 },
+            ["mesh"] = new Dictionary<string, object?>
             {
                 ["type"] = "sync",
-                ["version"] = 1
-            };
-        }
+                ["v"] = MeshProtocol.Version,
+            },
+        };
         return JsonSerializer.Serialize(payload);
     }
 

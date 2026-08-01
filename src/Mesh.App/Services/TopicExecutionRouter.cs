@@ -383,8 +383,8 @@ public sealed class TopicExecutionRouter(
                 state.SetQueuedTopicRunStage(
                     thread.Id,
                     draft.RunId,
-                    result.Code is DurableDeliveryCodes.RelayQueued
-                        or DurableDeliveryCodes.Delivered
+                    result.Code is TopicExecutionStatus.RelayAccepted
+                        or TopicExecutionStatus.Delivered
                         ? TopicQueueStage.Relay
                         : TopicQueueStage.Sending);
             }

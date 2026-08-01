@@ -67,9 +67,9 @@
         </div>
         <div class="topic-list-scroll">
             <div class="thread-groups">
-                @if (Mesh.IsDeviceSnapshotSyncing)
+                @if (Mesh.IsReplicationActive)
                 {
-                    <DeviceSyncPlaceholder Text="More chats are syncing..." />
+                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> More chats are syncing...</div>
                 }
                 @if (PinnedThreads.Count > 0)
                 {
@@ -144,7 +144,7 @@
                     }
                 }
             </div>
-            @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsDeviceSnapshotSyncing)
+            @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsReplicationActive)
             {
                 <div class="empty conv-empty">No chats yet. Start one with the + above, or just type below.</div>
             }
@@ -827,7 +827,7 @@
     protected override void OnInitialized()
     {
         State.Changed += Refresh;
-        Mesh.DeviceSyncStateChanged += Refresh;
+        Mesh.ReplicationStateChanged += Refresh;
         // Deep links take precedence, then local desktop history, then the existing recent-topic fallback.
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
         var wanted = ParseQueryValue(uri.Query, "thread");
@@ -1509,7 +1509,7 @@
     public void Dispose()
     {
         State.Changed -= Refresh;
-        Mesh.DeviceSyncStateChanged -= Refresh;
+        Mesh.ReplicationStateChanged -= Refresh;
         selfRef?.Dispose();
     }
 }

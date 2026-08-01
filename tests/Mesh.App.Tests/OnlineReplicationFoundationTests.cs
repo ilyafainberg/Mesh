@@ -679,7 +679,7 @@ public sealed class OnlineReplicationFoundationTests
     private CustodyEntry Genesis(KeyPair signer, string handle, string device)
         => OnlineReplicationProtocol.CreateCustodyEntry(
             handle, 0, OnlineReplicationProtocol.ZeroHash, CustodyAction.Genesis,
-            device, null, 1_700_000_000_000, signer.PublicB64, signer.PrivateB64);
+            signer.PublicB64, null, 1_700_000_000_000, signer.PublicB64, signer.PrivateB64);
 
     [TestMethod]
     public void Custody_Genesis_ValidatesAndVerifies()
@@ -784,6 +784,43 @@ public sealed class OnlineReplicationFoundationTests
             "device-c", null, 2, k.PublicB64, k.PrivateB64);
         Assert.ThrowsException<MeshDb.ReplicationForkException>(() => db.AppendCustodyEntry(forkC));
         Assert.AreEqual(1L, db.GetCustodyHead("alice")!.Generation);
+    }
+
+    [TestMethod]
+    public void Custody_DbAppend_RejectsInvalidOrUnauthorizedSignature()
+    {
+        using var db = MeshDb.Open(databasePath, key);
+        var owner = NewKeyPair();
+        var attacker = NewKeyPair();
+        var genesis = Genesis(owner, "alice", "ignored");
+        db.AppendCustodyEntry(genesis);
+
+        var unauthorized = OnlineReplicationProtocol.CreateCustodyEntry(
+            "alice",
+            1,
+            genesis.EntryHash,
+            CustodyAction.AddDevice,
+            attacker.PublicB64,
+            null,
+            2,
+            attacker.PublicB64,
+            attacker.PrivateB64);
+        Assert.ThrowsException<ArgumentException>(() =>
+            db.AppendCustodyEntry(unauthorized));
+
+        var valid = OnlineReplicationProtocol.CreateCustodyEntry(
+            "alice",
+            1,
+            genesis.EntryHash,
+            CustodyAction.AddDevice,
+            attacker.PublicB64,
+            null,
+            2,
+            owner.PublicB64,
+            owner.PrivateB64);
+        var tampered = valid with { Signature = Convert.ToBase64String(new byte[64]) };
+        Assert.ThrowsException<ArgumentException>(() =>
+            db.AppendCustodyEntry(tampered));
     }
 
     [TestMethod]

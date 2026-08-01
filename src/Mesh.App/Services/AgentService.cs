@@ -577,7 +577,7 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
     {
         var p = state.Profile;
         var contact = state.FindContact(fromHandle);
-        var circles = ProfileSyncState.ResolveGuestCircles(contact, p.Circles).ToList();
+        var circles = ProfileProjection.ResolveGuestCircles(contact, p.Circles).ToList();
 
         // The agent must see the requesting contact's inbound questions (any Role == "user"
         // turn), plus its own prior agent-channel replies. It must NOT see the owner's private

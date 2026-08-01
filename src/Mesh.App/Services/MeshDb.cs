@@ -23,7 +23,7 @@ public sealed partial class MeshDb : IDisposable
     internal sealed record SyncTombstoneWrite(string Kind, string EntityId, string Version);
     internal sealed record SyncCircleRenameWrite(
         string EntityId,
-        IReadOnlyList<DeviceSyncCircleRename> Renames);
+        IReadOnlyList<CircleRenameProjection> Renames);
     public sealed record TopicOutboxItem(
         string RunId, string ThreadId, string TriggerLineId, string TargetDeviceId,
         TopicRunRequestPayload Request, IReadOnlyList<ChatAttachment> Attachments,
@@ -41,18 +41,10 @@ public sealed partial class MeshDb : IDisposable
         string TerminalUpdateJson,
         DateTimeOffset CreatedAt);
 
-    public sealed record DeviceSyncSnapshotResumeState(
-        string? SnapshotId,
-        IReadOnlyList<int> MissingChunkIndexes);
-
-    public sealed record DeviceSyncSnapshotTransferState(
-        DeviceSyncSnapshotManifest Manifest,
-        IReadOnlyList<DeviceSyncSnapshotChunk> Chunks);
-
     public sealed record InboundRejectionItem(
         string RejectionId,
         string EnvelopeId,
-        string? RelayDeliveryId,
+        string? RelayReceiptId,
         string Kind,
         string FromHandle,
         string? FromDeviceId,
@@ -195,7 +187,7 @@ public sealed partial class MeshDb : IDisposable
             CREATE TABLE IF NOT EXISTS inbound_rejections(
                 rejection_id TEXT PRIMARY KEY,
                 envelope_id TEXT NOT NULL,
-                relay_delivery_id TEXT,
+                relay_receipt_id TEXT,
                 kind TEXT NOT NULL,
                 from_handle TEXT NOT NULL,
                 from_device_id TEXT,
@@ -210,26 +202,6 @@ public sealed partial class MeshDb : IDisposable
                 plaintext TEXT NOT NULL,
                 push_hint TEXT,
                 created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS device_sync_snapshot_manifests(
-                snapshot_id TEXT PRIMARY KEY,
-                source_device_id TEXT NOT NULL,
-                manifest_json TEXT NOT NULL,
-                created_at TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS ix_device_sync_snapshot_source
-                ON device_sync_snapshot_manifests(source_device_id, created_at DESC);
-            CREATE TABLE IF NOT EXISTS device_sync_snapshot_chunks(
-                snapshot_id TEXT NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                chunk_json TEXT NOT NULL,
-                PRIMARY KEY(snapshot_id, chunk_index));
-            CREATE TABLE IF NOT EXISTS device_sync_snapshot_receipts(
-                snapshot_id TEXT NOT NULL,
-                source_device_id TEXT NOT NULL,
-                target_device_id TEXT NOT NULL,
-                completed_at TEXT NOT NULL,
-                PRIMARY KEY(snapshot_id, target_device_id));
-            CREATE INDEX IF NOT EXISTS ix_device_sync_snapshot_receipt_source
-                ON device_sync_snapshot_receipts(source_device_id, target_device_id, completed_at DESC);
             CREATE TABLE IF NOT EXISTS composer_drafts(
                 kind TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
@@ -277,10 +249,10 @@ public sealed partial class MeshDb : IDisposable
         Exec("CREATE INDEX IF NOT EXISTS ix_own_chat_lineid ON own_chat(line_id);");
         Exec("""
             UPDATE chat_lines
-            SET line_id = 'legacy-conversation-' || printf('%016x', id)
+            SET line_id = 'conversation-' || printf('%016x', id)
             WHERE line_id IS NULL OR trim(line_id) = '';
             UPDATE own_chat
-            SET line_id = 'legacy-topic-' || printf('%016x', id)
+            SET line_id = 'topic-' || printf('%016x', id)
             WHERE line_id IS NULL OR trim(line_id) = '';
             """);
         // Service-thread metadata on conversations (null for normal person DMs).
@@ -334,7 +306,7 @@ public sealed partial class MeshDb : IDisposable
         AddColumnIfMissing("conversations", "last_activity_at", "TEXT");
         AddColumnIfMissing("conversations", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
         MigrateConversationActivity();
-        CreateFoundation117Schema();
+        CreateAssetsInteractionsSchema();
         CreateSkillPackagesSchema();
         CreateOnlineReplicationSchema();
     }
@@ -704,7 +676,7 @@ public sealed partial class MeshDb : IDisposable
         var newest = Newest(
             GetSyncVersion(transaction, versionKey),
             GetSyncTombstoneVersion(transaction, deleteKind, memory.Id));
-        if (!DeviceSyncVersion.IsNewer(version, newest))
+        if (!ProjectionVersion.IsNewer(version, newest))
         {
             transaction.Rollback();
             return false;
@@ -726,7 +698,7 @@ public sealed partial class MeshDb : IDisposable
         var newest = Newest(
             GetSyncTombstoneVersion(transaction, tombstoneKind, id),
             GetSyncVersion(transaction, upsertKey));
-        if (!DeviceSyncVersion.IsNewer(version, newest))
+        if (!ProjectionVersion.IsNewer(version, newest))
         {
             transaction.Rollback();
             return false;
@@ -860,7 +832,7 @@ public sealed partial class MeshDb : IDisposable
             var opposing = TryGetDeleteIdentity(version.EntityKey, out var deleteKind, out var entityId)
                 ? GetSyncTombstoneVersion(transaction, deleteKind, entityId)
                 : null;
-            if (!DeviceSyncVersion.IsNewer(version.Version, Newest(current, opposing)))
+            if (!ProjectionVersion.IsNewer(version.Version, Newest(current, opposing)))
             {
                 transaction.Rollback();
                 return false;
@@ -880,7 +852,7 @@ public sealed partial class MeshDb : IDisposable
                     ? acceptedUpsert
                     : GetSyncVersion(transaction, upsertKey)
                 : null;
-            if (!DeviceSyncVersion.IsNewer(tombstone.Version, Newest(current, opposing)))
+            if (!ProjectionVersion.IsNewer(tombstone.Version, Newest(current, opposing)))
             {
                 transaction.Rollback();
                 return false;
@@ -917,9 +889,9 @@ public sealed partial class MeshDb : IDisposable
         entityId = split > 0 && split + 1 < entityKey.Length ? entityKey[(split + 1)..] : "";
         deleteKind = kind switch
         {
-            DeviceSyncKinds.ContactUpsert => DeviceSyncKinds.ContactDelete,
-            DeviceSyncKinds.CircleUpsert => DeviceSyncKinds.CircleDelete,
-            DeviceSyncKinds.MemoryUpsert => DeviceSyncKinds.MemoryDelete,
+            DomainProjectionKinds.ContactUpsert => DomainProjectionKinds.ContactDelete,
+            DomainProjectionKinds.CircleUpsert => DomainProjectionKinds.CircleDelete,
+            DomainProjectionKinds.MemoryUpsert => DomainProjectionKinds.MemoryDelete,
             _ => ""
         };
         return deleteKind.Length > 0 && entityId.Length > 0;
@@ -932,9 +904,9 @@ public sealed partial class MeshDb : IDisposable
     {
         var upsertKind = deleteKind switch
         {
-            DeviceSyncKinds.ContactDelete => DeviceSyncKinds.ContactUpsert,
-            DeviceSyncKinds.CircleDelete => DeviceSyncKinds.CircleUpsert,
-            DeviceSyncKinds.MemoryDelete => DeviceSyncKinds.MemoryUpsert,
+            DomainProjectionKinds.ContactDelete => DomainProjectionKinds.ContactUpsert,
+            DomainProjectionKinds.CircleDelete => DomainProjectionKinds.CircleUpsert,
+            DomainProjectionKinds.MemoryDelete => DomainProjectionKinds.MemoryUpsert,
             _ => ""
         };
         entityKey = upsertKind.Length == 0 ? "" : upsertKind + "\u001f" + entityId;
@@ -982,7 +954,7 @@ public sealed partial class MeshDb : IDisposable
         SaveProfileJson(cmd, json);
     }
 
-    // ---- device sync merge state -------------------------------------------
+    // ---- projection merge state -------------------------------------------
 
     public sealed record SyncTombstone(string Kind, string EntityId, string Version);
 
@@ -1048,9 +1020,9 @@ public sealed partial class MeshDb : IDisposable
         return result;
     }
 
-    internal IReadOnlyList<DeviceSyncCircleRename> GetSyncCircleRenames(string entityId)
+    internal IReadOnlyList<CircleRenameProjection> GetSyncCircleRenames(string entityId)
     {
-        var result = new List<DeviceSyncCircleRename>();
+        var result = new List<CircleRenameProjection>();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             SELECT previous_name, delete_version
@@ -1061,7 +1033,7 @@ public sealed partial class MeshDb : IDisposable
         cmd.Parameters.AddWithValue("$id", entityId);
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
-            result.Add(new DeviceSyncCircleRename(reader.GetString(0), reader.GetString(1)));
+            result.Add(new CircleRenameProjection(reader.GetString(0), reader.GetString(1)));
         return result;
     }
 
@@ -1288,7 +1260,7 @@ public sealed partial class MeshDb : IDisposable
             insert.Parameters.AddWithValue("$id", rename.EntityId);
             insert.Parameters.AddWithValue(
                 "$previousId",
-                ProfileSyncState.CircleEntityId(ancestor.PreviousName));
+                ProfileProjection.CircleEntityId(ancestor.PreviousName));
             insert.Parameters.AddWithValue("$name", ancestor.PreviousName);
             insert.Parameters.AddWithValue("$version", ancestor.DeleteVersion);
             insert.ExecuteNonQuery();
@@ -1668,18 +1640,18 @@ public sealed partial class MeshDb : IDisposable
     {
         if (line.At == default) return false;
         using var tx = conn.BeginTransaction();
-        if (!DeviceSyncVersion.IsNewer(version, GetSyncVersion(tx, versionKey)))
+        if (!ProjectionVersion.IsNewer(version, GetSyncVersion(tx, versionKey)))
             return false;
         if (lineDeleteKind is not null
             && (GetSyncTombstoneVersion(
                     tx,
                     lineDeleteKind,
-                    DeviceSyncEntityIds.TopicLine(threadId, line.Id)) is not null
+                    DomainProjectionEntityIds.TopicLine(threadId, line.Id)) is not null
                 || line.ReplyToLineId is not null
                 && GetSyncTombstoneVersion(
                     tx,
                     lineDeleteKind,
-                    DeviceSyncEntityIds.TopicLine(threadId, line.ReplyToLineId)) is not null))
+                    DomainProjectionEntityIds.TopicLine(threadId, line.ReplyToLineId)) is not null))
             return false;
 
         using (var parent = conn.CreateCommand())
@@ -1737,7 +1709,7 @@ public sealed partial class MeshDb : IDisposable
     {
         if (line.At == default) return false;
         using var tx = conn.BeginTransaction();
-        if (!DeviceSyncVersion.IsNewer(version, GetSyncVersion(tx, versionKey)))
+        if (!ProjectionVersion.IsNewer(version, GetSyncVersion(tx, versionKey)))
             return false;
 
         using (var parent = conn.CreateCommand())

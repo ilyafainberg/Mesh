@@ -8,23 +8,26 @@ public enum BackplaneDeliveryOutcome
     Uncertain
 }
 
-public readonly record struct BackplaneDeliveryReceipt(
-    BackplaneDeliveryOutcome Outcome,
-    bool DurableAckExpected)
+/// <summary>Outcome of one directed cross-instance forward.</summary>
+public readonly record struct BackplaneDeliveryReceipt(BackplaneDeliveryOutcome Outcome)
 {
     public static BackplaneDeliveryReceipt NotDelivered =>
-        new(BackplaneDeliveryOutcome.NotDelivered, false);
+        new(BackplaneDeliveryOutcome.NotDelivered);
+
+    public static BackplaneDeliveryReceipt Delivered =>
+        new(BackplaneDeliveryOutcome.Delivered);
 }
 
 /// <summary>
-/// Cross-instance routing seam for the relay. When the relay runs as more than one
-/// replica, the WebSocket for a given handle lives on exactly one instance. The
-/// backplane tracks which instance holds each handle (presence) and forwards a
-/// message to the instance that can actually deliver it.
+/// Cross-instance routing seam for the online-only relay. When the relay runs as more than one
+/// replica, the WebSocket for a given handle/device lives on exactly one instance. The backplane
+/// tracks which instance holds each authenticated connection (ephemeral presence with TTL) and
+/// forwards an in-flight opaque frame to the instance that can deliver it to the live socket.
 ///
-/// The default in-memory implementation is a no-op suitable for a single instance;
-/// the Redis implementation lights up multi-replica routing via pub/sub + presence
-/// keys with TTL.
+/// This is transient pub/sub ONLY. The backplane never persists a frame, a delivery, a receipt or
+/// any payload; a forward that finds no live socket simply reports NotDelivered. The default
+/// in-memory implementation is a no-op single-instance seam; the Redis implementation lights up
+/// multi-replica routing via presence keys with TTL and per-instance channels.
 /// </summary>
 public interface IBackplane
 {
@@ -32,10 +35,12 @@ public interface IBackplane
     string InstanceId { get; }
 
     /// <summary>
-    /// Starts listening for messages addressed to sockets on THIS instance. The handler
-    /// is invoked with (toHandle, envelopeJson) and should deliver to the local socket.
+    /// Starts listening for frames addressed to sockets on THIS instance. The handler is invoked
+    /// with (toHandle, deliveryJson) and should deliver the opaque frame to the local socket(s).
     /// </summary>
-    Task StartAsync(Func<string, string, Task<BackplaneDeliveryReceipt>> deliverLocal, CancellationToken ct = default);
+    Task StartAsync(
+        Func<string, string, Task<BackplaneDeliveryReceipt>> deliverLocal,
+        CancellationToken ct = default);
 
     /// <summary>Records that <paramref name="handle"/> is connected on this instance (renew before TTL).</summary>
     Task SetPresenceAsync(string handle, CancellationToken ct = default);
@@ -43,19 +48,11 @@ public interface IBackplane
     /// <summary>Records that one specific device is connected on this instance.</summary>
     Task SetDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default);
 
-    /// <summary>
-    /// Records a transient route to a background-sync socket without advertising the device as online.
-    /// </summary>
-    Task SetTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default);
-
-    /// <summary>Clears presence for a handle when its socket closes on this instance.</summary>
+    /// <summary>Clears presence for a handle when its last socket closes on this instance.</summary>
     Task ClearPresenceAsync(string handle, CancellationToken ct = default);
 
     /// <summary>Clears one device's presence when its last socket closes on this instance.</summary>
     Task ClearDevicePresenceAsync(string handle, string deviceId, CancellationToken ct = default);
-
-    /// <summary>Clears a transient background-sync route owned by this instance.</summary>
-    Task ClearTransientDeviceRouteAsync(string handle, string deviceId, CancellationToken ct = default);
 
     /// <summary>Returns the instance id currently holding the handle's socket, or null if none.</summary>
     Task<string?> GetInstanceForAsync(string handle, CancellationToken ct = default);
@@ -64,23 +61,9 @@ public interface IBackplane
     Task<string?> GetInstanceForDeviceAsync(string handle, string deviceId, CancellationToken ct = default);
 
     /// <summary>
-    /// Returns the instance holding a transient background-sync socket, without affecting online presence.
-    /// </summary>
-    Task<string?> GetTransientInstanceForDeviceAsync(
-        string handle, string deviceId, CancellationToken ct = default);
-
-    /// <summary>
-    /// Publishes a message to the instance that owns the handle so it can deliver it to the
-    /// live socket. Returns the confirmed outcome and whether the client will acknowledge durable delivery.
+    /// Publishes an in-flight opaque frame to the instance that owns the handle so it can deliver it
+    /// to the live socket. Returns the confirmed outcome. The payload is transient and never stored.
     /// </summary>
     Task<BackplaneDeliveryReceipt> PublishToOwnerAsync(
-        string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default);
-
-    /// <summary>
-    /// Publishes an atomic agent request only to a replica that advertises single-connection
-    /// atomic delivery. Unlike the legacy boolean API, an acknowledgement timeout or remote
-    /// send exception is reported as uncertain so the caller never reassigns ambiguous work.
-    /// </summary>
-    Task<BackplaneDeliveryOutcome> PublishAtomicToOwnerAsync(
-        string instanceId, string toHandle, string envelopeJson, CancellationToken ct = default);
+        string instanceId, string toHandle, string deliveryJson, CancellationToken ct = default);
 }

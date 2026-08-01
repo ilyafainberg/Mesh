@@ -4,15 +4,19 @@ using Mesh.Shared;
 namespace Mesh.Relay.Hub;
 
 /// <summary>
-/// Per-node registry of live hub connections. Maps each SignalR connection id to the handle
-/// it authenticated as, and each handle to its set of local connection ids, so the router can
-/// deliver a message to every device of a recipient that is connected to THIS instance.
+/// Per-node registry of live hub connections for the online-only switchboard. Maps each SignalR
+/// connection id to the handle/device it authenticated as, and each handle to its set of local
+/// connection ids, so the router can forward an opaque frame to every online device of a recipient
+/// that is connected to THIS instance.
 ///
-/// This is intentionally per-instance (connections cannot be persisted). Cross-instance
-/// delivery is handled by the directed backplane using presence, not by this registry.
+/// This is intentionally per-instance and ephemeral (connections are never persisted). Cross-instance
+/// delivery is handled by the directed backplane using ephemeral presence, not by this registry.
 /// </summary>
 public sealed class ConnectionRegistry
 {
+    /// <summary>The bounded number of in-flight opaque frames a single connection may buffer.</summary>
+    public const int MaxOutboundInFlight = 256;
+
     /// <summary>State tracked for a single connection while it is open.</summary>
     public sealed class ConnState
     {
@@ -21,32 +25,63 @@ public sealed class ConnectionRegistry
 
         /// <summary>
         /// Stable short device id derived from this connection's authenticated device public key
-        /// (see <see cref="DeviceProtocol.DeviceId"/>). Set at authentication so the router can
-        /// target one specific device of a handle (MeshEnvelope.ToDevice) and so the directory can
-        /// report which devices are online.
+        /// (see <see cref="DeviceProtocol.DeviceId"/>). Set at authentication so the router can target
+        /// one specific device of a handle and so presence can report which devices are online.
         /// </summary>
         public string? DeviceId { get; set; }
         public string Nonce { get; set; } = "";
         public bool Authenticated { get; set; }
-        public bool SupportsDurableDelivery { get; init; }
-        public bool IsBackgroundSync { get; init; }
-        public SemaphoreSlim DeliveryGate { get; } = new(1, 1);
+
+        /// <summary>The Protocol 9 protocol version asserted on the connect query (always 9 once accepted).</summary>
+        public int ProtocolVersion { get; set; }
+
+        /// <summary>The authentication generation the client asserted at connect, bound into the challenge.</summary>
+        public long AuthGeneration { get; set; }
+
+        /// <summary>The custody head the client asserted at connect, bound into the challenge.</summary>
+        public string CustodyHead { get; set; } = "";
+
+        private int outboundInFlight;
+
+        /// <summary>Reserves one outbound slot; returns false when the bounded buffer is already full.</summary>
+        public bool TryReserveOutbound()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref outboundInFlight);
+                if (current >= MaxOutboundInFlight) return false;
+                if (Interlocked.CompareExchange(ref outboundInFlight, current + 1, current) == current)
+                    return true;
+            }
+        }
+
+        /// <summary>Releases one previously reserved outbound slot.</summary>
+        public void ReleaseOutbound()
+        {
+            var updated = Interlocked.Decrement(ref outboundInFlight);
+            if (updated < 0) Interlocked.Exchange(ref outboundInFlight, 0);
+        }
     }
 
     private readonly ConcurrentDictionary<string, ConnState> byConnection = new();
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> byHandle =
         new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Registers a freshly connected (not yet authenticated) connection with its nonce.</summary>
+    /// <summary>Registers a freshly connected (not yet authenticated) connection with its challenge state.</summary>
     public void Add(
-        string connectionId, string handle, string nonce,
-        bool supportsDurableDelivery = false, bool isBackgroundSync = false)
+        string connectionId,
+        string handle,
+        string nonce,
+        int protocolVersion,
+        long authGeneration,
+        string custodyHead)
         => byConnection[connectionId] = new ConnState
         {
             Handle = handle,
             Nonce = nonce,
-            SupportsDurableDelivery = supportsDurableDelivery,
-            IsBackgroundSync = isBackgroundSync
+            ProtocolVersion = protocolVersion,
+            AuthGeneration = authGeneration,
+            CustodyHead = custodyHead
         };
 
     public ConnState? Get(string connectionId)
@@ -105,9 +140,10 @@ public sealed class ConnectionRegistry
         if (set.IsEmpty) byHandle.TryRemove(handle, out _);
         return revokedDeviceIds.ToArray();
     }
+
     /// <summary>
     /// Removes a connection on disconnect. Returns the handle to clear from presence only when
-    /// this was its last foreground connection (so background drains never hold presence open).
+    /// this was its last authenticated connection on this instance.
     /// </summary>
     public string? Remove(string connectionId)
     {
@@ -117,44 +153,31 @@ public sealed class ConnectionRegistry
             set.TryRemove(connectionId, out _);
             if (set.IsEmpty) byHandle.TryRemove(s.Handle, out _);
         }
-        return s.Authenticated
-            && !s.IsBackgroundSync
-            && !HandleHasLocalConnections(s.Handle, includeBackgroundSync: false)
-                ? s.Handle
-                : null;
+        return s.Authenticated && !HandleHasLocalConnections(s.Handle) ? s.Handle : null;
     }
 
     /// <summary>All local connection ids currently authenticated for a handle.</summary>
-    public IReadOnlyCollection<string> ConnectionsFor(string handle, bool includeBackgroundSync = true)
+    public IReadOnlyCollection<string> ConnectionsFor(string handle)
     {
         if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
         return set.Keys
-            .Where(id => byConnection.TryGetValue(id, out var state)
-                && state.Authenticated
-                && (includeBackgroundSync || !state.IsBackgroundSync))
+            .Where(id => byConnection.TryGetValue(id, out var state) && state.Authenticated)
             .ToArray();
     }
 
     /// <summary>
     /// The local connection ids for a handle whose authenticated device id matches
-    /// <paramref name="deviceId"/>. Used to route an envelope to ONE specific device of a handle.
+    /// <paramref name="deviceId"/>. Used to forward a frame to ONE specific device of a handle.
     /// </summary>
-    public IReadOnlyCollection<string> ConnectionsForDevice(
-        string handle, string deviceId, bool includeBackgroundSync = true)
+    public IReadOnlyCollection<string> ConnectionsForDevice(string handle, string deviceId)
     {
         if (!byHandle.TryGetValue(handle, out var set)) return Array.Empty<string>();
         return set.Keys
             .Where(c => byConnection.TryGetValue(c, out var s)
                 && s.Authenticated
-                && s.DeviceId == deviceId
-                && (includeBackgroundSync || !s.IsBackgroundSync))
+                && s.DeviceId == deviceId)
             .ToArray();
     }
-
-    public bool SupportsDurableDelivery(string connectionId)
-        => byConnection.TryGetValue(connectionId, out var state)
-           && state.Authenticated
-           && state.SupportsDurableDelivery;
 
     /// <summary>The distinct device ids of a handle's authenticated connections on this instance.</summary>
     public IReadOnlyCollection<string> OnlineDeviceIds(string handle)
@@ -169,53 +192,16 @@ public sealed class ConnectionRegistry
     }
 
     /// <summary>Every handle with at least one authenticated connection on this instance.</summary>
-    public IReadOnlyCollection<string> LocalHandles(bool includeBackgroundSync = true)
-    {
-        if (includeBackgroundSync) return byHandle.Keys.ToArray();
-        return byHandle
-            .Where(pair => pair.Value.Keys.Any(id =>
-                byConnection.TryGetValue(id, out var state) && !state.IsBackgroundSync))
-            .Select(pair => pair.Key)
-            .ToArray();
-    }
+    public IReadOnlyCollection<string> LocalHandles() => byHandle.Keys.ToArray();
 
     /// <summary>Every distinct authenticated (handle, device) pair connected to this instance.</summary>
-    public IReadOnlyCollection<(string Handle, string DeviceId)> LocalDevices(
-        bool includeBackgroundSync = true)
+    public IReadOnlyCollection<(string Handle, string DeviceId)> LocalDevices()
         => byConnection.Values
-            .Where(s => s.Authenticated
-                && s.Handle is not null
-                && s.DeviceId is not null
-                && (includeBackgroundSync || !s.IsBackgroundSync))
+            .Where(s => s.Authenticated && s.Handle is not null && s.DeviceId is not null)
             .Select(s => (s.Handle!, s.DeviceId!))
             .Distinct()
             .ToArray();
 
-    /// <summary>Every distinct device with an authenticated background-sync socket on this instance.</summary>
-    public IReadOnlyCollection<(string Handle, string DeviceId)> LocalBackgroundDevices()
-        => byConnection.Values
-            .Where(s => s.Authenticated
-                && s.IsBackgroundSync
-                && s.Handle is not null
-                && s.DeviceId is not null)
-            .Select(s => (s.Handle!, s.DeviceId!))
-            .Distinct()
-            .ToArray();
-
-    public bool HasBackgroundConnectionForDevice(string handle, string deviceId)
-        => byHandle.TryGetValue(handle, out var set)
-           && set.Keys.Any(id =>
-               byConnection.TryGetValue(id, out var state)
-               && state.Authenticated
-               && state.IsBackgroundSync
-               && string.Equals(state.DeviceId, deviceId, StringComparison.Ordinal));
-
-    private bool HandleHasLocalConnections(string handle, bool includeBackgroundSync = true)
-    {
-        if (!byHandle.TryGetValue(handle, out var set)) return false;
-        return includeBackgroundSync
-            ? !set.IsEmpty
-            : set.Keys.Any(id =>
-                byConnection.TryGetValue(id, out var state) && !state.IsBackgroundSync);
-    }
+    private bool HandleHasLocalConnections(string handle)
+        => byHandle.TryGetValue(handle, out var set) && !set.IsEmpty;
 }

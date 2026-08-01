@@ -399,6 +399,43 @@ public sealed class SkillPackageTests
         Assert.IsNull(restored.Compatibility);
     }
 
+    [TestMethod]
+    public void SkillPackageTransfer_RoundTripsFullSkillMetadata()
+    {
+        var content = SkillPackageArchive.Parse(ValidPackageZip(), DesktopCompat());
+        var skill = new Skill
+        {
+            Id = "skill-meta",
+            Name = "Deployment Helper",
+            Description = "Deploys the current application.",
+            Instructions = content.SkillMarkdownText,
+            Visibility = "shared:Work",
+            Enabled = false,
+            SourceMarketplaceId = "catalog:skills.sh",
+            SourceSkillId = "deploy",
+            Version = "3.1.0",
+            Compatibility = content.Manifest.Compatibility.Clone(),
+            PackageHash = content.Manifest.PackageHash,
+            PackageVersion = "3.1.0"
+        };
+
+        var encoded = SkillPackageTransfer.Serialize(skill, content);
+        var (restored, manifest, files) = SkillPackageTransfer.Deserialize(encoded);
+
+        Assert.AreEqual(skill.Id, restored.Id);
+        Assert.AreEqual(skill.Name, restored.Name);
+        Assert.AreEqual(skill.Description, restored.Description);
+        Assert.AreEqual(skill.Visibility, restored.Visibility);
+        Assert.AreEqual(skill.Enabled, restored.Enabled);
+        Assert.AreEqual(skill.SourceMarketplaceId, restored.SourceMarketplaceId);
+        Assert.AreEqual(skill.SourceSkillId, restored.SourceSkillId);
+        Assert.AreEqual(skill.Version, restored.Version);
+        Assert.AreEqual(manifest.PackageHash, restored.PackageHash);
+        CollectionAssert.AreEqual(
+            content.Files["Skill.md"],
+            files["Skill.md"]);
+    }
+
     private static string Sha256Hex(byte[] bytes)
         => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 }

@@ -1,10 +1,11 @@
 using Mesh.App.Domain;
 using Mesh.Shared;
+using System.Text.Json;
 
 namespace Mesh.App.Services;
 
 /// <summary>
-/// Mesh 1.17 asynchronous profile persistence plus SQLCipher-backed capability-asset
+/// Online profile persistence plus SQLCipher-backed capability-asset
 /// (Skill/Knowledge/Widget) storage, migration and hydration.
 ///
 /// The in-memory <see cref="MeshProfile.Skills"/>/<see cref="MeshProfile.Knowledge"/>/
@@ -13,23 +14,14 @@ namespace Mesh.App.Services;
 /// <see cref="MeshDb.SerializeProfileForStorage"/>). Instead each asset is stored losslessly in the
 /// asset tables. On identity load the legacy embedded assets are migrated idempotently, then the
 /// in-memory collections are hydrated back from those tables. All subsequent create/update/delete
-/// operations flowing through <see cref="Mutate"/> are diffed and persisted through
-/// <see cref="IAssetStore"/>, and an <see cref="AssetMutationCreated"/> event is raised for the sync
-/// layer. Profile-blob writes are scheduled onto a <see cref="ProfilePersistenceCoordinator{T}"/>
-/// worker so the UI thread never performs SQLite work.
+/// operations flowing through <see cref="Mutate"/> are diffed and, for a replicated (non
+/// local-only) asset, committed by the replication journal in ONE transaction that writes the
+/// actual asset rows, the signed event and its outbox references together. Profile-blob writes are
+/// scheduled onto a <see cref="ProfilePersistenceCoordinator{T}"/> worker so the UI thread never
+/// performs SQLite work.
 /// </summary>
 public sealed partial class AppState : IAsyncDisposable
 {
-    /// <summary>
-    /// Raised after a local asset mutation has been made durable. For an upsert the record and its
-    /// content bytes are carried; for a delete the tombstone record is carried with null content.
-    /// The sync layer uses this to propagate asset changes without re-embedding them in the profile.
-    /// </summary>
-    public event Action<AssetSyncMutation>? AssetMutationCreated;
-
-    /// <summary>An asset change that is ready to be surfaced to device sync.</summary>
-    public sealed record AssetSyncMutation(AssetRecord Record, byte[]? Content);
-
     /// <summary>How a single asset change must be applied by the persistence worker.</summary>
     private enum AssetWorkOp
     {
@@ -47,8 +39,9 @@ public sealed partial class AppState : IAsyncDisposable
         AssetWorkOp Op,
         AssetRecord? Record,
         byte[]? Content,
-        bool CreateOutboxEntry,
-        string SourceDeviceId);
+        bool Replicate,
+        string SourceDeviceId,
+        IReadOnlyList<string> Targets);
 
     /// <summary>The kind of change a caller declares for a single asset, before it is diffed.</summary>
     private enum AssetChange
@@ -74,17 +67,29 @@ public sealed partial class AppState : IAsyncDisposable
         MetadataSweep
     }
 
+    /// <summary>
+    /// An immutable local replication descriptor. The background persistence worker turns this into
+    /// one SQLite transaction containing the ACTUAL domain table write, the signed local event and
+    /// its outbox references.
+    /// </summary>
+    private sealed record ReplicationWork(
+        MeshDb Db,
+        string Kind,
+        ReplicationPayloadCodec.DomainAction Action,
+        string EntityId,
+        string? ConversationId,
+        string CausalVersion,
+        string BodyJson,
+        IReadOnlyList<string> Targets);
+
     private sealed record ProfileWork(
         MeshDb? Db,
         string? BlobJson,
-        IReadOnlyList<MeshDb.SyncVersionWrite> Versions,
-        IReadOnlyList<MeshDb.SyncTombstoneWrite> Tombstones,
-        IReadOnlyList<MeshDb.SyncCircleRenameWrite> CircleRenames,
-        IReadOnlyList<DeviceSyncOperation> Operations,
         bool WriteAccountIndex,
         string? IndexActiveId,
         IReadOnlyList<AccountRef>? IndexAccounts,
-        IReadOnlyList<AssetWork> Assets);
+        IReadOnlyList<AssetWork> Assets,
+        IReadOnlyList<ReplicationWork>? Replications = null);
 
     private ProfilePersistenceCoordinator<long>? persistence;
     private readonly object writeQueueGate = new();
@@ -187,73 +192,134 @@ public sealed partial class AppState : IAsyncDisposable
             {
                 var store = new AssetStore(work.Db);
                 foreach (var asset in work.Assets)
-                {
-                    switch (asset.Op)
-                    {
-                        case AssetWorkOp.Delete:
-                        {
-                            var tombstone = await store
-                                .DeleteAsync(asset.Kind, asset.Id, asset.SourceDeviceId, asset.CreateOutboxEntry, ct)
-                                .ConfigureAwait(false);
-                            assetContentCache.Remove(CacheKey(asset.Kind, asset.Id));
-                            AssetMutationCreated?.Invoke(new AssetSyncMutation(tombstone, null));
-                            break;
-                        }
-                        case AssetWorkOp.UpsertMetadataOnly:
-                        {
-                            // Preserve the existing body: fetch the single stored body off the UI
-                            // thread and re-upsert it under the new metadata. Never overwrites an
-                            // unloaded body with empty content.
-                            var existing = await store
-                                .GetFullAssetAsync(asset.Kind, asset.Id, ct).ConfigureAwait(false);
-                            var body = existing?.Content ?? Array.Empty<byte>();
-                            var record = asset.Record! with { ContentHash = null, ContentByteCount = 0 };
-                            await store.UpsertAsync(record, body, asset.CreateOutboxEntry, ct)
-                                .ConfigureAwait(false);
-                            assetContentCache.Set(CacheKey(asset.Kind, asset.Id), body);
-                            // The stored row's byte count is recomputed from the preserved body; surface
-                            // that same count (not the zeroed placeholder) to the sync layer.
-                            AssetMutationCreated?.Invoke(new AssetSyncMutation(
-                                record with { ContentByteCount = body.LongLength }, body));
-                            break;
-                        }
-                        default:
-                        {
-                            await store.UpsertAsync(asset.Record!, asset.Content!, asset.CreateOutboxEntry, ct)
-                                .ConfigureAwait(false);
-                            assetContentCache.Set(CacheKey(asset.Kind, asset.Id), asset.Content!);
-                            AssetMutationCreated?.Invoke(new AssetSyncMutation(asset.Record!, asset.Content));
-                            break;
-                        }
-                    }
-                }
+                    await ApplyAssetWorkAsync(work.Db, store, asset, ct).ConfigureAwait(false);
             }
 
             if (work.BlobJson is not null)
             {
-                if (work.Versions.Count > 0 || work.Tombstones.Count > 0 || work.CircleRenames.Count > 0)
-                {
-                    var accepted = work.Db.SaveProfileAndSyncState(
-                        work.BlobJson, work.Versions, work.Tombstones, circleRenames: work.CircleRenames);
-                    if (!accepted)
-                    {
-                        throw new InvalidOperationException(
-                            "The profile sync transaction was not accepted.");
-                    }
-                    foreach (var operation in work.Operations)
-                        DeviceSyncOperationCreated?.Invoke(operation);
-                }
-                else
-                {
-                    work.Db.SaveProfileJson(work.BlobJson);
-                }
+                work.Db.SaveProfileJson(work.BlobJson);
             }
         }
 
         if (work.WriteAccountIndex && work.IndexAccounts is not null)
             WriteIndexCore(work.IndexActiveId, work.IndexAccounts);
 
+        if (work.Replications is { Count: > 0 })
+            foreach (var replication in work.Replications)
+                await ExecuteReplicationAsync(replication, ct).ConfigureAwait(false);
+
         ClearError();
+    }
+
+    /// <summary>
+    /// Applies exactly one asset change. A local-only (mobile or explicitly local) asset writes the
+    /// actual asset rows and nothing else: no signed event, no outbox reference, no sequence is
+    /// consumed. A replicated asset instead routes through the replication journal so the actual
+    /// <c>assets</c>/<c>asset_content</c> row (or tombstone), the signed event, its target-account
+    /// outbox references and the sequence bump all commit in ONE transaction. The bounded content
+    /// cache is only updated after that commit returns.
+    /// </summary>
+    private async Task ApplyAssetWorkAsync(MeshDb db, AssetStore store, AssetWork asset, CancellationToken ct)
+    {
+        var key = CacheKey(asset.Kind, asset.Id);
+
+        if (!asset.Replicate)
+        {
+            switch (asset.Op)
+            {
+                case AssetWorkOp.Delete:
+                    await store.DeleteAsync(asset.Kind, asset.Id, asset.SourceDeviceId, ct).ConfigureAwait(false);
+                    assetContentCache.Remove(key);
+                    return;
+                case AssetWorkOp.UpsertMetadataOnly:
+                {
+                    var existing = await store.GetFullAssetAsync(asset.Kind, asset.Id, ct).ConfigureAwait(false);
+                    var body = existing?.Content ?? Array.Empty<byte>();
+                    await store.UpsertAsync(asset.Record! with { ContentHash = null, ContentByteCount = 0 }, body, ct)
+                        .ConfigureAwait(false);
+                    assetContentCache.Set(key, body);
+                    return;
+                }
+                default:
+                    await store.UpsertAsync(asset.Record!, asset.Content!, ct).ConfigureAwait(false);
+                    assetContentCache.Set(key, asset.Content!);
+                    return;
+            }
+        }
+
+        var entityId = AssetEntityId(asset.Kind, asset.Id);
+
+        if (asset.Op == AssetWorkOp.Delete)
+        {
+            var deleteBody = JsonSerializer.Serialize(
+                new { kind = asset.Kind.ToString(), id = asset.Id, sourceDeviceId = asset.SourceDeviceId },
+                ReplicationJson);
+            await ReplicateLocalAsync(
+                ReplicationOpKinds.Asset, ReplicationPayloadCodec.DomainAction.AssetDelete,
+                entityId, null, NewReplicationVersion(), deleteBody, asset.Targets, ct: ct).ConfigureAwait(false);
+            assetContentCache.Remove(key);
+            return;
+        }
+
+        // Metadata-only edits must never overwrite an unloaded body: the single stored body is
+        // loaded on this worker thread BEFORE the journal transaction is opened.
+        byte[] content;
+        if (asset.Op == AssetWorkOp.UpsertMetadataOnly)
+        {
+            var existing = await store.GetFullAssetAsync(asset.Kind, asset.Id, ct).ConfigureAwait(false);
+            content = existing?.Content ?? Array.Empty<byte>();
+        }
+        else
+        {
+            content = asset.Content ?? Array.Empty<byte>();
+        }
+
+        var record = asset.Record!;
+        var bodyJson = JsonSerializer.Serialize(
+            new ReplicationDomainMaterializer.AssetBody(
+                record.Kind.ToString(),
+                record.Id,
+                record.Name,
+                record.MetadataJson,
+                record.ContentMime,
+                Convert.ToBase64String(content),
+                Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(content)).ToLowerInvariant(),
+                record.Version,
+                record.SourceDeviceId,
+                record.UpdatedAt,
+                content.LongLength,
+                LocalOnly: false),
+            ReplicationJson);
+
+        await ReplicateLocalAsync(
+            ReplicationOpKinds.Asset, ReplicationPayloadCodec.DomainAction.AssetUpsert,
+            entityId, null, NewReplicationVersion(), bodyJson, asset.Targets, ct: ct).ConfigureAwait(false);
+
+        assetContentCache.Set(key, content);
+    }
+
+    /// <summary>The replication entity id for one asset: the kind and the asset id.</summary>
+    internal static string AssetEntityId(AssetKind kind, string id)
+        => ReplicationDomainMaterializer.AssetEntityId(kind, id);
+
+    /// <summary>
+    /// Executes one local replication descriptor. The actual domain rows, the signed event and its
+    /// outbox references all commit in a single transaction (see
+    /// <c>MeshDb.AllocateAndAppendLocalEvent</c>), so a partial write is impossible and a failure
+    /// propagates to the caller for requeue rather than being swallowed.
+    /// </summary>
+    private async Task ExecuteReplicationAsync(ReplicationWork work, CancellationToken ct)
+    {
+        // The account may have been switched or signed out while this work was queued; the old
+        // database is gone, so the descriptor is dropped rather than written to a swapped-in one.
+        if (!ReferenceEquals(work.Db, activeDb)) return;
+
+        var envelope = new ReplicationPayloadCodec.DomainEnvelope(
+            work.Kind, work.Action, work.EntityId, work.ConversationId, work.CausalVersion, work.BodyJson);
+
+        await ReplicateLocalAsync(
+            work.Kind, work.Action, work.EntityId, work.ConversationId,
+            work.CausalVersion, work.BodyJson, work.Targets, ct: ct).ConfigureAwait(false);
     }
 
     private void RecordError(Exception ex)
@@ -276,10 +342,6 @@ public sealed partial class AppState : IAsyncDisposable
         Enqueue(new ProfileWork(
             db,
             MeshDb.SerializeProfileForStorage(Profile),
-            Array.Empty<MeshDb.SyncVersionWrite>(),
-            Array.Empty<MeshDb.SyncTombstoneWrite>(),
-            Array.Empty<MeshDb.SyncCircleRenameWrite>(),
-            Array.Empty<DeviceSyncOperation>(),
             WriteAccountIndex: false,
             IndexActiveId: null,
             IndexAccounts: null,
@@ -308,11 +370,7 @@ public sealed partial class AppState : IAsyncDisposable
         Enqueue(new ProfileWork(
             activeDb,
             blobJson,
-            Array.Empty<MeshDb.SyncVersionWrite>(),
-            Array.Empty<MeshDb.SyncTombstoneWrite>(),
-            Array.Empty<MeshDb.SyncCircleRenameWrite>(),
-            Array.Empty<DeviceSyncOperation>(),
-            WriteAccountIndex: true,
+            true,
             activeId,
             SnapshotAccounts(),
             assetWorks));
@@ -394,6 +452,8 @@ public sealed partial class AppState : IAsyncDisposable
     private IReadOnlyList<AssetWork> BuildHintedAssetWorks(
         IReadOnlyList<AssetHint> hints, string deviceId, bool localOnly)
     {
+        var replicate = !localOnly && !applyingReplicationProjection;
+        var targets = replicate ? TargetsForOwnerState().ToArray() : Array.Empty<string>();
         var works = new List<AssetWork>(hints.Count);
         foreach (var hint in hints)
         {
@@ -401,8 +461,7 @@ public sealed partial class AppState : IAsyncDisposable
             {
                 BumpAssetVersion((hint.Kind, hint.Id));
                 works.Add(new AssetWork(
-                    hint.Kind, hint.Id, AssetWorkOp.Delete, null, null,
-                    CreateOutboxEntry: !localOnly, deviceId));
+                    hint.Kind, hint.Id, AssetWorkOp.Delete, null, null, replicate, deviceId, targets));
                 continue;
             }
 
@@ -414,7 +473,7 @@ public sealed partial class AppState : IAsyncDisposable
                 : AssetWorkOp.Upsert;
             works.Add(new AssetWork(
                 hint.Kind, hint.Id, op, built.Value.Record with { Version = version },
-                built.Value.Content, CreateOutboxEntry: !localOnly, deviceId));
+                built.Value.Content, replicate, deviceId, targets));
         }
         return works;
     }
@@ -439,6 +498,8 @@ public sealed partial class AppState : IAsyncDisposable
     private IReadOnlyList<AssetWork> DiffAssetMetadata(
         Dictionary<(AssetKind, string), string> before, string deviceId, bool localOnly)
     {
+        var replicate = !localOnly && !applyingReplicationProjection;
+        var targets = replicate ? TargetsForOwnerState().ToArray() : Array.Empty<string>();
         var works = new List<AssetWork>();
         var afterKeys = new HashSet<(AssetKind, string)>();
         foreach (var (kind, id, record, content) in EnumerateAssets(Profile, deviceId, localOnly))
@@ -452,16 +513,14 @@ public sealed partial class AppState : IAsyncDisposable
             // materialised content.
             var op = known ? AssetWorkOp.UpsertMetadataOnly : AssetWorkOp.Upsert;
             works.Add(new AssetWork(
-                kind, id, op, record with { Version = version }, content,
-                CreateOutboxEntry: !localOnly, deviceId));
+                kind, id, op, record with { Version = version }, content, replicate, deviceId, targets));
         }
         foreach (var key in before.Keys)
         {
             if (afterKeys.Contains(key)) continue;
             BumpAssetVersion(key);
             works.Add(new AssetWork(
-                key.Item1, key.Item2, AssetWorkOp.Delete, null, null,
-                CreateOutboxEntry: !localOnly, deviceId));
+                key.Item1, key.Item2, AssetWorkOp.Delete, null, null, replicate, deviceId, targets));
         }
         return works;
     }
@@ -525,7 +584,7 @@ public sealed partial class AppState : IAsyncDisposable
         {
             foreach (var (kind, id, record, content) in EnumerateAssets(Profile, deviceId, localOnly))
                 if (db.GetFullAsset(kind, id) is null)
-                    db.UpsertAsset(record, content, createOutboxEntry: !localOnly);
+                    db.UpsertAsset(record, content);
             if (hadLegacy) db.SaveProfile(Profile);
             HydrateFromAssets(db);
         }

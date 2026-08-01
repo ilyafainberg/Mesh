@@ -5,6 +5,22 @@ using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
+internal sealed record MemoryProjection(
+    string Id,
+    string Title,
+    string Content,
+    string Category,
+    string Origin,
+    double Importance,
+    double Confidence,
+    double Stability,
+    int ReinforcementCount,
+    string? SourceThreadId,
+    string? SourceLineId,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset LastReinforcedAt);
+
 internal static class MemoryPolicy
 {
     public const int MaxTitleChars = 160;
@@ -106,7 +122,7 @@ internal static class MemoryPolicy
         return item;
     }
 
-    public static bool IsValid(DeviceSyncMemory memory)
+    public static bool IsValid(MemoryProjection memory)
     {
         if (memory is null
             || !TopicRunProtocol.IsValidIdentifier(memory.Id)
@@ -132,10 +148,10 @@ internal static class MemoryPolicy
                && IsOptionalIdentifier(memory.SourceLineId);
     }
 
-    public static DeviceSyncMemory ToSync(MemoryItem memory)
+    public static MemoryProjection ToSync(MemoryItem memory)
     {
         var item = Normalize(memory);
-        return new DeviceSyncMemory(
+        return new MemoryProjection(
             item.Id,
             item.Title,
             item.Content,
@@ -152,7 +168,7 @@ internal static class MemoryPolicy
             item.LastReinforcedAt);
     }
 
-    public static MemoryItem FromSync(DeviceSyncMemory memory)
+    public static MemoryItem FromSync(MemoryProjection memory)
     {
         if (!IsValid(memory)) throw new ArgumentException("Synchronized memory is invalid.", nameof(memory));
         return Normalize(new MemoryItem
