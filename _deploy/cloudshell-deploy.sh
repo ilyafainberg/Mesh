@@ -47,7 +47,7 @@ az containerapp update -n "$APP" -g "$RG" \
   --set-env-vars \
     "ASPNETCORE_URLS=http://+:8080" \
     "COSMOS_CONNECTION=secretref:cosmos" \
-    "MESH_REQUIRE_DURABLE_STORAGE=true" \
+    "MESH_REQUIRE_METADATA_STORAGE=true" \
     "REDIS_CONNECTION=secretref:redis" \
     "MODEL_DAILY_TOKEN_LIMIT=100000" \
   --min-replicas 1 --max-replicas 5 -o none

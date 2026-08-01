@@ -104,16 +104,11 @@ public sealed class SkillPackageCache
                         $"File '{file.Path}' failed hash validation after materialization.");
             }
 
-            // Atomic publish. If a concurrent writer beat us to it, keep the existing folder.
-            try
-            {
-                Directory.Move(tempDir, finalDir);
-            }
-            catch (IOException) when (Directory.Exists(finalDir))
-            {
-                TryDelete(tempDir);
+            // Atomic publish. Windows security scanners can briefly hold a newly written directory,
+            // so retry a bounded number of times. If a concurrent writer wins, reuse its verified
+            // package directory instead of replacing it.
+            if (!PublishDirectory(tempDir, finalDir))
                 return finalDir;
-            }
         }
         catch
         {
@@ -164,6 +159,33 @@ public sealed class SkillPackageCache
         {
             // Read-only marking is best-effort; the DB remains the source of truth.
         }
+    }
+
+    private static bool PublishDirectory(string tempDir, string finalDir)
+    {
+        IOException? last = null;
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                Directory.Move(tempDir, finalDir);
+                return true;
+            }
+            catch (IOException ex)
+            {
+                if (Directory.Exists(finalDir))
+                {
+                    TryDelete(tempDir);
+                    return false;
+                }
+                last = ex;
+                if (attempt < 4)
+                    Thread.Sleep(25 * (attempt + 1));
+            }
+        }
+        throw new IOException(
+            $"Could not atomically publish skill package directory '{finalDir}'.",
+            last);
     }
 
     private static void RemoveDir(string dir)

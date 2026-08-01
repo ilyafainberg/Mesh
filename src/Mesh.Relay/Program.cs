@@ -21,18 +21,18 @@ builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.W
 // REST payloads (registration, link, token broker, model prompt) are always small.
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 512 * 1024);
 
-// ---- Durable storage + directed backplane (config-gated, in-memory by default) ------
-// Cosmos connection => durable handle registry / invites / service directory (metadata only).
+// ---- Metadata storage + directed backplane (config-gated, in-memory by default) ------
+// Cosmos connection => handle registry / invites / service directory metadata only.
 // Redis connection  => multi-replica presence + directed per-node message forwarding.
 var cosmosConn = Config(builder.Configuration, "COSMOS_CONNECTION", "Cosmos:Connection");
 var redisConn = Config(builder.Configuration, "REDIS_CONNECTION", "Redis:Connection");
-var requireDurableStorage = bool.TryParse(
-    Config(builder.Configuration, "MESH_REQUIRE_DURABLE_STORAGE", "Mesh:RequireDurableStorage"),
-    out var durableRequired) && durableRequired;
-if (requireDurableStorage && string.IsNullOrWhiteSpace(cosmosConn))
+var requireMetadataStorage = bool.TryParse(
+    Config(builder.Configuration, "MESH_REQUIRE_METADATA_STORAGE", "Mesh:RequireMetadataStorage"),
+    out var metadataRequired) && metadataRequired;
+if (requireMetadataStorage && string.IsNullOrWhiteSpace(cosmosConn))
     throw new InvalidOperationException(
-        "MESH_REQUIRE_DURABLE_STORAGE is enabled, but COSMOS_CONNECTION is not configured.");
-var durableStorage = !string.IsNullOrWhiteSpace(cosmosConn);
+        "MESH_REQUIRE_METADATA_STORAGE is enabled, but COSMOS_CONNECTION is not configured.");
+var metadataStorage = !string.IsNullOrWhiteSpace(cosmosConn);
 
 IRelayStore store = string.IsNullOrWhiteSpace(cosmosConn)
     ? new InMemoryRelayStore()
@@ -140,7 +140,7 @@ var transportCapabilities = new
     protocolVersion = MeshProtocol.Version,
     onlineOnly = true,
     durablePayloadStorage = false,
-    metadataStore = durableStorage,
+    metadataStore = metadataStorage,
     sendResults = true,
     presenceResolution = true,
     fanout = true,
