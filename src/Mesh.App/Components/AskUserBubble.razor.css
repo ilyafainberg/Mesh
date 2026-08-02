@@ -26,7 +26,7 @@
     display: block;
 
     /* Fill the flex-column parent up to 680px.
-       Do NOT set cross-axis self-alignment to flex-start — that is the primary
+       Do NOT set cross-axis self-alignment to flex-start - that is the primary
        rendering bug: it causes the bubble to shrink to content width, making
        child width:100% buttons resolve to minimum content size on Windows/Android. */
     width: 100%;
