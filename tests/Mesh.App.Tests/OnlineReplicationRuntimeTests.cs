@@ -558,6 +558,42 @@ public sealed class OnlineReplicationRuntimeTests
     }
 
     [TestMethod]
+    public async Task Poller_NewSibling_BootstrapsExactlyOnce()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
+        source.SetPresence("alice", true, myDevice, siblingDevice);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var bootstraps = 0;
+        var poller = new ReplicationPresencePoller(
+            engine,
+            roster,
+            source,
+            () => new[] { "alice" },
+            _ => false,
+            "alice",
+            myDevice,
+            _ => { },
+            (_, device, _) =>
+            {
+                Assert.AreEqual(siblingDevice, device);
+                bootstraps++;
+                return Task.CompletedTask;
+            });
+        _disposables.Add(poller);
+
+        await poller.PollOnceAsync(default);
+        await poller.PollOnceAsync(default);
+
+        Assert.AreEqual(1, bootstraps);
+    }
+
+    [TestMethod]
     public async Task Poller_OfflineHandle_StartsNoSession()
     {
         var source = new FakeMetadataSource();

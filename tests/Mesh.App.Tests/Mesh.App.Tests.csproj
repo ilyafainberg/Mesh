@@ -35,6 +35,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Protocol9Domain.cs" Link="MeshDb.Protocol9Domain.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReplicationDomainMaterializer.cs" Link="ReplicationDomainMaterializer.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReplicationProfileMaterializer.cs" Link="ReplicationProfileMaterializer.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ReplicationInboundProjection.cs" Link="ReplicationInboundProjection.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.ReplicationJournal.cs" Link="MeshDb.ReplicationJournal.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReplicationJournal.cs" Link="ReplicationJournal.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\OnlineReplicationEngine.cs" Link="OnlineReplicationEngine.cs" />
@@ -53,6 +54,8 @@
     <Compile Include="..\..\src\Mesh.App\Services\AssetPersistenceModels.cs" Link="AssetPersistenceModels.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AssetLazyLoading.cs" Link="AssetLazyLoading.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\PlatformCaps.cs" Link="PlatformCaps.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\CircleToolPolicy.cs" Link="CircleToolPolicy.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\CircleSkillPolicy.cs" Link="CircleSkillPolicy.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\IAgentTool.cs" Link="IAgentTool.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AgentToolExecutor.cs" Link="AgentToolExecutor.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReasoningExtract.cs" Link="ReasoningExtract.cs" />

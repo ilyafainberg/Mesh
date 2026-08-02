@@ -34,6 +34,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     private readonly ConcurrentDictionary<string, SemaphoreSlim> inboundTopicExecutionGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Lazy<Task>> serviceRequestExecutions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> serviceRequestReplay = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Lazy<Task>> agentRequestExecutions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> agentRequestReplay = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<long, Task> backgroundTasks = new();
     private long nextBackgroundTaskId;
     private readonly ConcurrentDictionary<string, IReadOnlyList<string>> keyCache = new(StringComparer.OrdinalIgnoreCase);
@@ -156,6 +158,9 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         try
         {
             var h = AppState.Norm(p.Handle);
+            state.EnsureLocalReplicationAuthority();
+            var custody = state.LocalCustodyAuthority(h)
+                ?? throw new OnlineReplicationError("No signed local custody authority is available.");
             // Proof of possession: sign the claim with this device's private key so the relay can
             // confirm we control the key we are registering (collision avoidance).
             var sig = IdentityService.Sign(p.PrivateKey, ClaimProtocol.Message(h, p.PublicKey));
@@ -171,7 +176,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                     PlatformCaps.DevicePlatform,
                     PlatformCaps.CanRunAgent && agent.IsModelReady,
                     AgentHostEnabled: true,
-                    ProtocolVersion: MeshProtocol.Version));
+                    ProtocolVersion: MeshProtocol.Version,
+                    CustodyAuthority: custody));
             Log?.Invoke($"register {p.Handle}: {(int)resp.StatusCode}");
             if (resp.IsSuccessStatusCode) return true;
 
@@ -289,6 +295,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 var body = await resp.Content.ReadAsStringAsync();
                 return (false, $"relay {(int)resp.StatusCode}: {body}");
             }
+            var authority = await http.GetFromJsonAsync<HandleInfo>(
+                $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}");
+            if (authority?.CustodyAuthority is null)
+                return (false, "The relay did not return signed custody authority after recovery.");
+            state.ImportCustodyAuthority(h, authority.CustodyAuthority);
             return (true, null);
         }
         catch (Exception ex) { return (false, ex.Message); }
@@ -341,6 +352,10 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 return (false, $"relay {(int)resp.StatusCode}: {body}");
             }
             var result = await resp.Content.ReadFromJsonAsync<LinkRedeemResponse>();
+            var authority = await http.GetFromJsonAsync<HandleInfo>(
+                $"{relayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}");
+            if (authority?.CustodyAuthority is null)
+                return (false, "The relay did not return signed custody authority after device linking.");
             // Adopt the linked identity: this device keeps its own keypair but takes the handle.
             state.Mutate(x =>
             {
@@ -348,6 +363,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 x.RelayUrl = relayUrl.TrimEnd('/');
                 if (!string.IsNullOrWhiteSpace(result?.DisplayName)) x.DisplayName = result!.DisplayName!;
             });
+            state.ImportCustodyAuthority(h, authority.CustodyAuthority);
             return (true, null);
         }
         catch (Exception ex) { return (false, ex.Message); }
@@ -914,7 +930,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         // agent, or a request their agent addressed to ours) is tagged "agent"; a message a
         // person typed to the human (chat or a direct message) is "person". Chat still engages
         // our guest agent below, but for labeling/history it is treated as person-authored.
-        var via = env.Kind is MeshKinds.AgentResponse or MeshKinds.AgentRequest or MeshKinds.AtomicAgentResponse
+        var via = env.Kind is MeshKinds.AgentResponse or MeshKinds.AgentRequest
+            or MeshKinds.AtomicAgentRequest or MeshKinds.AtomicAgentResponse
             ? "agent"
             : "person";
         var receiptable = env.Kind is MeshKinds.DirectMessage or MeshKinds.Chat
@@ -924,6 +941,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 string.Equals(line.Id, env.Id, StringComparison.Ordinal)) == true)
         {
             if (receiptable) TrackBackground(SendReceiptAsync(from, env.Id), "duplicate delivery receipt");
+            if (env.Kind == MeshKinds.AtomicAgentRequest && allowed && agent.IsModelReady)
+                await HandleAgentQuestionOnceAsync(env, from, text, display, ct);
             return;
         }
         state.AddChatLine(from, new ChatLine
@@ -945,6 +964,16 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             state.MarkUnread(from);
             if (ShouldNotify(contact))
                 notifier.Notify($"Message from {display}", Preview(text), NotifyKind.Message, "messages");
+        }
+
+        // A response to this device's own outbound agent request is solicited traffic. It is shown
+        // in the conversation but must never create a new contact approval request merely because
+        // the responder is not allowed to initiate independent agent questions.
+        if (env.Kind is MeshKinds.AgentResponse or MeshKinds.AtomicAgentResponse)
+        {
+            state.MarkUnread(from);
+            StateChanged?.Invoke();
+            return;
         }
 
         if (!allowed)
@@ -969,7 +998,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         // Allowed -> guest agent drafts a scoped reply, subject to the daily cost budget.
         if ((env.Kind is MeshKinds.Chat or MeshKinds.AgentRequest or MeshKinds.AtomicAgentRequest)
             && agent.IsModelReady)
-            await HandleAgentQuestionAsync(env, from, text, display, ct);
+            await HandleAgentQuestionOnceAsync(env, from, text, display, ct);
         StateChanged?.Invoke();
     }
 
@@ -1023,7 +1052,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 MeshKinds.ServiceResponse,
                 ServiceProtocol.Body(serviceId,
                     "This service has reached its usage budget and is not accepting requests right now."),
-                StableEnvelopeId("service.response", envelope.Id));
+                StableEnvelopeId("service.response", envelope.Id),
+                toDevice: envelope.FromDevice);
             Log?.Invoke($"service '{serviceId}' refused for @{from}: budget exhausted");
             return;
         }
@@ -1035,7 +1065,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 MeshKinds.ServiceResponse,
                 ServiceProtocol.Body(serviceId,
                     "You have reached this service's daily request limit. Please try again tomorrow."),
-                StableEnvelopeId("service.response", envelope.Id));
+                StableEnvelopeId("service.response", envelope.Id),
+                toDevice: envelope.FromDevice);
             Log?.Invoke($"service '{serviceId}' refused for @{from}: daily rate limit");
             return;
         }
@@ -1067,7 +1098,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             from,
             MeshKinds.ServiceResponse,
             ServiceProtocol.Body(serviceId, reply.Text),
-            StableEnvelopeId("service.response", envelope.Id));
+            StableEnvelopeId("service.response", envelope.Id),
+            toDevice: envelope.FromDevice);
     }
 
     private async Task HandleAgentQuestionAsync(
@@ -1104,7 +1136,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                     From = from,
                     RequestBody = text,
                     DraftReply = reply,
-                    AgentRequestId = atomic ? request.AgentRequestId : null
+                    AgentRequestId = atomic ? request.AgentRequestId : null,
+                    FromDevice = atomic ? request.FromDevice : null
                 }));
                 if (!state.Profile.DoNotDisturb)
                     notifier.Notify("Reply needs your approval",
@@ -1120,11 +1153,42 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 atomic ? MeshKinds.AtomicAgentResponse : MeshKinds.AgentResponse,
                 reply,
                 line.Id,
+                toDevice: atomic ? request.FromDevice : null,
                 agentRequestId: atomic ? request.AgentRequestId : null);
         }
+
         finally
         {
             gate.Release();
+        }
+    }
+
+    private async Task HandleAgentQuestionOnceAsync(
+        MeshEnvelope request,
+        string from,
+        string text,
+        string display,
+        CancellationToken ct)
+    {
+        var key = request.AgentRequestId ?? request.Id;
+        if (agentRequestReplay.ContainsKey(key)) return;
+        var execution = agentRequestExecutions.GetOrAdd(
+            key,
+            _ => new Lazy<Task>(
+                () => HandleAgentQuestionAsync(request, from, text, display, ct),
+                LazyThreadSafetyMode.ExecutionAndPublication));
+        var completed = false;
+        try
+        {
+            await execution.Value;
+            completed = true;
+        }
+        finally
+        {
+            if (completed) RememberReplay(agentRequestReplay, key);
+            if (agentRequestExecutions.TryGetValue(key, out var current)
+                && ReferenceEquals(current, execution))
+                agentRequestExecutions.TryRemove(key, out _);
         }
     }
 
@@ -2138,6 +2202,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             atomic ? MeshKinds.AtomicAgentResponse : MeshKinds.AgentResponse,
             text,
             line.Id,
+            toDevice: approval.FromDevice,
             agentRequestId: approval.AgentRequestId);
     }
 
@@ -2600,6 +2665,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         string? agentRequestId = null,
         string? remoteAgentToken = null)
     {
+        if (string.Equals(kind, MeshKinds.DirectMessage, StringComparison.Ordinal))
+        {
+            if (lineId is not null) state.SetLineStatus(lineId, "sent");
+            return true;
+        }
         if (hub is null || hub.State != HubConnectionState.Connected || !authenticated)
         {
             Log?.Invoke("send failed: not connected");
@@ -2608,6 +2678,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         }
         var p = state.Profile;
         var to = AppState.Norm(toHandle);
+        if (string.Equals(kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal))
+            agentRequestId ??= lineId;
 
         // End-to-end encrypt to the recipient's device keys when we can resolve them. The relay
         // only ever sees ciphertext. If keys are unavailable (recipient not in the directory yet)

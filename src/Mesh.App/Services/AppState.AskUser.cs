@@ -38,7 +38,7 @@ public sealed partial class AppState
         Func<SuspendedAgentContext, AskUserPrompt, CancellationToken, Task> handler)
         => askUserResumeHandler = handler ?? throw new ArgumentNullException(nameof(handler));
 
-    /// <summary>The visual bubbles to render for a Me thread, ordered oldest-first.</summary>
+    /// <summary>The pending visual bubbles to render for a Me thread, ordered oldest-first.</summary>
     public IReadOnlyList<AskUserBubbleView> AskUserPromptsFor(string? threadId)
     {
         if (string.IsNullOrWhiteSpace(threadId)) return Array.Empty<AskUserBubbleView>();
@@ -47,6 +47,7 @@ public sealed partial class AppState
             .Where(p => string.Equals(p.ThreadId, threadId, StringComparison.Ordinal))
             .OrderBy(p => p.CreatedAt)
             .Select(p => AskUserBubbleView.From(p, now))
+            .Where(view => view.IsInteractive)
             .ToList();
     }
 
@@ -77,7 +78,23 @@ public sealed partial class AppState
         }
     }
 
-    private void UpsertAskUserView(AskUserPrompt prompt) => askUserPrompts[prompt.PromptId] = prompt;
+    private void UpsertAskUserView(AskUserPrompt prompt)
+    {
+        if (prompt.State == AskUserState.Pending)
+        {
+            askUserPrompts[prompt.PromptId] = prompt;
+            return;
+        }
+
+        DismissAskUserView(prompt.PromptId);
+    }
+
+    private void DismissAskUserView(string promptId)
+    {
+        askUserPrompts.TryRemove(promptId, out _);
+        if (string.Equals(focusedAskUserPromptId, promptId, StringComparison.Ordinal))
+            focusedAskUserPromptId = null;
+    }
 
     /// <summary>
     /// The suspend-the-run body invoked by the internal ask_user tool. Persists the prompt and its
@@ -171,10 +188,29 @@ public sealed partial class AppState
         var store = ResolveAskUserStore();
         if (store is null) return false;
 
+        askUserPrompts.TryGetValue(promptId, out var pendingView);
+        DismissAskUserView(promptId);
+        NotifyChanged();
+
+        AskUserPrompt? resolved;
         var deviceId = LocalDeviceId() ?? "local";
-        var resolved = await EmitAskUserResolutionAsync(
-            promptId, AskUserState.Resolved, optionId, deviceId, ct).ConfigureAwait(false);
-        if (resolved is null) return false;
+        try
+        {
+            resolved = await EmitAskUserResolutionAsync(
+                promptId, AskUserState.Resolved, optionId, deviceId, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            if (pendingView is not null) UpsertAskUserView(pendingView);
+            NotifyChanged();
+            throw;
+        }
+        if (resolved is null)
+        {
+            if (pendingView is not null) UpsertAskUserView(pendingView);
+            NotifyChanged();
+            return false;
+        }
 
         await ApplyAskUserResolvedAsync(resolved, ct).ConfigureAwait(false);
         return resolved.State == AskUserState.Resolved

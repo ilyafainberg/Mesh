@@ -25,11 +25,12 @@ internal sealed record KeyPair(string PrivateB64, string PublicB64)
 }
 
 /// <summary>A shared, authoritative device roster / custody generation view for all engines.</summary>
-internal sealed class FabricRoster : IReplicationRoster
+internal sealed class FabricRoster : IRefreshableReplicationRoster
 {
     private readonly object gate = new();
     private readonly Dictionary<string, List<ReplicationDevice>> byAccount = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> generation = new(StringComparer.Ordinal);
+    public int RefreshCalls { get; private set; }
 
     public void Add(string account, ReplicationDevice device)
     {
@@ -76,6 +77,12 @@ internal sealed class FabricRoster : IReplicationRoster
     public long AuthGeneration(string accountHandle)
     {
         lock (gate) return generation.TryGetValue(accountHandle, out var g) ? g : 0;
+    }
+
+    public Task RefreshAsync(IReadOnlyList<string> handles, CancellationToken ct)
+    {
+        RefreshCalls++;
+        return Task.CompletedTask;
     }
 }
 

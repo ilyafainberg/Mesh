@@ -200,6 +200,18 @@ function Build-Windows {
     "--self-contained", "true", "-o", $PubDir, "--nologo"
   ) "dotnet publish (windows)"
   if (-not (Test-Path (Join-Path $PubDir "Mesh.App.exe"))) { Die "publish produced no Mesh.App.exe" }
+  $playwrightNode = Join-Path $PubDir ".playwright\node"
+  $windowsNode = Join-Path $playwrightNode "win32_x64\node.exe"
+  if (-not (Test-Path $windowsNode -PathType Leaf)) {
+    Die "Windows Playwright driver is missing from publish output."
+  }
+  $foreignPlaywrightDrivers = @(
+    Get-ChildItem $playwrightNode -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -ne "win32_x64" }
+  )
+  if ($foreignPlaywrightDrivers.Count -gt 0) {
+    Die "Windows publish contains non-Windows Playwright drivers: $($foreignPlaywrightDrivers.Name -join ', ')"
+  }
   Ok "published"
 
   Note "staging license/notices/icon"

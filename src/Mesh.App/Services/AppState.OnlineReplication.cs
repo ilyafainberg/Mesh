@@ -72,6 +72,10 @@ public sealed partial class AppState
         var engine = new OnlineReplicationEngine(
             db, identity, transport, roster, CreateReplicationApplier(),
             deviceIsDesktop: !PlatformCaps.IsMobile);
+        engine.StateChanged += change =>
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "replication",
+                $"reason={change.Reason}; error={change.Error}");
         replicationEngine = engine;
         replicationEngineDb = db;
         return engine;
@@ -396,6 +400,94 @@ public sealed partial class AppState
             return activeDb?.GetCustodyHead(h)?.EntryHash;
     }
 
+    /// <summary>Returns the signed local custody authority for registration or re-assertion.</summary>
+    public CustodyEntry? LocalCustodyAuthority(string handle)
+    {
+        var h = Norm(handle);
+        lock (profileSyncGate)
+            return activeDb?.GetCustodyHead(h);
+    }
+
+    /// <summary>Imports relay-published signed custody metadata after device linking or recovery.</summary>
+    public void ImportCustodyAuthority(string handle, CustodyEntry authority)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        var h = Norm(handle);
+        if (!string.Equals(Norm(authority.Handle), h, StringComparison.Ordinal))
+            throw new OnlineReplicationError("The relay returned custody authority for a different handle.");
+        if (!OnlineReplicationProtocol.VerifyCustodyEntry(authority, authority.SignerKey))
+            throw new OnlineReplicationError("The relay returned invalid custody authority.");
+        lock (profileSyncGate)
+        {
+            var db = activeDb
+                ?? throw new OnlineReplicationError("No account database is open for custody import.");
+            db.AppendCustodyEntry(authority);
+        }
+    }
+
+    /// <summary>
+    /// Re-emits current owner state as fresh immutable events for a newly online sibling. Existing
+    /// ciphertext may predate that device's key, so replay alone cannot hydrate a future device.
+    /// </summary>
+    public async Task EmitOwnerBootstrapSnapshotAsync(
+        string accountHandle,
+        string peerDevice,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(peerDevice)) return;
+
+        lock (profileSyncGate)
+        {
+            if (!string.Equals(Norm(accountHandle), Norm(Profile.Handle), StringComparison.Ordinal))
+                return;
+
+            foreach (var thread in Profile.OwnThreads)
+            {
+                EmitTopicUpsert(thread);
+                foreach (var line in thread.Lines)
+                    EmitLineUpsert("topic.bootstrap", thread.Id, line);
+            }
+
+            foreach (var conversation in Profile.Conversations)
+            {
+                EmitConversationUpsert(conversation);
+                foreach (var line in conversation.Lines)
+                {
+                    var handle = Norm(conversation.Handle);
+                    EmitReplicatedChange(
+                        ReplicationOpKinds.Message,
+                        ReplicationPayloadCodec.DomainAction.AppendLine,
+                        handle,
+                        handle,
+                        JsonSerializer.Serialize(line, ReplicationJson),
+                        TargetsForOwnerState());
+                }
+            }
+
+            var emptyProjection = new ProfileProjectionState(
+                new Dictionary<string, CircleProjection>(StringComparer.Ordinal),
+                new Dictionary<string, ContactProjection>(StringComparer.Ordinal));
+            EmitProfileProjectionChanges(
+                emptyProjection,
+                ProfileProjection.Snapshot(Profile),
+                renamedCircleFrom: null);
+
+            foreach (var memory in Profile.Memories)
+                EmitReplicatedChange(
+                    ReplicationOpKinds.Memory,
+                    ReplicationPayloadCodec.DomainAction.Upsert,
+                    memory.Id,
+                    null,
+                    JsonSerializer.Serialize(MemoryPolicy.ToSync(memory), ReplicationJson),
+                    TargetsForOwnerState());
+        }
+
+        await FlushPersistenceAsync(ct).ConfigureAwait(false);
+        RuntimeDiagnostics.Current?.RecordEvent(
+            "replication",
+            $"owner bootstrap emitted for device={peerDevice}");
+    }
+
     /// <summary>
     /// True when any of <paramref name="targetAccounts"/> has a pending outbox reference awaiting
     /// delivery. Read off the UI thread; the presence poller uses it to choose the fast (pending) vs
@@ -438,6 +530,7 @@ public sealed partial class AppState
         lock (profileSyncGate)
         {
             if (sourceDb is null || !ReferenceEquals(sourceDb, activeDb)) return;
+            envelope = ReplicationInboundProjection.ForLocalAccount(evt, envelope, Profile.Handle);
         }
 
         if (envelope.Action is ReplicationPayloadCodec.DomainAction.AssetUpsert
@@ -482,6 +575,19 @@ public sealed partial class AppState
             try
             {
                 changed = ReplicationProfileMaterializer.Apply(Profile, envelope);
+                if (changed
+                    && envelope.Kind == ReplicationOpKinds.Topic
+                    && envelope.Action == ReplicationPayloadCodec.DomainAction.AppendLine)
+                {
+                    var line = JsonSerializer.Deserialize<ChatLine>(envelope.BodyJson, ReplicationJson);
+                    var thread = Profile.OwnThreads.FirstOrDefault(item =>
+                        string.Equals(item.Id, envelope.EntityId, StringComparison.Ordinal));
+                    if (line is { Role: "assistant" } && thread is not null)
+                        changed |= ReconcileTopicRunWithAnswer(
+                            thread,
+                            line.ReplyToLineId,
+                            line.At == default ? DateTimeOffset.UtcNow : line.At);
+                }
             }
             finally
             {
@@ -517,7 +623,11 @@ public sealed partial class AppState
         ReplicationEvent evt,
         ReplicationPayloadCodec.DomainEnvelope envelope,
         bool deviceIsDesktop)
-        => ReplicationDomainMaterializer.Apply(conn, tx, evt, envelope, deviceIsDesktop);
+    {
+        lock (profileSyncGate)
+            envelope = ReplicationInboundProjection.ForLocalAccount(evt, envelope, Profile.Handle);
+        return ReplicationDomainMaterializer.Apply(conn, tx, evt, envelope, deviceIsDesktop);
+    }
 
     private sealed class AppStateReplicationApplier(AppState owner) : IReplicationDomainApplier
     {

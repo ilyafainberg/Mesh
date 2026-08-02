@@ -40,10 +40,10 @@
         <ApplicationIcon>Platforms\Windows\appicon.ico</ApplicationIcon>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.16.2</ApplicationDisplayVersion>
-        <ApplicationVersion>63</ApplicationVersion>
+        <ApplicationDisplayVersion>1.17.0</ApplicationDisplayVersion>
+        <ApplicationVersion>64</ApplicationVersion>
         <!-- Drives AssemblyVersion/FileVersion/InformationalVersion, read by the self-updater. -->
-        <Version>1.16.2</Version>
+        <Version>1.17.0</Version>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
@@ -176,6 +176,20 @@
         <Copy SourceFiles="@(TotalControlFiles)"
               DestinationFiles="@(TotalControlFiles->'$(PublishDir)mcp\totalcontrol\%(RecursiveDir)%(Filename)%(Extension)')"
               SkipUnchangedFiles="true" />
+    </Target>
+
+    <!-- Microsoft.Playwright publishes Node drivers for every supported desktop OS. A win-x64
+         release needs only win32_x64; retaining the others adds roughly 466 MB of unusable files. -->
+    <Target Name="PruneNonWindowsPlaywrightDrivers" AfterTargets="Publish"
+            Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
+        <ItemGroup>
+            <NonWindowsPlaywrightDriver Include="$(PublishDir).playwright\node\darwin-arm64" />
+            <NonWindowsPlaywrightDriver Include="$(PublishDir).playwright\node\darwin-x64" />
+            <NonWindowsPlaywrightDriver Include="$(PublishDir).playwright\node\linux-arm64" />
+            <NonWindowsPlaywrightDriver Include="$(PublishDir).playwright\node\linux-x64" />
+        </ItemGroup>
+        <RemoveDir Directories="@(NonWindowsPlaywrightDriver)"
+                   Condition="Exists('%(NonWindowsPlaywrightDriver.Identity)')" />
     </Target>
 
 </Project>

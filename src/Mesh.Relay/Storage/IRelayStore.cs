@@ -35,6 +35,9 @@ public sealed class StoredHandle
     /// </summary>
     public string CustodyHead { get; set; } = "";
 
+    /// <summary>The signed custody entry represented by <see cref="CustodyHead"/>.</summary>
+    public CustodyEntry? CustodyAuthority { get; set; }
+
     /// <summary>
     /// The handle's recovery public key, captured at registration. Used to authorize a brand-new
     /// device via <c>POST /handles/{handle}/recover</c> when no existing device can issue a link
@@ -128,7 +131,12 @@ public interface IRelayStore
     /// Returns the resulting record and whether the supplied device key is authorized on it.
     /// </summary>
     Task<(StoredHandle record, bool deviceAuthorized)> UpsertHandleAsync(
-        string handle, string devicePublicKey, string? displayName, bool allowNewDevice, CancellationToken ct = default);
+        string handle,
+        string devicePublicKey,
+        string? displayName,
+        bool allowNewDevice,
+        CustodyEntry? initialCustodyAuthority = null,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Removes a handle registration entirely, freeing the name to be claimed again. Also drops the

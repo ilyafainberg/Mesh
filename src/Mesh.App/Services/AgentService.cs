@@ -805,8 +805,12 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         MeshProfile p, IReadOnlyList<IAgentTool> agentTools, bool compact, string query, CancellationToken ct)
     {
         var knowledge = await HydrateKnowledgeAsync(p.Knowledge, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        var checker = SkillCompatibilityChecker.ForCurrentDevice(state.SkillCliProbe);
+        var skillCandidates = p.Skills
+            .Where(s => CircleSkillPolicy.Evaluate(s, isOwner: true, guestCircles: null, checker).Allowed)
+            .ToList();
         var skills = await HydrateSkillsAsync(
-            p.Skills.Where(s => s.Enabled).ToList(), p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+            skillCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
         return BuildOwnerSystemPrompt(p, agentTools, compact, knowledge, skills);
     }
 
@@ -818,7 +822,10 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         // metadata field, so this filter runs on summaries WITHOUT loading any body: an unauthorized
         // asset is never even a load candidate.
         var knowledgeCandidates = p.Knowledge.Where(k => AudiencePolicy.CanAccess(k.Visibility, circles)).ToList();
-        var skillCandidates = p.Skills.Where(s => s.Enabled && AudiencePolicy.CanAccess(s.Visibility, circles)).ToList();
+        var checker = SkillCompatibilityChecker.ForCurrentDevice(state.SkillCliProbe);
+        var skillCandidates = p.Skills
+            .Where(s => CircleSkillPolicy.Evaluate(s, isOwner: false, circles, checker).Allowed)
+            .ToList();
         var knowledge = await HydrateKnowledgeAsync(knowledgeCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
         var skills = await HydrateSkillsAsync(skillCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
         return BuildGuestSystemPrompt(p, fromHandle, agentTools, widgets, knowledge, skills, IsSmall(p.Model.Provider));
@@ -831,7 +838,11 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
         // The candidate lists are already restricted to exactly the service's own attached ids, so the
         // bounded load can only ever touch those bodies.
         var knowledge = await HydrateKnowledgeAsync(knowledgeCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
-        var skills = await HydrateSkillsAsync(skillCandidates, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
+        var checker = SkillCompatibilityChecker.ForCurrentDevice(state.SkillCliProbe);
+        var compatibleSkills = skillCandidates
+            .Where(s => CircleSkillPolicy.Evaluate(s, isOwner: true, guestCircles: null, checker).Allowed)
+            .ToList();
+        var skills = await HydrateSkillsAsync(compatibleSkills, p.Model.TokenOptimization, query, ct).ConfigureAwait(false);
         return BuildServiceSystemPrompt(p, svc, widgets, knowledge, skills, IsSmall(p.Model.Provider));
     }
 

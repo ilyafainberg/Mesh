@@ -1,0 +1,116 @@
+@* ─────────────────────────────────────────────────────────────────────────────
+   AskUserBubble.razor  –  Persistent interactive question bubble for ask_user.
+
+   Renders as a visually-distinct card inside the flex-column messages container
+   with tappable/clickable choice buttons, correct layout at narrow-mobile and
+   desktop widths, and clear pending / answered / expired / cancelled states.
+
+   Parent wires:
+     OnSelect="optId => ResolveAskAsync(Bubble.PromptId, optId)"
+     IsResolving="@(askResolving.Contains(Bubble.PromptId))"
+     IsFocused="@(Bubble.PromptId == State.FocusedAskUserPromptId)"
+   ───────────────────────────────────────────────────────────────────────────── *@
+
+@if (Bubble is not null)
+{
+    <div class="ask-user-bubble @StatusClass @FocusClass"
+         role="group"
+         aria-label="Assistant question"
+         id="@($"ask-{Bubble.PromptId}")">
+
+        <div class="ask-user-head">
+            <i class="bi bi-patch-question" aria-hidden="true"></i>
+            <span class="ask-user-question">@Bubble.Question</span>
+        </div>
+
+        <div class="ask-user-options">
+            @foreach (var option in Bubble.Options)
+            {
+                <button type="button"
+                        @key="option.Id"
+                        class="ask-user-option @(option.IsSelected ? "is-selected" : "") @(option.IsRecommended ? "is-recommended" : "")"
+                        disabled="@(!Bubble.IsInteractive || IsResolving)"
+                        aria-pressed="@(option.IsSelected ? "true" : "false")"
+                        aria-label="@OptionLabel(option)"
+                        @onclick="() => HandleSelectAsync(option.Id)">
+                    <span class="ask-user-option-title">@option.Title</span>
+                    @if (option.IsRecommended)
+                    {
+                        <span class="ask-user-badge" aria-hidden="true">Recommended</span>
+                    }
+                    @if (!string.IsNullOrWhiteSpace(option.Description))
+                    {
+                        <span class="ask-user-option-desc">@option.Description</span>
+                    }
+                </button>
+            }
+        </div>
+
+        <div class="ask-user-status" aria-live="polite" aria-atomic="true">
+            @switch (Bubble.Status)
+            {
+                case AskUserBubbleStatus.Pending:
+                    <span class="muted">Waiting for your choice…</span>
+                    break;
+                case AskUserBubbleStatus.Answered:
+                    <span class="ask-user-answered">
+                        <i class="bi bi-check-circle" aria-hidden="true"></i> You chose @Bubble.SelectedOptionTitle
+                    </span>
+                    break;
+                case AskUserBubbleStatus.Expired:
+                    <span class="muted">This question expired.</span>
+                    break;
+                case AskUserBubbleStatus.Cancelled:
+                    <span class="muted">This question was cancelled.</span>
+                    break;
+            }
+        </div>
+    </div>
+}
+
+@code {
+    /// <summary>
+    /// The view model from <see cref="AskUserBubbleView.From"/>. When null the component renders nothing.
+    /// </summary>
+    [Parameter, EditorRequired] public AskUserBubbleView? Bubble { get; set; }
+
+    /// <summary>
+    /// Raised when the user clicks a choice. The argument is the chosen option id.
+    /// The parent is responsible for calling ResolveAskUserPromptAsync with Bubble.PromptId.
+    /// </summary>
+    [Parameter] public EventCallback<string> OnSelect { get; set; }
+
+    /// <summary>
+    /// Set to true while the parent is persisting the selection to prevent double-submit.
+    /// All option buttons are disabled until the operation completes.
+    /// </summary>
+    [Parameter] public bool IsResolving { get; set; }
+
+    /// <summary>
+    /// Highlights the bubble with a focus outline when true (e.g. it has just been scrolled into view).
+    /// </summary>
+    [Parameter] public bool IsFocused { get; set; }
+
+    private string StatusClass =>
+        Bubble?.Status == AskUserBubbleStatus.Pending ? "is-pending" : "is-settled";
+
+    private string FocusClass => IsFocused ? "is-focused" : "";
+
+    private async Task HandleSelectAsync(string optionId)
+    {
+        if (Bubble is null || !Bubble.IsInteractive || IsResolving) return;
+        await OnSelect.InvokeAsync(optionId);
+    }
+
+    /// <summary>
+    /// Builds the full accessible label for a choice button: title, optional "(recommended)",
+    /// and optional description sentence. Exposed internal for unit tests.
+    /// </summary>
+    internal static string OptionLabel(AskUserOptionView option)
+    {
+        var label = option.Title;
+        if (option.IsRecommended) label += " (recommended)";
+        if (!string.IsNullOrWhiteSpace(option.Description)) label += ". " + option.Description;
+        return label;
+    }
+}

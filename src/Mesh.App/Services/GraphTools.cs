@@ -382,18 +382,9 @@ public sealed class ToolRegistry(MsalAuthService auth, GoogleAuthService google,
         var tools = new List<IAgentTool>();
         foreach (var (kind, setting) in settings)
         {
-            if (setting is null || !setting.Enabled) continue;
-            // Mesh data contains the owner's private chats and configuration. It is never exposed
-            // through a guest agent, even if an old profile contains a non-private visibility value.
-            if (!owner && kind == LocalToolKind.MeshData) continue;
-            // Desktop-only tools (scripts, browsers) cannot run on a phone, so never offer them to the
-            // agent on mobile. This gates both the owner and guest paths since both flow through here.
-            if (PlatformCaps.IsMobile && kind.IsDesktopOnly()) continue;
-            if (!owner)
-            {
-                // Guest: only if explicitly shared with a matching circle or all allowed contacts.
-                if (circles is null || !AudiencePolicy.CanAccess(setting.Visibility, circles)) continue;
-            }
+            var availability = CircleToolPolicy.Evaluate(
+                kind, setting, owner, circles, PlatformCaps.IsMobile);
+            if (!availability.Allowed) continue;
             var tool = MakeLocalTool(kind);
             if (tool is not null)
                 tools.Add(new ApprovalTool(tool, setting.ApprovalLevel, approvals));

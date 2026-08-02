@@ -191,7 +191,12 @@ public sealed class CosmosRelayStore : IRelayStore
 
     /// <inheritdoc />
     public async Task<(StoredHandle record, bool deviceAuthorized)> UpsertHandleAsync(
-        string handle, string devicePublicKey, string? displayName, bool allowNewDevice, CancellationToken ct = default)
+        string handle,
+        string devicePublicKey,
+        string? displayName,
+        bool allowNewDevice,
+        CustodyEntry? initialCustodyAuthority = null,
+        CancellationToken ct = default)
     {
         await EnsureInitAsync(ct).ConfigureAwait(false);
 
@@ -222,8 +227,9 @@ public sealed class CosmosRelayStore : IRelayStore
                     Handle = handle,
                     DisplayName = displayName,
                     RegisteredAt = DateTimeOffset.UtcNow,
-                    AuthGeneration = 1,
-                    CustodyHead = "",
+                    AuthGeneration = initialCustodyAuthority?.Generation ?? 0,
+                    CustodyHead = initialCustodyAuthority?.EntryHash ?? "",
+                    CustodyAuthority = initialCustodyAuthority,
                     DevicePublicKeys = new List<string> { devicePublicKey }
                 };
 
@@ -1123,6 +1129,7 @@ public sealed class CosmosRelayStore : IRelayStore
         RegisteredAt = doc.RegisteredAt,
         AuthGeneration = doc.AuthGeneration,
         CustodyHead = doc.CustodyHead ?? "",
+        CustodyAuthority = doc.CustodyAuthority,
         DevicePublicKeys = doc.DevicePublicKeys is null ? new List<string>() : new List<string>(doc.DevicePublicKeys),
         RecoveryPublicKey = doc.RecoveryPublicKey,
         DeviceNames = doc.DeviceNames is null ? new Dictionary<string, string>() : new Dictionary<string, string>(doc.DeviceNames),
@@ -1181,6 +1188,9 @@ public sealed class CosmosRelayStore : IRelayStore
 
         [JsonPropertyName("custodyHead")]
         public string? CustodyHead { get; set; }
+
+        [JsonPropertyName("custodyAuthority")]
+        public CustodyEntry? CustodyAuthority { get; set; }
 
         [JsonPropertyName("deleting")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]

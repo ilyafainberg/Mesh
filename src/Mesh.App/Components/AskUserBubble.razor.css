@@ -1,0 +1,218 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   AskUserBubble.razor.css  –  Scoped layout/visual for the ask-user card.
+
+   ROOT-CAUSE FIX documented here:
+   The global app.css set the cross-axis self-alignment of .ask-user-bubble to
+   "flex-start" (the shrink-to-content value).  As a direct child of the
+   flex-column .messages-wrap container this caused the bubble to collapse to
+   its intrinsic/content width.  Child .ask-user-option buttons with
+   `width: 100%` then had no concrete parent dimension to resolve against, so
+   they collapsed to their minimum content size (the text label width).  On
+   Windows and Android this produced narrow, untappable pill buttons instead of
+   full-width choice cards.
+
+   FIX: Use `width: 100%` + `max-width: 680px` on the bubble WITHOUT the
+   shrink-to-content alignment.  This gives the bubble a definite width in the
+   flex context, and child `width: 100%` buttons fill it correctly.
+
+   Since this file produces scoped selectors (.ask-user-bubble[b-...]) with
+   specificity (0,1,1) > the global (0,1,0) in app.css, and Mesh.App.styles.css
+   is loaded after app.css, every declaration here wins over the global sheet
+   when this component is used.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+/* ── Bubble container ───────────────────────────────────────────────────────── */
+.ask-user-bubble {
+    display: block;
+
+    /* Fill the flex-column parent up to 680px.
+       Do NOT set cross-axis self-alignment to flex-start — that is the primary
+       rendering bug: it causes the bubble to shrink to content width, making
+       child width:100% buttons resolve to minimum content size on Windows/Android. */
+    width: 100%;
+    max-width: 680px;
+    box-sizing: border-box;
+    min-width: 0;           /* guard against flex-item overflow blowout */
+
+    margin: 8px 0;
+    padding: 14px 16px;
+    background: var(--brand-tint, #EBF3FC);
+    border: 1px solid var(--brand-tint-2, #CFE4FA);
+    border-radius: var(--radius-l, 8px);
+    box-shadow: var(--shadow-2, 0 1px 2px rgba(0,0,0,.14), 0 0 2px rgba(0,0,0,.12));
+}
+
+.ask-user-bubble.is-settled {
+    background: var(--bg-2, #FAFAFA);
+    border-color: var(--stroke-1, #E0E0E0);
+}
+
+.ask-user-bubble.is-focused {
+    outline: 2px solid var(--brand, #0F6CBD);
+    outline-offset: 2px;
+}
+
+/* ── Question header ────────────────────────────────────────────────────────── */
+.ask-user-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 12px;
+    min-width: 0;
+}
+
+.ask-user-head .bi {
+    color: var(--brand, #0F6CBD);
+    font-size: 1.1rem;
+    line-height: 1.4;
+    flex: 0 0 auto;
+}
+
+.ask-user-question {
+    font-weight: 600;
+    color: var(--fg-1, #242424);
+    line-height: 1.4;
+    min-width: 0;
+    /* overflow-wrap: break-word is the widely-supported fallback;
+       overflow-wrap: anywhere is the enhanced value for modern browsers. */
+    overflow-wrap: break-word;
+    word-break: break-word;     /* older Android WebView fallback */
+}
+
+/* ── Options list ───────────────────────────────────────────────────────────── */
+.ask-user-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+
+/* ── Individual option button ─────────────────────────────────────────────── */
+.ask-user-option {
+    /* Flex column so title, badge, and description stack vertically */
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+
+    /* width:100% resolves against the bubble's concrete width (100%/≤680px).
+       This is correct only because the bubble is NOT set to shrink to content
+       width by cross-axis self-alignment. */
+    width: 100%;
+    box-sizing: border-box;
+    min-width: 0;
+
+    /* WCAG 2.5.5 / Android minimum touch-target height */
+    min-height: 48px;
+    padding: 10px 14px;
+    text-align: left;
+
+    background: var(--bg-1, #FFFFFF);
+    border: 1px solid var(--stroke-2, #D1D1D1);
+    border-radius: var(--radius-m, 6px);
+    color: var(--fg-1, #242424);
+    font-size: 0.95rem;
+    cursor: pointer;
+    transition: background .12s ease, border-color .12s ease;
+}
+
+.ask-user-option:hover:not(:disabled) {
+    background: var(--bg-hover, #F5F5F5);
+    border-color: var(--brand, #0F6CBD);
+}
+
+.ask-user-option:focus-visible {
+    outline: 2px solid var(--brand, #0F6CBD);
+    outline-offset: 2px;
+}
+
+.ask-user-option:disabled {
+    cursor: default;
+    opacity: .7;
+}
+
+.ask-user-option.is-recommended {
+    border-color: var(--brand, #0F6CBD);
+}
+
+.ask-user-option.is-selected {
+    background: var(--brand, #0F6CBD);
+    border-color: var(--brand, #0F6CBD);
+    color: var(--fg-on-brand, #FFFFFF);
+}
+
+/* ── Option text spans ─────────────────────────────────────────────────────── */
+.ask-user-option-title {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    font-weight: 600;
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.ask-user-option-desc {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    font-size: 0.82rem;
+    color: var(--fg-3, #616161);
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.ask-user-option.is-selected .ask-user-option-desc {
+    color: var(--fg-on-brand, #FFFFFF);
+}
+
+/* ── Recommended badge ──────────────────────────────────────────────────────── */
+.ask-user-badge {
+    /* Parent .ask-user-option sets align-items: flex-start, so the badge
+       already stays left-aligned without needing an explicit align-self. */
+    margin-top: 2px;
+    padding: 1px 8px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    border-radius: 999px;
+    background: var(--brand, #0F6CBD);
+    color: var(--fg-on-brand, #FFFFFF);
+}
+
+.ask-user-option.is-selected .ask-user-badge {
+    background: var(--fg-on-brand, #FFFFFF);
+    color: var(--brand, #0F6CBD);
+}
+
+/* ── Status footer ──────────────────────────────────────────────────────────── */
+.ask-user-status {
+    margin-top: 10px;
+    font-size: 0.85rem;
+    min-width: 0;
+}
+
+.ask-user-status .muted {
+    color: var(--fg-3, #616161);
+}
+
+.ask-user-answered {
+    color: var(--ok, #0E7A0B);
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* ── Narrow-mobile overrides (≤640px) ─────────────────────────────────────── */
+@media (max-width: 640px) {
+    .ask-user-bubble {
+        max-width: 100%;
+        padding: 12px;
+    }
+
+    /* Larger touch target on small screens per WCAG 2.5.5 */
+    .ask-user-option {
+        min-height: 52px;
+    }
+}

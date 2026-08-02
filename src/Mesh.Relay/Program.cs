@@ -135,20 +135,7 @@ await backplane.StartAsync((toHandle, deliveryJson) =>
     router.DeliverFromBackplaneAsync(toHandle, deliveryJson));
 
 // ---- Health ---------------------------------------------------------------
-var transportCapabilities = new
-{
-    protocolVersion = MeshProtocol.Version,
-    onlineOnly = true,
-    durablePayloadStorage = false,
-    metadataStore = metadataStorage,
-    sendResults = true,
-    presenceResolution = true,
-    fanout = true,
-    deviceRevocation = true,
-    contentlessPush = true,
-    maxTransportBytes = OnlineReplicationLimits.MaxTransportBytes,
-    maxFanoutRecipients = FanoutProtocol.MaxRecipients
-};
+var transportCapabilities = Mesh.Relay.RelayTransportCapabilities.Protocol9(metadataStorage);
 app.MapGet("/", () => Results.Ok(new
 {
     service = "Mesh.Relay",
@@ -324,8 +311,23 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
         if (Mesh.Shared.ReservedHandles.IsReserved(handle))
             return Results.Conflict(new { error = "handle is reserved" });
 
-        // First registration CLAIMS the handle for this device key.
-        var (created, _) = await store.UpsertHandleAsync(handle, req.DevicePublicKey, req.DisplayName, allowNewDevice: true);
+        var custody = req.CustodyAuthority;
+        var custodyValid = custody is not null
+            && string.Equals(LinkProtocol.Normalize(custody.Handle), handle, StringComparison.Ordinal)
+            && string.Equals(custody.SubjectDeviceKey, req.DevicePublicKey, StringComparison.Ordinal)
+            && string.Equals(custody.SignerKey, req.DevicePublicKey, StringComparison.Ordinal)
+            && OnlineReplicationProtocol.ValidateCustodyAppend(null, custody) == CustodyValidationResult.Valid
+            && OnlineReplicationProtocol.VerifyCustodyEntry(custody, req.DevicePublicKey);
+        if (!custodyValid)
+            return Results.BadRequest(new { error = "a valid signed genesis custody authority is required" });
+
+        // First registration CLAIMS the handle and atomically publishes its signed genesis authority.
+        var (created, _) = await store.UpsertHandleAsync(
+            handle,
+            req.DevicePublicKey,
+            req.DisplayName,
+            allowNewDevice: true,
+            initialCustodyAuthority: custody);
         // Capture the recovery public key at registration so a future device can recover the handle.
         if (!string.IsNullOrWhiteSpace(req.RecoveryPublicKey))
             await store.SetRecoveryKeyAsync(handle, req.RecoveryPublicKey);
@@ -349,6 +351,13 @@ app.MapPost("/handles", async (RegisterHandleRequest req) =>
 
     if (existing.DevicePublicKeys.Contains(req.DevicePublicKey))
     {
+        var custody = req.CustodyAuthority;
+        if (custody is null
+            || !string.Equals(custody.EntryHash, existing.CustodyHead, StringComparison.Ordinal)
+            || !existing.DevicePublicKeys.Contains(custody.SignerKey, StringComparer.Ordinal)
+            || !OnlineReplicationProtocol.VerifyCustodyEntry(custody, custody.SignerKey))
+            return Results.BadRequest(new { error = "the device did not present current signed custody authority" });
+
         // Re-asserting an already authorized device is idempotent (normal launch).
         if (req.DisplayName is not null) await store.SetDisplayNameAsync(handle, req.DisplayName);
         // First-writer-wins: adopt a recovery key on re-register only if none is stored yet.
@@ -626,7 +635,7 @@ app.MapGet("/handles/{handle}", async (string handle) =>
     var online = await backplane.GetInstanceForAsync(key) is not null;
     return Results.Ok(new HandleInfo(
         rec.Handle, rec.DisplayName, rec.DevicePublicKeys, online, rec.RegisteredAt,
-        rec.AuthGeneration, rec.CustodyHead));
+        rec.AuthGeneration, rec.CustodyHead, rec.CustodyAuthority));
 });
 
 // Per-device directory: metadata is durable, while online state comes from cross-replica presence.

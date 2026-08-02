@@ -219,6 +219,7 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
 
         Assert.IsNotNull(b.Db.GetEvent(eid));
         Assert.AreEqual(ReplicationDeliveryState.Persisted, a.Engine.GetDeliveryState(eid, "bob"));
+        Assert.IsTrue(Roster.RefreshCalls > 0, "batch validation must refresh origin-account authority");
     }
 
     [TestMethod]
@@ -234,6 +235,24 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         await Fabric.DrainAsync();
 
         Assert.IsNotNull(b.Db.GetEvent(eid));
+    }
+
+    [TestMethod]
+    public async Task RepeatedPresencePoll_DoesNotReplaceEstablishedSession()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        await ConnectAsync(a, b);
+        var delivered = Fabric.Delivered;
+
+        await a.Engine.OnPresenceOnlineAsync(b.Handle, b.Device);
+        await b.Engine.OnPresenceOnlineAsync(a.Handle, a.Device);
+        await Fabric.DrainAsync();
+
+        Assert.AreEqual(
+            delivered,
+            Fabric.Delivered,
+            "an established session must not be replaced on every presence poll");
     }
 
     // =====================================================================

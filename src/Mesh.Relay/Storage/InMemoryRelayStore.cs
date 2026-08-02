@@ -45,7 +45,12 @@ public sealed class InMemoryRelayStore : IRelayStore
     }
 
     public Task<(StoredHandle record, bool deviceAuthorized)> UpsertHandleAsync(
-        string handle, string devicePublicKey, string? displayName, bool allowNewDevice, CancellationToken ct = default)
+        string handle,
+        string devicePublicKey,
+        string? displayName,
+        bool allowNewDevice,
+        CustodyEntry? initialCustodyAuthority = null,
+        CancellationToken ct = default)
     {
         var normalized = NormalizeHandle(handle);
         lock (HandleGate(normalized))
@@ -59,8 +64,9 @@ public sealed class InMemoryRelayStore : IRelayStore
                     Handle = normalized,
                     DisplayName = displayName,
                     RegisteredAt = DateTimeOffset.UtcNow,
-                    AuthGeneration = 1,
-                    CustodyHead = ""
+                    AuthGeneration = initialCustodyAuthority?.Generation ?? 0,
+                    CustodyHead = initialCustodyAuthority?.EntryHash ?? "",
+                    CustodyAuthority = initialCustodyAuthority
                 };
                 rec.DevicePublicKeys.Add(devicePublicKey);
                 handles[normalized] = rec;
@@ -430,6 +436,7 @@ public sealed class InMemoryRelayStore : IRelayStore
                 RegisteredAt = r.RegisteredAt,
                 AuthGeneration = r.AuthGeneration,
                 CustodyHead = r.CustodyHead,
+                CustodyAuthority = r.CustodyAuthority,
                 DevicePublicKeys = r.DevicePublicKeys.ToList(),
                 RecoveryPublicKey = r.RecoveryPublicKey,
                 DeviceNames = new Dictionary<string, string>(r.DeviceNames),

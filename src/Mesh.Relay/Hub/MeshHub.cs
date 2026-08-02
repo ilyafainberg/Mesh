@@ -43,6 +43,20 @@ public sealed class MeshHub(
     ILogger<MeshHub> logger) : Microsoft.AspNetCore.SignalR.Hub
 {
     private static readonly TimeSpan PresenceTtl = TimeSpan.FromSeconds(30);
+    private static readonly HashSet<string> OnlineControlKinds = new(StringComparer.Ordinal)
+    {
+        MeshKinds.AtomicAgentRequest,
+        MeshKinds.AtomicAgentResponse,
+        MeshKinds.ServiceRequest,
+        MeshKinds.ServiceResponse,
+        MeshKinds.Receipt,
+        MeshKinds.Report,
+        MeshKinds.TopicRunRequest,
+        MeshKinds.TopicRunUpdate,
+        MeshKinds.TopicRunCancel,
+        MeshKinds.AttachmentChunk,
+        MeshKinds.TopicAttachmentChunk
+    };
 
     public override async Task OnConnectedAsync()
     {
@@ -230,6 +244,96 @@ public sealed class MeshHub(
             throw;
         }
     }
+
+    /// <summary>
+    /// Routes an encrypted control envelope only while the target is online. This is not a message
+    /// queue: the relay never stores the envelope and returns not_online when no target socket exists.
+    /// Durable human messages and history use the Protocol 9 replication journal instead.
+    /// </summary>
+    public async Task<MeshSendResult> SendEnvelope(MeshEnvelope env)
+    {
+        var (connection, registration, revoked) = await GetAuthorizedConnectionAsync();
+        if (revoked) return MeshSendResult.Reject(OnlineRelaySendCodes.DeviceRevoked);
+        if (connection?.Handle is null || connection.DeviceId is null || registration is null)
+            return MeshSendResult.Reject("unauthenticated");
+        if (env is null
+            || !OnlineControlKinds.Contains(env.Kind)
+            || string.IsNullOrWhiteSpace(env.To)
+            || string.IsNullOrWhiteSpace(env.Id)
+            || string.IsNullOrEmpty(env.Body))
+            return MeshSendResult.Reject("unsupported_control");
+        if (!MeshCrypto.Verify(connection.PublicKey!, env.Body, env.Signature ?? ""))
+            return MeshSendResult.Reject("invalid_signature");
+        if (Encoding.UTF8.GetByteCount(env.Body) > MessageLimits.MaxEnvelopeBodyBytes)
+            return MeshSendResult.Reject("message_too_large");
+
+        var (decision, policy) = await rateLimiter.TryAcquireAsync(
+            connection.Handle, MessageRateBucket.Direct, Context.ConnectionAborted);
+        if (!policy.Enabled) return MeshSendResult.Reject("disabled");
+        if (!decision.Allowed)
+        {
+            metrics.RateLimitRejected();
+            return MeshSendResult.Reject(OnlineRelaySendCodes.RateLimited, decision.RetryAfterMs);
+        }
+
+        var toHandle = Normalize(env.To);
+        var target = await store.GetHandleAsync(toHandle, Context.ConnectionAborted);
+        if (target is null) return MeshSendResult.Reject(OnlineRelaySendCodes.NotOnline);
+
+        var stamped = env with
+        {
+            From = connection.Handle,
+            FromDevice = connection.DeviceId,
+            To = toHandle
+        };
+        string? directedDevice = string.IsNullOrWhiteSpace(stamped.ToDevice) ? null : stamped.ToDevice;
+        if (stamped.Kind is MeshKinds.AtomicAgentRequest or MeshKinds.ServiceRequest)
+        {
+            var online = (await OnlineDevicesAsync(toHandle)).ToHashSet(StringComparer.Ordinal);
+            directedDevice = AgentRoutingPolicy.ChooseOnlineDevice(target, online);
+            if (directedDevice is null)
+                return MeshSendResult.Reject("agent_unavailable");
+            stamped = stamped with { ToDevice = directedDevice };
+        }
+
+        var authorized = AuthorizedDeviceIds(target);
+        if (directedDevice is not null)
+        {
+            if (!authorized.Contains(directedDevice))
+                return MeshSendResult.Reject(OnlineRelaySendCodes.TargetDeviceUnknown);
+            var outcome = await router.ForwardControlToDeviceAsync(
+                toHandle,
+                directedDevice,
+                stamped,
+                string.Equals(toHandle, connection.Handle, StringComparison.Ordinal)
+                    ? Context.ConnectionId
+                    : null,
+                Context.ConnectionAborted);
+            if (outcome != BackplaneDeliveryOutcome.Delivered)
+                return MeshSendResult.Reject(OnlineRelaySendCodes.NotOnline);
+            metrics.OnlineDelivered();
+            return MeshSendResult.Ok();
+        }
+
+        var delivered = 0;
+        foreach (var device in authorized)
+        {
+            var outcome = await router.ForwardControlToDeviceAsync(
+                toHandle,
+                device,
+                stamped with { ToDevice = device },
+                string.Equals(toHandle, connection.Handle, StringComparison.Ordinal)
+                    ? Context.ConnectionId
+                    : null,
+                Context.ConnectionAborted);
+            if (outcome == BackplaneDeliveryOutcome.Delivered) delivered++;
+        }
+        if (delivered == 0) return MeshSendResult.Reject(OnlineRelaySendCodes.NotOnline);
+        metrics.OnlineDelivered(delivered);
+        return MeshSendResult.Ok(delivered);
+    }
+
+    public Task<MeshSendResult> SendEphemeralEnvelope(MeshEnvelope env) => SendEnvelope(env);
 
     private async Task<OnlineRelaySendResult> RelayDirectedAsync(
         ConnectionRegistry.ConnState connection,

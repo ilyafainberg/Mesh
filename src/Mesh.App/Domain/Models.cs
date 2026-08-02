@@ -1378,6 +1378,7 @@ public sealed class PendingApproval
     public string RequestBody { get; set; } = "";
     public string DraftReply { get; set; } = "";
     public string? AgentRequestId { get; set; }
+    public string? FromDevice { get; set; }
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
 }
 

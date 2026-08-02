@@ -135,6 +135,42 @@ public sealed class RelaySignalRIntegrationTests
         CollectionAssert.Contains(presence.Devices.ToArray(), bobDevice);
     }
 
+    [TestMethod]
+    public async Task SendEnvelope_Forwards_OnlineOnly_Control_To_TargetDevice()
+    {
+        var alice = await RegisterAsync("alice");
+        var bob = await RegisterAsync("bob");
+        var (connA, _) = await ConnectAsync(alice);
+        var (connB, _) = await ConnectAsync(bob);
+        var controls = new TypedSignal<string>();
+        connB.On<string>(MeshHubProtocol.Receive, controls.Set);
+
+        const string body = "opaque-control-body";
+        var envelope = MeshEnvelope.Create(
+            alice.Handle,
+            bob.Handle,
+            MeshKinds.Receipt,
+            body,
+            Sign(alice.Keys.PrivateB64, body),
+            toDevice: bob.DeviceId);
+
+        var result = await connA.InvokeAsync<MeshSendResult>(
+            MeshHubProtocol.SendEnvelope, envelope);
+        var receivedJson = await controls.WaitAsync(TimeSpan.FromSeconds(15));
+        var received = System.Text.Json.JsonSerializer.Deserialize<MeshEnvelope>(
+            receivedJson, new System.Text.Json.JsonSerializerOptions(
+                System.Text.Json.JsonSerializerDefaults.Web));
+
+        Assert.IsTrue(result.Accepted);
+        Assert.IsNotNull(received);
+        Assert.AreEqual(alice.Handle, received.From);
+        Assert.AreEqual(alice.DeviceId, received.FromDevice);
+        Assert.AreEqual(bob.Handle, received.To);
+        Assert.AreEqual(bob.DeviceId, received.ToDevice);
+        Assert.AreEqual(MeshKinds.Receipt, received.Kind);
+        Assert.AreEqual(body, received.Body);
+    }
+
     // -------------------------------------------------------------------------
 
     private sealed record Registration(string Handle, string DeviceId, KeyPair Keys);

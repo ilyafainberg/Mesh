@@ -22,6 +22,7 @@ public sealed class MeshRouter(
     RelayMetrics metrics)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    private sealed record ControlBackplanePayload(MeshEnvelope ControlEnvelope);
 
     public string InstanceId => backplane.InstanceId;
 
@@ -66,6 +67,41 @@ public sealed class MeshRouter(
         return delivered;
     }
 
+    /// <summary>Delivers one opaque online-only control envelope to authenticated local sockets.</summary>
+    public async Task<int> DeliverControlLocalAsync(
+        string handle,
+        MeshEnvelope envelope,
+        string? toDevice = null,
+        string? excludeConnectionId = null)
+    {
+        var normalized = Normalize(handle);
+        var conns = toDevice is not null
+            ? registry.ConnectionsForDevice(normalized, toDevice)
+            : registry.ConnectionsFor(normalized);
+        if (excludeConnectionId is not null)
+            conns = conns.Where(c => !string.Equals(c, excludeConnectionId, StringComparison.Ordinal)).ToArray();
+        if (conns.Count == 0) return 0;
+
+        var payload = JsonSerializer.Serialize(envelope, Json);
+        var delivered = 0;
+        foreach (var connectionId in conns)
+        {
+            var state = registry.Get(connectionId);
+            if (state is not { Authenticated: true }) continue;
+            if (!state.TryReserveOutbound()) continue;
+            try
+            {
+                await hub.Clients.Client(connectionId).SendAsync(MeshHubProtocol.Receive, payload);
+                delivered++;
+            }
+            finally
+            {
+                state.ReleaseOutbound();
+            }
+        }
+        return delivered;
+    }
+
     /// <summary>
     /// Backplane entry point: another instance forwarded an in-flight frame to us as opaque JSON.
     /// The delivery is deserialized back into a typed <see cref="OnlineRelayDelivery"/> exactly once
@@ -74,6 +110,26 @@ public sealed class MeshRouter(
     /// </summary>
     public async Task<BackplaneDeliveryReceipt> DeliverFromBackplaneAsync(string handle, string deliveryJson)
     {
+        try
+        {
+            var control = JsonSerializer.Deserialize<ControlBackplanePayload>(deliveryJson, Json);
+            if (control?.ControlEnvelope is not null)
+            {
+                var controlDevice = string.IsNullOrWhiteSpace(control.ControlEnvelope.ToDevice)
+                    ? null
+                    : control.ControlEnvelope.ToDevice;
+                var controlDelivered = await DeliverControlLocalAsync(
+                    handle, control.ControlEnvelope, controlDevice);
+                return controlDelivered > 0
+                    ? BackplaneDeliveryReceipt.Delivered
+                    : BackplaneDeliveryReceipt.NotDelivered;
+            }
+        }
+        catch (JsonException)
+        {
+            return BackplaneDeliveryReceipt.NotDelivered;
+        }
+
         OnlineRelayDelivery? delivery;
         try
         {
@@ -112,6 +168,29 @@ public sealed class MeshRouter(
             return BackplaneDeliveryOutcome.NotDelivered;
 
         var deliveryJson = JsonSerializer.Serialize(delivery, Json);
+        var outcome = (await backplane.PublishToOwnerAsync(owner, normalized, deliveryJson, ct)).Outcome;
+        if (outcome == BackplaneDeliveryOutcome.Delivered)
+            metrics.BackplaneForwarded();
+        return outcome;
+    }
+
+    /// <summary>Forwards an online-only control envelope to one device without persistence.</summary>
+    public async Task<BackplaneDeliveryOutcome> ForwardControlToDeviceAsync(
+        string handle,
+        string deviceId,
+        MeshEnvelope envelope,
+        string? excludeConnectionId = null,
+        CancellationToken ct = default)
+    {
+        var normalized = Normalize(handle);
+        if (await DeliverControlLocalAsync(normalized, envelope, deviceId, excludeConnectionId) > 0)
+            return BackplaneDeliveryOutcome.Delivered;
+
+        var owner = await backplane.GetInstanceForDeviceAsync(normalized, deviceId, ct);
+        if (owner is null || string.Equals(owner, backplane.InstanceId, StringComparison.Ordinal))
+            return BackplaneDeliveryOutcome.NotDelivered;
+
+        var deliveryJson = JsonSerializer.Serialize(new ControlBackplanePayload(envelope), Json);
         var outcome = (await backplane.PublishToOwnerAsync(owner, normalized, deliveryJson, ct)).Outcome;
         if (outcome == BackplaneDeliveryOutcome.Delivered)
             metrics.BackplaneForwarded();

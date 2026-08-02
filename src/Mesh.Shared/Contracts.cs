@@ -28,7 +28,8 @@ public record RegisterHandleRequest(
     string? DevicePlatform = null,
     bool RemoteAgentEnabled = false,
     bool AgentHostEnabled = false,
-    int ProtocolVersion = MeshProtocol.Version)
+    int ProtocolVersion = MeshProtocol.Version,
+    CustodyEntry? CustodyAuthority = null)
 {
     [System.Text.Json.Serialization.JsonIgnore]
     public bool AgentReady => RemoteAgentEnabled;
@@ -164,7 +165,10 @@ public static class LinkProtocol
 
     public static string HashCode(string code)
         => Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(code)));
+                System.Text.Encoding.UTF8.GetBytes(code)))
+            .Replace('+', '-')
+            .Replace('/', '_')
+            .TrimEnd('=');
 
     public static string Normalize(string handle)
         => handle.Trim().TrimStart('@').ToLowerInvariant();
@@ -382,7 +386,8 @@ public record HandleInfo(
     bool Online,
     DateTimeOffset RegisteredAt,
     long AuthGeneration = 0,
-    string CustodyHead = "");
+    string CustodyHead = "",
+    CustodyEntry? CustodyAuthority = null);
 
 /// <summary>
 /// Public view of a single device under a handle: its stable device id, a friendly name (if the

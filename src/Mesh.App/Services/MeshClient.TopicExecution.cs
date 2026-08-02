@@ -749,8 +749,10 @@ public sealed partial class MeshClient
             ? null
             : detail.Replace('\r', ' ').Replace('\n', ' ').Trim();
         if (safeDetail?.Length > 160) safeDetail = safeDetail[..160];
-        Log?.Invoke(safeDetail is null
+        var message = safeDetail is null
             ? $"transport {eventName}"
-            : $"transport {eventName}: {safeDetail}");
+            : $"transport {eventName}: {safeDetail}";
+        Log?.Invoke(message);
+        RuntimeDiagnostics.Current?.RecordEvent("transport", message);
     }
 }

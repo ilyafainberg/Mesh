@@ -182,20 +182,21 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                 hasDueOutbox: state.HasDueOutbox,
                 ownHandle: ownHandle,
                 ownDevice: identity.DeviceId,
-                surface: reason => TraceTransport("replication-poll", reason));
+                surface: reason => TraceTransport("replication-poll", reason),
+                bootstrapPeer: state.EmitOwnerBootstrapSnapshotAsync);
             replicationPoller = poller;
             poller.Start();
-            Log?.Invoke("online replication armed");
+            TraceTransport("replication-armed", $"handle={ownHandle}; device={identity.DeviceId}");
         }
         catch (OnlineReplicationError ex)
         {
-            Log?.Invoke($"online replication not started (fail-closed): {ex.Message}");
+            TraceTransport("replication-arm-rejected", ex.Message);
             StopReplication();
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            Log?.Invoke($"online replication arm failed: {ex.Message}");
+            TraceTransport("replication-arm-failed", ex.Message);
             StopReplication();
         }
         finally

@@ -445,51 +445,10 @@
                 {
                     @foreach (var bubble in State.AskUserPromptsFor(Active.Id))
                     {
-                        <div class="ask-user-bubble @(bubble.Status == AskUserBubbleStatus.Pending ? "is-pending" : "is-settled") @(bubble.PromptId == State.FocusedAskUserPromptId ? "is-focused" : "")"
-                             role="group" aria-label="Assistant question" id="@($"ask-{bubble.PromptId}")">
-                            <div class="ask-user-head">
-                                <i class="bi bi-patch-question"></i>
-                                <span class="ask-user-question">@bubble.Question</span>
-                            </div>
-                            <div class="ask-user-options">
-                                @foreach (var option in bubble.Options)
-                                {
-                                    <button type="button"
-                                            class="ask-user-option @(option.IsSelected ? "is-selected" : "") @(option.IsRecommended ? "is-recommended" : "")"
-                                            disabled="@(!bubble.IsInteractive || askResolving.Contains(bubble.PromptId))"
-                                            aria-pressed="@(option.IsSelected ? "true" : "false")"
-                                            aria-label="@AskOptionLabel(option)"
-                                            @onclick="() => ResolveAskAsync(bubble.PromptId, option.Id)">
-                                        <span class="ask-user-option-title">@option.Title</span>
-                                        @if (option.IsRecommended)
-                                        {
-                                            <span class="ask-user-badge" aria-hidden="true">Recommended</span>
-                                        }
-                                        @if (!string.IsNullOrWhiteSpace(option.Description))
-                                        {
-                                            <span class="ask-user-option-desc">@option.Description</span>
-                                        }
-                                    </button>
-                                }
-                            </div>
-                            <div class="ask-user-status" aria-live="polite">
-                                @switch (bubble.Status)
-                                {
-                                    case AskUserBubbleStatus.Pending:
-                                        <span class="muted">Waiting for your choice…</span>
-                                        break;
-                                    case AskUserBubbleStatus.Answered:
-                                        <span class="ask-user-answered"><i class="bi bi-check-circle"></i> You chose @bubble.SelectedOptionTitle</span>
-                                        break;
-                                    case AskUserBubbleStatus.Expired:
-                                        <span class="muted">This question expired.</span>
-                                        break;
-                                    case AskUserBubbleStatus.Cancelled:
-                                        <span class="muted">This question was cancelled.</span>
-                                        break;
-                                }
-                            </div>
-                        </div>
+                        <AskUserBubble Bubble="@bubble"
+                                       IsResolving="@askResolving.Contains(bubble.PromptId)"
+                                       IsFocused="@(bubble.PromptId == State.FocusedAskUserPromptId)"
+                                       OnSelect="optionId => ResolveAskAsync(bubble.PromptId, optionId)" />
                     }
                 }
                 </div>
@@ -866,14 +825,6 @@
             askResolving.Remove(promptId);
             await InvokeAsync(StateHasChanged);
         }
-    }
-
-    static string AskOptionLabel(AskUserOptionView option)
-    {
-        var label = option.Title;
-        if (option.IsRecommended) label += " (recommended)";
-        if (!string.IsNullOrWhiteSpace(option.Description)) label += ". " + option.Description;
-        return label;
     }
 
     static string? ParseQueryValue(string queryString, string key)

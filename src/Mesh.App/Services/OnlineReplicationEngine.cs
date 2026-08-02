@@ -46,6 +46,15 @@ public interface IReplicationRoster
     long AuthGeneration(string accountHandle);
 }
 
+/// <summary>
+/// Relay-backed rosters can refresh origin-account authority before validating a holder-served
+/// batch that contains events created by a third-party account.
+/// </summary>
+public interface IRefreshableReplicationRoster : IReplicationRoster
+{
+    Task RefreshAsync(IReadOnlyList<string> handles, CancellationToken ct);
+}
+
 /// <summary>Opaque relay forwarder seam. Implemented over the hub by <c>MeshClient</c>.</summary>
 public interface IReplicationTransport
 {
@@ -215,7 +224,12 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
     /// <summary>Opens a replication session by sending a signed session init to the peer.</summary>
     public Task StartSessionAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
-        => WithPeerLock(peerDevice, () => SendSessionInitAsync(peerHandle, peerDevice, ct), ct);
+        => WithPeerLock(peerDevice, async () =>
+        {
+            if (sessions.TryGetValue(peerDevice, out var existing) && existing.Established)
+                return;
+            await SendSessionInitAsync(peerHandle, peerDevice, ct).ConfigureAwait(false);
+        }, ct);
 
     /// <summary>
     /// Presence transition to online: initiate a session (which drives the symmetric
@@ -460,6 +474,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         if (batch is null) { Surface("route", "Malformed batch: null."); return; }
         if (!OnlineReplicationProtocol.ValidateBatch(batch, out var berr)) { Surface("route", $"Malformed batch: {berr}."); return; }
         if (IsHalted(batch.OriginDeviceId)) return;
+
+        if (roster is IRefreshableReplicationRoster refreshable)
+        {
+            var originAccounts = batch.Events
+                .Select(evt => evt.OriginAccount)
+                .Where(account => !string.IsNullOrWhiteSpace(account))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            await refreshable.RefreshAsync(originAccounts, ct).ConfigureAwait(false);
+        }
 
         foreach (var evt in batch.Events)
         {
@@ -862,7 +886,7 @@ public sealed class OnlineReplicationError : Exception
 /// report auth generation -1 so the engine's stale-generation guard does not falsely reject a peer
 /// whose directory entry has not yet been fetched; a fetched handle reports its true generation.
 /// </summary>
-public sealed class RelayReplicationRoster : IReplicationRoster
+public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
 {
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromSeconds(30);
 
@@ -1033,12 +1057,14 @@ public sealed class ReplicationPresencePoller : IDisposable
     private readonly string ownHandle;
     private readonly string ownDevice;
     private readonly Action<string> surface;
+    private readonly Func<string, string, CancellationToken, Task>? bootstrapPeer;
 
     private readonly object gate = new();
     private readonly Random jitter = new();
     private CancellationTokenSource? loopCts;
     private Task? loopTask;
     private TaskCompletionSource<bool>? poke;
+    private readonly HashSet<string> bootstrappedPeers = new(StringComparer.Ordinal);
     private int backoffStep;
     private bool disposed;
 
@@ -1050,7 +1076,8 @@ public sealed class ReplicationPresencePoller : IDisposable
         Func<IReadOnlyCollection<string>, bool> hasDueOutbox,
         string ownHandle,
         string ownDevice,
-        Action<string> surface)
+        Action<string> surface,
+        Func<string, string, CancellationToken, Task>? bootstrapPeer = null)
     {
         this.engine = engine ?? throw new ArgumentNullException(nameof(engine));
         this.roster = roster ?? throw new ArgumentNullException(nameof(roster));
@@ -1060,6 +1087,7 @@ public sealed class ReplicationPresencePoller : IDisposable
         this.ownHandle = ReplicationHandle.Norm(ownHandle);
         this.ownDevice = ownDevice ?? "";
         this.surface = surface ?? (_ => { });
+        this.bootstrapPeer = bootstrapPeer;
     }
 
     /// <summary>Starts (or restarts) the polling loop, polling immediately.</summary>
@@ -1145,6 +1173,27 @@ public sealed class ReplicationPresencePoller : IDisposable
                 onlineAuthorized = true;
                 try
                 {
+                    if (bootstrapPeer is not null
+                        && string.Equals(
+                            ReplicationHandle.Norm(handle.Handle),
+                            ownHandle,
+                            StringComparison.Ordinal))
+                    {
+                        var shouldBootstrap = false;
+                        lock (gate) shouldBootstrap = bootstrappedPeers.Add(device);
+                        if (shouldBootstrap)
+                        {
+                            try
+                            {
+                                await bootstrapPeer(handle.Handle, device, ct).ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                lock (gate) bootstrappedPeers.Remove(device);
+                                throw;
+                            }
+                        }
+                    }
                     await engine.StartSessionAsync(handle.Handle, device, ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { throw; }

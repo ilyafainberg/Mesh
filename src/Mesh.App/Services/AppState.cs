@@ -903,7 +903,7 @@ public sealed partial class AppState : IMemoryState
         var handle = Norm(conversation.Handle);
         var body = JsonSerializer.Serialize(conversation, ReplicationJson);
         EmitReplicatedChange(ReplicationOpKinds.Conversation, ReplicationPayloadCodec.DomainAction.Upsert,
-            handle, handle, body, TargetsForConversation(handle));
+            handle, handle, body, TargetsForOwnerState());
     }
 
     private void EmitLineUpsert(string kind, string parentId, ChatLine line)
@@ -921,7 +921,7 @@ public sealed partial class AppState : IMemoryState
         var mappedKind = kind.Contains("Conversation", StringComparison.OrdinalIgnoreCase)
             ? ReplicationOpKinds.Conversation
             : ReplicationOpKinds.Topic;
-        var targets = mappedKind == ReplicationOpKinds.Conversation ? TargetsForConversation(entityId) : TargetsForOwnerState();
+        var targets = TargetsForOwnerState();
         // A "clear" empties the history but keeps the entity; a "delete" removes it. Both are
         // Delete actions on the wire, so the body carries the discriminator and replicas apply the
         // matching destructive operation deterministically instead of guessing.
