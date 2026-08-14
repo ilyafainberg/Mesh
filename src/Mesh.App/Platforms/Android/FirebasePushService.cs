@@ -82,13 +82,16 @@ public sealed class FirebasePushService : IPushService
             }
         }
     }
+
+    internal static bool AreAlertsEnabled()
+        => AndroidNotifier.CanNotify(global::Android.App.Application.Context);
 #endif
 
 #if ANDROID && MESH_FIREBASE
     private static async Task<PushRegistrationInfo?> GetFcmTokenAsync(CancellationToken ct)
     {
         var token = await GetFcmTokenValueAsync(ct).ConfigureAwait(false);
-        return PushRegistrationPolicy.Create(token, alertsEnabled: true);
+        return PushRegistrationPolicy.Create(token, AreAlertsEnabled());
     }
 
     private static async Task<string?> GetFcmTokenValueAsync(CancellationToken ct)

@@ -28,15 +28,17 @@ public static class MauiProgram
 			});
 
 #if WINDOWS
-		// Minimize/close to the system tray and expose a real quit.
 		builder.ConfigureLifecycleEvents(events =>
 		{
 			events.AddWindows(w => w.OnWindowCreated(window =>
 			{
-				Mesh.App.Platforms.Windows.WindowsAppControl.AttachTray(window);
-				// Register the toast manager up front so the first notification actually pops
-				// (unpackaged apps drop toasts shown before registration completes).
-				Mesh.App.Platforms.Windows.WindowsNotifier.Prime();
+				if (MeshProcessContext.IsHeadless)
+					Mesh.App.Platforms.Windows.WindowsAppControl.AttachHeadless(window);
+				else
+				{
+					Mesh.App.Platforms.Windows.WindowsAppControl.AttachTray(window);
+					Mesh.App.Platforms.Windows.WindowsNotifier.Prime();
+				}
 			}));
 		});
 #endif
@@ -78,18 +80,31 @@ public static class MauiProgram
 		builder.Services.AddSingleton<IPushService, NoopPushService>();
 #elif IOS
 		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
-		builder.Services.AddSingleton<INotifier, DefaultNotifier>();
+		builder.Services.AddSingleton<INotifier, Mesh.App.Platforms.iOS.AppleNotifier>();
 		builder.Services.AddSingleton<IPushService, Mesh.App.Platforms.iOS.ApplePushService>();
 #elif ANDROID
 		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
-		builder.Services.AddSingleton<INotifier, DefaultNotifier>();
+		builder.Services.AddSingleton<INotifier, Mesh.App.Platforms.Android.AndroidNotifier>();
 		builder.Services.AddSingleton<IPushService, Mesh.App.Platforms.Android.FirebasePushService>();
 #else
 		builder.Services.AddSingleton<IAppControl, DefaultAppControl>();
 		builder.Services.AddSingleton<INotifier, DefaultNotifier>();
 		builder.Services.AddSingleton<IPushService, NoopPushService>();
 #endif
+#if WINDOWS
+		builder.Services.AddSingleton<IAccountInstanceCoordinator, DesktopAccountInstanceCoordinator>();
+#else
+		builder.Services.AddSingleton<IAccountInstanceCoordinator, DefaultAccountInstanceCoordinator>();
+#endif
 		builder.Services.AddSingleton<AppState>();
+		builder.Services.AddSingleton<INotificationState>(services => services.GetRequiredService<AppState>());
+		builder.Services.AddSingleton<NotificationViewState>();
+		builder.Services.AddSingleton<NotificationWakeSession>();
+		builder.Services.AddSingleton<NotificationCoordinator>();
+		builder.Services.AddSingleton<INotificationCoordinator>(services => services.GetRequiredService<NotificationCoordinator>());
+		builder.Services.AddSingleton<IMessageClipboard>(_ => new MessageClipboard(
+			markdown => Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default
+				.SetTextAsync(markdown)));
 		builder.Services.AddSingleton<IBuiltInContentProvider>(_ => new BuiltInContentProvider(
 			path => FileSystem.Current.OpenAppPackageFileAsync(path),
 			message => diagnostics.RecordEvent("built-in-content", message)));
@@ -155,6 +170,31 @@ public static class MauiProgram
 		// can forward --ui-mode args from a second launch without a service-locator call.
 		UiModeActivationBridge.Register(app.Services.GetRequiredService<IUiModeService>());
 		OnlineReplicationWakeBridge.Register(app.Services.GetRequiredService<OnlineReplicationWakeCoordinator>());
+		var notificationCoordinator = app.Services.GetRequiredService<NotificationCoordinator>();
+		NotificationCoordinatorBridge.Register(notificationCoordinator);
+		NotificationCoordinatorBridge.RecoverPending();
+		NotificationWakeSessionBridge.Register(app.Services.GetRequiredService<NotificationWakeSession>());
+		NotificationNavigationBridge.Register(notificationCoordinator.GetHighestPriorityRouteAsync);
+		PushRegistrationBridge.Register(ct =>
+			app.Services.GetRequiredService<MeshClient>().RegisterPushTokenAsync(ct));
+
+
+#if WINDOWS
+		MeshDesktopInstanceRuntime.AttachHost(
+			arguments =>
+			{
+				Mesh.App.Platforms.Windows.WindowsAppControl.Activate(arguments);
+				return Task.CompletedTask;
+			},
+			async ct =>
+			{
+				var mesh = app.Services.GetRequiredService<MeshClient>();
+				mesh.BeginShutdown();
+				await app.Services.GetRequiredService<AppState>().FlushPersistenceAsync(ct).ConfigureAwait(false);
+				await mesh.DisconnectAsync().WaitAsync(ct).ConfigureAwait(false);
+			},
+			Mesh.App.Platforms.Windows.WindowsAppControl.ExitNow);
+#endif
 
 		// Auto-update marketplace-imported skills in the background at startup (never blocks launch).
 		_ = Task.Run(async () =>

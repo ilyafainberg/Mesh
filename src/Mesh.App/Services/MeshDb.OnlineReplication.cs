@@ -29,6 +29,40 @@ public sealed partial class MeshDb
         int Attempts,
         string? LastError);
 
+    public sealed record ReplicationOutboxNotification(
+        bool NotificationWorthy,
+        string? NotificationId)
+    {
+        public static ReplicationOutboxNotification None { get; } = new(false, null);
+    }
+
+    public sealed record ReplicationWakeCandidate(
+        ulong Seq,
+        string EventId,
+        string Ciphertext,
+        bool NotificationWorthy,
+        string? NotificationId);
+
+    public sealed record ReplicationPeerBootstrap(
+        string PeerHandle,
+        string PeerDeviceId,
+        string PeerKeyHash,
+        long AuthGeneration,
+        string LocalOriginDeviceId,
+        string LocalLogEpoch,
+        string BootstrapId,
+        ulong BootstrapThroughSeq,
+        string StateHash,
+        string State,
+        int EmittedItems,
+        int TotalItems,
+        string SnapshotJson,
+        DateTimeOffset CreatedAt,
+        DateTimeOffset UpdatedAt,
+        DateTimeOffset? CompletedAt);
+
+    public sealed record ReplicationSyncCheckpoint(string PeerDeviceId, DateTimeOffset At);
+
     /// <summary>Raised when a log position is reused with conflicting content (a fork).</summary>
     public sealed class ReplicationForkException : Exception
     {
@@ -38,6 +72,9 @@ public sealed partial class MeshDb
     public const string OutboxStatePending = "pending";
     public const string OutboxStateOffered = "offered";
     public const string OutboxStatePersisted = "persisted";
+    public const string BootstrapStatePending = "pending";
+    public const string BootstrapStateEmitted = "emitted";
+    public const string BootstrapStatePersisted = "persisted";
 
     // Called from CreateSchema() after all existing schema initialisation.
     internal void CreateOnlineReplicationSchema()
@@ -77,10 +114,14 @@ public sealed partial class MeshDb
                 last_attempt_at TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
+                notification_worthy INTEGER NOT NULL DEFAULT 0,
+                notification_id TEXT,
                 PRIMARY KEY(event_id, target_account),
                 FOREIGN KEY(event_id) REFERENCES replication_events(event_id));
             CREATE INDEX IF NOT EXISTS ix_replication_outbox_due
                 ON replication_outbox(target_account, state, event_id);
+            CREATE INDEX IF NOT EXISTS ix_replication_outbox_notification
+                ON replication_outbox(target_account, notification_worthy, event_id);
 
             CREATE TABLE IF NOT EXISTS replication_cursors(
                 origin_device_id TEXT PRIMARY KEY,
@@ -130,7 +171,30 @@ public sealed partial class MeshDb
                 last_sync_at TEXT,
                 last_error TEXT,
                 PRIMARY KEY(peer_handle, peer_device));
+
+            CREATE TABLE IF NOT EXISTS replication_peer_bootstrap(
+                peer_handle TEXT NOT NULL,
+                peer_device_id TEXT NOT NULL,
+                peer_key_hash TEXT NOT NULL,
+                auth_generation INTEGER NOT NULL,
+                local_origin_device_id TEXT NOT NULL,
+                local_log_epoch TEXT NOT NULL,
+                bootstrap_id TEXT NOT NULL,
+                bootstrap_through_seq INTEGER NOT NULL,
+                state_hash TEXT NOT NULL,
+                state TEXT NOT NULL,
+                emitted_items INTEGER NOT NULL,
+                total_items INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY(peer_handle, peer_device_id, peer_key_hash, auth_generation));
             """);
+
+        AddColumnIfMissing("replication_outbox", "notification_worthy", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("replication_outbox", "notification_id", "TEXT");
+        Exec("CREATE INDEX IF NOT EXISTS ix_replication_outbox_notification ON replication_outbox(target_account, notification_worthy, event_id);");
     }
 
     // -----------------------------------------------------------------------
@@ -286,16 +350,7 @@ public sealed partial class MeshDb
         foreach (var account in targetAccounts)
         {
             if (string.IsNullOrWhiteSpace(account)) continue;
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.CommandText = """
-                INSERT INTO replication_outbox(event_id, target_account, state, attempts)
-                VALUES($eid, $account, 'pending', 0)
-                ON CONFLICT(event_id, target_account) DO NOTHING;
-                """;
-            cmd.Parameters.AddWithValue("$eid", e.EventId);
-            cmd.Parameters.AddWithValue("$account", account);
-            cmd.ExecuteNonQuery();
+            InsertOutboxCore(tx, e.EventId, account, ReplicationOutboxNotification.None);
         }
         tx.Commit();
         return result;
@@ -490,7 +545,7 @@ public sealed partial class MeshDb
         if (!OnlineReplicationProtocol.VerifyReceipt(receipt, receiverPublicKeyB64))
             throw new ArgumentException("The persistence receipt failed verification.", nameof(receipt));
         using var tx = conn.BeginTransaction(deferred: false);
-        StoreReceiptCore(receipt, tx);
+        var receiptAdvanced = StoreReceiptCore(receipt, tx);
         int advanced;
         using (var cmd = conn.CreateCommand())
         {
@@ -509,6 +564,10 @@ public sealed partial class MeshDb
             cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"));
             advanced = cmd.ExecuteNonQuery();
         }
+        var persistedAt = DateTimeOffset.UtcNow;
+        var bootstrapAdvanced = MarkPeerBootstrapPersistedCore(receipt, targetAccount, persistedAt, tx);
+        if (receiptAdvanced || advanced > 0 || bootstrapAdvanced)
+            RecordPeerSyncCore(targetAccount, receipt.ReceiverDeviceId, persistedAt, tx);
         tx.Commit();
         return advanced;
     }
@@ -541,6 +600,117 @@ public sealed partial class MeshDb
         return work;
     }
 
+    /// <summary>
+    /// Highest local-origin sequence ever addressed to a target account. Persisted outbox rows remain
+    /// part of this history so each authorised device can be compared with its own signed receipt.
+    /// </summary>
+    public ulong GetTargetOutboxThrough(string targetAccount, string originDeviceId, string logEpoch)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT COALESCE(MAX(events.seq), 0)
+            FROM replication_outbox AS outbox
+            INNER JOIN replication_events AS events ON events.event_id = outbox.event_id
+            WHERE outbox.target_account = $account
+              AND events.origin_device_id = $origin
+              AND events.log_epoch = $epoch;
+            """;
+        cmd.Parameters.AddWithValue("$account", targetAccount);
+        cmd.Parameters.AddWithValue("$origin", originDeviceId);
+        cmd.Parameters.AddWithValue("$epoch", logEpoch);
+        return checked((ulong)Convert.ToInt64(cmd.ExecuteScalar()));
+    }
+
+    /// <summary>Counts target-account events newer than one device's signed receipt.</summary>
+    public int CountTargetOutboxAfter(
+        string targetAccount,
+        string originDeviceId,
+        string logEpoch,
+        ulong throughSeq)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(*)
+            FROM replication_outbox AS outbox
+            INNER JOIN replication_events AS events ON events.event_id = outbox.event_id
+            WHERE outbox.target_account = $account
+              AND events.origin_device_id = $origin
+              AND events.log_epoch = $epoch
+              AND events.seq > $through;
+            """;
+        cmd.Parameters.AddWithValue("$account", targetAccount);
+        cmd.Parameters.AddWithValue("$origin", originDeviceId);
+        cmd.Parameters.AddWithValue("$epoch", logEpoch);
+        cmd.Parameters.AddWithValue("$through", checked((long)throughSeq));
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    public IReadOnlyList<ReplicationWakeCandidate> QueryTargetOutboxAfter(
+        string targetAccount,
+        string originDeviceId,
+        string logEpoch,
+        ulong throughSeq,
+        bool? notificationWorthy,
+        int limit = OnlineReplicationLimits.MaxBatchOps)
+    {
+        if (limit is <= 0 or > OnlineReplicationLimits.MaxBatchOps)
+            throw new ArgumentOutOfRangeException(nameof(limit));
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT events.seq, events.event_id, events.ciphertext,
+                   outbox.notification_worthy, outbox.notification_id
+            FROM replication_outbox AS outbox
+            INNER JOIN replication_events AS events ON events.event_id = outbox.event_id
+            WHERE outbox.target_account = $account
+              AND events.origin_device_id = $origin
+              AND events.log_epoch = $epoch
+              AND events.seq > $through
+              AND ($worthy IS NULL OR outbox.notification_worthy = $worthy)
+            ORDER BY events.seq
+            LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$account", targetAccount);
+        cmd.Parameters.AddWithValue("$origin", originDeviceId);
+        cmd.Parameters.AddWithValue("$epoch", logEpoch);
+        cmd.Parameters.AddWithValue("$through", checked((long)throughSeq));
+        cmd.Parameters.AddWithValue(
+            "$worthy",
+            notificationWorthy is null ? DBNull.Value : notificationWorthy.Value ? 1 : 0);
+        cmd.Parameters.AddWithValue("$limit", limit);
+        var result = new List<ReplicationWakeCandidate>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            result.Add(new ReplicationWakeCandidate(
+                checked((ulong)reader.GetInt64(0)),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetInt32(3) != 0,
+                reader.IsDBNull(4) ? null : reader.GetString(4)));
+        return result;
+    }
+    private void InsertOutboxCore(
+        SqliteTransaction tx,
+        string eventId,
+        string targetAccount,
+        ReplicationOutboxNotification? notification)
+    {
+        notification ??= ReplicationOutboxNotification.None;
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO replication_outbox(
+                event_id, target_account, state, attempts, notification_worthy, notification_id)
+            VALUES($event, $account, 'pending', 0, $worthy, $notification)
+            ON CONFLICT(event_id, target_account) DO NOTHING;
+            """;
+        cmd.Parameters.AddWithValue("$event", eventId);
+        cmd.Parameters.AddWithValue("$account", targetAccount);
+        cmd.Parameters.AddWithValue("$worthy", notification.NotificationWorthy ? 1 : 0);
+        cmd.Parameters.AddWithValue("$notification", (object?)notification.NotificationId ?? DBNull.Value);
+        cmd.ExecuteNonQuery();
+    }
+
+
     // -----------------------------------------------------------------------
     // Persistence receipts.
     // -----------------------------------------------------------------------
@@ -554,7 +724,7 @@ public sealed partial class MeshDb
         tx.Commit();
     }
 
-    private void StoreReceiptCore(PersistenceReceipt receipt, SqliteTransaction tx)
+    private bool StoreReceiptCore(PersistenceReceipt receipt, SqliteTransaction tx)
     {
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
@@ -579,7 +749,7 @@ public sealed partial class MeshDb
         cmd.Parameters.AddWithValue("$bhash", receipt.BatchHash);
         cmd.Parameters.AddWithValue("$sig", receipt.Signature);
         cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"));
-        cmd.ExecuteNonQuery();
+        return cmd.ExecuteNonQuery() > 0;
     }
 
     /// <summary>Reads the stored receipt for a receiver/origin/epoch triple, or null.</summary>
@@ -599,6 +769,307 @@ public sealed partial class MeshDb
         return new PersistenceReceipt(
             r.GetString(0), r.GetString(1), r.GetString(2), (ulong)r.GetInt64(3),
             r.GetString(4), r.GetString(5), r.GetString(6));
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable per-device bootstrap state.
+    // -----------------------------------------------------------------------
+
+    public ReplicationPeerBootstrap? GetPeerBootstrap(ReplicationBootstrapTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        return GetPeerBootstrapCore(target, null);
+    }
+
+    public ReplicationPeerBootstrap CreateOrResumePeerBootstrap(
+        ReplicationBootstrapTarget target,
+        string bootstrapId,
+        string stateHash,
+        string snapshotJson,
+        int totalItems)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentException.ThrowIfNullOrWhiteSpace(bootstrapId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(stateHash);
+        ArgumentNullException.ThrowIfNull(snapshotJson);
+        if (totalItems < 0) throw new ArgumentOutOfRangeException(nameof(totalItems));
+
+        using var tx = conn.BeginTransaction(deferred: false);
+        var existing = GetPeerBootstrapCore(target, tx);
+        if (existing is not null
+            && string.Equals(existing.LocalOriginDeviceId, target.LocalOriginDeviceId, StringComparison.Ordinal)
+            && string.Equals(existing.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal))
+        {
+            tx.Commit();
+            return existing;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var initialState = totalItems == 0 ? BootstrapStatePersisted : BootstrapStatePending;
+        var completedAt = totalItems == 0 ? now.ToString("O") : null;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO replication_peer_bootstrap(
+                    peer_handle, peer_device_id, peer_key_hash, auth_generation,
+                    local_origin_device_id, local_log_epoch, bootstrap_id,
+                    bootstrap_through_seq, state_hash, state, emitted_items, total_items,
+                    snapshot_json, created_at, updated_at, completed_at)
+                VALUES($handle, $device, $keyHash, $generation, $origin, $epoch, $bootstrap,
+                    0, $stateHash, $state, 0, $total, $snapshot, $created, $updated, $completed)
+                ON CONFLICT(peer_handle, peer_device_id, peer_key_hash, auth_generation) DO UPDATE SET
+                    local_origin_device_id = excluded.local_origin_device_id,
+                    local_log_epoch = excluded.local_log_epoch,
+                    bootstrap_id = excluded.bootstrap_id,
+                    bootstrap_through_seq = 0,
+                    state_hash = excluded.state_hash,
+                    state = excluded.state,
+                    emitted_items = 0,
+                    total_items = excluded.total_items,
+                    snapshot_json = excluded.snapshot_json,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    completed_at = excluded.completed_at;
+                """;
+            cmd.Parameters.AddWithValue("$handle", target.PeerHandle);
+            cmd.Parameters.AddWithValue("$device", target.PeerDeviceId);
+            cmd.Parameters.AddWithValue("$keyHash", target.PeerKeyHash);
+            cmd.Parameters.AddWithValue("$generation", target.AuthGeneration);
+            cmd.Parameters.AddWithValue("$origin", target.LocalOriginDeviceId);
+            cmd.Parameters.AddWithValue("$epoch", target.LocalLogEpoch);
+            cmd.Parameters.AddWithValue("$bootstrap", bootstrapId);
+            cmd.Parameters.AddWithValue("$stateHash", stateHash);
+            cmd.Parameters.AddWithValue("$state", initialState);
+            cmd.Parameters.AddWithValue("$total", totalItems);
+            cmd.Parameters.AddWithValue("$snapshot", snapshotJson);
+            cmd.Parameters.AddWithValue("$created", now.ToString("O"));
+            cmd.Parameters.AddWithValue("$updated", now.ToString("O"));
+            cmd.Parameters.AddWithValue("$completed", (object?)completedAt ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+        if (totalItems == 0)
+            RecordPeerSyncCore(target.PeerHandle, target.PeerDeviceId, now, tx);
+        var created = GetPeerBootstrapCore(target, tx)
+            ?? throw new InvalidOperationException("The bootstrap marker was not persisted.");
+        tx.Commit();
+        return created;
+    }
+
+    internal ReplicationPeerBootstrap CompleteEmptyPeerBootstrap(
+        ReplicationBootstrapTarget target,
+        string bootstrapId)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentException.ThrowIfNullOrWhiteSpace(bootstrapId);
+
+        using var tx = conn.BeginTransaction(deferred: false);
+        var existing = GetPeerBootstrapCore(target, tx)
+            ?? throw new InvalidOperationException("The empty bootstrap marker no longer exists.");
+        if (!string.Equals(existing.BootstrapId, bootstrapId, StringComparison.Ordinal))
+            throw new InvalidOperationException("The empty bootstrap marker changed unexpectedly.");
+        if (existing.TotalItems != 0 || existing.EmittedItems != 0 || existing.BootstrapThroughSeq != 0)
+            throw new InvalidOperationException("Only an empty, un-emitted bootstrap can complete without a receipt.");
+
+        if (existing.State != BootstrapStatePersisted)
+        {
+            var completedAt = DateTimeOffset.UtcNow;
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                UPDATE replication_peer_bootstrap
+                SET state = 'persisted', updated_at = $at, completed_at = $at
+                WHERE peer_handle = $handle
+                  AND peer_device_id = $device
+                  AND peer_key_hash = $keyHash
+                  AND auth_generation = $generation
+                  AND bootstrap_id = $bootstrap
+                  AND total_items = 0
+                  AND emitted_items = 0
+                  AND bootstrap_through_seq = 0
+                  AND state != 'persisted';
+                """;
+            cmd.Parameters.AddWithValue("$at", completedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$handle", target.PeerHandle);
+            cmd.Parameters.AddWithValue("$device", target.PeerDeviceId);
+            cmd.Parameters.AddWithValue("$keyHash", target.PeerKeyHash);
+            cmd.Parameters.AddWithValue("$generation", target.AuthGeneration);
+            cmd.Parameters.AddWithValue("$bootstrap", bootstrapId);
+            if (cmd.ExecuteNonQuery() != 1)
+                throw new InvalidOperationException("The empty bootstrap marker changed unexpectedly.");
+            RecordPeerSyncCore(target.PeerHandle, target.PeerDeviceId, completedAt, tx);
+        }
+
+        var completed = GetPeerBootstrapCore(target, tx)
+            ?? throw new InvalidOperationException("The completed bootstrap marker was not persisted.");
+        tx.Commit();
+        return completed;
+    }
+
+    internal void UpdatePeerBootstrapProgress(
+        ReplicationBootstrapTarget target,
+        string bootstrapId,
+        int emittedItems,
+        int totalItems,
+        ulong throughSeq,
+        SqliteTransaction tx)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentNullException.ThrowIfNull(tx);
+        if (emittedItems < 0 || emittedItems > totalItems)
+            throw new ArgumentOutOfRangeException(nameof(emittedItems));
+        var state = emittedItems == totalItems ? BootstrapStateEmitted : BootstrapStatePending;
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            UPDATE replication_peer_bootstrap
+            SET emitted_items = $emitted,
+                bootstrap_through_seq = $through,
+                state = $state,
+                updated_at = $updated
+            WHERE peer_handle = $handle
+              AND peer_device_id = $device
+              AND peer_key_hash = $keyHash
+              AND auth_generation = $generation
+              AND bootstrap_id = $bootstrap
+              AND emitted_items <= $emitted;
+            """;
+        cmd.Parameters.AddWithValue("$emitted", emittedItems);
+        cmd.Parameters.AddWithValue("$through", (long)throughSeq);
+        cmd.Parameters.AddWithValue("$state", state);
+        cmd.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$handle", target.PeerHandle);
+        cmd.Parameters.AddWithValue("$device", target.PeerDeviceId);
+        cmd.Parameters.AddWithValue("$keyHash", target.PeerKeyHash);
+        cmd.Parameters.AddWithValue("$generation", target.AuthGeneration);
+        cmd.Parameters.AddWithValue("$bootstrap", bootstrapId);
+        if (cmd.ExecuteNonQuery() != 1)
+            throw new InvalidOperationException("The bootstrap progress marker changed unexpectedly.");
+    }
+
+    private ReplicationPeerBootstrap? GetPeerBootstrapCore(
+        ReplicationBootstrapTarget target,
+        SqliteTransaction? tx)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            SELECT peer_handle, peer_device_id, peer_key_hash, auth_generation,
+                   local_origin_device_id, local_log_epoch, bootstrap_id,
+                   bootstrap_through_seq, state_hash, state, emitted_items, total_items,
+                   snapshot_json, created_at, updated_at, completed_at
+            FROM replication_peer_bootstrap
+            WHERE peer_handle = $handle
+              AND peer_device_id = $device
+              AND peer_key_hash = $keyHash
+              AND auth_generation = $generation;
+            """;
+        cmd.Parameters.AddWithValue("$handle", target.PeerHandle);
+        cmd.Parameters.AddWithValue("$device", target.PeerDeviceId);
+        cmd.Parameters.AddWithValue("$keyHash", target.PeerKeyHash);
+        cmd.Parameters.AddWithValue("$generation", target.AuthGeneration);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        return new ReplicationPeerBootstrap(
+            reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetInt64(3),
+            reader.GetString(4), reader.GetString(5), reader.GetString(6), (ulong)reader.GetInt64(7),
+            reader.GetString(8), reader.GetString(9), reader.GetInt32(10), reader.GetInt32(11),
+            reader.GetString(12), DateTimeOffset.Parse(reader.GetString(13)),
+            DateTimeOffset.Parse(reader.GetString(14)),
+            reader.IsDBNull(15) ? null : DateTimeOffset.Parse(reader.GetString(15)));
+    }
+
+    private bool MarkPeerBootstrapPersistedCore(
+        PersistenceReceipt receipt,
+        string peerHandle,
+        DateTimeOffset persistedAt,
+        SqliteTransaction tx)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            UPDATE replication_peer_bootstrap
+            SET state = 'persisted', updated_at = $at, completed_at = $at
+            WHERE peer_handle = $handle
+              AND peer_device_id = $device
+              AND local_origin_device_id = $origin
+              AND local_log_epoch = $epoch
+              AND bootstrap_through_seq <= $through
+              AND state = 'emitted';
+            """;
+        cmd.Parameters.AddWithValue("$handle", peerHandle);
+        cmd.Parameters.AddWithValue("$device", receipt.ReceiverDeviceId);
+        cmd.Parameters.AddWithValue("$origin", receipt.OriginDeviceId);
+        cmd.Parameters.AddWithValue("$epoch", receipt.LogEpoch);
+        cmd.Parameters.AddWithValue("$through", (long)receipt.ThroughSeq);
+        cmd.Parameters.AddWithValue("$at", persistedAt.ToString("O"));
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    public int CountUnpersistedOutbox(IReadOnlyCollection<string> targetAccounts)
+    {
+        ArgumentNullException.ThrowIfNull(targetAccounts);
+        var total = 0;
+        foreach (var account in targetAccounts
+                     .Where(value => !string.IsNullOrWhiteSpace(value))
+                     .Distinct(StringComparer.Ordinal))
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT COUNT(*) FROM replication_outbox
+                WHERE target_account = $account AND state != 'persisted';
+                """;
+            cmd.Parameters.AddWithValue("$account", account);
+            total = checked(total + Convert.ToInt32(cmd.ExecuteScalar()));
+        }
+        return total;
+    }
+
+    public void RecordPeerSync(string peerHandle, string peerDevice)
+    {
+        using var tx = conn.BeginTransaction(deferred: false);
+        RecordPeerSyncCore(peerHandle, peerDevice, DateTimeOffset.UtcNow, tx);
+        tx.Commit();
+    }
+
+    public ReplicationSyncCheckpoint? GetLastSuccessfulReplication(string? peerHandle = null)
+    {
+        if (peerHandle is not null && string.IsNullOrWhiteSpace(peerHandle))
+            throw new ArgumentException("Peer handle cannot be empty.", nameof(peerHandle));
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT peer_device, last_sync_at
+            FROM replication_peer_state
+            WHERE last_sync_at IS NOT NULL
+              AND ($handle IS NULL OR peer_handle = $handle)
+            ORDER BY last_sync_at DESC
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("$handle", (object?)peerHandle ?? DBNull.Value);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        return new ReplicationSyncCheckpoint(reader.GetString(0), DateTimeOffset.Parse(reader.GetString(1)));
+    }
+
+    private void RecordPeerSyncCore(
+        string peerHandle,
+        string peerDevice,
+        DateTimeOffset at,
+        SqliteTransaction tx)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO replication_peer_state(peer_handle, peer_device, last_session, last_sync_at, last_error)
+            VALUES($handle, $device, NULL, $at, NULL)
+            ON CONFLICT(peer_handle, peer_device) DO UPDATE SET
+                last_sync_at = excluded.last_sync_at,
+                last_error = NULL;
+            """;
+        cmd.Parameters.AddWithValue("$handle", peerHandle);
+        cmd.Parameters.AddWithValue("$device", peerDevice);
+        cmd.Parameters.AddWithValue("$at", at.ToString("O"));
+        cmd.ExecuteNonQuery();
     }
 
     // -----------------------------------------------------------------------
@@ -847,16 +1318,14 @@ public sealed partial class MeshDb
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO replication_peer_state(peer_handle, peer_device, last_session, last_sync_at, last_error)
-            VALUES($handle, $device, $session, $at, $error)
+            VALUES($handle, $device, $session, NULL, $error)
             ON CONFLICT(peer_handle, peer_device) DO UPDATE SET
                 last_session = excluded.last_session,
-                last_sync_at = excluded.last_sync_at,
                 last_error = excluded.last_error;
             """;
         cmd.Parameters.AddWithValue("$handle", peerHandle);
         cmd.Parameters.AddWithValue("$device", peerDevice);
         cmd.Parameters.AddWithValue("$session", (object?)lastSession ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"));
         cmd.Parameters.AddWithValue("$error", (object?)lastError ?? DBNull.Value);
         cmd.ExecuteNonQuery();
     }

@@ -72,6 +72,28 @@ public class MainActivity : MauiAppCompatActivity
         HandleDeepLinkIntent(intent);
         base.OnNewIntent(intent);
     }
+    protected override void OnResume()
+    {
+        base.OnResume();
+        AppLifecycleState.SetForeground(true);
+    }
+
+    protected override void OnPause()
+    {
+        AppLifecycleState.SetForeground(false);
+        base.OnPause();
+    }
+
+    public override void OnRequestPermissionsResult(
+        int requestCode,
+        string[] permissions,
+        [Android.Runtime.GeneratedEnum] Permission[] grantResults)
+    {
+        Microsoft.Maui.ApplicationModel.Platform.OnRequestPermissionsResult(
+            requestCode, permissions, grantResults);
+        base.OnRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 9101) Observe(PushRegistrationBridge.RegisterCurrentTokenAsync());
+    }
 
     protected override void OnActivityResult(int requestCode, Result resultCode, Intent? data)
     {
@@ -80,15 +102,28 @@ public class MainActivity : MauiAppCompatActivity
             requestCode, resultCode, data);
     }
 
-    /// <summary>Routes a mesh:// deep link from an intent to the Blazor UI, if present.</summary>
+    /// <summary>Routes notification or mesh:// activation from an intent to the Blazor UI.</summary>
     private static void HandleDeepLinkIntent(Intent? intent)
     {
-        var data = intent?.DataString;
+        if (intent?.GetBooleanExtra("mesh_notification_generic", false) == true)
+        {
+            Observe(NotificationNavigationBridge.OpenHighestPriorityAfterSyncAsync());
+            return;
+        }
+
+        var data = intent?.DataString ?? intent?.GetStringExtra("mesh_notification_route");
         if (!string.IsNullOrWhiteSpace(data) &&
             (data.StartsWith("mesh://", System.StringComparison.OrdinalIgnoreCase) ||
              data.StartsWith("https://meshrelay.net/link", System.StringComparison.OrdinalIgnoreCase)))
             DeepLinkDispatch.Dispatch(data);
     }
+
+    private static void Observe(Task task)
+        => _ = task.ContinueWith(
+            static completed => System.Diagnostics.Debug.WriteLine(completed.Exception),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted,
+            TaskScheduler.Default);
 
     /// <summary>Pads the content view by the system bars and display cutout (top + sides) and by the
     /// IME (keyboard) at the bottom, so the WebView shrinks and the focused field stays above the

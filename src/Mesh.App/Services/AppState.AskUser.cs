@@ -140,6 +140,7 @@ public sealed partial class AppState
             request.ExpiresAt?.AddDays(7),
             null);
         await EmitAskUserPromptAsync(prompt, context, ct).ConfigureAwait(false);
+        await PublishLocalAskNotificationAsync(prompt).ConfigureAwait(false);
 
         UpsertAskUserView(prompt);
         NotifyChanged();
@@ -271,7 +272,7 @@ public sealed partial class AppState
                     envelope,
                     deviceIsDesktop: !PlatformCaps.IsMobile);
                 Protocol9DomainTables.UpsertAskUserContext(conn, tx, context);
-            });
+            }, NotificationIntents.Ask(prompt.PromptId, prompt.ThreadId, prompt.Question));
 
     /// <summary>
     /// Transitions a prompt to a terminal state atomically: the fenced first-writer UPDATE on the
@@ -316,7 +317,8 @@ public sealed partial class AppState
         CancellationToken ct,
         Action<Microsoft.Data.Sqlite.SqliteConnection,
             Microsoft.Data.Sqlite.SqliteTransaction,
-            ReplicationEvent>? domainWork = null)
+            ReplicationEvent>? domainWork = null,
+        NotificationIntent? notificationIntent = null)
     {
         MeshDb? db;
         lock (profileSyncGate) db = activeDb;
@@ -325,15 +327,29 @@ public sealed partial class AppState
         var targets = TargetsForOwnerState();
         var envelope = new ReplicationPayloadCodec.DomainEnvelope(
             Mesh.Shared.ReplicationOpKinds.AskUser, action, entityId, conversationId,
-            NewReplicationVersion(), bodyJson);
+            NewReplicationVersion(), bodyJson, notificationIntent);
 
         await ReplicateLocalAsync(
             envelope.Kind, envelope.Action, envelope.EntityId, envelope.ConversationId,
-            envelope.CausalVersion, envelope.BodyJson, targets, ct: ct, domainWork: domainWork)
+            envelope.CausalVersion, envelope.BodyJson, targets, ct: ct, domainWork: domainWork,
+            notificationIntent: notificationIntent)
             .ConfigureAwait(false);
     }
 
     /// <summary>The canonical wire shape of a prompt, carrying every option id/title/description.</summary>
+    private async Task PublishLocalAskNotificationAsync(AskUserPrompt prompt)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var intent = NotificationIntents.Ask(prompt.PromptId, prompt.ThreadId, prompt.Question);
+        var activity = NotificationIntents.ToCommittedActivity(
+            intent,
+            $"local:{intent.StableId}",
+            prompt.CreatedAt,
+            now,
+            Profile.Handle);
+        await NotificationCoordinatorBridge.PublishAsync(activity).ConfigureAwait(false);
+    }
+
     private static ReplicationDomainMaterializer.AskPromptBody PromptBody(AskUserPrompt prompt)
         => new(
             prompt.PromptId,
@@ -479,6 +495,7 @@ public sealed partial class AppState
     /// </summary>
     private async Task ApplyAskUserResolvedAsync(AskUserPrompt resolved, CancellationToken ct)
     {
+        await NotificationCoordinatorBridge.MarkEntityReadAsync(resolved.PromptId, ct).ConfigureAwait(false);
         UpsertAskUserView(resolved);
         NotifyChanged();
 

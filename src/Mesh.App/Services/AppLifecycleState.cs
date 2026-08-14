@@ -9,13 +9,15 @@ public interface IAppLifecycleState
 /// <summary>Process-wide lifecycle state shared by MAUI services and native platform callbacks.</summary>
 public sealed class AppLifecycleState : IAppLifecycleState
 {
-    private static int foreground = OperatingSystem.IsIOS() ? 0 : 1;
+    private static int foreground = OperatingSystem.IsAndroid() || OperatingSystem.IsIOS() ? 0 : 1;
     private static AppLifecycleState? current;
 
     public AppLifecycleState()
         => Volatile.Write(ref current, this);
 
-    public bool IsForeground => Volatile.Read(ref foreground) != 0;
+    public static bool IsProcessForeground => Volatile.Read(ref foreground) != 0;
+
+    public bool IsForeground => IsProcessForeground;
     public event Action<bool>? ForegroundChanged;
 
     public static void SetForeground(bool value)

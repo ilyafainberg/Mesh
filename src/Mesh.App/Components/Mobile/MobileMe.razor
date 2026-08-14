@@ -11,6 +11,7 @@
 @inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
 @inject NavigationManager Nav
+@inject NotificationViewState NotificationViews
 @implements IDisposable
 
 <MobileOverlayScope Active="@(newDeviceMenuOpen || moveMenuOpen || pendingMove is not null)" />
@@ -48,9 +49,9 @@
         else
         {
             <div class="thread-rows" @ref="threadRowsEl">
-                @if (Mesh.IsReplicationActive)
+                @if (Mesh.ShouldShowReplicationStatus)
                 {
-                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> More chats are syncing...</div>
+                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> @Mesh.ReplicationStatusText</div>
                 }
                 @foreach (var section in ThreadSections)
                 {
@@ -233,8 +234,10 @@ else
                                     }
                                 }
                             }
-                            <MessageContent Text="@line.Text" Attachments="@line.Attachments"
-                                            OnPin="html => PinWidget(html, line)" />
+                            <MessageActions Markdown="@line.Text" IsMobile="true" IsInternal="@line.Internal">
+                                <MessageContent Text="@line.Text" Attachments="@line.Attachments"
+                                                OnPin="html => PinWidget(html, line)" />
+                            </MessageActions>
                             @if (queued)
                             {
                                 <div class="msg-tag queue-tag">
@@ -600,6 +603,7 @@ else
         {
             if (string.Equals(activeThreadValue, value, StringComparison.Ordinal)) return;
             activeThreadValue = value;
+            NotificationViews.SetVisibleEntities("mobile-topics", value is null ? Array.Empty<string>() : new[] { value });
             messageRenderCount = MessageRenderWindow.InitialCount;
             inputValue = value is null ? "" : State.GetTopicDraft(value);
         }
@@ -1508,6 +1512,7 @@ else
 
     public void Dispose()
     {
+        NotificationViews.Clear("mobile-topics");
         disposed = true;
         _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
         State.Changed -= Refresh;

@@ -16,6 +16,7 @@ public sealed partial class MeshClient
     {
         if (isForeground)
         {
+            DrainDeferredTopicRunUpdates();
             ResumeTransport();
             return;
         }
@@ -23,15 +24,40 @@ public sealed partial class MeshClient
         TrackBackground(SuspendForegroundTransportAsync(), "foreground transport suspension");
     }
 
+    private void DrainDeferredTopicRunUpdates()
+    {
+        var changed = false;
+        foreach (var deferred in state.ListDeferredTopicRunUpdates())
+        {
+            if (!state.TryApplyRemoteRunUpdate(deferred.Update))
+            {
+                TraceTransport("deferred-topic-update-failed", deferred.Update.RunId);
+                break;
+            }
+            if (!state.DeleteDeferredTopicRunUpdate(deferred.EnvelopeId))
+            {
+                TraceTransport("deferred-topic-update-delete-failed", deferred.Update.RunId);
+                break;
+            }
+            RememberReplay(topicEnvelopeReplay, deferred.EnvelopeId);
+            changed = true;
+        }
+        if (changed) StateChanged?.Invoke();
+    }
+
     private async Task SuspendForegroundTransportAsync()
     {
+        if (Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
         await connectionGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (lifecycle.IsForeground) return;
+            if (lifecycle.IsForeground || Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
+            StopReplication();
             var current = hub;
             hub = null;
             authenticated = false;
+            connectionAuthentication?.TrySetCanceled();
+            connectionAuthentication = null;
             authenticatedReplicationConnectionIdentity = null;
             StateChanged?.Invoke();
             if (current is null) return;
@@ -55,7 +81,8 @@ public sealed partial class MeshClient
 
     public void ResumeTransport()
     {
-        if (!wantConnected || !lifecycle.IsForeground) return;
+        if (MeshProcessContext.IsShuttingDown
+            || !wantConnected || !lifecycle.IsForeground) return;
         var identity = authenticatedReplicationConnectionIdentity;
         if (identity is not null && Connected && IsCurrentReplicationConnectionIdentity(identity))
         {

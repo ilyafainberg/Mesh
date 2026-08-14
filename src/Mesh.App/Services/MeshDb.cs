@@ -309,6 +309,8 @@ public sealed partial class MeshDb : IDisposable
         CreateAssetsInteractionsSchema();
         CreateSkillPackagesSchema();
         CreateOnlineReplicationSchema();
+        CreateNotificationSchema();
+        CreateDeferredTopicUpdateSchema();
     }
 
     private void AddColumnIfMissing(string table, string column, string decl)

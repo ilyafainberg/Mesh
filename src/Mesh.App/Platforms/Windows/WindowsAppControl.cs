@@ -1,5 +1,5 @@
-using System.Windows.Input;
 using System.Drawing;
+using System.Windows.Input;
 using H.NotifyIcon;
 using Microsoft.UI.Windowing;
 using Mesh.App.Services;
@@ -9,24 +9,18 @@ using MenuFlyoutSeparator = Microsoft.UI.Xaml.Controls.MenuFlyoutSeparator;
 
 namespace Mesh.App.Platforms.Windows;
 
-/// <summary>
-/// Windows desktop integration: a system tray icon, close-to-tray behavior, and a real quit.
-/// Closing the window hides it to the tray instead of exiting; the tray menu (and an in-app Quit
-/// button) exit for good. Backed by static state so the DI-resolved <see cref="IAppControl"/> and
-/// the window-created lifecycle hook share one tray.
-/// </summary>
+/// <summary>Windows tray, activation, headless-window, and graceful-exit integration.</summary>
 public sealed class WindowsAppControl : IAppControl
 {
     private static Microsoft.UI.Xaml.Window? window;
     private static AppWindow? appWindow;
     private static TaskbarIcon? tray;
     private static bool forceQuit;
+    private static bool headless;
 
     public void ShowMainWindow() => Show();
     public void Quit() => QuitApp();
 
-    // "Launch at startup" is stored in the per-user Run key so it works for both the installer and
-    // the portable build, and points at the actual running executable.
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string RunValueName = "Mesh";
 
@@ -34,70 +28,70 @@ public sealed class WindowsAppControl : IAppControl
     {
         try
         {
-            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
-            var value = key?.GetValue(RunValueName) as string;
-            return !string.IsNullOrWhiteSpace(value);
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath, false);
+            return key?.GetValue(RunValueName) is string value && !string.IsNullOrWhiteSpace(value);
         }
-        catch { return false; }
+        catch
+        {
+            return false;
+        }
     }
 
     public void SetLaunchAtStartup(bool enabled)
     {
         try
         {
-            using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKeyPath, writable: true);
+            using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKeyPath, true);
             if (key is null) return;
             if (enabled)
             {
-                var exe = Environment.ProcessPath;
-                if (!string.IsNullOrWhiteSpace(exe)) key.SetValue(RunValueName, $"\"{exe}\"");
+                var executable = Environment.ProcessPath;
+                if (!string.IsNullOrWhiteSpace(executable))
+                    key.SetValue(RunValueName, $"\"{executable}\"");
             }
             else if (key.GetValue(RunValueName) is not null)
             {
-                key.DeleteValue(RunValueName, throwOnMissingValue: false);
+                key.DeleteValue(RunValueName, false);
             }
         }
-        catch { /* best-effort: a registry failure should not crash the app */ }
+        catch
+        {
+        }
     }
 
-    /// <summary>Wires the tray + close-to-tray onto the app's main window. Called once at window creation.</summary>
-    public static void AttachTray(Microsoft.UI.Xaml.Window w)
+    public static void AttachTray(Microsoft.UI.Xaml.Window createdWindow)
     {
-        if (tray is not null) return; // already attached
-        window = w;
+        if (window is not null) return;
+        window = createdWindow;
+        headless = false;
+        appWindow = ResolveAppWindow(createdWindow);
+        AppLifecycleState.SetForeground(true);
+        createdWindow.Activated += (_, args) => AppLifecycleState.SetForeground(
+            args.WindowActivationState != Microsoft.UI.Xaml.WindowActivationState.Deactivated
+            && appWindow?.IsVisible == true);
 
-        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(w);
-        var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
-        appWindow = AppWindow.GetFromWindowId(windowId);
-
-        // Restore the maximized state from the last run, and persist it whenever it changes, so the
-        // window reopens the way the user left it (size/position are handled by WindowGeometry).
-        if (appWindow.Presenter is OverlappedPresenter presenter)
+        if (appWindow.Presenter is OverlappedPresenter presenter
+            && Microsoft.Maui.Storage.Preferences.Get("win.maximized", false))
+            presenter.Maximize();
+        appWindow.Changed += (sender, _) =>
         {
-            if (Microsoft.Maui.Storage.Preferences.Get("win.maximized", false))
-                presenter.Maximize();
-        }
-        appWindow.Changed += (sender, args) =>
-        {
-            if (sender.Presenter is OverlappedPresenter p)
-                Microsoft.Maui.Storage.Preferences.Set("win.maximized", p.State == OverlappedPresenterState.Maximized);
+            if (sender.Presenter is OverlappedPresenter current)
+                Microsoft.Maui.Storage.Preferences.Set(
+                    "win.maximized",
+                    current.State == OverlappedPresenterState.Maximized);
         };
-
-        // Intercept the window close: hide to tray unless the user really chose Quit.
         appWindow.Closing += (_, args) =>
         {
             if (forceQuit) return;
             args.Cancel = true;
+            AppLifecycleState.SetForeground(false);
             appWindow.Hide();
         };
 
         var menu = new MenuFlyout();
-        var open = new MenuFlyoutItem { Text = "Open Mesh", Command = new RelayCommand(Show) };
-        var quit = new MenuFlyoutItem { Text = "Quit Mesh", Command = new RelayCommand(QuitApp) };
-        menu.Items.Add(open);
+        menu.Items.Add(new MenuFlyoutItem { Text = "Open Mesh", Command = new RelayCommand(Show) });
         menu.Items.Add(new MenuFlyoutSeparator());
-        menu.Items.Add(quit);
-
+        menu.Items.Add(new MenuFlyoutItem { Text = "Quit Mesh", Command = new RelayCommand(QuitApp) });
         tray = new TaskbarIcon
         {
             ToolTipText = "Mesh",
@@ -107,42 +101,89 @@ public sealed class WindowsAppControl : IAppControl
             NoLeftClickDelay = true
         };
 
-        // Load the tray glyph as a System.Drawing.Icon (set synchronously via the icon handle),
-        // which is reliable at 16px, unlike an async BitmapImage that can render blank.
         var pngPath = Path.Combine(AppContext.BaseDirectory, "mesh-tray.png");
         if (File.Exists(pngPath))
         {
             try
             {
-                using var bmp = new Bitmap(pngPath);
-                using var small = new Bitmap(bmp, new System.Drawing.Size(32, 32));
+                using var bitmap = new Bitmap(pngPath);
+                using var small = new Bitmap(bitmap, new System.Drawing.Size(32, 32));
                 tray.Icon = Icon.FromHandle(small.GetHicon());
             }
-            catch { /* fall back to no icon rather than crash */ }
+            catch
+            {
+            }
         }
-
-        tray.ForceCreate(enablesEfficiencyMode: false);
+        tray.ForceCreate(false);
     }
 
-    private static void Show()
+    public static void AttachHeadless(Microsoft.UI.Xaml.Window createdWindow)
     {
-        if (appWindow is null || window is null) return;
+        if (window is not null) return;
+        window = createdWindow;
+        headless = true;
+        appWindow = ResolveAppWindow(createdWindow);
+        appWindow.IsShownInSwitchers = false;
+        AppLifecycleState.SetForeground(true);
+        createdWindow.Activated += (_, _) =>
+        {
+            AppLifecycleState.SetForeground(true);
+            appWindow?.Hide();
+        };
+        appWindow.Hide();
+    }
+
+    internal static void Activate(IReadOnlyList<string> arguments)
+        => RunOnUiThread(() =>
+        {
+            ShowCore();
+            Mesh.App.WinUI.App.DispatchFromArgs(arguments);
+        });
+
+    private static AppWindow ResolveAppWindow(Microsoft.UI.Xaml.Window value)
+    {
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(value);
+        var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
+        return AppWindow.GetFromWindowId(windowId);
+    }
+
+    private static void Show() => RunOnUiThread(ShowCore);
+
+    private static void ShowCore()
+    {
+        if (headless || appWindow is null || window is null) return;
         appWindow.Show();
         window.Activate();
-        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(window);
-        Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd); // no-op keep-alive for interop
+        AppLifecycleState.SetForeground(true);
         appWindow.MoveInZOrderAtTop();
     }
 
     private static void QuitApp()
     {
-        forceQuit = true;
-        try { tray?.Dispose(); } catch { }
-        tray = null;
-        Microsoft.UI.Xaml.Application.Current.Exit();
+        if (MeshDesktopInstanceRuntime.RequestLocalShutdown()) return;
+        ExitNow();
     }
 
-    /// <summary>Minimal ICommand for wiring tray clicks to an action.</summary>
+    internal static void ExitNow()
+        => RunOnUiThread(() =>
+        {
+            forceQuit = true;
+            try { tray?.Dispose(); } catch { }
+            tray = null;
+            Microsoft.UI.Xaml.Application.Current.Exit();
+        });
+
+    private static void RunOnUiThread(Action action)
+    {
+        var dispatcher = window?.DispatcherQueue;
+        if (dispatcher is not null && !dispatcher.HasThreadAccess)
+        {
+            dispatcher.TryEnqueue(() => action());
+            return;
+        }
+        action();
+    }
+
     private sealed class RelayCommand(Action execute) : ICommand
     {
         public event EventHandler? CanExecuteChanged { add { } remove { } }

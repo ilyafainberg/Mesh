@@ -130,14 +130,6 @@ else
         Memories.Changed += Refresh;
         UiModeSvc.Changed += OnModeChanged;
 
-        // When a toast is clicked, bring the window up and navigate to the relevant page.
-#if WINDOWS
-        global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = route => InvokeAsync(() =>
-        {
-            AppControl.ShowMainWindow();
-            if (!string.IsNullOrWhiteSpace(route)) Nav.NavigateTo(route);
-        });
-#endif
 
         // A clicked mesh:// deep link (service or handle) opens the matching conversation.
         DeepLinkDispatch.SetHandler(uri => InvokeAsync(() => HandleDeepLink(uri)));
@@ -252,6 +244,11 @@ else
             State.SetPendingPairingLink(pairing);
             return;
         }
+        if (NotificationRouteParser.TryParse(uri, out var notificationRoute))
+        {
+            HandleNotificationRoute(notificationRoute);
+            return;
+        }
 
         // mesh://ask/<promptId> focuses the Me thread that owns the prompt and highlights its bubble.
         // Parsed manually because the shared DeepLink contract has no ask kind; pairing stays first.
@@ -273,6 +270,40 @@ else
         AppControl.ShowMainWindow();
         State.RequestOpenConversation(key);
         Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone ? "/m/messages" : "/messages");
+    }
+
+    private void HandleNotificationRoute(ParsedNotificationRoute route)
+    {
+        AppControl.ShowMainWindow();
+        switch (route.Kind)
+        {
+            case NotificationRouteKind.Messages when route.EntityId is not null:
+                State.GetOrCreateConversation(route.EntityId);
+                State.RequestOpenConversation(route.EntityId);
+                NotificationCoordinatorBridge.MarkEntityRead(route.EntityId);
+                Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone ? "/m/messages" : "/messages");
+                break;
+            case NotificationRouteKind.Topic when route.EntityId is not null:
+                State.MarkThreadSeen(route.EntityId);
+                NotificationCoordinatorBridge.MarkEntityRead(route.EntityId);
+                Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone
+                    ? $"/m/me?thread={Uri.EscapeDataString(route.EntityId)}"
+                    : $"/?thread={Uri.EscapeDataString(route.EntityId)}");
+                break;
+            case NotificationRouteKind.Ask when route.PromptId is not null:
+                NotificationCoordinatorBridge.MarkEntityRead(route.PromptId);
+                _ = FocusAskPromptAsync(route.PromptId);
+                break;
+            case NotificationRouteKind.Requests:
+                NotificationCoordinatorBridge.MarkKindRead(NotificationKind.ContactRequest);
+                NotificationCoordinatorBridge.MarkKindRead(NotificationKind.ServiceInvite);
+                Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone ? "/m/messages" : "/contacts");
+                break;
+            case NotificationRouteKind.Approvals:
+                NotificationCoordinatorBridge.MarkKindRead(NotificationKind.ApprovalRequired);
+                Nav.NavigateTo(UiModeSvc.EffectiveMode == UiMode.Phone ? "/m/messages" : "/messages");
+                break;
+        }
     }
 
     private static bool TryParseAskLink(string uri, out string promptId)
@@ -306,9 +337,7 @@ else
         Updater.Changed -= Refresh;
         Memories.Changed -= Refresh;
         UiModeSvc.Changed -= OnModeChanged;
-#if WINDOWS
-        global::Mesh.App.Platforms.Windows.WindowsNotifier.OnActivated = null;
-#endif
+
         DeepLinkDispatch.SetHandler(null);
         fileLinkRef?.Dispose();
     }

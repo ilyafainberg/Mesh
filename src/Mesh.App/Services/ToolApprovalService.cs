@@ -39,6 +39,8 @@ public sealed class ToolApprovalService
         JsonElement arguments,
         CancellationToken ct)
     {
+        if (MeshProcessContext.IsHeadless) return false;
+
         var id = Guid.NewGuid().ToString("n");
         var request = new ToolApprovalRequest(
             id,

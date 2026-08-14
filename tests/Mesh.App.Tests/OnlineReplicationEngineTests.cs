@@ -164,6 +164,34 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
     }
 
     [TestMethod]
+    public async Task Convergence_FastAccountReceiptDoesNotHideLaggingAuthorisedDevice()
+    {
+        var a = NewNode("alice", "a1");
+        var b1 = NewNode("bob", "b1");
+        var b2 = NewNode("bob", "b2");
+        var eid = await a.Engine.EmitLocalAsync(Msg("m1"), new[] { "bob" });
+
+        await ConnectAsync(a, b1);
+
+        Assert.AreEqual(ReplicationDeliveryState.Persisted, a.Engine.GetDeliveryState(eid, "bob"),
+            "one durable account receipt still clears account-level custody");
+        Assert.IsFalse(a.Engine.HasPendingWorkForPeer(Roster.ResolveDevice("bob", "b1")!));
+        Assert.IsTrue(a.Engine.HasPendingWorkForPeer(Roster.ResolveDevice("bob", "b2")!),
+            "the second authorised device must remain independently catch-up eligible");
+        Assert.AreEqual(1, a.Engine.CountPendingTargetEvents(new[] { "bob" }));
+        Assert.IsNull(b2.Db.GetEvent(eid));
+
+        await Task.Delay(20);
+        await ConnectAsync(a, b2);
+
+        Assert.IsNotNull(b2.Db.GetEvent(eid));
+        Assert.IsFalse(a.Engine.HasPendingWorkForPeer(Roster.ResolveDevice("bob", "b2")!));
+        Assert.AreEqual(0, a.Engine.CountPendingTargetEvents(new[] { "bob" }));
+        Assert.AreEqual("b2", a.Db.GetLastSuccessfulReplication("bob")?.PeerDeviceId,
+            "a later receipt from a device that did not advance account custody still updates its sync checkpoint");
+    }
+
+    [TestMethod]
     public async Task Convergence_ReceiverStoresSignedReceipt()
     {
         var a = NewNode("alice", "a1");

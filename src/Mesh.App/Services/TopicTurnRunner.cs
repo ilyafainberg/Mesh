@@ -168,17 +168,20 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
                 await ExecuteWidgetAsync(draft, widgetTurn, progress, linked.Token);
 
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Completed);
+            await PublishTerminalAsync(draft, NotificationKind.TopicCompleted).ConfigureAwait(false);
             state.MarkThreadCompleted(draft.ThreadId);
             return Complete(progress, draft, TopicRunPhase.Completed, "Completed");
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested)
         {
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Cancelled);
+            await PublishTerminalAsync(draft, NotificationKind.TopicCancelled).ConfigureAwait(false);
             return Complete(progress, draft, TopicRunPhase.Cancelled, "Cancelled");
         }
         catch (InvalidWidgetContextException ex)
         {
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Failed);
+            await PublishTerminalAsync(draft, NotificationKind.TopicFailed).ConfigureAwait(false);
             return Complete(
                 progress, draft, TopicRunPhase.Failed, "Failed",
                 ex.Message, "invalid_widget_context");
@@ -186,6 +189,7 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
         catch (Exception ex)
         {
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Failed);
+            await PublishTerminalAsync(draft, NotificationKind.TopicFailed).ConfigureAwait(false);
             return Complete(
                 progress, draft, TopicRunPhase.Failed, "Failed",
                 ex.Message, "execution_failed");
@@ -198,6 +202,20 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
             state.ClearRemoteRunProjection(draft.ThreadId, draft.RunId);
         }
     }
+    private async Task PublishTerminalAsync(TopicTurnDraft draft, NotificationKind kind)
+    {
+        await state.FlushPersistenceAsync(CancellationToken.None).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        var intent = NotificationIntents.Topic(draft.RunId, draft.ThreadId, state.TopicTitle(draft.ThreadId), kind);
+        var activity = NotificationIntents.ToCommittedActivity(
+            intent,
+            $"local:{intent.StableId}",
+            now,
+            now,
+            state.Profile.Handle);
+        await NotificationCoordinatorBridge.PublishAsync(activity).ConfigureAwait(false);
+    }
+
 
     private void ClearTriggerAttachments(TopicTurnDraft draft)
     {

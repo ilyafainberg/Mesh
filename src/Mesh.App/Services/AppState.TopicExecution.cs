@@ -153,6 +153,37 @@ public sealed partial class AppState
         }
     }
 
+    public bool SaveDeferredTopicRunUpdate(string envelopeId, TopicRunUpdatePayload update)
+    {
+        lock (profileSyncGate)
+        {
+            if (activeDb is null) return false;
+            activeDb.SaveDeferredTopicRunUpdate(envelopeId, update, DateTimeOffset.UtcNow);
+            return true;
+        }
+    }
+
+    public IReadOnlyList<MeshDb.DeferredTopicRunUpdate> ListDeferredTopicRunUpdates()
+    {
+        lock (profileSyncGate)
+            return activeDb?.ListDeferredTopicRunUpdates() ?? [];
+    }
+
+    public bool DeleteDeferredTopicRunUpdate(string envelopeId)
+    {
+        lock (profileSyncGate)
+        {
+            if (activeDb is null) return false;
+            activeDb.DeleteDeferredTopicRunUpdate(envelopeId);
+            return true;
+        }
+    }
+
+    public void DeleteDeferredTopicRunUpdates(string runId)
+    {
+        lock (profileSyncGate) activeDb?.DeleteDeferredTopicRunUpdates(runId);
+    }
+
     private void RehydrateTopicExecutionState()
     {
         lock (profileSyncGate)

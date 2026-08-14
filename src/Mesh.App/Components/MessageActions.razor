@@ -1,0 +1,218 @@
+@inject IMessageClipboard Clipboard
+@implements IDisposable
+
+<div class="message-action-surface @(IsMobile ? "mobile" : "desktop") @(CanCopy ? "copyable" : "")"
+     @oncontextmenu="OpenContextActions"
+     @oncontextmenu:preventDefault="CanCopy"
+     @onpointerdown="BeginLongPress"
+     @onpointermove="TrackLongPress"
+     @onpointerup="EndLongPress"
+     @onpointercancel="EndLongPress"
+     @onclick="OnSurfaceClick"
+     @onclick:preventDefault="suppressNextClick">
+    @ChildContent
+
+    @if (CanCopy)
+    {
+        @if (IsMobile)
+        {
+            <button type="button"
+                    class="message-more-button"
+                    aria-label="Message actions"
+                    title="Message actions"
+                    @onclick="OpenMobileActions"
+                    @onclick:stopPropagation="true">
+                <span aria-hidden="true">⋯</span>
+            </button>
+        }
+        else
+        {
+            <button type="button"
+                    class="message-copy-button"
+                    aria-label="Copy message"
+                    title="Copy Markdown source"
+                    @onclick="CopyAsync"
+                    @onclick:stopPropagation="true">
+                @(copied ? "Copied" : "Copy")
+            </button>
+        }
+    }
+
+    @if (CanCopy && !IsMobile && desktopMenuOpen)
+    {
+        <div class="message-context-menu" role="menu" aria-label="Message actions">
+            <button type="button" role="menuitem" @onclick="CopyAsync">Copy</button>
+        </div>
+    }
+</div>
+
+@if (CanCopy && IsMobile && mobileSheetOpen)
+{
+    <div class="message-action-scrim" @onclick="CloseActions">
+        <div class="message-action-sheet"
+             role="dialog"
+             aria-modal="true"
+             aria-label="Message actions"
+             tabindex="-1"
+             autofocus
+             @onclick:stopPropagation="true"
+             @onkeydown="OnSheetKeyDown">
+            <div class="message-action-handle" aria-hidden="true"></div>
+            <button type="button" class="message-sheet-copy" @onclick="CopyAsync">
+                <i class="bi bi-clipboard" aria-hidden="true"></i>
+                <span>Copy</span>
+            </button>
+        </div>
+    </div>
+}
+
+@if (!string.IsNullOrEmpty(feedback))
+{
+    <div class="message-copy-feedback @(IsMobile ? "toast" : "sr-only") @(copyFailed ? "failed" : "")"
+         role="@(copyFailed ? "alert" : "status")"
+         aria-live="@(copyFailed ? "assertive" : "polite")">
+        @feedback
+    </div>
+}
+
+@code {
+    private static readonly TimeSpan LongPressDelay = TimeSpan.FromMilliseconds(550);
+    private const double LongPressMoveTolerance = 12;
+
+    [Parameter] public string Markdown { get; set; } = "";
+    [Parameter] public bool IsMobile { get; set; }
+    [Parameter] public bool IsInternal { get; set; }
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+
+    private bool copied;
+    private bool copyFailed;
+    private bool desktopMenuOpen;
+    private bool mobileSheetOpen;
+    private bool suppressNextClick;
+    private string? feedback;
+    private double pointerStartX;
+    private double pointerStartY;
+    private CancellationTokenSource? longPressCancellation;
+    private CancellationTokenSource? feedbackCancellation;
+
+    private bool CanCopy => !IsInternal && MessageCopyPolicy.HasVisibleContent(Markdown);
+
+    private void OpenContextActions(MouseEventArgs args)
+    {
+        if (!CanCopy) return;
+        if (IsMobile) mobileSheetOpen = true;
+        else desktopMenuOpen = true;
+    }
+
+    private void OpenMobileActions()
+    {
+        CancelLongPress();
+        mobileSheetOpen = true;
+    }
+
+    private void CloseActions()
+    {
+        desktopMenuOpen = false;
+        mobileSheetOpen = false;
+    }
+
+    private void BeginLongPress(PointerEventArgs args)
+    {
+        if (!IsMobile || !CanCopy || args.Button != 0
+            || string.Equals(args.PointerType, "mouse", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        CancelLongPress();
+        pointerStartX = args.ClientX;
+        pointerStartY = args.ClientY;
+        longPressCancellation = new CancellationTokenSource();
+        _ = CompleteLongPressAsync(longPressCancellation.Token);
+    }
+
+    private void TrackLongPress(PointerEventArgs args)
+    {
+        if (longPressCancellation is null) return;
+        if (Math.Abs(args.ClientX - pointerStartX) > LongPressMoveTolerance
+            || Math.Abs(args.ClientY - pointerStartY) > LongPressMoveTolerance)
+            CancelLongPress();
+    }
+
+    private void EndLongPress(PointerEventArgs args) => CancelLongPress();
+
+    private async Task CompleteLongPressAsync(CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(LongPressDelay, ct);
+            suppressNextClick = true;
+            mobileSheetOpen = true;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+    }
+
+    private void OnSurfaceClick(MouseEventArgs args)
+    {
+        if (!suppressNextClick) return;
+        suppressNextClick = false;
+    }
+
+    private async Task CopyAsync()
+    {
+        if (!CanCopy) return;
+        CloseActions();
+        CancelLongPress();
+        feedbackCancellation?.Cancel();
+        feedbackCancellation?.Dispose();
+        feedbackCancellation = new CancellationTokenSource();
+        var ct = feedbackCancellation.Token;
+
+        try
+        {
+            await Clipboard.CopyMarkdownAsync(Markdown);
+            copied = true;
+            copyFailed = false;
+            feedback = IsMobile ? "Copied to clipboard" : "Copied";
+        }
+        catch (Exception ex)
+        {
+            copied = false;
+            copyFailed = true;
+            feedback = $"Could not copy message: {ex.Message}";
+        }
+
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2), ct);
+            copied = false;
+            copyFailed = false;
+            feedback = null;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+    }
+
+    private void OnSheetKeyDown(KeyboardEventArgs args)
+    {
+        if (args.Key == "Escape") CloseActions();
+    }
+
+    private void CancelLongPress()
+    {
+        longPressCancellation?.Cancel();
+        longPressCancellation?.Dispose();
+        longPressCancellation = null;
+    }
+
+    public void Dispose()
+    {
+        CancelLongPress();
+        feedbackCancellation?.Cancel();
+        feedbackCancellation?.Dispose();
+    }
+}

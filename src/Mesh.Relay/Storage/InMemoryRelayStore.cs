@@ -234,9 +234,7 @@ public sealed class InMemoryRelayStore : IRelayStore
             lock (rec)
             {
                 rec.DevicePushTokens.TryGetValue(deviceId, out var previous);
-                var preserveWakeState = previous is not null
-                    && string.Equals(previous.Platform, platform, StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(previous.Token, token, StringComparison.Ordinal);
+                var preserveWakeState = previous is not null;
                 rec.DevicePushTokens[deviceId] = new DevicePushToken
                 {
                     Platform = platform,
@@ -245,6 +243,9 @@ public sealed class InMemoryRelayStore : IRelayStore
                     BackgroundPushWindowStartedAt = preserveWakeState ? previous!.BackgroundPushWindowStartedAt : null,
                     BackgroundPushCount = preserveWakeState ? previous!.BackgroundPushCount : 0,
                     LastBackgroundPushAt = preserveWakeState ? previous!.LastBackgroundPushAt : null,
+                    VisiblePushWindowStartedAt = preserveWakeState ? previous!.VisiblePushWindowStartedAt : null,
+                    VisiblePushCount = preserveWakeState ? previous!.VisiblePushCount : 0,
+                    LastVisiblePushAt = preserveWakeState ? previous!.LastVisiblePushAt : null,
                     UpdatedAt = DateTimeOffset.UtcNow
                 };
             }
@@ -254,6 +255,7 @@ public sealed class InMemoryRelayStore : IRelayStore
     public Task<bool> TryAcquireBackgroundPushAsync(
         string handle,
         string deviceId,
+        PushWakeMode mode,
         DateTimeOffset now,
         TimeSpan minimumInterval,
         TimeSpan window,
@@ -264,17 +266,37 @@ public sealed class InMemoryRelayStore : IRelayStore
         lock (rec)
         {
             if (!rec.DevicePushTokens.TryGetValue(deviceId, out var token)) return Task.FromResult(false);
-            if (token.LastBackgroundPushAt is { } last && now - last < minimumInterval)
+            var lastPush = mode == PushWakeMode.AlertAndSync
+                ? token.LastVisiblePushAt
+                : token.LastBackgroundPushAt;
+            if (lastPush is { } last && now - last < minimumInterval)
                 return Task.FromResult(false);
-            if (token.BackgroundPushWindowStartedAt is null
-                || now - token.BackgroundPushWindowStartedAt.Value >= window)
+
+            if (mode == PushWakeMode.AlertAndSync)
             {
-                token.BackgroundPushWindowStartedAt = now;
-                token.BackgroundPushCount = 0;
+                if (token.VisiblePushWindowStartedAt is null
+                    || now - token.VisiblePushWindowStartedAt.Value >= window)
+                {
+                    token.VisiblePushWindowStartedAt = now;
+                    token.VisiblePushCount = 0;
+                }
+                if (token.VisiblePushCount >= maxCount) return Task.FromResult(false);
+                token.VisiblePushCount++;
             }
-            if (token.BackgroundPushCount >= maxCount) return Task.FromResult(false);
-            token.BackgroundPushCount++;
-            token.LastBackgroundPushAt = now;
+            else
+            {
+                if (token.BackgroundPushWindowStartedAt is null
+                    || now - token.BackgroundPushWindowStartedAt.Value >= window)
+                {
+                    token.BackgroundPushWindowStartedAt = now;
+                    token.BackgroundPushCount = 0;
+                }
+                if (token.BackgroundPushCount >= maxCount) return Task.FromResult(false);
+                token.BackgroundPushCount++;
+            }
+
+            if (mode == PushWakeMode.AlertAndSync) token.LastVisiblePushAt = now;
+            else token.LastBackgroundPushAt = now;
             return Task.FromResult(true);
         }
     }

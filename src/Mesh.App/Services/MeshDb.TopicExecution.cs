@@ -7,6 +7,110 @@ namespace Mesh.App.Services;
 
 public sealed partial class MeshDb
 {
+    private const int MaxDeferredTopicUpdatesPerRun = 512;
+
+    public sealed record DeferredTopicRunUpdate(
+        string EnvelopeId,
+        TopicRunUpdatePayload Update,
+        DateTimeOffset ReceivedAt);
+
+    private void CreateDeferredTopicUpdateSchema()
+    {
+        Exec("""
+            CREATE TABLE IF NOT EXISTS deferred_topic_updates(
+                envelope_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                delta_seq INTEGER NOT NULL,
+                update_json TEXT NOT NULL,
+                received_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_deferred_topic_updates_run
+                ON deferred_topic_updates(run_id, delta_seq, received_at);
+            """);
+    }
+
+    public void SaveDeferredTopicRunUpdate(
+        string envelopeId,
+        TopicRunUpdatePayload update,
+        DateTimeOffset receivedAt)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(envelopeId);
+        ArgumentNullException.ThrowIfNull(update);
+        using var transaction = conn.BeginTransaction(deferred: false);
+        using (var insert = conn.CreateCommand())
+        {
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT OR IGNORE INTO deferred_topic_updates(
+                    envelope_id, run_id, thread_id, delta_seq, update_json, received_at)
+                VALUES($envelope, $run, $thread, $seq, $update, $received);
+                """;
+            insert.Parameters.AddWithValue("$envelope", envelopeId);
+            insert.Parameters.AddWithValue("$run", update.RunId);
+            insert.Parameters.AddWithValue("$thread", update.ThreadId);
+            insert.Parameters.AddWithValue("$seq", checked((long)update.DeltaSeq));
+            insert.Parameters.AddWithValue("$update", TopicRunProtocol.UpdateBody(update));
+            insert.Parameters.AddWithValue("$received", receivedAt.ToString("O"));
+            insert.ExecuteNonQuery();
+        }
+        using (var prune = conn.CreateCommand())
+        {
+            prune.Transaction = transaction;
+            prune.CommandText = """
+                DELETE FROM deferred_topic_updates
+                WHERE envelope_id IN (
+                    SELECT envelope_id
+                    FROM deferred_topic_updates
+                    WHERE run_id = $run
+                    ORDER BY delta_seq DESC, received_at DESC
+                    LIMIT -1 OFFSET $retain);
+                """;
+            prune.Parameters.AddWithValue("$run", update.RunId);
+            prune.Parameters.AddWithValue("$retain", MaxDeferredTopicUpdatesPerRun);
+            prune.ExecuteNonQuery();
+        }
+        transaction.Commit();
+    }
+
+    public IReadOnlyList<DeferredTopicRunUpdate> ListDeferredTopicRunUpdates()
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT envelope_id, update_json, received_at
+            FROM deferred_topic_updates
+            ORDER BY received_at, delta_seq, envelope_id;
+            """;
+        using var reader = cmd.ExecuteReader();
+        var result = new List<DeferredTopicRunUpdate>();
+        while (reader.Read())
+        {
+            var raw = reader.GetString(1);
+            if (!TopicRunProtocol.TryParseUpdate(raw, out var update))
+                throw new InvalidDataException("A deferred topic update is corrupt.");
+            result.Add(new DeferredTopicRunUpdate(
+                reader.GetString(0),
+                update,
+                DateTimeOffset.Parse(reader.GetString(2))));
+        }
+        return result;
+    }
+
+    public void DeleteDeferredTopicRunUpdate(string envelopeId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM deferred_topic_updates WHERE envelope_id = $envelope;";
+        cmd.Parameters.AddWithValue("$envelope", envelopeId);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void DeleteDeferredTopicRunUpdates(string runId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM deferred_topic_updates WHERE run_id = $run;";
+        cmd.Parameters.AddWithValue("$run", runId);
+        cmd.ExecuteNonQuery();
+    }
+
     public void UpsertTopicOutbox(TopicOutboxItem item)
     {
         using var cmd = conn.CreateCommand();

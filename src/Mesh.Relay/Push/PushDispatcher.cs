@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Mesh.Relay.Storage;
 using Mesh.Shared;
 
@@ -14,117 +15,159 @@ public sealed record PushSendResult(PushSendStatus Status, int StatusCode = 0, s
         => new(PushSendStatus.InvalidToken, statusCode, reason);
 }
 
-/// <summary>
-/// A platform push transport. In the online-only relay a push is ONLY ever a contentless wake:
-/// the native payload carries no sender, event, body or frame id, just enough for the device to
-/// know it should reconnect and pull. Custody stays with the sender until an online socket receives
-/// the frame, so a wake never counts as delivery.
-/// </summary>
 public interface IPushSender
 {
     string Platform { get; }
-
-    /// <summary>Sends a single contentless wake to one device token.</summary>
-    Task<PushSendResult> SendWakeAsync(string token, CancellationToken ct = default);
+    Task<PushSendResult> SendWakeAsync(
+        string token,
+        PushWakeMode mode,
+        string wakeId,
+        CancellationToken ct = default);
 }
 
-/// <summary>
-/// Emits contentless wakes to the offline devices of a recipient so they reconnect and pull. The
-/// wake never carries sender identity, message content, an event id or a frame id; the only signal
-/// is "sync". Wakes are throttled per device via the store's ephemeral push-throttle metadata, and
-/// an invalid token is pruned from the push-token directory. The relay never treats a wake as
-/// delivery, so the send result the caller returns to the submitter remains not_online.
-/// </summary>
+public enum PushDispatchOutcome { Sent, Coalesced, Throttled, NoTarget, Failed }
+
+/// <summary>Sends contentless sync wakes with stable wake-ID deduplication and per-device throttles.</summary>
 public sealed class PushDispatcher(
     IRelayStore store,
     IEnumerable<IPushSender> senders,
     ILogger<PushDispatcher> logger)
 {
-    private static readonly TimeSpan WakeMinimumInterval = TimeSpan.FromMinutes(20);
+    internal static readonly TimeSpan VisibleWakeMinimumInterval = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan SilentWakeMinimumInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan WakeWindow = TimeSpan.FromHours(1);
-    private const int MaxWakesPerWindow = 3;
-
+    internal const int MaxVisibleWakesPerWindow = 60;
+    internal const int MaxSilentWakesPerWindow = 12;
+    private readonly ConcurrentDictionary<string, DateTimeOffset> recentWakeIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, IPushSender> byPlatform =
-        senders.ToDictionary(s => s.Platform, StringComparer.OrdinalIgnoreCase);
+        senders.ToDictionary(sender => sender.Platform, StringComparer.OrdinalIgnoreCase);
 
     public bool Enabled => byPlatform.Count > 0;
 
-    /// <summary>
-    /// Fire-and-forget: wake the given offline device (or every offline-tokened device of the handle
-    /// when <paramref name="deviceId"/> is null) with a contentless sync signal.
-    /// </summary>
-    public void QueueWake(string toHandle, string? deviceId = null)
+
+    public async Task<PushDispatchOutcome> RequestWakeAsync(
+        string toHandle,
+        string? deviceId,
+        string wakeId,
+        bool notificationWorthy,
+        CancellationToken ct = default)
     {
-        if (!Enabled) return;
-        _ = SafeWakeAsync(Normalize(toHandle), deviceId);
+        if (!Enabled || string.IsNullOrWhiteSpace(wakeId)) return PushDispatchOutcome.NoTarget;
+        var handle = Normalize(toHandle);
+        var dedupKey = $"{handle}:{deviceId ?? "*"}:{wakeId}";
+        var now = DateTimeOffset.UtcNow;
+        PruneWakeIds(now);
+        if (!recentWakeIds.TryAdd(dedupKey, now)) return PushDispatchOutcome.Coalesced;
+
+        var record = await store.GetHandleAsync(handle, ct).ConfigureAwait(false);
+        if (record is null || record.DevicePushTokens.Count == 0)
+        {
+            recentWakeIds.TryRemove(dedupKey, out _);
+            return PushDispatchOutcome.NoTarget;
+        }
+        var targets = (deviceId is null
+                ? record.DevicePushTokens
+                : record.DevicePushTokens.Where(item =>
+                    string.Equals(item.Key, deviceId, StringComparison.Ordinal)))
+            .ToArray();
+        if (targets.Length == 0)
+        {
+            recentWakeIds.TryRemove(dedupKey, out _);
+            return PushDispatchOutcome.NoTarget;
+        }
+
+        var outcomes = new List<PushDispatchOutcome>(targets.Length);
+        foreach (var (targetDeviceId, token) in targets)
+        {
+            outcomes.Add(await TryWakeAsync(handle, targetDeviceId, token, wakeId, notificationWorthy, ct)
+                .ConfigureAwait(false));
+        }
+
+        var aggregate = outcomes.Contains(PushDispatchOutcome.Sent)
+            ? PushDispatchOutcome.Sent
+            : outcomes.Contains(PushDispatchOutcome.Coalesced)
+                ? PushDispatchOutcome.Coalesced
+                : outcomes.Contains(PushDispatchOutcome.Throttled)
+                    ? PushDispatchOutcome.Throttled
+                    : outcomes.Contains(PushDispatchOutcome.Failed)
+                        ? PushDispatchOutcome.Failed
+                        : PushDispatchOutcome.NoTarget;
+        if (aggregate is PushDispatchOutcome.Throttled or PushDispatchOutcome.NoTarget or PushDispatchOutcome.Failed)
+            recentWakeIds.TryRemove(dedupKey, out _);
+        return aggregate;
     }
 
-    private async Task SafeWakeAsync(string handle, string? deviceId)
-    {
-        try
-        {
-            var rec = await store.GetHandleAsync(handle).ConfigureAwait(false);
-            if (rec is null || rec.DevicePushTokens.Count == 0) return;
-
-            var targets = (deviceId is null
-                    ? rec.DevicePushTokens
-                    : rec.DevicePushTokens.Where(kv =>
-                        string.Equals(kv.Key, deviceId, StringComparison.Ordinal)))
-                .ToArray();
-
-            foreach (var (targetDeviceId, token) in targets)
-                await TryWakeAsync(handle, targetDeviceId, token).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "push wake failed");
-        }
-    }
-
-    private async Task TryWakeAsync(string handle, string deviceId, DevicePushToken token)
+    private async Task<PushDispatchOutcome> TryWakeAsync(
+        string handle,
+        string deviceId,
+        DevicePushToken token,
+        string wakeId,
+        bool notificationWorthy,
+        CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(token.Token)
             || !byPlatform.TryGetValue(token.Platform, out var sender))
-            return;
+            return PushDispatchOutcome.NoTarget;
 
+        var mode = notificationWorthy && token.AlertsEnabled
+            ? PushWakeMode.AlertAndSync
+            : PushWakeMode.SyncOnly;
+        var maxCount = mode == PushWakeMode.AlertAndSync
+            ? MaxVisibleWakesPerWindow
+            : MaxSilentWakesPerWindow;
+        var minimumInterval = mode == PushWakeMode.AlertAndSync
+            ? VisibleWakeMinimumInterval
+            : SilentWakeMinimumInterval;
         var acquired = await store.TryAcquireBackgroundPushAsync(
             handle,
             deviceId,
+            mode,
             DateTimeOffset.UtcNow,
-            WakeMinimumInterval,
+            minimumInterval,
             WakeWindow,
-            MaxWakesPerWindow).ConfigureAwait(false);
+            maxCount,
+            ct).ConfigureAwait(false);
         if (!acquired)
         {
-            logger.LogDebug("wake coalesced for {Handle} device {DeviceId}", handle, deviceId);
-            return;
+            logger.LogDebug("wake throttled for {Handle} device {DeviceId}", handle, deviceId);
+            return PushDispatchOutcome.Throttled;
         }
 
-        try
+        var result = await sender.SendWakeAsync(token.Token, mode, wakeId, ct).ConfigureAwait(false);
+        if (result.Status == PushSendStatus.Sent)
         {
-            var result = await sender.SendWakeAsync(token.Token).ConfigureAwait(false);
-            if (result.Status == PushSendStatus.Sent)
-            {
-                logger.LogInformation("wake sent to {Handle} (platform {Platform})", handle, token.Platform);
-                return;
-            }
-            if (result.Status == PushSendStatus.InvalidToken)
-            {
-                await store.RemoveDevicePushTokenAsync(handle, deviceId).ConfigureAwait(false);
-                logger.LogWarning(
-                    "removed invalid push token for {Handle} device {DeviceId}: {Reason}",
-                    handle, deviceId, result.Reason ?? result.StatusCode.ToString());
-                return;
-            }
+            logger.LogInformation(
+                "wake sent to {Handle} (platform {Platform}, mode {Mode})",
+                handle,
+                token.Platform,
+                mode);
+            return PushDispatchOutcome.Sent;
+        }
+        if (result.Status == PushSendStatus.InvalidToken)
+        {
+            await store.RemoveDevicePushTokenAsync(handle, deviceId, ct).ConfigureAwait(false);
             logger.LogWarning(
-                "wake rejected for {Handle} (platform {Platform}, status {Status}): {Reason}",
-                handle, token.Platform, result.StatusCode, result.Reason ?? "unknown");
+                "removed invalid push token for {Handle} device {DeviceId}: {Reason}",
+                handle,
+                deviceId,
+                result.Reason ?? result.StatusCode.ToString());
+            return PushDispatchOutcome.NoTarget;
         }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "wake send failed (platform {Platform})", token.Platform);
-        }
+        logger.LogWarning(
+            "wake rejected for {Handle} (platform {Platform}, status {Status}): {Reason}",
+            handle,
+            token.Platform,
+            result.StatusCode,
+            result.Reason ?? "unknown");
+        return PushDispatchOutcome.Failed;
     }
+
+    private void PruneWakeIds(DateTimeOffset now)
+    {
+        foreach (var item in recentWakeIds)
+            if (now - item.Value >= WakeWindow) recentWakeIds.TryRemove(item.Key, out _);
+    }
+
 
     private static string Normalize(string handle) => handle.Trim().TrimStart('@').ToLowerInvariant();
 }

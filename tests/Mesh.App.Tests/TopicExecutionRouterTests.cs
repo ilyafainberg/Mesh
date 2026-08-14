@@ -18,6 +18,11 @@ namespace Mesh.App.Services
         public QueuedTopicRunState QueuedRuns { get; } = new();
 
         public static string Norm(string value) => value.Trim().TrimStart('@').ToLowerInvariant();
+        public string TopicTitle(string threadId)
+            => Profile.OwnThreads.First(thread => thread.Id == threadId).Title;
+
+        public Task FlushPersistenceAsync(CancellationToken ct = default) => Task.CompletedTask;
+
 
         public void AddOwnChatLine(string threadId, ChatLine line)
             => Profile.OwnThreads.Single(thread => thread.Id == threadId).Lines.Add(line);

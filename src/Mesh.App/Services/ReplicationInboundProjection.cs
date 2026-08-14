@@ -23,10 +23,19 @@ public static class ReplicationInboundProjection
         if (envelope.Kind != ReplicationOpKinds.Message)
             return envelope;
 
+        var notificationIntent = envelope.NotificationIntent is null
+            ? null
+            : envelope.NotificationIntent with
+            {
+                EntityId = origin,
+                ConversationId = origin,
+                Route = NotificationRoutes.Messages(origin)
+            };
         var projected = envelope with
         {
             EntityId = origin,
-            ConversationId = origin
+            ConversationId = origin,
+            NotificationIntent = notificationIntent
         };
         if (envelope.Action is not (
                 ReplicationPayloadCodec.DomainAction.AppendLine

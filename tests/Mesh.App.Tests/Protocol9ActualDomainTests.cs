@@ -311,6 +311,26 @@ public sealed class Protocol9ActualDomainTests : ReplicationTestBase
     }
 
     [TestMethod]
+    public void TopicClear_BlocksStaleLinesButAllowsNewerLines()
+    {
+        var node = Local();
+        node.Journal.EmitLocal(TopicUpsert("t-9", "Keep"), new[] { "alice" });
+        node.Journal.EmitLocal(new ReplicationPayloadCodec.DomainEnvelope(
+            ReplicationOpKinds.Topic, ReplicationPayloadCodec.DomainAction.Delete, "t-9", "t-9", "v3",
+            "{\"clear\":true}"), new[] { "alice" });
+
+        node.Journal.EmitLocal(
+            LineEnv("t-9", Line("stale"), "v2", ReplicationOpKinds.Topic),
+            new[] { "alice" });
+        node.Journal.EmitLocal(
+            LineEnv("t-9", Line("fresh"), "v4", ReplicationOpKinds.Topic),
+            new[] { "alice" });
+
+        Assert.AreEqual(0, OwnChatCount(node.Db, "t-9", "stale"));
+        Assert.AreEqual(1, OwnChatCount(node.Db, "t-9", "fresh"));
+    }
+
+    [TestMethod]
     public void TopicDelete_RemovesTheActualThreadRow()
     {
         var node = Local();
@@ -331,6 +351,21 @@ public sealed class Protocol9ActualDomainTests : ReplicationTestBase
             "{\"clear\":true}"), new[] { "alice", "bob" });
         Assert.AreEqual(0, Scalar(node.Db, "SELECT COUNT(*) FROM chat_lines WHERE handle = 'bob';"));
         Assert.AreEqual(1, Scalar(node.Db, "SELECT COUNT(*) FROM conversations WHERE handle = 'bob';"));
+    }
+
+    [TestMethod]
+    public void ConversationClear_BlocksStaleLinesButAllowsNewerLines()
+    {
+        var node = Local();
+        node.Journal.EmitLocal(new ReplicationPayloadCodec.DomainEnvelope(
+            ReplicationOpKinds.Conversation, ReplicationPayloadCodec.DomainAction.Delete, "bob", "bob", "v3",
+            "{\"clear\":true}"), new[] { "alice", "bob" });
+
+        node.Journal.EmitLocal(LineEnv("bob", Line("stale"), "v2"), new[] { "alice", "bob" });
+        node.Journal.EmitLocal(LineEnv("bob", Line("fresh"), "v4"), new[] { "alice", "bob" });
+
+        Assert.AreEqual(0, ChatLineCount(node.Db, "bob", "stale"));
+        Assert.AreEqual(1, ChatLineCount(node.Db, "bob", "fresh"));
     }
 
     [TestMethod]

@@ -1,7 +1,222 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Mesh.Shared;
 
 namespace Mesh.App.Services;
+
+internal enum ConnectionPurpose
+{
+    Foreground,
+    BackgroundWake
+}
+
+internal static class ConnectionPurposePolicy
+{
+    public static bool AllowsConnection(ConnectionPurpose purpose, bool isForeground)
+        => purpose == ConnectionPurpose.BackgroundWake || isForeground;
+}
+
+internal static class WakeQuiescencePolicy
+{
+    public static bool IsComplete(
+        DateTimeOffset now,
+        DateTimeOffset? lastActivity,
+        DateTimeOffset sessionStartedAt,
+        TimeSpan idlePeriod,
+        bool hasImmediatelyDeliverableWork)
+    {
+        if (idlePeriod < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(idlePeriod));
+        if (hasImmediatelyDeliverableWork) return false;
+
+        var activityAt = lastActivity ?? sessionStartedAt;
+        return now - activityAt >= idlePeriod;
+    }
+}
+
+internal sealed class ReplicationConnectionLease : IAsyncDisposable
+{
+    private Func<ValueTask>? release;
+
+    internal ReplicationConnectionLease(
+        ConnectionPurpose purpose,
+        bool isConnected,
+        Func<ValueTask>? release = null)
+    {
+        Purpose = purpose;
+        IsConnected = isConnected;
+        this.release = release;
+    }
+
+    public ConnectionPurpose Purpose { get; }
+    public bool IsConnected { get; }
+
+    public ValueTask DisposeAsync()
+        => Interlocked.Exchange(ref release, null)?.Invoke() ?? ValueTask.CompletedTask;
+}
+
+public enum ReplicationPhase
+{
+    UpToDate,
+    WaitingForPeer,
+    Connecting,
+    Synchronizing,
+    Bootstrapping,
+    DeferredByOperatingSystem,
+    AuthenticationFailed,
+    Failed
+}
+
+public sealed record ReplicationStatus(
+    ReplicationPhase Phase,
+    int PendingEvents,
+    string? PeerDeviceId,
+    DateTimeOffset? LastSuccessfulSync,
+    string? Reason);
+
+public static class ReplicationStatusFormatter
+{
+    public static string Format(ReplicationStatus status, DateTimeOffset? now = null)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        return status.Phase switch
+        {
+            ReplicationPhase.UpToDate => "Up to date",
+            ReplicationPhase.WaitingForPeer => status.PeerDeviceId is null
+                ? "Waiting for a linked device to come online"
+                : "Waiting for linked device to come online",
+            ReplicationPhase.Connecting => "Connecting for synchronization",
+            ReplicationPhase.Synchronizing => status.PendingEvents > 0
+                ? $"Syncing {status.PendingEvents} change{(status.PendingEvents == 1 ? "" : "s")}"
+                : "Synchronizing",
+            ReplicationPhase.Bootstrapping => "Preparing device history",
+            ReplicationPhase.DeferredByOperatingSystem => "Background synchronization unavailable",
+            ReplicationPhase.AuthenticationFailed => "Synchronization authentication failed",
+            ReplicationPhase.Failed => status.LastSuccessfulSync is { } last
+                ? $"Last synced {Relative(last, now ?? DateTimeOffset.Now)}"
+                : "Synchronization failed",
+            _ => "Synchronization unavailable"
+        };
+    }
+
+    private static string Relative(DateTimeOffset value, DateTimeOffset now)
+    {
+        var elapsed = now - value.ToLocalTime();
+        if (elapsed < TimeSpan.FromMinutes(1)) return "just now";
+        if (elapsed < TimeSpan.FromHours(1)) return $"{Math.Max(1, (int)elapsed.TotalMinutes)} minutes ago";
+        if (elapsed < TimeSpan.FromDays(1)) return $"{Math.Max(1, (int)elapsed.TotalHours)} hours ago";
+        return value.LocalDateTime.ToString("g", CultureInfo.CurrentCulture);
+    }
+}
+
+internal enum AndroidReplicationWakePayloadKind
+{
+    None,
+    Sync,
+    UnsupportedMeshPayload
+}
+
+internal sealed record AndroidReplicationWakePayload(string? WakeId, bool ShowAlert);
+
+internal static class AndroidReplicationWakePolicy
+{
+    public const string UniqueWorkName = "mesh-protocol9-sync";
+
+    public static AndroidReplicationWakePayloadKind Classify(
+        IEnumerable<KeyValuePair<string, string>>? data)
+        => TryParse(data, out _) ? AndroidReplicationWakePayloadKind.Sync : ClassifyInvalid(data);
+
+    public static bool TryParse(
+        IEnumerable<KeyValuePair<string, string>>? data,
+        out AndroidReplicationWakePayload payload)
+    {
+        payload = new AndroidReplicationWakePayload(null, false);
+        if (data is null) return false;
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var item in data) values[item.Key] = item.Value;
+
+        if (values.TryGetValue("mesh_type", out var type))
+        {
+            if (!string.Equals(type, "sync", StringComparison.Ordinal)
+                || !(HasCurrentVersion(values, "mesh_version")
+                     || HasCurrentVersion(values, "mesh_v")))
+                return false;
+            values.TryGetValue("wake_id", out var wakeId);
+            payload = new AndroidReplicationWakePayload(
+                string.IsNullOrWhiteSpace(wakeId) ? null : wakeId,
+                values.TryGetValue("show_alert", out var show)
+                && (show == "1" || bool.TryParse(show, out var parsed) && parsed));
+            return true;
+        }
+
+        if (values.TryGetValue("mesh.type", out var flatType))
+        {
+            if (!string.Equals(flatType, "sync", StringComparison.Ordinal)
+                || !HasCurrentVersion(values, "mesh.v"))
+                return false;
+            values.TryGetValue("wake_id", out var wakeId);
+            payload = new AndroidReplicationWakePayload(wakeId, false);
+            return true;
+        }
+
+        if (!values.TryGetValue("mesh", out var raw) || string.IsNullOrWhiteSpace(raw)) return false;
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("type", out var nestedType)
+                || !string.Equals(nestedType.GetString(), "sync", StringComparison.Ordinal)
+                || !root.TryGetProperty("v", out var version)
+                || !version.TryGetInt32(out var parsedVersion)
+                || parsedVersion != MeshProtocol.Version)
+                return false;
+            payload = new AndroidReplicationWakePayload(null, false);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    public static bool IsSyncPayload(IEnumerable<KeyValuePair<string, string>>? data)
+        => TryParse(data, out _);
+
+    private static AndroidReplicationWakePayloadKind ClassifyInvalid(
+        IEnumerable<KeyValuePair<string, string>>? data)
+    {
+        if (data is null) return AndroidReplicationWakePayloadKind.None;
+        var keys = data.Select(item => item.Key).ToHashSet(StringComparer.Ordinal);
+        return keys.Contains("mesh_type")
+               || keys.Contains("mesh.type")
+               || keys.Contains("mesh")
+            ? AndroidReplicationWakePayloadKind.UnsupportedMeshPayload
+            : AndroidReplicationWakePayloadKind.None;
+    }
+
+    private static bool HasCurrentVersion(IReadOnlyDictionary<string, string> values, string key)
+        => values.TryGetValue(key, out var raw)
+           && int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var version)
+           && version == MeshProtocol.Version;
+}
+
+internal static class ReplicationDiagnostics{
+    public static void Record(string eventName, params (string Key, object? Value)[] fields)
+    {
+        var message = new StringBuilder(eventName);
+        foreach (var (key, value) in fields)
+        {
+            if (string.IsNullOrWhiteSpace(key) || value is null) continue;
+            var text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+            text = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
+            if (text.Length > 160) text = text[..160];
+            message.Append(';').Append(key).Append('=').Append(text);
+        }
+        RuntimeDiagnostics.Current?.RecordEvent("replication", message.ToString());
+    }
+}
 
 public enum OnlineReplicationWakeOutcome
 {
@@ -26,6 +241,27 @@ public sealed record OnlineReplicationWakeResult(
         => new(OnlineReplicationWakeOutcome.Failed, processed, deferred, error);
 }
 
+internal static class OnlineReplicationWakeResultPolicy
+{
+    public static OnlineReplicationWakeResult FromProgress(
+        long committedBefore,
+        long committedAfter,
+        int deferred)
+    {
+        if (committedBefore < 0) throw new ArgumentOutOfRangeException(nameof(committedBefore));
+        if (committedAfter < 0) throw new ArgumentOutOfRangeException(nameof(committedAfter));
+        if (deferred < 0) throw new ArgumentOutOfRangeException(nameof(deferred));
+
+        var delta = committedAfter > committedBefore
+            ? committedAfter - committedBefore
+            : 0;
+        var processed = (int)Math.Min(int.MaxValue, delta);
+        return processed > 0
+            ? OnlineReplicationWakeResult.NewData(processed, deferred)
+            : OnlineReplicationWakeResult.NoData(deferred);
+    }
+}
+
 public interface IOnlineReplicationWakeTransport
 {
     Task<OnlineReplicationWakeResult> SynchronizePendingAsync(CancellationToken ct = default);
@@ -44,7 +280,8 @@ internal static class OnlineReplicationWakeCapabilityPolicy
             return false;
 
         return IsEnabled(capabilities, "onlineReplication")
-            && IsEnabled(capabilities, "onlineWake");
+            && IsEnabled(capabilities, "onlineWake")
+            && IsEnabled(capabilities, "contentlessPush");
     }
 
     private static bool IsEnabled(JsonElement capabilities, string name)
@@ -151,6 +388,7 @@ public sealed class OnlineReplicationWakeCoordinator(IOnlineReplicationWakeTrans
         CancellationToken ct = default)
     {
         Task<OnlineReplicationWakeResult> session;
+        ReplicationDiagnostics.Record("wake.received", ("budget_ms", (long)(budget ?? DefaultBudget).TotalMilliseconds));
         lock (gate)
         {
             if (active is { IsCompleted: false })
@@ -180,19 +418,37 @@ public sealed class OnlineReplicationWakeCoordinator(IOnlineReplicationWakeTrans
         if (budget <= TimeSpan.Zero)
             return OnlineReplicationWakeResult.Failed("invalid_budget");
 
+        var started = Stopwatch.StartNew();
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(budget);
         try
         {
-            return await transport.SynchronizePendingAsync(timeout.Token).ConfigureAwait(false);
+            var result = await transport.SynchronizePendingAsync(timeout.Token).ConfigureAwait(false);
+            ReplicationDiagnostics.Record(
+                "wake.completed",
+                ("duration_ms", started.ElapsedMilliseconds),
+                ("processed", result.ProcessedEnvelopes),
+                ("deferred", result.DeferredEnvelopes),
+                ("outcome", result.Outcome));
+            return result;
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested)
         {
-            return OnlineReplicationWakeResult.Failed(ct.IsCancellationRequested ? "cancelled" : "timeout");
+            var error = ct.IsCancellationRequested ? "cancelled" : "timeout";
+            ReplicationDiagnostics.Record(
+                "wake.timed_out",
+                ("duration_ms", started.ElapsedMilliseconds),
+                ("error_code", error));
+            return OnlineReplicationWakeResult.Failed(error);
         }
         catch (Exception ex)
         {
-            return OnlineReplicationWakeResult.Failed(ex.GetType().Name);
+            var error = ex.GetType().Name;
+            ReplicationDiagnostics.Record(
+                "wake.completed",
+                ("duration_ms", started.ElapsedMilliseconds),
+                ("error_code", error));
+            return OnlineReplicationWakeResult.Failed(error);
         }
     }
 }

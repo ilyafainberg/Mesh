@@ -1,159 +1,199 @@
-# Push notifications and iOS background sync
+# Cross-platform notifications and background sync
 
-Mesh mobile clients can receive metadata-only push notifications when encrypted
-work is queued at the relay. On iOS, eligible pushes can also grant a short,
-best-effort background execution window. Mesh uses that window to connect to the
-relay, drain encrypted envelopes, decrypt and persist passive updates, and
-acknowledge only the records that were stored successfully.
+Mesh exposes notification context only after authenticated decryption and a durable local commit.
+Protocol 9 replication remains online-only: senders retain encrypted events, and the relay stores no
+replication frame or notification intent.
 
-The durable relay inbox remains authoritative. APNs and FCM never carry message
-content, keys, topic text, group names, prompts, or agent responses. A dropped or
-throttled push delays delivery but does not lose the queued envelope.
+APNs and FCM are wake channels. Their payloads contain no message text, sender identity, topic title,
+prompt, agent response, event id, frame id, key, or deep link. A device with alert permission may
+receive the generic text `Mesh` / `New activity`; exact titles, previews, routes, mute decisions, and
+badges are computed locally from SQLCipher state.
 
-## Privacy model
+## Push payloads
 
-The relay already sees the cleartext envelope `Kind`, `From` / `To` handles, device
-routing ids, and an optional metadata-only `PushHint`. Message bodies remain
-end-to-end encrypted. The relay can compose these visible alerts:
+Only the authenticated relay `Wake` operation can invoke push delivery. Failed ordinary forwarding
+does not trigger a push. A wake targets one authorized device and carries a stable opaque SHA-256 wake
+id plus a notification-worthy flag. If that device is already online, the relay accepts the wake
+without sending APNs or FCM.
 
-| Situation | Alert shown |
+The relay selects `AlertAndSync` only when the wake is notification-worthy and the target device has
+alerts enabled. Every other wake uses `SyncOnly`.
+
+APNs uses one of two modes:
+
+| Mode | Headers and payload |
 |---|---|
-| A direct message or agent-addressed message is queued | `Message from @sender` |
-| A group message is queued | `New group message` |
-| A remotely hosted topic turn completes successfully | `Your agent replied in a topic` |
+| `SyncOnly` | `apns-push-type: background`, priority `5`, `content-available: 1` |
+| `AlertAndSync` | `apns-push-type: alert`, priority `10`, generic alert, sound, and `content-available: 1` |
 
-For the topic case, the terminal update carries `PushHint = topic.response`. This
-discloses only that a successful response finished between two devices owned by
-the same handle.
-
-A pure background APNs payload contains only:
+Both APNs modes include nested Mesh metadata:
 
 ```json
 {
   "aps": { "content-available": 1 },
-  "mesh": { "type": "sync", "version": 1 }
+  "mesh": {
+    "type": "sync",
+    "v": 9,
+    "wake_id": "opaque-stable-id"
+  }
 }
 ```
 
-## APNs delivery modes
+`AlertAndSync` additionally adds the generic `aps.alert` and `aps.sound` values. iOS still accepts the
+legacy flat Mesh fields while deployed clients transition.
 
-The relay selects one of three APNs modes per envelope and device:
+FCM sends only a high-priority data message with collapse key `mesh-sync`:
 
-| Mode | Used when | APNs headers and payload |
-|---|---|---|
-| Alert | The work requires foreground processing, or background sync is disabled | `apns-push-type: alert`, priority `10`, visible alert only |
-| Alert and background | A visible alert represents a passive update that iOS may persist immediately | Alert push, priority `10`, plus `content-available: 1` |
-| Background | No visible alert is available or alert permission is disabled, and the queued kind is safe for passive sync | `apns-push-type: background`, priority `5`, collapse id `mesh-sync`, no alert text |
+```json
+{
+  "mesh_type": "sync",
+  "mesh_version": "9",
+  "wake_id": "opaque-stable-id",
+  "show_alert": "0"
+}
+```
 
-Foreground-only work is never converted into a silent wake when alert permission
-is disabled. Set `PUSH_BACKGROUND_SYNC_ENABLED=false` to restore alert-only APNs
-behavior without changing client builds.
+`show_alert` is `1` only for `AlertAndSync`. Android renders the generic alert itself only while the
+app is backgrounded. iOS suppresses generic wake presentation in the foreground.
 
-## Passive background policy
+## Local notification pipeline
 
-An iOS background session may persist and acknowledge passive state updates such
-as direct and group messages, responses, receipts, topic run updates, and
-device-sync operation batches. It does not execute agents, public services, topic
-turns, cancellation work, attachment transfer, or snapshot requests. Those
-records remain queued for a foreground connection or an available linked device.
+1. A Protocol 9 domain envelope carries an encrypted `NotificationIntent` beside the encrypted
+   domain mutation.
+2. The receiving device authenticates and decrypts the event, commits the domain projection and
+   replication cursor, then publishes a committed activity.
+3. A SQLCipher notification ledger deduplicates the stable id and records one of `pending`,
+   `scheduled`, `suppressed`, or `read`.
+4. Local policy applies historical suppression, origin-account suppression, current-view state,
+   do-not-disturb, contact mute, preview mode, sound, and whether the OS already displayed a generic
+   remote alert.
+5. The platform notifier uses the stable id to replace or remove the native notification and updates
+   the application badge from ledger attention state.
 
-When iOS backgrounds Mesh, the normal SignalR connection is stopped so relay
-presence clears and leased records are released. A silent wake uses a separate
-`backgroundSync=1` connection. The relay suppresses atomic agent dispatch for that
-connection, excludes it from ordinary online presence, and the client applies the
-passive policy again before acknowledging an envelope.
+A process restart or account activation retries ledger entries left in `pending`. Stable native ids
+make retry safe if the OS accepted a notification immediately before the process stopped. Suppression
+and attention are separate: do-not-disturb, mute, or an already-visible remote alert suppresses the
+contextual banner but keeps the item unread until the user opens it. Historical and `Notify=false`
+entries never require attention.
 
-Protocol 6 relays advertise `backgroundSync: true` with `durableDelivery: true` in
-their health capabilities. The client requires both flags before opening a
-background connection; protocol version alone is not sufficient. Older relays
-continue normal foreground delivery and retain queued records until the app opens.
+Bootstrap snapshots carry an explicit historical-suppression intent, so old messages and topic lines
+never become new alerts. Owner-sent sibling message copies are marked read and never create a visible
+alert. The default preview mode is `Never`; message, decision, and topic content is hidden until the
+user opts in.
 
-Topic streaming deltas are not rendered during a background wake. Durable topic
-state, terminal updates, and committed device-sync conversation lines remain the
-authoritative state shown when the app next opens.
+Notification activation uses exact local routes:
+
+- `mesh://messages/{conversationId}`
+- `mesh://me/{threadId}`
+- `mesh://me/{threadId}/ask/{promptId}`
+- `mesh://requests`
+- `mesh://approvals`
+
+A generic remote-alert tap first runs a bounded synchronization and then opens the highest-priority
+unread ledger activity. Account changes clear delivered notifications before recovering pending work
+and applying the active account's badge.
+
+A visible remote alert is intentionally device-wide because the relay cannot inspect the encrypted
+entity. Per-conversation mute suppresses the contextual local banner after synchronization, but it
+cannot retract a generic alert that APNs or Android already displayed. Device do-not-disturb disables
+relay-visible alert mode and therefore uses silent wakes.
+
+## Background synchronization
+
+When iOS or Android backgrounds Mesh, the foreground SignalR connection is stopped. A push wake
+acquires a bounded connection lease, authenticates with the normal Protocol 9 challenge, drains
+eligible legacy records, pulls missing Protocol 9 events from online peers, persists them, sends
+signed receipts, and disconnects after quiescence. The default wake budget is 25 seconds.
+
+Background sessions may persist passive updates such as messages, receipts, terminal topic state,
+and device-sync batches. They do not execute agents, public services, topic turns, cancellation work,
+attachment transfer, or snapshot requests. Nonterminal streaming deltas are stored in bounded
+SQLCipher deferred-update rows and replayed on foreground activation; durable terminal state deletes
+obsolete deferred deltas and remains authoritative.
+
+Android coalesces process callbacks by stable wake id and enqueues one unique WorkManager job with
+`ExistingWorkPolicy.Keep`, so concurrent wakes share one synchronization pass. iOS also schedules
+`BGAppRefreshTask` as an opportunistic fallback.
+
+Protocol 9 relays must advertise `onlineReplication`, `onlineWake`, and `contentlessPush` before the
+client uses this path.
 
 ## End-to-end flow
 
-1. The client registers with APNs or FCM and signs `POST /handles/{handle}/push`
-   with its device key. iOS requests an APNs device token independently of visible
-   notification permission and reports the current alert authorization separately.
-2. The relay stores `(deviceId -> platform, token, alertsEnabled)` with the handle.
-   Cosmos-backed relays persist this state across restarts.
-3. Every encrypted envelope is enqueued before live delivery is attempted. When a
-   target device is offline, or an offline sibling should be updated, the relay
-   chooses the appropriate push mode.
-4. An iOS wake runs one coalesced synchronization session with a default 25-second
-   budget. The session authenticates normally, drains the durable inbox, decrypts
-   and persists safe records, then acknowledges each successful record.
-5. `BGAppRefreshTask` provides an additional opportunistic refresh path. iOS, not
-   Mesh, decides whether and when that task runs.
-6. On sign-out the client signs `DELETE /handles/{handle}/push`, removing the token.
-   APNs responses such as `Unregistered` also remove invalid tokens automatically.
+1. The client registers its APNs or FCM token with a device-key-signed request. Alert authorization
+   is reported separately from token availability, and do-not-disturb disables alert mode.
+2. The relay persists `(handle, deviceId, platform, token, alertsEnabled)` when durable storage is
+   configured. Refreshing a device token preserves that device's visible and silent throttle state.
+3. A sender with outstanding device-specific custody calls the authenticated, ephemeral `Wake`
+   operation. No encrypted probe or replication payload is stored at the relay.
+4. The sender derives a stable wake id from notification or synchronization context. The relay and
+   mobile process deduplicate that id without receiving the underlying notification id.
+5. The mobile client runs one bounded synchronization session and records notification context only
+   after local decryption and persistence.
+6. Signed receipts advance device-specific custody. Failed or expired sessions leave work pending for
+   the next wake or foreground connection.
+7. Sign-out and account switching unregister the previous account identity's token. APNs/FCM
+   invalid-token responses also remove stale registrations.
 
 ## Delivery guarantees and limits
 
-- Silent pushes and `BGAppRefreshTask` are opportunistic. iOS may delay or discard
-  them, especially under power, network, usage, or system scheduling constraints.
-- iOS does not deliver silent pushes to an app the user force-quit. Queued records
-  are drained after the user opens Mesh again.
-- Pure silent wakes are coalesced per device: at least 20 minutes apart and no more
-  than three in one hour. Visible alerts with background content are not subject to
-  this silent-wake throttle.
-- Once APNs delivers a visible alert, iOS can render it without launching Mesh.
-  The encrypted content still comes only from the relay inbox.
-- A failed wake, expired execution budget, or transient network error leaves
-  unacknowledged envelopes queued for normal redelivery.
+- Silent APNs delivery and `BGAppRefreshTask` are opportunistic. iOS may delay or discard them, and
+  does not deliver silent pushes after the user force-quits the app.
+- Visible wakes are spaced by at least 5 seconds per device and limited to 60 per rolling hour.
+- Silent wakes are spaced by at least 30 seconds per device and limited to 12 per rolling hour.
+- Visible and silent throttle windows are independent.
+- Wake ids are deduplicated for one hour, and the sender keeps unsatisfied encrypted custody locally.
+- A receipt from one device does not mark sibling devices caught up; each authorized device advances
+  independently.
+- A device linked after an event is not woken for that event unless its key appears in the encrypted
+  recipient slots.
+- Visible APNs alerts may be rendered without launching Mesh. Encrypted content appears only after a
+  later successful synchronization.
+- Physical APNs/FCM delivery still depends on valid production credentials, provisioning, OS policy,
+  network availability, and a real device.
 
 ## Relay configuration
 
-Push is disabled unless at least one backend is configured. Environment variables
-also have matching `Push:...` configuration keys.
+Push is disabled unless at least one backend is configured. Environment variables also have matching
+`Push:...` configuration keys.
 
 ### APNs
 
 | Variable | Purpose |
 |---|---|
-| `APNS_KEY_ID` | The APNs auth-key id |
+| `APNS_KEY_ID` | APNs auth-key id |
 | `APNS_TEAM_ID` | Apple Developer team id |
-| `APNS_BUNDLE_ID` | App bundle id, used as `apns-topic` |
-| `APNS_PRIVATE_KEY` | `.p8` PEM contents, or a path to the `.p8` file |
-| `APNS_PRODUCTION` | `true` for production APNs; otherwise the sandbox host is used |
-| `PUSH_BACKGROUND_SYNC_ENABLED` | Set to `false` for alert-only APNs behavior; default is enabled |
+| `APNS_BUNDLE_ID` | App bundle id used as `apns-topic` |
+| `APNS_PRIVATE_KEY` | `.p8` PEM contents or a path to the key file |
+| `APNS_PRODUCTION` | `true` for production APNs; otherwise sandbox |
 
 ### FCM
 
 | Variable | Purpose |
 |---|---|
-| `FCM_SERVICE_ACCOUNT_JSON` | Google service-account JSON, or a path to the JSON file |
+| `FCM_SERVICE_ACCOUNT_JSON` | Google service-account JSON or a path to it |
 
 ## Client provisioning
 
 ### iOS
 
-1. Enable Push Notifications for the `net.meshrelay.mesh` App ID and create an
-   APNs auth key.
-2. Use a provisioning profile containing the Push Notifications capability.
-3. The client already includes:
-   - `aps-environment` entitlements for development and release builds.
-   - `remote-notification` and `fetch` background modes.
-   - the permitted background task id `net.meshrelay.mesh.sync.refresh`.
-   - APNs callbacks for device tokens and silent wakes.
-   - SQLCipher key and file protection that remains readable after the device's
-     first unlock.
-4. Match `APNS_PRODUCTION` to the provisioning environment. Sandbox and production
-   device tokens are not interchangeable.
+1. Enable Push Notifications for `net.meshrelay.mesh` and create an APNs auth key.
+2. Use a provisioning profile with Push Notifications.
+3. The app includes `aps-environment`, `remote-notification`, `fetch`, the background task id
+   `net.meshrelay.mesh.sync.refresh`, and protected SQLCipher storage.
+4. Match `APNS_PRODUCTION` to the provisioning environment.
 
 ### Android
 
-Android FCM is opt-in at build time so the default build needs no Firebase
-provisioning.
+Android FCM is opt-in, so the default build needs no Firebase configuration.
 
-1. Create a Firebase project and add an Android app with package name
-   `net.meshrelay.mesh`. Download `google-services.json`.
-2. Place it in `Platforms/Android/`. Do not commit it.
-3. Build with `MeshPushEnabled=true`, for example:
-   `dotnet build src/Mesh.App/Mesh.App.csproj -f net10.0-android -c Release -p:MeshPushEnabled=true`.
+1. Create a Firebase Android app for `net.meshrelay.mesh` and download `google-services.json`.
+2. Keep the file outside source control. By default place it at
+   `Platforms\Android\google-services.json`; CI can pass an alternate path with
+   `-p:MeshGoogleServicesJson=C:\secure\google-services.json`.
+3. Build with `-p:MeshPushEnabled=true`.
 4. Configure `FCM_SERVICE_ACCOUNT_JSON` on the relay.
 
-Android 13 and later require the `POST_NOTIFICATIONS` runtime permission. The
-manifest declares it and the client requests it during registration.
+Android 13 and later require `POST_NOTIFICATIONS`; the manifest declares it and the client requests it
+during registration. Android notification channels are `Mesh messages`, `Mesh topics`, and
+`Mesh decisions`.

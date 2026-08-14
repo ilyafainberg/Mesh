@@ -71,20 +71,22 @@ public sealed class ApnsPushSender : IPushSender, IDisposable
 
     public async Task<PushSendResult> SendWakeAsync(
         string token,
+        PushWakeMode mode,
+        string wakeId,
         CancellationToken ct = default)
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, $"/3/device/{token}")
         {
             Version = HttpVersion.Version20,
             VersionPolicy = HttpVersionPolicy.RequestVersionExact,
-            Content = new StringContent(SerializeWakePayload(), Encoding.UTF8, "application/json"),
+            Content = new StringContent(SerializeWakePayload(mode, wakeId), Encoding.UTF8, "application/json"),
         };
         req.Headers.TryAddWithoutValidation("authorization", "bearer " + GetJwt());
         req.Headers.TryAddWithoutValidation("apns-topic", bundleId);
 
-        // A wake is always a silent, collapsible background notification: no alert, no content.
-        req.Headers.TryAddWithoutValidation("apns-push-type", "background");
-        req.Headers.TryAddWithoutValidation("apns-priority", "5");
+        var visible = mode == PushWakeMode.AlertAndSync;
+        req.Headers.TryAddWithoutValidation("apns-push-type", visible ? "alert" : "background");
+        req.Headers.TryAddWithoutValidation("apns-priority", visible ? "10" : "5");
         req.Headers.TryAddWithoutValidation("apns-collapse-id", "mesh-sync");
         req.Headers.TryAddWithoutValidation("apns-expiration", "0");
 
@@ -99,17 +101,29 @@ public sealed class ApnsPushSender : IPushSender, IDisposable
             : PushSendResult.Rejected((int)resp.StatusCode, reason);
     }
 
-    internal static string SerializeWakePayload()
+    internal static string SerializeWakePayload(
+        PushWakeMode mode = PushWakeMode.SyncOnly,
+        string wakeId = "test")
     {
-        // Contentless wake: silent background push, no alert/sound/category, no sender or frame id.
+        var aps = new Dictionary<string, object?> { ["content-available"] = 1 };
+        if (mode == PushWakeMode.AlertAndSync)
+        {
+            aps["alert"] = new Dictionary<string, string>
+            {
+                ["title"] = "Mesh",
+                ["body"] = "New activity"
+            };
+            aps["sound"] = "default";
+        }
         var payload = new Dictionary<string, object?>
         {
-            ["aps"] = new Dictionary<string, object?> { ["content-available"] = 1 },
+            ["aps"] = aps,
             ["mesh"] = new Dictionary<string, object?>
             {
                 ["type"] = "sync",
                 ["v"] = MeshProtocol.Version,
-            },
+                ["wake_id"] = wakeId
+            }
         };
         return JsonSerializer.Serialize(payload);
     }

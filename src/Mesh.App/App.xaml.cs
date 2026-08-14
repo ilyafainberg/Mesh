@@ -22,7 +22,8 @@ public partial class App : Application
 		window.Activated += (_, _) => _meshClient.ResumeTransport();
 		window.Stopped += async (_, _) => await FlushPersistenceOnSuspendAsync();
 
-		var hasDesktopWindowGeometry = OperatingSystem.IsWindows() || OperatingSystem.IsMacCatalyst();
+		var hasDesktopWindowGeometry = (OperatingSystem.IsWindows() || OperatingSystem.IsMacCatalyst())
+			&& !MeshProcessContext.IsHeadless;
 		if (hasDesktopWindowGeometry)
 		{
 			// Restore and persist resizable desktop window geometry. Mobile platforms own their

@@ -102,7 +102,8 @@ public sealed class ReplicationJournal
                     domainWork(conn, tx, created);
                 else
                     ReplicationPayloadCodec.Project(conn, tx, created, envelope, deviceIsDesktop);
-            });
+            },
+            account => NotificationForTarget(envelope.NotificationIntent, account));
         return evt.EventId;
     }
 
@@ -116,7 +117,8 @@ public sealed class ReplicationJournal
     public IReadOnlyList<string> EmitLocalBatch(
         IReadOnlyList<ReplicationPayloadCodec.DomainEnvelope> envelopes,
         IReadOnlyCollection<string> targetAccounts,
-        Action<SqliteConnection, SqliteTransaction, int>? domainWork = null)
+        Action<SqliteConnection, SqliteTransaction, int>? domainWork = null,
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent, int>? eventWork = null)
     {
         ArgumentNullException.ThrowIfNull(envelopes);
         ArgumentNullException.ThrowIfNull(targetAccounts);
@@ -153,10 +155,26 @@ public sealed class ReplicationJournal
             {
                 if (domainWork is not null)
                     domainWork(conn, tx, index);
-                else
+                else if (eventWork is null)
                     ReplicationPayloadCodec.Project(conn, tx, evt, envelopes[index], deviceIsDesktop);
-            });
+                eventWork?.Invoke(conn, tx, evt, index);
+            },
+            (index, account) => NotificationForTarget(envelopes[index].NotificationIntent, account));
         return created.Select(e => e.EventId).ToList();
+    }
+
+    private MeshDb.ReplicationOutboxNotification NotificationForTarget(
+        NotificationIntent? intent,
+        string targetAccount)
+    {
+        var notificationId = string.IsNullOrWhiteSpace(intent?.StableId) ? null : intent.StableId;
+        var ownerCopy = intent?.SuppressOnOriginAccount == true
+                        && string.Equals(
+                            ReplicationHandle.Norm(targetAccount),
+                            ReplicationHandle.Norm(identity.Handle),
+                            StringComparison.Ordinal);
+        var worthy = intent is { Notify: true, IsHistorical: false } && notificationId is not null && !ownerCopy;
+        return new MeshDb.ReplicationOutboxNotification(worthy, notificationId);
     }
 
     private void ValidateIdentity(ReplicationIdentity id)

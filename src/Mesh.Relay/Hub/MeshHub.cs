@@ -244,6 +244,65 @@ public sealed class MeshHub(
             throw;
         }
     }
+    /// <summary>Authenticates and emits an ephemeral contentless wake for one authorized device.</summary>
+    public async Task<OnlineWakeResult> Wake(OnlineWakeRequest request)
+    {
+        var (connection, _, revoked) = await GetAuthorizedConnectionAsync();
+        if (revoked) return new OnlineWakeResult(false, OnlineWakeCodes.DeviceRevoked);
+        if (connection?.Handle is null || connection.DeviceId is null)
+        {
+            Context.Abort();
+            return new OnlineWakeResult(false, OnlineWakeCodes.Invalid);
+        }
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.ToHandle)
+            || !DeviceProtocol.IsValidDeviceId(request.ToDevice)
+            || string.IsNullOrWhiteSpace(request.WakeId)
+            || request.WakeId.Length > 128)
+            return new OnlineWakeResult(false, OnlineWakeCodes.Invalid);
+
+        var (decision, policy) = await rateLimiter.TryAcquireAsync(
+            connection.Handle, MessageRateBucket.Direct, Context.ConnectionAborted);
+        if (!policy.Enabled || !decision.Allowed)
+        {
+            metrics.RateLimitRejected();
+            return new OnlineWakeResult(
+                false, OnlineWakeCodes.RateLimited, decision.RetryAfterMs);
+        }
+
+        var toHandle = Normalize(request.ToHandle);
+        var target = await store.GetHandleAsync(toHandle, Context.ConnectionAborted);
+        if (target is null || !AuthorizedDeviceIds(target).Contains(request.ToDevice))
+            return new OnlineWakeResult(false, OnlineWakeCodes.TargetDeviceUnknown);
+        if (registry.ConnectionsForDevice(toHandle, request.ToDevice).Count > 0
+            || await backplane.GetInstanceForDeviceAsync(
+                toHandle,
+                request.ToDevice,
+                Context.ConnectionAborted) is not null)
+            return new OnlineWakeResult(true, OnlineWakeCodes.Accepted);
+
+
+        var outcome = await push.RequestWakeAsync(
+            toHandle,
+            request.ToDevice,
+            request.WakeId,
+            request.NotificationWorthy,
+            Context.ConnectionAborted);
+        if (outcome == PushDispatchOutcome.Sent) metrics.PushWake();
+        return outcome switch
+        {
+            PushDispatchOutcome.Sent or PushDispatchOutcome.Coalesced
+                => new OnlineWakeResult(true, OnlineWakeCodes.Accepted),
+            PushDispatchOutcome.Throttled
+                => new OnlineWakeResult(
+                    false, OnlineWakeCodes.RateLimited,
+                    request.NotificationWorthy ? 5_000 : 30_000),
+            PushDispatchOutcome.NoTarget
+                => new OnlineWakeResult(false, OnlineWakeCodes.TargetUnavailable),
+            _ => new OnlineWakeResult(false, OnlineWakeCodes.DeliveryFailed)
+        };
+    }
+
 
     /// <summary>
     /// Routes an encrypted control envelope only while the target is online. This is not a message
@@ -356,7 +415,6 @@ public sealed class MeshHub(
         }
 
         metrics.OfflineNack();
-        Wake(toHandle, toDevice);
         return new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline);
     }
 
@@ -371,24 +429,20 @@ public sealed class MeshHub(
     {
         var fanout = authorizedDevices.Take(Math.Max(1, policy.MaxFanoutRecipients)).ToArray();
         var delivered = 0;
-        var offline = new List<string>();
         foreach (var device in fanout)
         {
             var delivery = StampDelivery(connection, toHandle, device, frame, pushClass);
             var outcome = await router.ForwardToDeviceAsync(toHandle, device, delivery, excludeSelf, Context.ConnectionAborted);
             if (outcome == BackplaneDeliveryOutcome.Delivered) delivered++;
-            else offline.Add(device);
         }
 
         if (delivered > 0)
         {
             metrics.OnlineDelivered(delivered);
-            foreach (var device in offline) Wake(toHandle, device);
             return new OnlineRelaySendResult(true, OnlineRelaySendCodes.Delivered);
         }
 
-        metrics.OfflineNack(Math.Max(1, offline.Count));
-        foreach (var device in offline) Wake(toHandle, device);
+        metrics.OfflineNack(Math.Max(1, fanout.Length));
         return new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline);
     }
 
@@ -443,12 +497,6 @@ public sealed class MeshHub(
             PushClass: pushClass,
             Ciphertext: frame.Ciphertext);
 
-    private void Wake(string toHandle, string deviceId)
-    {
-        if (!push.Enabled) return;
-        push.QueueWake(toHandle, deviceId);
-        metrics.PushWake();
-    }
 
     private async Task<(
         ConnectionRegistry.ConnState? Connection,

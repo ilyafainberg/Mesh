@@ -312,7 +312,7 @@ public static class ReplicationDomainMaterializer
         // The convergence log is exact-once per (kind, entity, line): a duplicate event returns
         // false here and never reaches the actual table, so no duplicate row can be produced.
         var appended = ReplicationDomainStore.AppendLine(conn, tx, envelope.Kind, envelope.EntityId,
-            line.Id, conv, causal, envelope.BodyJson, updated);
+            line.Id, conv, causal, evt.EventId, envelope.BodyJson, updated);
         if (!appended) return false;
         RequireDomainSchema(conn, tx, envelope.Kind, envelope.Action);
 

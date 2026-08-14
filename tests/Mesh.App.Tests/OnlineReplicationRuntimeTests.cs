@@ -63,7 +63,9 @@ public sealed class OnlineReplicationRuntimeTests
     private sealed class RecordingTransport : IReplicationTransport
     {
         private readonly List<OnlineRelayFrame> sent = new();
+        private readonly List<OnlineWakeRequest> wakes = new();
         public OnlineRelaySendResult Result = new(true, OnlineRelaySendCodes.Delivered);
+        public OnlineWakeResult WakeResult = new(true, OnlineWakeCodes.Accepted);
 
         public Task<OnlineRelaySendResult> SendAsync(OnlineRelayFrame frame, CancellationToken ct)
         {
@@ -71,7 +73,14 @@ public sealed class OnlineReplicationRuntimeTests
             return Task.FromResult(Result);
         }
 
+        public Task<OnlineWakeResult> WakeAsync(OnlineWakeRequest request, CancellationToken ct)
+        {
+            lock (wakes) wakes.Add(request);
+            return Task.FromResult(WakeResult);
+        }
+
         public IReadOnlyList<OnlineRelayFrame> Sent { get { lock (sent) return sent.ToList(); } }
+        public IReadOnlyList<OnlineWakeRequest> Wakes { get { lock (wakes) return wakes.ToList(); } }
 
         public IReadOnlyList<(E2EFrameKind Kind, string ToDevice)> DecodedKinds()
         {
@@ -163,7 +172,8 @@ public sealed class OnlineReplicationRuntimeTests
 
     private OnlineReplicationEngine NewEngine(
         string handle, string device, IReplicationRoster roster, IReplicationTransport transport,
-        KeyPair keys, IReplicationDomainApplier? applier = null, bool desktop = true)
+        KeyPair keys, IReplicationDomainApplier? applier = null, bool desktop = true,
+        TimeSpan? sessionInitRetryInterval = null)
     {
         var db = MeshDb.Open(Path.Combine(_root, device + ".meshdb"), DbKey);
         _dbs.Add(db);
@@ -171,7 +181,8 @@ public sealed class OnlineReplicationRuntimeTests
             handle, device, keys.PublicB64, keys.PrivateB64, "epoch-1", 0, OnlineReplicationProtocol.ZeroHash);
         var engine = new OnlineReplicationEngine(
             db, identity, transport, roster, applier ?? new CapturingApplier(),
-            deviceIsDesktop: desktop, sendTimeout: TimeSpan.FromSeconds(2), maxSendAttempts: 1);
+            deviceIsDesktop: desktop, sendTimeout: TimeSpan.FromSeconds(2), maxSendAttempts: 1,
+            sessionInitRetryInterval: sessionInitRetryInterval);
         engine.EnsureLocalOrigin();
         _engines.Add(engine);
         return engine;
@@ -532,6 +543,14 @@ public sealed class OnlineReplicationRuntimeTests
         return poller;
     }
 
+    private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (!predicate() && DateTimeOffset.UtcNow < deadline)
+            await Task.Delay(20);
+        Assert.IsTrue(predicate(), $"Condition was not met within {timeout}.");
+    }
+
     [TestMethod]
     public async Task Poller_OnlineAuthorizedSibling_StartsSession()
     {
@@ -558,7 +577,34 @@ public sealed class OnlineReplicationRuntimeTests
     }
 
     [TestMethod]
-    public async Task Poller_NewSibling_BootstrapsExactlyOnce()
+    public async Task Poller_PokeInterruptsIdleDelay()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
+        source.SetPresence("alice", false, siblingDevice);
+
+        var roster = NewRoster(source, "alice", new List<string>());
+        var transport = new RecordingTransport();
+        var engine = NewEngine("alice", myDevice, roster, transport, mine);
+        var poller = NewPoller(engine, roster, source, "alice", myDevice, () => new[] { "alice" });
+        poller.Start();
+        await WaitUntilAsync(() => Volatile.Read(ref source.ResolveCount) >= 1, TimeSpan.FromSeconds(2));
+
+        source.SetPresence("alice", true, siblingDevice);
+        poller.Poke();
+
+        await WaitUntilAsync(
+            () => transport.DecodedKinds().Any(item =>
+                item.Kind == E2EFrameKind.SessionInit && item.ToDevice == siblingDevice),
+            TimeSpan.FromSeconds(2));
+    }
+
+    [TestMethod]
+    public async Task Poller_NewSibling_BootstrapsOnlyAfterSessionEstablished()
     {
         var source = new FakeMetadataSource();
         var mine = KeyPair.New();
@@ -567,51 +613,294 @@ public sealed class OnlineReplicationRuntimeTests
         var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
         source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
         source.SetPresence("alice", true, myDevice, siblingDevice);
-        var roster = NewRoster(source, "alice", new List<string>());
-        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+
+        var sessionRoster = new FabricRoster();
+        sessionRoster.Add("alice", new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        sessionRoster.Add("alice", new ReplicationDevice("alice", siblingDevice, sibling.PublicB64, 0, false));
+        var fabric = new ReplicationFabric();
+        var engine = NewEngine("alice", myDevice, sessionRoster, fabric.TransportFor("alice", myDevice), mine);
+        var siblingEngine = NewEngine(
+            "alice",
+            siblingDevice,
+            sessionRoster,
+            fabric.TransportFor("alice", siblingDevice),
+            sibling);
+        fabric.Register("alice", myDevice, engine);
+        fabric.Register("alice", siblingDevice, siblingEngine);
+
+        var presenceRoster = NewRoster(source, "alice", new List<string>());
+        ReplicationBootstrapTarget? bootstrapTarget = null;
         var bootstraps = 0;
         var poller = new ReplicationPresencePoller(
             engine,
-            roster,
+            presenceRoster,
             source,
             () => new[] { "alice" },
             _ => false,
             "alice",
             myDevice,
             _ => { },
-            (_, device, _) =>
+            (target, _) =>
             {
-                Assert.AreEqual(siblingDevice, device);
+                bootstrapTarget = target;
                 bootstraps++;
                 return Task.CompletedTask;
             });
         _disposables.Add(poller);
 
         await poller.PollOnceAsync(default);
+        Assert.AreEqual(0, bootstraps, "bootstrap must not start before the signed session handshake completes");
+
+        await fabric.DrainAsync();
+        Assert.IsTrue(engine.IsSessionEstablished(siblingDevice));
         await poller.PollOnceAsync(default);
 
         Assert.AreEqual(1, bootstraps);
+        Assert.IsNotNull(bootstrapTarget);
+        Assert.AreEqual(siblingDevice, bootstrapTarget.PeerDeviceId);
+        Assert.AreEqual("alice", bootstrapTarget.PeerHandle);
     }
 
     [TestMethod]
-    public async Task Poller_OfflineHandle_StartsNoSession()
+    public async Task Poller_OfflineNewSibling_RequestsBootstrapWake()
     {
         var source = new FakeMetadataSource();
         var mine = KeyPair.New();
         var sib = KeyPair.New();
         var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sib.PublicB64);
         source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sib.PublicB64));
-        source.SetPresence("alice", false, DeviceProtocol.DeviceId(sib.PublicB64));
+        source.SetPresence("alice", false, siblingDevice);
 
         var roster = NewRoster(source, "alice", new List<string>());
-        var transport = new RecordingTransport();
+        var transport = new RecordingTransport
+        {
+            Result = new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline)
+        };
         var engine = NewEngine("alice", myDevice, roster, transport, mine);
         var poller = NewPoller(engine, roster, source, "alice", myDevice, () => new[] { "alice" });
 
         var pending = await poller.PollOnceAsync(default);
 
-        Assert.AreEqual(0, transport.Sent.Count, "offline peers must leave the outbox pending, not start a session");
-        Assert.IsFalse(pending, "no online peer and no due outbox means no pending work");
+        Assert.IsTrue(pending, "an unbootstrapped authorised sibling is pending synchronization work");
+        Assert.IsTrue(transport.Wakes.Any(item =>
+            item.ToHandle == "alice" && item.ToDevice == siblingDevice));
+    }
+
+    [TestMethod]
+    public async Task Poller_DueOfflineSibling_EmitsOneBoundedWakeRequest()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var bob = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        var bobDevice = DeviceProtocol.DeviceId(bob.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
+        source.SetHandle("bob", Dir("bob", 0, "", bob.PublicB64));
+        source.SetPresence("alice", false);
+        source.SetPresence("bob", true, bobDevice);
+
+        var roster = NewRoster(source, "alice", new List<string>());
+        var transport = new RecordingTransport
+        {
+            Result = new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline)
+        };
+        var engine = NewEngine("alice", myDevice, roster, transport, mine);
+        (bool Online, bool Pending)? completed = null;
+        var poller = new ReplicationPresencePoller(
+            engine,
+            roster,
+            source,
+            () => new[] { "alice", "bob" },
+            handles => handles.Contains("alice", StringComparer.Ordinal),
+            "alice",
+            myDevice,
+            _ => { },
+            pollCompleted: (online, pending) => completed = (online, pending));
+        _disposables.Add(poller);
+
+        Assert.IsTrue(await poller.PollOnceAsync(default));
+        Assert.AreEqual((false, true), completed);
+        Assert.IsFalse(
+            poller.HasImmediatelyDeliverableWork,
+            "pending work for an offline sibling is not immediately deliverable through an unrelated online handle");
+        await poller.PollOnceAsync(default);
+
+        var wakes = transport.Wakes.Count(item => item.ToDevice == siblingDevice);
+        Assert.AreEqual(1, wakes, "the offline device must receive one bounded relay wake request");
+    }
+
+    [TestMethod]
+    public async Task Poller_AccountReceiptDoesNotSuppressLaggingDeviceWake()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var bob1 = KeyPair.New();
+        var bob2 = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var bob1Device = DeviceProtocol.DeviceId(bob1.PublicB64);
+        var bob2Device = DeviceProtocol.DeviceId(bob2.PublicB64);
+        source.SetHandle("bob", Dir("bob", 0, "", bob1.PublicB64, bob2.PublicB64));
+        source.SetPresence("bob", false);
+
+        var roster = NewRoster(source, "alice", new List<string>());
+        await roster.RefreshAsync(new[] { "bob" }, default);
+        var transport = new RecordingTransport
+        {
+            Result = new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline)
+        };
+        var engine = NewEngine("alice", myDevice, roster, transport, mine);
+        var db = _dbs[^1];
+        var eventId = await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "lagged"),
+            new[] { "bob" });
+        var receipt = OnlineReplicationProtocol.CreateReceipt(
+            bob1Device,
+            myDevice,
+            "epoch-1",
+            1,
+            OnlineReplicationProtocol.HashText("cursor"),
+            OnlineReplicationProtocol.HashText("batch"),
+            bob1.PrivateB64);
+        Assert.AreEqual(1, db.MarkOutboxPersistedFromReceipt(receipt, bob1.PublicB64, "bob"));
+        Assert.AreEqual(MeshDb.OutboxStatePersisted, db.GetOutboxState(eventId, "bob"));
+
+        var poller = new ReplicationPresencePoller(
+            engine,
+            roster,
+            source,
+            () => new[] { "bob" },
+            handles => db.CountUnpersistedOutbox(handles) > 0,
+            "alice",
+            myDevice,
+            _ => { });
+        _disposables.Add(poller);
+
+        Assert.IsTrue(await poller.PollOnceAsync(default));
+
+        var wokenDevices = transport.Wakes
+            .Select(item => item.ToDevice)
+            .ToArray();
+        CollectionAssert.AreEquivalent(new[] { bob2Device }, wokenDevices,
+            "only the authorised device without its own receipt should be woken");
+        Assert.IsTrue(poller.HasPendingSynchronizationWork);
+        Assert.IsFalse(poller.HasImmediatelyDeliverableWork);
+    }
+
+    [TestMethod]
+    public async Task Poller_EstablishedPeerReoffersPendingWorkAfterReconnect()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
+        source.SetPresence("alice", true, siblingDevice);
+
+        var sessionRoster = new FabricRoster();
+        sessionRoster.Add("alice", new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        sessionRoster.Add("alice", new ReplicationDevice("alice", siblingDevice, sibling.PublicB64, 0, false));
+        var fabric = new ReplicationFabric();
+        var engine = NewEngine("alice", myDevice, sessionRoster, fabric.TransportFor("alice", myDevice), mine);
+        var siblingEngine = NewEngine(
+            "alice",
+            siblingDevice,
+            sessionRoster,
+            fabric.TransportFor("alice", siblingDevice),
+            sibling);
+        var siblingDb = _dbs[^1];
+        fabric.Register("alice", myDevice, engine);
+        fabric.Register("alice", siblingDevice, siblingEngine);
+
+        await engine.StartSessionAsync("alice", siblingDevice);
+        await fabric.DrainAsync();
+        Assert.IsTrue(engine.IsSessionEstablished(siblingDevice));
+
+        fabric.SetOnline(siblingDevice, false);
+        var eventId = await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Topic, ReplicationPayloadCodec.DomainAction.Upsert, "topic-retry"),
+            new[] { "alice" });
+        await fabric.DrainAsync();
+        Assert.IsNull(siblingDb.GetEvent(eventId));
+
+        fabric.SetOnline(siblingDevice, true);
+        var presenceRoster = NewRoster(source, "alice", new List<string>());
+        var poller = NewPoller(
+            engine,
+            presenceRoster,
+            source,
+            "alice",
+            myDevice,
+            () => new[] { "alice" },
+            hasDueOutbox: true);
+
+        await poller.PollOnceAsync(default);
+        await fabric.DrainAsync();
+
+        Assert.IsNotNull(siblingDb.GetEvent(eventId));
+    }
+
+    [TestMethod]
+    public async Task Poller_ReplayedOfferRecoversLostPersistenceReceipt()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
+        source.SetPresence("alice", true, siblingDevice);
+
+        var sessionRoster = new FabricRoster();
+        sessionRoster.Add("alice", new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        sessionRoster.Add("alice", new ReplicationDevice("alice", siblingDevice, sibling.PublicB64, 0, false));
+        var fabric = new ReplicationFabric();
+        var engine = NewEngine("alice", myDevice, sessionRoster, fabric.TransportFor("alice", myDevice), mine);
+        var engineDb = _dbs[^1];
+        var siblingEngine = NewEngine(
+            "alice",
+            siblingDevice,
+            sessionRoster,
+            fabric.TransportFor("alice", siblingDevice),
+            sibling);
+        var siblingDb = _dbs[^1];
+        fabric.Register("alice", myDevice, engine);
+        fabric.Register("alice", siblingDevice, siblingEngine);
+
+        await engine.StartSessionAsync("alice", siblingDevice);
+        await fabric.DrainAsync();
+        fabric.DropFrame = (fromDevice, frame) =>
+            string.Equals(fromDevice, siblingDevice, StringComparison.Ordinal)
+            && ReplicationPayloadCodec.DecodeFrame(frame.Ciphertext)?.Kind == E2EFrameKind.Receipt;
+
+        var eventId = await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Topic, ReplicationPayloadCodec.DomainAction.Upsert, "topic-receipt"),
+            new[] { "alice" });
+        await fabric.DrainAsync();
+
+        Assert.IsNotNull(siblingDb.GetEvent(eventId));
+        Assert.AreNotEqual(ReplicationDeliveryState.Persisted, engine.GetDeliveryState(eventId, "alice"));
+
+        fabric.DropFrame = null;
+        var presenceRoster = NewRoster(source, "alice", new List<string>());
+        var poller = new ReplicationPresencePoller(
+            engine,
+            presenceRoster,
+            source,
+            () => new[] { "alice" },
+            handles => engineDb.CountUnpersistedOutbox(handles) > 0,
+            "alice",
+            myDevice,
+            _ => { });
+        _disposables.Add(poller);
+
+        await poller.PollOnceAsync(default);
+        await fabric.DrainAsync();
+
+        Assert.AreEqual(ReplicationDeliveryState.Persisted, engine.GetDeliveryState(eventId, "alice"));
     }
 
     [TestMethod]
@@ -699,6 +988,125 @@ public sealed class OnlineReplicationRuntimeTests
     // =====================================================================
     // Engine typed inbound dispatch (real delivery invokes the engine; spoof rejected).
     // =====================================================================
+
+    [TestMethod]
+    public async Task Engine_RepeatedSessionStart_CoalescesInFlightHandshake()
+    {
+        var mine = KeyPair.New();
+        var peer = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var peerDevice = DeviceProtocol.DeviceId(peer.PublicB64);
+        var roster = new FabricRoster();
+        roster.Add("alice", new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        roster.Add("alice", new ReplicationDevice("alice", peerDevice, peer.PublicB64, 0, false));
+        var transport = new RecordingTransport();
+        var engine = NewEngine(
+            "alice", myDevice, roster, transport, mine,
+            sessionInitRetryInterval: TimeSpan.FromMilliseconds(20));
+
+        await engine.StartSessionAsync("alice", peerDevice);
+        await engine.StartSessionAsync("alice", peerDevice);
+        await engine.OnWakeAsync("alice", peerDevice);
+
+        Assert.AreEqual(
+            1,
+            transport.DecodedKinds().Count(item => item.Kind == E2EFrameKind.SessionInit),
+            "polling must not replace an in-flight session nonce before its acknowledgement can arrive");
+
+        await Task.Delay(TimeSpan.FromMilliseconds(40));
+        await engine.StartSessionAsync("alice", peerDevice);
+        Assert.AreEqual(
+            2,
+            transport.DecodedKinds().Count(item => item.Kind == E2EFrameKind.SessionInit),
+            "an unacknowledged handshake must retry after the bounded interval");
+    }
+
+    [TestMethod]
+    public async Task Engine_NotificationWakeIsWorthyOpaqueAndStableAcrossRetries()
+    {
+        var mine = KeyPair.New();
+        var peerKeys = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var peerDevice = DeviceProtocol.DeviceId(peerKeys.PublicB64);
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        roster.Add(new ReplicationDevice("bob", peerDevice, peerKeys.PublicB64, 0, false));
+        var transport = new RecordingTransport();
+        var engine = NewEngine("alice", myDevice, roster, transport, mine);
+        var envelope = Env(
+            ReplicationOpKinds.Topic,
+            ReplicationPayloadCodec.DomainAction.Upsert,
+            "topic-notification") with
+        {
+            NotificationIntent = NotificationIntents.Message(
+                "line-1", "bob", "Alice", "private body")
+        };
+
+        await engine.EmitLocalAsync(envelope, new[] { "bob" });
+        await engine.OnWakeAsync("bob", peerDevice);
+        await engine.OnWakeAsync("bob", peerDevice);
+
+        Assert.AreEqual(2, transport.Wakes.Count);
+        Assert.IsTrue(transport.Wakes.All(wake => wake.NotificationWorthy));
+        Assert.AreEqual(transport.Wakes[0].WakeId, transport.Wakes[1].WakeId);
+        Assert.AreEqual(OnlineReplicationLimits.HashHexLength, transport.Wakes[0].WakeId.Length);
+        Assert.IsFalse(transport.Wakes[0].WakeId.Contains("line-1", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public async Task Engine_OwnerSiblingMessageUsesSilentStableWake()
+    {
+        var mine = KeyPair.New();
+        var siblingKeys = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(siblingKeys.PublicB64);
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        roster.Add(new ReplicationDevice("alice", siblingDevice, siblingKeys.PublicB64, 0, false));
+        var transport = new RecordingTransport();
+        var engine = NewEngine("alice", myDevice, roster, transport, mine);
+        var envelope = Env(
+            ReplicationOpKinds.Topic,
+            ReplicationPayloadCodec.DomainAction.Upsert,
+            "topic-owner-copy") with
+        {
+            NotificationIntent = NotificationIntents.Message(
+                "line-owner", "bob", "Alice", "private body", suppressOnOriginAccount: true)
+        };
+
+        await engine.EmitLocalAsync(envelope, new[] { "alice" });
+        await engine.OnWakeAsync("alice", siblingDevice);
+
+        Assert.AreEqual(1, transport.Wakes.Count);
+        Assert.IsFalse(transport.Wakes[0].NotificationWorthy);
+    }
+
+    [TestMethod]
+    public async Task Engine_DoesNotWakeDeviceMissingFromEncryptedRecipientSlots()
+    {
+        var mine = KeyPair.New();
+        var peerKeys = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var peerDevice = DeviceProtocol.DeviceId(peerKeys.PublicB64);
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        var transport = new RecordingTransport();
+        var engine = NewEngine("alice", myDevice, roster, transport, mine);
+        var envelope = Env(
+            ReplicationOpKinds.Topic,
+            ReplicationPayloadCodec.DomainAction.Upsert,
+            "topic-before-link") with
+        {
+            NotificationIntent = NotificationIntents.Message(
+                "line-before-link", "bob", "Alice", "private body")
+        };
+
+        await engine.EmitLocalAsync(envelope, new[] { "bob" });
+        roster.Add(new ReplicationDevice("bob", peerDevice, peerKeys.PublicB64, 0, false));
+        await engine.OnWakeAsync("bob", peerDevice);
+
+        Assert.AreEqual(0, transport.Wakes.Count);
+    }
 
     [TestMethod]
     public async Task Engine_SessionInitFromAuthorizedPeer_RepliesWithAck()

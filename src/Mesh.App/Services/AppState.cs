@@ -124,7 +124,7 @@ public sealed partial class AppState : IMemoryState
 
             var idx = JsonSerializer.Deserialize<AccountIndex>(File.ReadAllText(indexPath), JsonOpts) ?? new AccountIndex();
             accounts = idx.Accounts ?? new();
-            activeId = idx.ActiveId;
+            activeId = MeshProcessContext.PreferredAccountId ?? idx.ActiveId;
 
             if (activeId is not null)
             {
@@ -178,8 +178,9 @@ public sealed partial class AppState : IMemoryState
 
     private void WriteIndexCore(string? id, IReadOnlyList<AccountRef> accts)
     {
-        File.WriteAllText(indexPath, JsonSerializer.Serialize(
-            new AccountIndex { ActiveId = id, Accounts = accts.ToList() }, JsonOpts));
+        MeshAccountIndexWriter.WriteAtomic(
+            indexPath,
+            JsonSerializer.Serialize(new AccountIndex { ActiveId = id, Accounts = accts.ToList() }, JsonOpts));
         StorageProtection.TryEnsureBackgroundReadable(indexPath);
     }
 
@@ -389,6 +390,7 @@ public sealed partial class AppState : IMemoryState
                 Profile.Memories[i] = memory;
                 activeDb.UpsertMemory(memory);
             }
+            NotificationCoordinatorBridge.ResetForAccount();
         }
     }
 
@@ -572,20 +574,20 @@ public sealed partial class AppState : IMemoryState
     /// Appends a line to a conversation, persisting it as a single row (not a full re-serialize)
     /// so history stays scalable. Updates the in-memory conversation and notifies the UI.
     /// </summary>
-    public void AddChatLine(string handle, ChatLine line)
+    public void AddChatLine(string handle, ChatLine line, NotificationIntent? notificationIntent = null)
     {
         var conv = GetOrCreateConversation(handle);
         conv.Lines.Add(line);
         conv.LastActivityAt = ActivityTimestamp.Advance(conv.LastActivityAt, line.At);
         // The row itself is written by the persistence worker inside the same transaction as the
         // signed replication event, so history and its event can never diverge.
-        EmitLineUpsert("conversation.line", conv.Handle, line);
+        EmitLineUpsert("conversation.line", conv.Handle, line, notificationIntent);
         EmitConversationUpsert(conv);
         NotifyChanged();
     }
 
     /// <summary>Appends a line to a "Me" topic thread as a single row.</summary>
-    public void AddOwnChatLine(string threadId, ChatLine line)
+    public void AddOwnChatLine(string threadId, ChatLine line, NotificationIntent? notificationIntent = null)
     {
         lock (profileSyncGate)
         {
@@ -595,7 +597,7 @@ public sealed partial class AppState : IMemoryState
             var thread = GetOrCreateOwnThread(threadId);
             thread.Lines.Add(line);
             thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
-            EmitLineUpsert("topic.line", thread.Id, line);
+            EmitLineUpsert("topic.line", thread.Id, line, notificationIntent);
             EmitTopicUpsert(thread);
         }
         NotifyChanged();
@@ -877,7 +879,7 @@ public sealed partial class AppState : IMemoryState
 
     // ---- online replication emission ---------------------------------------
 
-    private void EmitTopicUpsert(OwnThread thread)
+    private void EmitTopicUpsert(OwnThread thread, NotificationIntent? notificationIntent = null)
     {
         var sortOrder = Profile.OwnThreads.IndexOf(thread);
         var body = JsonSerializer.Serialize(new
@@ -895,7 +897,7 @@ public sealed partial class AppState : IMemoryState
             thread.ExecutionRunId
         }, ReplicationJson);
         EmitReplicatedChange(ReplicationOpKinds.Topic, ReplicationPayloadCodec.DomainAction.Upsert,
-            thread.Id, thread.Id, body, TargetsForOwnerState());
+            thread.Id, thread.Id, body, TargetsForOwnerState(), notificationIntent);
     }
 
     private void EmitConversationUpsert(Conversation conversation)
@@ -906,14 +908,14 @@ public sealed partial class AppState : IMemoryState
             handle, handle, body, TargetsForOwnerState());
     }
 
-    private void EmitLineUpsert(string kind, string parentId, ChatLine line)
+    private void EmitLineUpsert(string kind, string parentId, ChatLine line, NotificationIntent? notificationIntent = null)
     {
         var mappedKind = kind.Contains("Topic", StringComparison.OrdinalIgnoreCase)
             ? ReplicationOpKinds.Topic
             : ReplicationOpKinds.Message;
         var targets = mappedKind == ReplicationOpKinds.Topic ? TargetsForOwnerState() : TargetsForConversation(parentId);
         EmitReplicatedChange(mappedKind, ReplicationPayloadCodec.DomainAction.AppendLine,
-            parentId, parentId, JsonSerializer.Serialize(line, ReplicationJson), targets);
+            parentId, parentId, JsonSerializer.Serialize(line, ReplicationJson), targets, notificationIntent);
     }
 
     private void EmitTombstone(string kind, string entityId, IEnumerable<string?>? additionalVersions = null)
@@ -1033,7 +1035,8 @@ public sealed partial class AppState : IMemoryState
         string entityId,
         string? conversationId,
         string bodyJson,
-        IReadOnlyCollection<string> targets)
+        IReadOnlyCollection<string> targets,
+        NotificationIntent? notificationIntent = null)
     {
         if (applyingReplicationProjection) return;
         var db = activeDb;
@@ -1048,7 +1051,8 @@ public sealed partial class AppState : IMemoryState
             Replications: new[]
             {
                 new ReplicationWork(db, kind, action, entityId, conversationId,
-                    NewReplicationVersion(), bodyJson ?? string.Empty, targets.ToArray())
+                    NewReplicationVersion(), bodyJson ?? string.Empty, targets.ToArray(),
+                    notificationIntent)
             }));
     }
 
@@ -1456,7 +1460,14 @@ public sealed partial class AppState : IMemoryState
 
     public bool TryApplyRemoteRunUpdate(TopicRunUpdatePayload update)
     {
-        if (update.Delta is { Length: > 0 })
+        var correlationKey = update.ThreadId + "\0" + update.RunId;
+        lock (profileSyncGate)
+            if (terminalRemoteRuns.Contains(correlationKey)) return true;
+
+        var terminal = update.Phase is TopicRunPhase.Completed
+            or TopicRunPhase.Failed
+            or TopicRunPhase.Cancelled;
+        if (!terminal && update.Delta is { Length: > 0 })
         {
             if (!ApplyQueuedTopicRunUpdate(update)) return false;
             ApplyRemoteAssistantDelta(update);
@@ -1726,10 +1737,18 @@ public sealed partial class AppState : IMemoryState
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
         if (thread is not null)
         {
+            var notificationIntent = phase switch
+            {
+                AgentRunPhase.Completed => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicCompleted),
+                AgentRunPhase.Failed => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicFailed),
+                AgentRunPhase.Cancelled => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicCancelled),
+                _ => null
+            };
+
             var at = updatedAt ?? DateTimeOffset.UtcNow;
             thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
             activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt!.Value);
-            EmitTopicUpsert(thread);
+            EmitTopicUpsert(thread, notificationIntent);
         }
         NotifyChanged();
     }
@@ -1750,6 +1769,7 @@ public sealed partial class AppState : IMemoryState
     public void MarkThreadSeen(string threadId)
     {
         if (completedThreads.Remove(threadId)) NotifyChanged();
+        NotificationCoordinatorBridge.MarkEntityRead(threadId);
     }
 
     /// <summary>
@@ -2002,6 +2022,7 @@ public sealed partial class AppState : IMemoryState
     public void MarkRead(string handle)
     {
         var h = Norm(handle);
+        NotificationCoordinatorBridge.MarkEntityRead(h);
         var changed = unread.Remove(h);
         if (Profile.UnreadFrom.Remove(h)) { ScheduleProfileSave(); changed = true; }
         if (changed)
@@ -2185,6 +2206,7 @@ public sealed partial class AppState : IMemoryState
         }
         db.SaveProfile(imported);
 
+        if (activeId is not null) RaiseActiveAccountChanging();
         activeDb?.Dispose();
         activeDb = db;
         activeId = id;
@@ -2192,6 +2214,7 @@ public sealed partial class AppState : IMemoryState
         MigrateAndHydrateAssets(db);
         RehydrateUnread();
         RehydrateTopicExecutionState();
+        NotificationCoordinatorBridge.ResetForAccount();
         accounts.Add(new AccountRef { Id = id, Handle = imported.Handle, DisplayName = imported.DisplayName });
         WriteIndex();
         NotifyChanged();
@@ -2206,13 +2229,18 @@ public sealed partial class AppState : IMemoryState
     /// </summary>
     public void SignOut()
     {
-        if (activeId is not null) FlushBlocking();
+        if (activeId is not null)
+        {
+            FlushBlocking();
+            RaiseActiveAccountChanging();
+        }
         activeDb?.Dispose();
         activeDb = null;
         activeId = null;
         Profile = new MeshProfile();
         ResetAssetState();
         queuedTopicRuns.Clear();
+        NotificationCoordinatorBridge.ResetForAccount();
         WriteIndex();
         NotifyChanged();
     }
@@ -2237,6 +2265,7 @@ public sealed partial class AppState : IMemoryState
             MigrateAndHydrateAssets(db);
             RehydrateUnread();
             RehydrateTopicExecutionState();
+            NotificationCoordinatorBridge.ResetForAccount();
             WriteIndex();
             NotifyChanged();
             return true;
@@ -2257,6 +2286,7 @@ public sealed partial class AppState : IMemoryState
             activeId = null;
             Profile = new MeshProfile();
             ResetAssetState();
+            NotificationCoordinatorBridge.ResetForAccount();
         }
         try { var p = DbPath(id); if (File.Exists(p)) File.Delete(p); } catch { }
         secrets.DeleteDbKey(id);

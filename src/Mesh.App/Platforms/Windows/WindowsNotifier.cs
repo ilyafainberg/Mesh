@@ -1,55 +1,118 @@
+#if WINDOWS
+using System.Security.Cryptography;
+using System.Text;
+using Mesh.App.Services;
+using Microsoft.Extensions.Logging;
 using Microsoft.Windows.AppNotifications;
 using Microsoft.Windows.AppNotifications.Builder;
-using Mesh.App.Services;
+using Microsoft.Windows.BadgeNotifications;
 
 namespace Mesh.App.Platforms.Windows;
 
-/// <summary>
-/// Windows toast notifications via the Windows App SDK AppNotificationManager, which works for
-/// unpackaged apps after Register(). Clicking a toast raises the app and (when a route is attached)
-/// asks the app to navigate there. Registration is done once, lazily, on the first notification.
-/// </summary>
-public sealed class WindowsNotifier : INotifier
+public sealed class WindowsNotifier(ILogger<WindowsNotifier> logger) : INotifier
 {
-    private static bool registered;
-    private static readonly object gate = new();
+    private static int registered;
 
-    /// <summary>Optional hook the app sets so a clicked toast can bring the window up + navigate.</summary>
-    public static Action<string?>? OnActivated { get; set; }
-
-    public void Notify(string title, string body, NotifyKind kind, string? route = null)
+    public static void Prime()
     {
+        if (Interlocked.Exchange(ref registered, 1) != 0) return;
+        var manager = AppNotificationManager.Default;
+        manager.NotificationInvoked += (_, args) =>
+        {
+            var route = ParseArgument(args.Argument, "route");
+            if (!string.IsNullOrWhiteSpace(route)) DeepLinkDispatch.Dispatch(route);
+        };
+        manager.Register();
+    }
+
+    public Task<bool> ShowAsync(LocalNotification notification, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
         try
         {
-            EnsureRegistered();
-            var builder = new AppNotificationBuilder()
-                .AddText(title)
-                .AddText(body);
-            if (!string.IsNullOrWhiteSpace(route))
-                builder.AddArgument("route", route);
-            AppNotificationManager.Default.Show(builder.BuildNotification());
+            Prime();
+            var native = new AppNotificationBuilder()
+                .AddText(notification.Title)
+                .AddText(notification.Body)
+                .AddArgument("route", notification.Route);
+            if (!notification.PlaySound) native.MuteAudio();
+            var built = native.BuildNotification();
+            built.Tag = Tag(notification.StableId);
+            built.Group = Group(notification.Kind);
+            AppNotificationManager.Default.Show(built);
+            return Task.FromResult(true);
         }
-        catch { /* toast failures must never break message handling */ }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Windows notification could not be shown: kind={Kind}", notification.Kind);
+            return Task.FromResult(false);
+        }
     }
 
-    /// <summary>Registers the notification manager eagerly (e.g. at startup) so the first toast pops
-    /// reliably on unpackaged apps instead of being dropped while registration is still pending.</summary>
-    public static void Prime() => EnsureRegistered();
-
-    private static void EnsureRegistered()
+    public async Task RemoveAsync(string stableId, CancellationToken ct = default)
     {
-        if (registered) return;
-        lock (gate)
+        ct.ThrowIfCancellationRequested();
+        try
         {
-            if (registered) return;
-            var manager = AppNotificationManager.Default;
-            manager.NotificationInvoked += (_, args) =>
-            {
-                var route = args.Arguments.TryGetValue("route", out var r) ? r : null;
-                OnActivated?.Invoke(route);
-            };
-            manager.Register();
-            registered = true;
+            Prime();
+            await AppNotificationManager.Default.RemoveByTagAsync(Tag(stableId));
         }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Windows notification could not be removed.");
+        }
+    }
+
+    public async Task ClearAllAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        try
+        {
+            Prime();
+            await AppNotificationManager.Default.RemoveAllAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Windows notifications could not be cleared.");
+        }
+    }
+    public Task SetBadgeAsync(int count, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        try
+        {
+            if (count <= 0) BadgeNotificationManager.Current.ClearBadge();
+            else BadgeNotificationManager.Current.SetBadgeAsCount((uint)count);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Windows notification badge could not be updated.");
+        }
+        return Task.CompletedTask;
+    }
+
+    private static string Tag(string stableId)
+        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(stableId)))[..16].ToLowerInvariant();
+
+    private static string Group(NotificationKind kind) => kind switch
+    {
+        NotificationKind.Message or NotificationKind.ServiceResponse => "messages",
+        NotificationKind.TopicCompleted or NotificationKind.TopicFailed or NotificationKind.TopicCancelled => "topics",
+        NotificationKind.DecisionRequired => "decisions",
+        NotificationKind.ApprovalRequired => "approvals",
+        _ => "requests"
+    };
+
+    private static string? ParseArgument(string argument, string key)
+    {
+        foreach (var pair in argument.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = pair.IndexOf('=');
+            if (separator <= 0) continue;
+            if (string.Equals(Uri.UnescapeDataString(pair[..separator]), key, StringComparison.Ordinal))
+                return Uri.UnescapeDataString(pair[(separator + 1)..]);
+        }
+        return null;
     }
 }
+#endif

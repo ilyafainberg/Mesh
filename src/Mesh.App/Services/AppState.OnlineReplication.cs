@@ -1,6 +1,9 @@
 using Microsoft.Data.Sqlite;
 using Mesh.App.Domain;
 using Mesh.Shared;
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace Mesh.App.Services;
@@ -20,6 +23,7 @@ namespace Mesh.App.Services;
 public sealed partial class AppState
 {
     private OnlineReplicationEngine? replicationEngine;
+    private readonly SemaphoreSlim ownerBootstrapGate = new(1, 1);
 
     /// <summary>
     /// The database the attached engine was started against. A post-commit callback whose database
@@ -206,10 +210,11 @@ public sealed partial class AppState
         IReadOnlyCollection<string> targetAccounts,
         string pushClass = OnlinePushClasses.Normal,
         CancellationToken ct = default,
-        Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainWork = null)
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainWork = null,
+        NotificationIntent? notificationIntent = null)
     {
         var envelope = new ReplicationPayloadCodec.DomainEnvelope(
-            kind, action, entityId, conversationId, causalVersion, bodyJson);
+            kind, action, entityId, conversationId, causalVersion, bodyJson, notificationIntent);
 
         var engine = replicationEngine;
         if (engine is not null)
@@ -425,69 +430,342 @@ public sealed partial class AppState
         }
     }
 
-    /// <summary>
-    /// Re-emits current owner state as fresh immutable events for a newly online sibling. Existing
-    /// ciphertext may predate that device's key, so replay alone cannot hydrate a future device.
-    /// </summary>
+    /// <summary>Emits or resumes one durable owner-state bootstrap for an established sibling session.</summary>
     public async Task EmitOwnerBootstrapSnapshotAsync(
-        string accountHandle,
-        string peerDevice,
+        ReplicationBootstrapTarget target,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(peerDevice)) return;
+        ArgumentNullException.ThrowIfNull(target);
+        await ownerBootstrapGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            OnlineReplicationEngine? engine;
+            MeshDb? db;
+            lock (profileSyncGate)
+            {
+                engine = replicationEngine;
+                db = activeDb;
+                if (engine is null
+                    || db is null
+                    || !string.Equals(Norm(target.PeerHandle), Norm(Profile.Handle), StringComparison.Ordinal))
+                    return;
+            }
+            if (!engine.IsSessionEstablished(target.PeerDeviceId)) return;
 
+            var marker = db.GetPeerBootstrap(target);
+            if (marker is null
+                || !string.Equals(marker.LocalOriginDeviceId, target.LocalOriginDeviceId, StringComparison.Ordinal)
+                || !string.Equals(marker.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal))
+            {
+                var snapshot = CaptureOwnerBootstrapSnapshot(target.PeerHandle);
+                var snapshotJson = JsonSerializer.Serialize(snapshot, ReplicationJson);
+                var stateHash = Convert.ToHexString(
+                    SHA256.HashData(Encoding.UTF8.GetBytes(snapshotJson))).ToLowerInvariant();
+                marker = db.CreateOrResumePeerBootstrap(
+                    target,
+                    Guid.NewGuid().ToString("n"),
+                    stateHash,
+                    snapshotJson,
+                    snapshot.Count);
+            }
+
+            if (marker.State == MeshDb.BootstrapStatePersisted) return;
+            var actualStateHash = Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes(marker.SnapshotJson))).ToLowerInvariant();
+            if (!string.Equals(actualStateHash, marker.StateHash, StringComparison.Ordinal))
+                throw new InvalidOperationException("The saved bootstrap snapshot failed its integrity check.");
+            var items = JsonSerializer.Deserialize<List<ReplicationPayloadCodec.DomainEnvelope>>(
+                            marker.SnapshotJson,
+                            ReplicationJson)
+                        ?? throw new InvalidOperationException("The saved bootstrap snapshot is invalid.");
+            if (items.Count != marker.TotalItems)
+                throw new InvalidOperationException("The saved bootstrap snapshot count is inconsistent.");
+            if (marker.EmittedItems < 0 || marker.EmittedItems > items.Count)
+                throw new InvalidOperationException("The saved bootstrap progress is inconsistent.");
+
+            engine.ReportBootstrapActivity("bootstrap.started", target, marker.BootstrapId);
+            if (items.Count == 0)
+            {
+                marker = db.CompleteEmptyPeerBootstrap(target, marker.BootstrapId);
+                engine.ReportBootstrapActivity(
+                    "bootstrap.persisted",
+                    target,
+                    marker.BootstrapId);
+                return;
+            }
+
+            const int chunkSize = 50;
+            for (var offset = marker.EmittedItems; offset < items.Count; offset += chunkSize)
+            {
+                ct.ThrowIfCancellationRequested();
+                lock (profileSyncGate)
+                {
+                    if (!ReferenceEquals(db, activeDb) || !ReferenceEquals(engine, replicationEngine))
+                        throw new OperationCanceledException("The active replication account changed.", ct);
+                }
+
+                var chunk = items.Skip(offset).Take(chunkSize).ToList();
+                var emittedThrough = offset + chunk.Count;
+                await Task.Run(() => engine.Journal.EmitLocalBatch(
+                    chunk,
+                    new[] { target.PeerHandle },
+                    domainWork: static (_, _, _) => { },
+                    eventWork: (_, tx, evt, index) =>
+                    {
+                        if (index == chunk.Count - 1)
+                            db.UpdatePeerBootstrapProgress(
+                                target,
+                                marker.BootstrapId,
+                                emittedThrough,
+                                items.Count,
+                                evt.Seq,
+                                tx);
+                    }), ct).ConfigureAwait(false);
+
+                engine.ReportBootstrapActivity(
+                    "bootstrap.progress",
+                    target,
+                    marker.BootstrapId,
+                    emittedThrough);
+                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
+                await Task.Yield();
+            }
+
+            if (items.Count > 0)
+            {
+                engine.ReportBootstrapActivity(
+                    "bootstrap.emitted",
+                    target,
+                    marker.BootstrapId,
+                    items.Count);
+                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ownerBootstrapGate.Release();
+        }
+    }
+    private List<ReplicationPayloadCodec.DomainEnvelope> CaptureOwnerBootstrapSnapshot(string accountHandle)
+    {
+        OwnerBootstrapSource source;
+        var capture = Stopwatch.StartNew();
         lock (profileSyncGate)
         {
             if (!string.Equals(Norm(accountHandle), Norm(Profile.Handle), StringComparison.Ordinal))
-                return;
-
-            foreach (var thread in Profile.OwnThreads)
-            {
-                EmitTopicUpsert(thread);
-                foreach (var line in thread.Lines)
-                    EmitLineUpsert("topic.bootstrap", thread.Id, line);
-            }
-
-            foreach (var conversation in Profile.Conversations)
-            {
-                EmitConversationUpsert(conversation);
-                foreach (var line in conversation.Lines)
+                return new List<ReplicationPayloadCodec.DomainEnvelope>();
+            source = new OwnerBootstrapSource(
+                LocalDeviceId() ?? "local",
+                DateTimeOffset.UtcNow,
+                Profile.OwnThreads.Select(CloneBootstrapThread).ToList(),
+                Profile.Conversations.Select(conversation => CloneBootstrapConversation(conversation)).ToList(),
+                Profile.Contacts.Select(CloneBootstrapContact).ToList(),
+                Profile.Circles.Select(circle => new Circle
                 {
-                    var handle = Norm(conversation.Handle);
-                    EmitReplicatedChange(
-                        ReplicationOpKinds.Message,
-                        ReplicationPayloadCodec.DomainAction.AppendLine,
-                        handle,
-                        handle,
-                        JsonSerializer.Serialize(line, ReplicationJson),
-                        TargetsForOwnerState());
-                }
-            }
+                    Name = circle.Name,
+                    RequireApproval = circle.RequireApproval
+                }).ToList(),
+                Profile.Memories.Select(CloneBootstrapMemory).ToList());
+        }
+        capture.Stop();
+        ReplicationDiagnostics.Record(
+            "bootstrap.snapshot_captured",
+            ("duration_ms", capture.ElapsedMilliseconds),
+            ("topic_count", source.Threads.Count),
+            ("conversation_count", source.Conversations.Count));
 
-            var emptyProjection = new ProfileProjectionState(
-                new Dictionary<string, CircleProjection>(StringComparer.Ordinal),
-                new Dictionary<string, ContactProjection>(StringComparer.Ordinal));
-            EmitProfileProjectionChanges(
-                emptyProjection,
-                ProfileProjection.Snapshot(Profile),
-                renamedCircleFrom: null);
+        string Version() => ProjectionVersion.Create(
+            source.CapturedAt,
+            source.SourceDeviceId,
+            Guid.NewGuid().ToString("n"));
 
-            foreach (var memory in Profile.Memories)
-                EmitReplicatedChange(
-                    ReplicationOpKinds.Memory,
-                    ReplicationPayloadCodec.DomainAction.Upsert,
-                    memory.Id,
-                    null,
-                    JsonSerializer.Serialize(MemoryPolicy.ToSync(memory), ReplicationJson),
-                    TargetsForOwnerState());
+        var items = new List<ReplicationPayloadCodec.DomainEnvelope>();
+        for (var sortOrder = 0; sortOrder < source.Threads.Count; sortOrder++)
+        {
+            var thread = source.Threads[sortOrder];
+            var body = JsonSerializer.Serialize(new
+            {
+                thread.Id,
+                thread.Title,
+                thread.CreatedAt,
+                SortOrder = sortOrder,
+                thread.ExecutionDeviceId,
+                thread.ExecutionDeviceName,
+                thread.ExecutionDevicePlatform,
+                thread.LastActivityAt,
+                thread.IsPinned,
+                thread.ExecutionAt,
+                thread.ExecutionRunId
+            }, ReplicationJson);
+            items.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                ReplicationOpKinds.Topic,
+                ReplicationPayloadCodec.DomainAction.Upsert,
+                thread.Id,
+                thread.Id,
+                Version(),
+                body, NotificationIntent.SuppressedHistorical));
+            foreach (var line in thread.Lines)
+                items.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                    ReplicationOpKinds.Topic,
+                    ReplicationPayloadCodec.DomainAction.AppendLine,
+                    thread.Id,
+                    thread.Id,
+                    Version(),
+                    JsonSerializer.Serialize(line, ReplicationJson), NotificationIntent.SuppressedHistorical));
         }
 
-        await FlushPersistenceAsync(ct).ConfigureAwait(false);
-        RuntimeDiagnostics.Current?.RecordEvent(
-            "replication",
-            $"owner bootstrap emitted for device={peerDevice}");
+        foreach (var conversation in source.Conversations)
+        {
+            var handle = Norm(conversation.Handle);
+            items.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                ReplicationOpKinds.Conversation,
+                ReplicationPayloadCodec.DomainAction.Upsert,
+                handle,
+                handle,
+                Version(),
+                JsonSerializer.Serialize(
+                    CloneBootstrapConversation(conversation, includeLines: false),
+                    ReplicationJson), NotificationIntent.SuppressedHistorical));
+            foreach (var line in conversation.Lines)
+                items.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                    ReplicationOpKinds.Message,
+                    ReplicationPayloadCodec.DomainAction.AppendLine,
+                    handle,
+                    handle,
+                    Version(),
+                    JsonSerializer.Serialize(line, ReplicationJson), NotificationIntent.SuppressedHistorical));
+        }
+
+        var projectionProfile = new MeshProfile
+        {
+            Contacts = source.Contacts,
+            Circles = source.Circles
+        };
+        var projection = ProfileProjection.Snapshot(projectionProfile);
+        foreach (var (entityId, circle) in projection.Circles.OrderBy(item => item.Key, StringComparer.Ordinal))
+            items.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                ReplicationOpKinds.Circle,
+                ReplicationPayloadCodec.DomainAction.Upsert,
+                entityId,
+                null,
+                Version(),
+                JsonSerializer.Serialize(circle, ReplicationJson), NotificationIntent.SuppressedHistorical));
+        foreach (var (entityId, contact) in projection.Contacts.OrderBy(item => item.Key, StringComparer.Ordinal))
+            items.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                ReplicationOpKinds.Contact,
+                ReplicationPayloadCodec.DomainAction.Upsert,
+                entityId,
+                null,
+                Version(),
+                JsonSerializer.Serialize(contact, ReplicationJson), NotificationIntent.SuppressedHistorical));
+        foreach (var memory in source.Memories.OrderBy(item => item.Id, StringComparer.Ordinal))
+            items.Add(new ReplicationPayloadCodec.DomainEnvelope(
+                ReplicationOpKinds.Memory,
+                ReplicationPayloadCodec.DomainAction.Upsert,
+                memory.Id,
+                null,
+                Version(),
+                JsonSerializer.Serialize(MemoryPolicy.ToSync(memory), ReplicationJson), NotificationIntent.SuppressedHistorical));
+        return items;
     }
 
+    private sealed record OwnerBootstrapSource(
+        string SourceDeviceId,
+        DateTimeOffset CapturedAt,
+        List<OwnThread> Threads,
+        List<Conversation> Conversations,
+        List<Domain.Contact> Contacts,
+        List<Circle> Circles,
+        List<MemoryItem> Memories);
+
+    private static OwnThread CloneBootstrapThread(OwnThread thread)
+        => new()
+        {
+            Id = thread.Id,
+            Title = thread.Title,
+            CreatedAt = thread.CreatedAt,
+            LastActivityAt = thread.LastActivityAt,
+            IsPinned = thread.IsPinned,
+            ExecutionDeviceId = thread.ExecutionDeviceId,
+            ExecutionDeviceName = thread.ExecutionDeviceName,
+            ExecutionDevicePlatform = thread.ExecutionDevicePlatform,
+            ExecutionAt = thread.ExecutionAt,
+            ExecutionRunId = thread.ExecutionRunId,
+            Lines = thread.Lines.Where(static line => !line.Internal).Select(CloneBootstrapLine).ToList()
+        };
+
+    private static Conversation CloneBootstrapConversation(
+        Conversation conversation,
+        bool includeLines = true)
+        => new()
+        {
+            Handle = conversation.Handle,
+            CreatedAt = conversation.CreatedAt,
+            LastActivityAt = conversation.LastActivityAt,
+            IsPinned = conversation.IsPinned,
+            GroupId = conversation.GroupId,
+            GroupName = conversation.GroupName,
+            GroupOwnerHandle = conversation.GroupOwnerHandle,
+            GroupMembers = conversation.GroupMembers.ToList(),
+            GroupVersion = conversation.GroupVersion,
+            ServiceId = conversation.ServiceId,
+            ServiceName = conversation.ServiceName,
+            ProviderHandle = conversation.ProviderHandle,
+            Lines = includeLines
+                ? conversation.Lines.Where(static line => !line.Internal).Select(CloneBootstrapLine).ToList()
+                : new List<ChatLine>()
+        };
+
+    private static ChatLine CloneBootstrapLine(ChatLine line)
+        => new()
+        {
+            Id = line.Id,
+            Role = line.Role,
+            Text = line.Text,
+            ReplyToLineId = line.ReplyToLineId,
+            WidgetPrompt = line.WidgetPrompt,
+            SenderHandle = line.SenderHandle,
+            Via = line.Via,
+            AddressedToAgent = line.AddressedToAgent,
+            Status = line.Status,
+            Reasoning = line.Reasoning,
+            ModelId = line.ModelId,
+            Internal = line.Internal,
+            At = line.At
+        };
+
+    private static Domain.Contact CloneBootstrapContact(Domain.Contact contact)
+        => new()
+        {
+            Handle = contact.Handle,
+            DisplayName = contact.DisplayName,
+            Circles = contact.Circles.ToList(),
+            Allowed = contact.Allowed,
+            SigningKeys = contact.SigningKeys.ToList(),
+            KeyChanged = contact.KeyChanged,
+            TokensSpent = contact.TokensSpent,
+            Muted = contact.Muted,
+            Blocked = contact.Blocked
+        };
+
+    private static MemoryItem CloneBootstrapMemory(MemoryItem memory)
+        => new()
+        {
+            Id = memory.Id,
+            Title = memory.Title,
+            Content = memory.Content,
+            Category = memory.Category,
+            Origin = memory.Origin,
+            Importance = memory.Importance,
+            Confidence = memory.Confidence,
+            Stability = memory.Stability,
+            ReinforcementCount = memory.ReinforcementCount,
+            SourceThreadId = memory.SourceThreadId,
+            SourceLineId = memory.SourceLineId,
+            CreatedAt = memory.CreatedAt,
+            UpdatedAt = memory.UpdatedAt,
+            LastReinforcedAt = memory.LastReinforcedAt
+        };
     /// <summary>
     /// True when any of <paramref name="targetAccounts"/> has a pending outbox reference awaiting
     /// delivery. Read off the UI thread; the presence poller uses it to choose the fast (pending) vs
@@ -500,13 +778,43 @@ public sealed partial class AppState
         {
             var db = activeDb;
             if (db is null) return false;
-            foreach (var target in targetAccounts)
-            {
-                if (string.IsNullOrWhiteSpace(target)) continue;
-                if (db.QueryDueOutbox(Norm(target), MeshDb.OutboxStatePending, 1).Count > 0)
-                    return true;
-            }
-            return false;
+            return db.CountUnpersistedOutbox(targetAccounts) > 0;
+        }
+    }
+
+    public int CountPendingReplicationEvents(IReadOnlyCollection<string>? targetAccounts = null)
+    {
+        lock (profileSyncGate)
+        {
+            var db = activeDb;
+            if (db is null) return 0;
+            var targets = targetAccounts ?? TargetsForOwnerState();
+            return db.CountUnpersistedOutbox(targets);
+        }
+    }
+
+    public MeshDb.ReplicationSyncCheckpoint? GetLastSuccessfulReplication()
+    {
+        lock (profileSyncGate)
+        {
+            var db = activeDb;
+            var handle = Norm(Profile.Handle);
+            return db is null || handle.Length == 0
+                ? null
+                : db.GetLastSuccessfulReplication(handle);
+        }
+    }
+
+    public bool HasReplicationSibling()
+    {
+        lock (profileSyncGate)
+        {
+            var db = activeDb;
+            var handle = Norm(Profile.Handle);
+            var localDevice = LocalDeviceId();
+            if (db is null || handle.Length == 0 || string.IsNullOrWhiteSpace(localDevice)) return false;
+            return new LocalCustodyRoster(db).AuthorizedDevices(handle)
+                .Any(device => !string.Equals(device.DeviceId, localDevice, StringComparison.Ordinal));
         }
     }
 
@@ -558,6 +866,7 @@ public sealed partial class AppState
             {
                 UpsertAskUserView(prompt);
                 NotifyChanged();
+                await PublishNotificationAfterCommitAsync(evt, envelope).ConfigureAwait(false);
             }
             else
             {
@@ -567,6 +876,7 @@ public sealed partial class AppState
         }
 
         bool changed;
+        var markConversationUnread = false;
         lock (profileSyncGate)
         {
             if (!ReferenceEquals(sourceDb, activeDb)) return;
@@ -588,13 +898,44 @@ public sealed partial class AppState
                             line.ReplyToLineId,
                             line.At == default ? DateTimeOffset.UtcNow : line.At);
                 }
+                if (changed
+                    && envelope.Kind == ReplicationOpKinds.Message
+                    && envelope.Action == ReplicationPayloadCodec.DomainAction.AppendLine
+                    && !string.Equals(Norm(evt.OriginAccount), Norm(Profile.Handle), StringComparison.Ordinal))
+                {
+                    var line = JsonSerializer.Deserialize<ChatLine>(envelope.BodyJson, ReplicationJson);
+                    markConversationUnread = ReplicationUnreadPolicy.ShouldMarkConversationUnread(line?.Role);
+                    if (markConversationUnread)
+                    {
+                        var conversation = Norm(envelope.ConversationId ?? envelope.EntityId);
+                        if (unread.Add(conversation) && !Profile.UnreadFrom.Contains(conversation))
+                            Profile.UnreadFrom.Add(conversation);
+                    }
+                }
             }
             finally
             {
                 applyingReplicationProjection = previous;
             }
         }
+        if (markConversationUnread) ScheduleProfileSave();
+        await PublishNotificationAfterCommitAsync(evt, envelope).ConfigureAwait(false);
         if (changed) NotifyChanged();
+    }
+
+    private static Task PublishNotificationAfterCommitAsync(
+        ReplicationEvent evt,
+        ReplicationPayloadCodec.DomainEnvelope envelope)
+    {
+        var intent = envelope.NotificationIntent;
+        if (intent is null || string.IsNullOrWhiteSpace(intent.StableId)) return Task.CompletedTask;
+        var activity = NotificationIntents.ToCommittedActivity(
+            intent,
+            evt.EventId,
+            DateTimeOffset.FromUnixTimeMilliseconds(evt.CreatedAtUnixMs),
+            DateTimeOffset.UtcNow,
+            evt.OriginAccount);
+        return NotificationCoordinatorBridge.PublishAsync(activity);
     }
 
     private static bool TryParseAssetEntityId(

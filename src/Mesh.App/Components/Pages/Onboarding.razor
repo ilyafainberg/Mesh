@@ -1,6 +1,7 @@
 @inject AppState State
 @inject MeshClient Mesh
 @inject IQrScanner QrScanner
+@inject IAccountInstanceCoordinator AccountInstances
 
 <div class="onboard">
     <div class="card">
@@ -328,8 +329,15 @@
         Working = true;
         try
         {
+            using var reservation = AccountInstances.Reserve(a);
+            if (!reservation.Acquired)
+            {
+                error = reservation.Error
+                    ?? "This identity is already running in another Mesh instance.";
+                return;
+            }
             await Mesh.DisconnectAsync();
-            if (State.SwitchAccount(a.Id))
+            if (reservation.Commit(() => State.SwitchAccount(a.Id)))
             {
                 await Mesh.RegisterAsync();
                 await Mesh.ConnectAsync();

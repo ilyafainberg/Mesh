@@ -130,6 +130,7 @@ internal sealed class ReplicationFabric
     public int Delivered { get; private set; }
     public int DroppedOffline { get; private set; }
     public int Unknown { get; private set; }
+    public Func<string, OnlineRelayFrame, bool>? DropFrame { get; set; }
 
     private sealed class Node(string handle, string device, OnlineReplicationEngine engine)
     {
@@ -157,6 +158,11 @@ internal sealed class ReplicationFabric
     {
         lock (gate)
         {
+            if (DropFrame?.Invoke(fromDevice, frame) == true)
+            {
+                DroppedOffline++;
+                return new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline);
+            }
             if (frame.ToDevice is null || !nodes.TryGetValue(frame.ToDevice, out var target))
             {
                 Unknown++;
@@ -198,6 +204,9 @@ internal sealed class ReplicationFabric
     {
         public Task<OnlineRelaySendResult> SendAsync(OnlineRelayFrame frame, CancellationToken ct)
             => Task.FromResult(fabric.Enqueue(handle, device, frame));
+
+        public Task<OnlineWakeResult> WakeAsync(OnlineWakeRequest request, CancellationToken ct)
+            => Task.FromResult(new OnlineWakeResult(true, OnlineWakeCodes.Accepted));
     }
 }
 

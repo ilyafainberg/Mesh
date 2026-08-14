@@ -6,6 +6,7 @@
 @inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
 @inject NavigationManager Nav
+@inject NotificationViewState NotificationViews
 @implements IDisposable
 
 <MobileOverlayScope Active="@(createMenuOpen || moveMenuOpen)" />
@@ -67,9 +68,9 @@
         </div>
         <div class="topic-list-scroll">
             <div class="thread-groups">
-                @if (Mesh.IsReplicationActive)
+                @if (Mesh.ShouldShowReplicationStatus)
                 {
-                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> More chats are syncing...</div>
+                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> @Mesh.ReplicationStatusText</div>
                 }
                 @if (PinnedThreads.Count > 0)
                 {
@@ -286,8 +287,10 @@
                                         }
                                     }
                                 }
-                                <MessageContent Text="@line.Text" Attachments="@line.Attachments"
-                                                OnPin="html => PinWidget(html, line)" />
+                                <MessageActions Markdown="@line.Text" IsMobile="false" IsInternal="@line.Internal">
+                                    <MessageContent Text="@line.Text" Attachments="@line.Attachments"
+                                                    OnPin="html => PinWidget(html, line)" />
+                                </MessageActions>
                                 @if (queued)
                                 {
                                     <div class="msg-tag queue-tag">
@@ -624,6 +627,7 @@
         {
             if (string.Equals(activeThreadValue, value, StringComparison.Ordinal)) return;
             activeThreadValue = value;
+            NotificationViews.SetVisibleEntities("desktop-topics", value is null ? Array.Empty<string>() : new[] { value });
             messageRenderCount = MessageRenderWindow.InitialCount;
             inputValue = value is null ? "" : State.GetTopicDraft(value);
             State.SetLastDesktopTopicId(value);
@@ -1459,6 +1463,7 @@
 
     public void Dispose()
     {
+        NotificationViews.Clear("desktop-topics");
         State.Changed -= Refresh;
         Mesh.ReplicationStateChanged -= Refresh;
         selfRef?.Dispose();

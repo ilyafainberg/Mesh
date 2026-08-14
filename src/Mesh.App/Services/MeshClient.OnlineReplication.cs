@@ -21,10 +21,10 @@ namespace Mesh.App.Services;
 ///    or account switch, so peer sessions never outlive the identity they were established under.
 ///
 /// There is no durable relay queue here: sending is a single opaque <c>Relay</c> invocation, and an
-/// offline result simply leaves the outbox pending for the poller to retry when presence next brings
-/// the peer online. Presence is discovered by polling <c>ResolvePresence</c>; the relay does not push
-/// presence transitions to online-replication clients, so no <c>PresenceChanged</c> / <c>Wake</c>
-/// callbacks are registered.
+/// offline result leaves the outbox pending. The poller sends bounded authenticated wake requests for
+/// authorised offline devices so the relay can emit contentless native wakes, then retries when presence brings
+/// the peer online. Presence is discovered by polling <c>ResolvePresence</c>; no relay presence callback
+/// or durable payload queue is required.
 /// </summary>
 public sealed partial class MeshClient : IReplicationTransport, IReplicationMetadataSource
 {
@@ -69,6 +69,31 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
             return new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline);
         }
     }
+    async Task<OnlineWakeResult> IReplicationTransport.WakeAsync(
+        OnlineWakeRequest request,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var connection = hub;
+        if (connection is null || connection.State != HubConnectionState.Connected || !authenticated)
+            return new OnlineWakeResult(false, OnlineWakeCodes.Invalid);
+        try
+        {
+            return await connection
+                .InvokeAsync<OnlineWakeResult>(OnlineRelayMethods.Wake, request, ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            TraceTransport("relay-wake-failed", ex.Message);
+            return new OnlineWakeResult(false, OnlineWakeCodes.Invalid);
+        }
+    }
+
 
     // -----------------------------------------------------------------------
     // IReplicationMetadataSource: the roster and poller read relay authority (auth generation,
@@ -173,6 +198,8 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
 
             replicationRoster = roster;
             replicationEngine = engine;
+            engine.LocalWorkPending += OnReplicationLocalWorkPending;
+            engine.Activity += OnReplicationEngineActivity;
 
             var poller = new ReplicationPresencePoller(
                 engine,
@@ -183,9 +210,11 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                 ownHandle: ownHandle,
                 ownDevice: identity.DeviceId,
                 surface: reason => TraceTransport("replication-poll", reason),
-                bootstrapPeer: state.EmitOwnerBootstrapSnapshotAsync);
+                bootstrapPeer: state.EmitOwnerBootstrapSnapshotAsync,
+                pollCompleted: OnReplicationPresencePollCompleted);
             replicationPoller = poller;
-            poller.Start();
+            if (lifecycle.IsForeground) poller.Start();
+            RefreshReplicationStatus();
             TraceTransport("replication-armed", $"handle={ownHandle}; device={identity.DeviceId}");
         }
         catch (OnlineReplicationError ex)
@@ -222,11 +251,31 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
         replicationPoller = null;
         poller?.Dispose();
 
+        var attached = replicationEngine;
+        if (attached is not null)
+        {
+            attached.LocalWorkPending -= OnReplicationLocalWorkPending;
+            attached.Activity -= OnReplicationEngineActivity;
+        }
         var engine = state.DetachReplicationEngine();
         replicationEngine = null;
         replicationRoster = null;
         if (engine is not null)
             TrackBackground(engine.DisposeAsync().AsTask(), "replication engine dispose");
+    }
+
+    private void OnReplicationLocalWorkPending()
+    {
+        replicationPoller?.Poke();
+        SetReplicationStatus(ReplicationPhase.Synchronizing);
+    }
+
+    private void OnReplicationPresencePollCompleted(bool hasOnlinePendingPeer, bool hasPendingWork)
+    {
+        if (!hasOnlinePendingPeer && hasPendingWork)
+            SetReplicationStatus(ReplicationPhase.WaitingForPeer);
+        else if (!hasPendingWork)
+            RefreshReplicationStatus(replicationPoller?.LastOnlinePeerDevice);
     }
 
     /// <summary>

@@ -21,7 +21,8 @@ public sealed partial class MeshDb
         string originDeviceId,
         Func<string, ulong, ReplicationEvent> eventFactory,
         IReadOnlyCollection<string> targetAccounts,
-        Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainApply)
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainApply,
+        Func<string, ReplicationOutboxNotification>? notificationForTarget = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(originDeviceId);
         ArgumentNullException.ThrowIfNull(eventFactory);
@@ -63,16 +64,7 @@ public sealed partial class MeshDb
         foreach (var account in targetAccounts)
         {
             if (string.IsNullOrWhiteSpace(account)) continue;
-            using var outbox = conn.CreateCommand();
-            outbox.Transaction = tx;
-            outbox.CommandText = """
-                INSERT INTO replication_outbox(event_id, target_account, state, attempts)
-                VALUES($event, $account, 'pending', 0)
-                ON CONFLICT(event_id, target_account) DO NOTHING;
-                """;
-            outbox.Parameters.AddWithValue("$event", evt.EventId);
-            outbox.Parameters.AddWithValue("$account", account);
-            outbox.ExecuteNonQuery();
+            InsertOutboxCore(tx, evt.EventId, account, notificationForTarget?.Invoke(account));
         }
 
         domainApply?.Invoke(conn, tx, evt);
@@ -111,7 +103,8 @@ public sealed partial class MeshDb
         string originDeviceId,
         IReadOnlyList<Func<string, ulong, ReplicationEvent>> eventFactories,
         IReadOnlyCollection<string> targetAccounts,
-        Action<SqliteConnection, SqliteTransaction, ReplicationEvent, int>? domainApply)
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent, int>? domainApply,
+        Func<int, string, ReplicationOutboxNotification>? notificationForTarget = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(originDeviceId);
         ArgumentNullException.ThrowIfNull(eventFactories);
@@ -159,16 +152,7 @@ public sealed partial class MeshDb
             foreach (var account in targetAccounts)
             {
                 if (string.IsNullOrWhiteSpace(account)) continue;
-                using var outbox = conn.CreateCommand();
-                outbox.Transaction = tx;
-                outbox.CommandText = """
-                    INSERT INTO replication_outbox(event_id, target_account, state, attempts)
-                    VALUES($event, $account, 'pending', 0)
-                    ON CONFLICT(event_id, target_account) DO NOTHING;
-                    """;
-                outbox.Parameters.AddWithValue("$event", evt.EventId);
-                outbox.Parameters.AddWithValue("$account", account);
-                outbox.ExecuteNonQuery();
+                InsertOutboxCore(tx, evt.EventId, account, notificationForTarget?.Invoke(i, account));
             }
             domainApply?.Invoke(conn, tx, evt, i);
             created.Add(evt);
@@ -212,16 +196,7 @@ public sealed partial class MeshDb
         foreach (var account in targetAccounts)
         {
             if (string.IsNullOrWhiteSpace(account)) continue;
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.CommandText = """
-                INSERT INTO replication_outbox(event_id, target_account, state, attempts)
-                VALUES($eid, $account, 'pending', 0)
-                ON CONFLICT(event_id, target_account) DO NOTHING;
-                """;
-            cmd.Parameters.AddWithValue("$eid", e.EventId);
-            cmd.Parameters.AddWithValue("$account", account);
-            cmd.ExecuteNonQuery();
+            InsertOutboxCore(tx, e.EventId, account, ReplicationOutboxNotification.None);
         }
         domainApply?.Invoke(conn, tx);
         tx.Commit();

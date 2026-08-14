@@ -53,7 +53,8 @@ public static class ReplicationPayloadCodec
         string EntityId,
         string? ConversationId,
         string CausalVersion,
-        string BodyJson);
+        string BodyJson,
+        NotificationIntent? NotificationIntent = null);
 
     /// <summary>
     /// The canonical operation-mapping table. Each unified op kind is projected onto the

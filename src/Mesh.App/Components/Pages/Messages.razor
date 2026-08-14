@@ -3,6 +3,7 @@
 @inject MeshClient Mesh
 @inject IJSRuntime JS
 @inject NavigationManager Nav
+@inject NotificationViewState NotificationViews
 @implements IDisposable
 
 <div class="split">
@@ -210,8 +211,10 @@
                     @foreach (var line in renderedLines)
                     {
                         <div class="bubble @(line.Role == "user" ? "assistant" : "user")" @key="line.Id">
-                            <MessageContent Text="@line.Text" From="@InboundAuthor(conv, line)"
-                                            OnPin="html => PinWidget(html, line)" />
+                            <MessageActions Markdown="@line.Text" IsMobile="false" IsInternal="@line.Internal">
+                                <MessageContent Text="@line.Text" From="@InboundAuthor(conv, line)"
+                                                OnPin="html => PinWidget(html, line)" />
+                            </MessageActions>
                             <div class="msg-tag">
                                 <i class="bi @(conv.IsGroup || line.Via == "person" ? "bi-person" : "bi-robot")"></i> @TagLabel(conv, line)
                                 @if (queuedIds.Contains(line.Id))
@@ -359,6 +362,7 @@
         {
             if (string.Equals(activeValue, value, StringComparison.OrdinalIgnoreCase)) return;
             activeValue = value;
+            NotificationViews.SetVisibleEntities("desktop-messages", value is null ? Array.Empty<string>() : new[] { value });
             messageRenderCount = MessageRenderWindow.InitialCount;
             inputValue = value is null ? "" : State.GetConversationDraft(value);
             State.SetLastDesktopConversationKey(value);
@@ -770,7 +774,15 @@
             WidgetPrompt = widget?.Prompt
         };
         scrollToLatestRequested = true;
-        State.AddChatLine(active, line);
+        var notificationIntent = direct && !isGroup && !isService
+            ? NotificationIntents.Message(
+                line.Id, active,
+                string.IsNullOrWhiteSpace(State.Profile.DisplayName)
+                    ? $"@{AppState.Norm(State.Profile.Handle)}"
+                    : State.Profile.DisplayName,
+                text)
+            : null;
+        State.AddChatLine(active, line, notificationIntent);
 
         // A send is already running: queue this one for the next turn instead of starting a
         // second concurrent send. The line is already visible; mark it "queued" until delivered.
@@ -1051,6 +1063,7 @@
 
     public void Dispose()
     {
+        NotificationViews.Clear("desktop-messages");
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Mesh.ReplicationStateChanged -= Refresh;

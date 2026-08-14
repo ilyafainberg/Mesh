@@ -1386,6 +1386,13 @@ public sealed class PendingApproval
     public DateTimeOffset At { get; set; } = DateTimeOffset.UtcNow;
 }
 
+public enum NotificationPreviewMode
+{
+    Never,
+    WhenUnlocked,
+    Always
+}
+
 /// <summary>The entire persisted profile for this device/account.</summary>
 public sealed class MeshProfile
 {
@@ -1489,6 +1496,9 @@ public sealed class MeshProfile
 
     /// <summary>Play a sound with OS notifications.</summary>
     public bool NotificationSound { get; set; } = true;
+
+    /// <summary>Controls whether notification banners may contain message or prompt content.</summary>
+    public NotificationPreviewMode NotificationPreview { get; set; } = NotificationPreviewMode.Never;
 
     /// <summary>
     /// A friendly name for THIS device (e.g. "Ilya's Laptop"), shown in linked-device topic pickers.

@@ -19,7 +19,10 @@ public sealed class SiblingBootstrapRoutingTests
         var method = source[methodStart..methodEnd];
 
         StringAssert.Contains(method, "ReplicationOpKinds.Message");
-        StringAssert.Contains(method, "TargetsForOwnerState()");
+        StringAssert.Contains(method, "new[] { target.PeerHandle }");
+        StringAssert.Contains(method, "Where(static line => !line.Internal)");
+        StringAssert.Contains(method, "CloneBootstrapConversation(conversation, includeLines: false)");
+        StringAssert.Contains(method, "source.CapturedAt");
         Assert.IsFalse(
             method.Contains("TargetsForConversation", StringComparison.Ordinal),
             "a sibling bootstrap must never fan conversation history out to conversation peers");

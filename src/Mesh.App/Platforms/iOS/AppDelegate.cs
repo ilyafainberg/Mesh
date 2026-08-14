@@ -3,6 +3,7 @@ using Foundation;
 using MetricKit;
 using Mesh.App.Platforms.iOS;
 using Mesh.App.Services;
+using Mesh.Shared;
 using Microsoft.Identity.Client;
 using ObjCRuntime;
 using System.Text;
@@ -17,6 +18,12 @@ public class AppDelegate : MauiUIApplicationDelegate
     private const string BackgroundRefreshTaskIdentifier = "net.meshrelay.mesh.sync.refresh";
     private static readonly NSString MeshPayloadKey = new("mesh");
     private static readonly NSString MeshTypeKey = new("type");
+    private static readonly NSString MeshVersionKey = new("v");
+    private static readonly NSString FlatMeshTypeKey = new("mesh_type");
+    private static readonly NSString FlatMeshVersionKey = new("mesh_v");
+    private static readonly NSString WakeIdKey = new("wake_id");
+    private static readonly NSString ApsKey = new("aps");
+    private static readonly NSString AlertKey = new("alert");
     private readonly MeshNotificationCenterDelegate notificationCenterDelegate = new();
     private MeshMetricManagerSubscriber? metricSubscriber;
     private NSObject? memoryWarningObserver;
@@ -79,17 +86,22 @@ public class AppDelegate : MauiUIApplicationDelegate
         NSDictionary userInfo,
         Action<UIBackgroundFetchResult> completionHandler)
     {
-        if (!IsMeshSyncNotification(userInfo))
+        if (!TryGetMeshSyncNotification(userInfo, out var wakeId, out var hasVisibleAlert))
         {
             completionHandler(UIBackgroundFetchResult.NoData);
             return;
         }
-        _ = CompleteRemoteNotificationSyncAsync(completionHandler);
+        var visibleRemoteAlert = RemoteWakeNotificationPolicy.ShouldShowGenericAlert(
+            hasVisibleAlert, application.ApplicationState == UIApplicationState.Active);
+        _ = CompleteRemoteNotificationSyncAsync(wakeId, visibleRemoteAlert, completionHandler);
     }
 
     private static async Task CompleteRemoteNotificationSyncAsync(
+        string? wakeId,
+        bool visibleRemoteAlert,
         Action<UIBackgroundFetchResult> completionHandler)
     {
+        using var wakeSession = NotificationWakeSessionBridge.Begin(wakeId, visibleRemoteAlert);
         try
         {
             var result = await OnlineReplicationWakeBridge.SynchronizePendingAsync().ConfigureAwait(false);
@@ -107,9 +119,40 @@ public class AppDelegate : MauiUIApplicationDelegate
         }
     }
 
-    private static bool IsMeshSyncNotification(NSDictionary userInfo)
-        => userInfo[MeshPayloadKey] is NSDictionary mesh
-           && string.Equals(mesh[MeshTypeKey]?.ToString(), "sync", StringComparison.Ordinal);
+    internal static bool TryGetMeshSyncNotification(
+        NSDictionary userInfo,
+        out string? wakeId,
+        out bool hasVisibleAlert)
+    {
+        wakeId = null;
+        hasVisibleAlert = userInfo[ApsKey] is NSDictionary aps && aps[AlertKey] is not null;
+        var type = userInfo[FlatMeshTypeKey]?.ToString();
+        var versionValue = userInfo[FlatMeshVersionKey];
+        if (string.Equals(type, "sync", StringComparison.Ordinal)
+            && TryReadProtocolVersion(versionValue, out var flatVersion))
+        {
+            wakeId = userInfo[WakeIdKey]?.ToString();
+            return flatVersion == MeshProtocol.Version;
+        }
+
+        if (userInfo[MeshPayloadKey] is not NSDictionary mesh
+            || !string.Equals(mesh[MeshTypeKey]?.ToString(), "sync", StringComparison.Ordinal)
+            || !TryReadProtocolVersion(mesh[MeshVersionKey], out var nestedVersion)
+            || nestedVersion != MeshProtocol.Version)
+            return false;
+        wakeId = mesh[WakeIdKey]?.ToString();
+        return true;
+    }
+
+    private static bool TryReadProtocolVersion(NSObject? value, out int version)
+    {
+        if (value is NSNumber number)
+        {
+            version = number.Int32Value;
+            return true;
+        }
+        return int.TryParse(value?.ToString(), out version);
+    }
 
     private static void RegisterBackgroundRefreshTask()
     {
@@ -154,7 +197,7 @@ public class AppDelegate : MauiUIApplicationDelegate
         try
         {
             var result = await OnlineReplicationWakeBridge.SynchronizePendingAsync(
-                TimeSpan.FromSeconds(20), expired.Token).ConfigureAwait(false);
+                OnlineReplicationWakeCoordinator.DefaultBudget, expired.Token).ConfigureAwait(false);
             task.SetTaskCompleted(result.Outcome != OnlineReplicationWakeOutcome.Failed);
         }
         catch (Exception ex)
@@ -231,7 +274,8 @@ public class AppDelegate : MauiUIApplicationDelegate
         => RuntimeDiagnostics.Current?.RecordException("ios-managed-native-boundary", args.Exception);
 
     private void OnMarshalObjectiveCException(object? sender, MarshalObjectiveCExceptionEventArgs args)
-        => RuntimeDiagnostics.Current?.RecordEvent("ios-objective-c-exception", args.Exception.ToString());
+        => RuntimeDiagnostics.Current?.RecordEvent(
+            "ios-objective-c-exception", args.Exception?.ToString() ?? "unknown Objective-C exception");
 
     private void InstallMetricKit(RuntimeDiagnostics diagnostics)
     {
@@ -356,16 +400,54 @@ public sealed class MeshMetricManagerSubscriber(RuntimeDiagnostics diagnostics)
     }
 }
 
-// Presents notifications while the app is in the foreground so the user still sees relay-composed
-// message, group, and topic-response banners rather than having them silently dropped by iOS.
+// Suppresses contentless sync alerts in the foreground; committed local notifications are presented.
 public sealed class MeshNotificationCenterDelegate : UNUserNotificationCenterDelegate
 {
     public override void WillPresentNotification(
         UNUserNotificationCenter center,
         UNNotification notification,
         Action<UNNotificationPresentationOptions> completionHandler)
-        => completionHandler(
+    {
+        if (AppDelegate.TryGetMeshSyncNotification(
+                notification.Request.Content.UserInfo,
+                out _,
+                out _))
+        {
+            completionHandler(UNNotificationPresentationOptions.None);
+            return;
+        }
+
+        completionHandler(
             UNNotificationPresentationOptions.Banner
             | UNNotificationPresentationOptions.Sound
             | UNNotificationPresentationOptions.Badge);
+    }
+
+    public override void DidReceiveNotificationResponse(
+        UNUserNotificationCenter center,
+        UNNotificationResponse response,
+        Action completionHandler)
+        => _ = CompleteActivationAsync(response, completionHandler);
+
+    private static async Task CompleteActivationAsync(
+        UNNotificationResponse response,
+        Action completionHandler)
+    {
+        try
+        {
+            var userInfo = response.Notification.Request.Content.UserInfo;
+            if (AppDelegate.TryGetMeshSyncNotification(userInfo, out _, out _))
+                await NotificationNavigationBridge.OpenHighestPriorityAfterSyncAsync().ConfigureAwait(false);
+            else if (userInfo[new NSString(AppleNotifier.RouteKey)]?.ToString() is { Length: > 0 } route)
+                DeepLinkDispatch.Dispatch(route);
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("notification-activation", ex);
+        }
+        finally
+        {
+            completionHandler();
+        }
+    }
 }

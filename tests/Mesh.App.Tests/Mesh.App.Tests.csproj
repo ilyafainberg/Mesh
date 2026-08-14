@@ -18,6 +18,15 @@
     <Compile Include="..\..\src\Mesh.App\Services\UpdateService.cs" Link="UpdateService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\OnlineReplicationWakeCoordinator.cs" Link="OnlineReplicationWakeCoordinator.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\IPushService.cs" Link="IPushService.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\INotifier.cs" Link="INotifier.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\NotificationModels.cs" Link="NotificationModels.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\NotificationPolicies.cs" Link="NotificationPolicies.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\NotificationCoordinator.cs" Link="NotificationCoordinator.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\AppLifecycleState.cs" Link="AppLifecycleState.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Notifications.cs" Link="MeshDb.Notifications.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\NotificationBridges.cs" Link="NotificationBridges.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MessageClipboard.cs" Link="MessageClipboard.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\DeepLinkDispatch.cs" Link="DeepLinkDispatch.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\StorageProtection.cs" Link="StorageProtection.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReplicationActivityTracker.cs" Link="ReplicationActivityTracker.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AsyncWorkerPool.cs" Link="AsyncWorkerPool.cs" />
@@ -60,6 +69,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\AgentToolExecutor.cs" Link="AgentToolExecutor.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ReasoningExtract.cs" Link="ReasoningExtract.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ToolDetailFormatter.cs" Link="ToolDetailFormatter.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshInstanceManagement.cs" Link="MeshInstanceManagement.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ToolApprovalService.cs" Link="ToolApprovalService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TokenOptimizer.cs" Link="TokenOptimizer.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\BuiltInContentProvider.cs" Link="BuiltInContentProvider.cs" />

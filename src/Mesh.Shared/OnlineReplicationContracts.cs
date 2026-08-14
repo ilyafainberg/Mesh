@@ -82,6 +82,8 @@ public static class OnlineRelaySendCodes
     public const string Delivered = "delivered";
     public const string NotOnline = "not_online";
     public const string TargetDeviceUnknown = "target_device_unknown";
+    public const string TargetUnavailable = "target_unavailable";
+    public const string DeliveryFailed = "delivery_failed";
     public const string RateLimited = "rate_limited";
     public const string TooLarge = "too_large";
     public const string DeviceRevoked = "device_revoked";
@@ -90,6 +92,26 @@ public static class OnlineRelaySendCodes
         => code is Delivered or NotOnline or TargetDeviceUnknown
             or RateLimited or TooLarge or DeviceRevoked;
 }
+/// <summary>Authenticated request to wake one device without attaching an application payload.</summary>
+public sealed record OnlineWakeRequest(
+    string ToHandle,
+    string ToDevice,
+    string WakeId,
+    bool NotificationWorthy = false);
+
+public sealed record OnlineWakeResult(bool Accepted, string Code, int? RetryAfterMs = null);
+
+public static class OnlineWakeCodes
+{
+    public const string Accepted = "accepted";
+    public const string TargetDeviceUnknown = "target_device_unknown";
+    public const string TargetUnavailable = "target_unavailable";
+    public const string DeliveryFailed = "delivery_failed";
+    public const string RateLimited = "rate_limited";
+    public const string DeviceRevoked = "device_revoked";
+    public const string Invalid = "invalid";
+}
+
 
 /// <summary>Relay hub method names used for online-only forwarding and presence.</summary>
 public static class OnlineRelayMethods
@@ -102,6 +124,12 @@ public static class OnlineRelayMethods
 }
 
 /// <summary>Push urgency classes carried on a frame so the relay can pick a wake strategy.</summary>
+public enum PushWakeMode
+{
+    SyncOnly,
+    AlertAndSync
+}
+
 public static class OnlinePushClasses
 {
     public const string Silent = "silent";

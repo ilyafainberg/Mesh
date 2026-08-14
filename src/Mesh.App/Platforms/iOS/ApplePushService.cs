@@ -186,6 +186,13 @@ public sealed class ApplePushService : IPushService
             registration?.TrySetResult(token);
         }
         RuntimeDiagnostics.Current?.RecordEvent("apns-registration", "device token received");
+        _ = PushRegistrationBridge.RegisterCurrentTokenAsync().ContinueWith(
+            static completed => RuntimeDiagnostics.Current?.RecordException(
+                "apns-token-reregistration",
+                completed.Exception!),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted,
+            TaskScheduler.Default);
     }
 
     /// <summary>Fails only token registration; visible-alert denial does not call this path.</summary>

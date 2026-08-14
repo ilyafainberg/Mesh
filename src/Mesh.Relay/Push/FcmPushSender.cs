@@ -47,17 +47,20 @@ public sealed class FcmPushSender : IPushSender, IDisposable
         key.ImportFromPem(pem);
     }
 
-    public async Task<PushSendResult> SendWakeAsync(string token, CancellationToken ct = default)
+    public async Task<PushSendResult> SendWakeAsync(
+        string token,
+        PushWakeMode mode,
+        string wakeId,
+        CancellationToken ct = default)
     {
         var access = await GetAccessTokenAsync(ct).ConfigureAwait(false);
-        // Contentless wake: data-only, no notification/title/body, no sender or frame id.
         var message = new
         {
             message = new
             {
                 token,
-                data = new { mesh = $"{{\"type\":\"sync\",\"v\":{MeshProtocol.Version}}}" },
-                android = new { priority = "high" },
+                data = BuildWakeData(mode, wakeId),
+                android = new { priority = "high", collapse_key = "mesh-sync" },
             },
         };
         using var req = new HttpRequestMessage(
@@ -77,6 +80,14 @@ public sealed class FcmPushSender : IPushSender, IDisposable
             : PushSendResult.Rejected((int)resp.StatusCode, body);
     }
 
+    internal static IReadOnlyDictionary<string, string> BuildWakeData(PushWakeMode mode, string wakeId)
+        => new Dictionary<string, string>
+        {
+            ["mesh_type"] = "sync",
+            ["mesh_version"] = MeshProtocol.Version.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["wake_id"] = wakeId,
+            ["show_alert"] = mode == PushWakeMode.AlertAndSync ? "1" : "0"
+        };
     // OAuth2 service-account flow: sign an RS256 JWT bearer assertion and exchange it for an access token.
     private async Task<string> GetAccessTokenAsync(CancellationToken ct)
     {

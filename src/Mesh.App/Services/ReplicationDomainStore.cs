@@ -172,12 +172,22 @@ public static class ReplicationDomainStore
         string lineId,
         string? conversationId,
         string causalVersion,
+        string tiebreak,
         string bodyJson,
         long createdAtUnixMs)
     {
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(tx);
         EnsureSchema(conn, tx);
+        var parentKind = string.Equals(kind, ReplicationOpKinds.Message, StringComparison.Ordinal)
+            ? ReplicationOpKinds.Conversation
+            : kind;
+        var parent = ReadEntityRow(conn, tx, parentKind, entityId);
+        if (parent is not null
+            && (parent.Value.Deleted || IsClearTombstone(parent.Value.Body))
+            && !Wins(causalVersion, tiebreak, parent.Value.Causal, parent.Value.Tiebreak))
+            return false;
+
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
@@ -559,18 +569,32 @@ public static class ReplicationDomainStore
         return (int)(long)cmd.ExecuteScalar()!;
     }
 
-    private static (string Causal, string Tiebreak, string Body)? ReadEntityRow(
+    private static bool IsClearTombstone(string body)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            return document.RootElement.TryGetProperty("clear", out var clear)
+                   && clear.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static (string Causal, string Tiebreak, string Body, bool Deleted)? ReadEntityRow(
         SqliteConnection conn, SqliteTransaction? tx, string kind, string entityId)
     {
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
-            SELECT causal_version, tiebreak, body FROM replication_domain_entities
+            SELECT causal_version, tiebreak, body, deleted FROM replication_domain_entities
             WHERE kind = $kind AND entity_id = $eid;
             """;
         cmd.Parameters.AddWithValue("$kind", kind);
         cmd.Parameters.AddWithValue("$eid", entityId);
         using var r = cmd.ExecuteReader();
-        return r.Read() ? (r.GetString(0), r.GetString(1), r.GetString(2)) : null;
+        return r.Read() ? (r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3) != 0) : null;
     }
 }

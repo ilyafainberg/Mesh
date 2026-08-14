@@ -8,6 +8,7 @@
 @inject IHttpClientFactory HttpFactory
 @inject UpdateService Updater
 @inject IAppControl AppControl
+@inject IAccountInstanceCoordinator AccountInstances
 @inject RuntimeDiagnostics Diagnostics
 @implements IDisposable
 
@@ -170,6 +171,10 @@
                     </div>
                 }
             </div>
+            @if (switchError is not null)
+            {
+                <div class="err-text" role="alert">@switchError</div>
+            }
             <h3>Sign out</h3>
             <div class="field-hint" style="margin-bottom:12px;">
                 Sign out of <b>@("@")@State.Profile.Handle</b> and return to the account picker. Your identity
@@ -625,7 +630,23 @@
                     <div class="field-label">Do not disturb</div>
                     <div class="field-sub">Suppress all popup notifications. In-app badges still update.</div>
                 </div>
-                <label class="switch"><input type="checkbox" checked="@State.Profile.DoNotDisturb" @onchange="e => Toggle(p => p.DoNotDisturb = (bool)(e.Value ?? false))" aria-label="Do not disturb" /></label>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.DoNotDisturb" @onchange="OnDoNotDisturbChanged" aria-label="Do not disturb" /></label>
+            </div>
+            <div class="field-row">
+                <div>
+                    <div class="field-label">Notification sound</div>
+                    <div class="field-sub">Play the operating system notification sound for Mesh activity.</div>
+                </div>
+                <label class="switch"><input type="checkbox" checked="@State.Profile.NotificationSound" @onchange="e => Toggle(p => p.NotificationSound = (bool)(e.Value ?? false))" aria-label="Notification sound" /></label>
+            </div>
+            <div class="field">
+                <label>Notification previews</label>
+                <select class="full" value="@State.Profile.NotificationPreview.ToString()" @onchange="OnNotificationPreviewChanged">
+                    <option value="Never">Never show content</option>
+                    <option value="WhenUnlocked">Show while Mesh is unlocked</option>
+                    <option value="Always">Always show content</option>
+                </select>
+                <div class="field-hint">The default hides message and decision content from lock-screen banners.</div>
             </div>
             <div class="field">
                 <label>This device's name</label>
@@ -883,6 +904,7 @@
     bool signingOut;
     bool switching;
     string? deleteId;
+    string? switchError;
 
     // ---- local tools ----
     // Moved to /tools page (Tools.razor). Methods below removed.
@@ -902,11 +924,19 @@
     async Task Switch(AccountRef a)
     {
         if (a.Id == State.ActiveAccountId || switching) return;
+        switchError = null;
         switching = true;
         try
         {
+            using var reservation = AccountInstances.Reserve(a);
+            if (!reservation.Acquired)
+            {
+                switchError = reservation.Error
+                    ?? "This identity is already running in another Mesh instance.";
+                return;
+            }
             await Mesh.DisconnectAsync();
-            if (State.SwitchAccount(a.Id))
+            if (reservation.Commit(() => State.SwitchAccount(a.Id)))
             {
                 SyncFields();
                 await Mesh.RegisterAsync();
@@ -915,7 +945,10 @@
                 await LoadLinkedDevicesAsync();
                 await LoadAgentRoutingAsync();
             }
+            else
+                switchError = "That identity could not be loaded.";
         }
+        catch (Exception ex) { switchError = ex.Message; }
         finally { switching = false; }
     }
 
@@ -1821,6 +1854,18 @@
     }
 
     string? preparedUpdaterPath;
+
+    async Task OnDoNotDisturbChanged(ChangeEventArgs e)
+    {
+        Toggle(profile => profile.DoNotDisturb = (bool)(e.Value ?? false));
+        await Mesh.RegisterPushTokenAsync();
+    }
+
+    void OnNotificationPreviewChanged(ChangeEventArgs e)
+    {
+        if (Enum.TryParse<Mesh.App.Domain.NotificationPreviewMode>(e.Value?.ToString(), out var mode))
+            Toggle(profile => profile.NotificationPreview = mode);
+    }
 
     void Toggle(Action<Mesh.App.Domain.MeshProfile> change) => State.Mutate(change);
 

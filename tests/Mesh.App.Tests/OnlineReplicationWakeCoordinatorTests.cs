@@ -118,6 +118,21 @@ public sealed class OnlineReplicationWakeTests : ReplicationTestBase
     }
 
     [TestMethod]
+    public async Task LocalWorkPending_NotifiesPollerWithEstablishedSession()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        await ConnectAsync(a, b);
+        var signals = 0;
+        a.Engine.LocalWorkPending += () => Interlocked.Increment(ref signals);
+
+        await a.Engine.EmitLocalAsync(Msg("m1"), new[] { b.Handle });
+        await Fabric.DrainAsync();
+
+        Assert.AreEqual(1, signals, "every durable local change must wake the presence poller");
+    }
+
+    [TestMethod]
     public async Task Lifecycle_DisposeStopsEngineWithoutThrowing()
     {
         var a = NewNode("alice", "a1");

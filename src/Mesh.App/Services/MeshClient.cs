@@ -24,7 +24,6 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     private readonly AgentService agent;
     private readonly ITopicTurnRunner topicTurnRunner;
     private readonly IHttpClientFactory httpFactory;
-    private readonly INotifier notifier;
     private readonly IPushService push;
     private readonly IAppLifecycleState lifecycle;
     private readonly TopicAttachmentAssembler attachmentAssembler = new();
@@ -53,19 +52,20 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     private volatile bool supportsDeviceRevocation;
     private volatile bool supportsAuthoritativeTopicState;
     private volatile bool supportsAgentHost;
+    private volatile bool supportsWakeConnect;
     private readonly SemaphoreSlim onlineFlushGate = new(1, 1);
     private readonly SemaphoreSlim connectionGate = new(1, 1);
     private volatile ReplicationConnectionIdentity? authenticatedReplicationConnectionIdentity;
     private volatile bool wantConnected;   // the user intends to be connected; drives auto-recovery
     private int reconnectScheduled;         // 0/1 guard so only one recovery loop runs at a time
     private int onlineRetryScheduled;
+    private int shutdownRequested;
 
     public MeshClient(
         AppState state,
         AgentService agent,
         ITopicTurnRunner topicTurnRunner,
         IHttpClientFactory httpFactory,
-        INotifier notifier,
         IPushService push,
         IAppLifecycleState lifecycle)
     {
@@ -73,14 +73,24 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         this.agent = agent;
         this.topicTurnRunner = topicTurnRunner;
         this.httpFactory = httpFactory;
-        this.notifier = notifier;
         this.push = push;
         this.lifecycle = lifecycle;
         lifecycle.ForegroundChanged += OnForegroundChanged;
         lifecycle.ForegroundChanged += OnReplicationForegroundChanged;
-        state.ActiveAccountChanging += StopReplication;
+        state.ActiveAccountChanging += OnActiveAccountChanging;
         replicationActivity.Changed += () => ReplicationStateChanged?.Invoke();
         Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged += OnConnectivityChanged;
+    }
+
+    private void OnActiveAccountChanging()
+    {
+        var pushIdentity = CapturePushUnregistrationIdentity();
+        StopReplication();
+        Volatile.Write(ref registeredPushIdentity, null);
+        if (pushIdentity is not null)
+            TrackBackground(
+                UnregisterPushAsync(pushIdentity),
+                "push token clear on account change");
     }
     private sealed record ReplicationConnectionIdentity(
         HubConnection Connection,
@@ -111,7 +121,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     }
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
-    public bool IsReplicationActive => replicationActivity.IsActive;
+    public bool IsReplicationActive
+        => replicationActivity.IsActive
+           || CurrentReplicationStatus.Phase is ReplicationPhase.Connecting
+               or ReplicationPhase.Synchronizing
+               or ReplicationPhase.Bootstrapping;
     public bool SupportsAgentHost => supportsAgentHost;
     public bool SupportsDeviceRevocation => supportsDeviceRevocation;
     public bool SupportsAuthoritativeTopicState => supportsAuthoritativeTopicState;
@@ -371,24 +385,183 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
 
     public async Task ConnectAsync()
     {
+        await using var lease = await EnsureConnectedAsync(
+            ConnectionPurpose.Foreground,
+            CancellationToken.None).ConfigureAwait(false);
+    }
+
+    internal async Task<ReplicationConnectionLease> EnsureConnectedAsync(
+        ConnectionPurpose purpose,
+        CancellationToken cancellationToken)
+    {
+        if (MeshProcessContext.IsShuttingDown || Volatile.Read(ref shutdownRequested) != 0)
+            return new ReplicationConnectionLease(purpose, isConnected: false);
+
+        if (purpose == ConnectionPurpose.Foreground)
+        {
+            wantConnected = true;
+            if (!lifecycle.IsForeground)
+                return new ReplicationConnectionLease(purpose, isConnected: false);
+        }
+
+        var profile = state.Profile;
+        if (string.IsNullOrWhiteSpace(profile.Handle) || string.IsNullOrWhiteSpace(profile.RelayUrl))
+            return new ReplicationConnectionLease(purpose, isConnected: false);
+
+        var holdsWakeGate = false;
+        try
+        {
+            if (purpose == ConnectionPurpose.BackgroundWake)
+            {
+                await wakeConnectGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                holdsWakeGate = true;
+                Interlocked.Increment(ref backgroundWakeLeaseCount);
+            }
+
+            if (!Connected)
+                await ConnectCoreAsync(purpose, cancellationToken).ConfigureAwait(false);
+
+            if (!Connected)
+            {
+                var authentication = connectionAuthentication
+                    ?? throw new InvalidOperationException("The relay authentication handshake was not started.");
+                var timeout = purpose == ConnectionPurpose.BackgroundWake
+                    ? WakeAuthenticationTimeout
+                    : TimeSpan.FromSeconds(12);
+                using var authBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                authBudget.CancelAfter(timeout);
+                try
+                {
+                    await authentication.Task.WaitAsync(authBudget.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw new OnlineReplicationError("Relay authentication timed out.");
+                }
+            }
+
+            if (!Connected)
+                throw new InvalidOperationException("The relay connection did not authenticate.");
+            if (purpose == ConnectionPurpose.BackgroundWake && !supportsWakeConnect)
+                throw new OnlineReplicationError("The relay does not support Protocol 9 background wake synchronization.");
+            await ArmReplicationAsync(cancellationToken).ConfigureAwait(false);
+            if (replicationEngine is null || replicationPoller is null)
+                throw new OnlineReplicationError("Protocol 9 replication could not be armed.");
+
+            var leasedConnection = hub;
+            return new ReplicationConnectionLease(
+                purpose,
+                isConnected: true,
+                purpose == ConnectionPurpose.BackgroundWake
+                    ? () => ReleaseBackgroundWakeLeaseAsync(leasedConnection, allowPromotion: true)
+                    : null);
+        }
+        catch
+        {
+            if (holdsWakeGate)
+                await ReleaseBackgroundWakeLeaseAsync(hub, allowPromotion: false).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private async ValueTask ReleaseBackgroundWakeLeaseAsync(
+        HubConnection? leasedConnection,
+        bool allowPromotion)
+    {
+        var holdsConnectionGate = false;
+        var deferCleanup = false;
+        try
+        {
+            using var gateBudget = new CancellationTokenSource(WakeDisconnectTimeout);
+            try
+            {
+                await connectionGate.WaitAsync(gateBudget.Token).ConfigureAwait(false);
+                holdsConnectionGate = true;
+            }
+            catch (OperationCanceledException) when (gateBudget.IsCancellationRequested)
+            {
+                TraceTransport("background-release-gate-timeout", "connection gate acquisition timed out");
+                deferCleanup = true;
+            }
+
+            if (!deferCleanup)
+                await CompleteBackgroundWakeReleaseUnderGateAsync(leasedConnection, allowPromotion)
+                    .ConfigureAwait(false);
+        }
+        finally
+        {
+            if (holdsConnectionGate) connectionGate.Release();
+            Interlocked.Decrement(ref backgroundWakeLeaseCount);
+            wakeConnectGate.Release();
+        }
+
+        if (deferCleanup)
+            TrackBackground(
+                CompleteDeferredBackgroundWakeReleaseAsync(leasedConnection, allowPromotion),
+                "deferred background wake release");
+    }
+
+    private async Task CompleteDeferredBackgroundWakeReleaseAsync(
+        HubConnection? leasedConnection,
+        bool allowPromotion)
+    {
+        await connectionGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (Volatile.Read(ref backgroundWakeLeaseCount) != 0) return;
+            await CompleteBackgroundWakeReleaseUnderGateAsync(leasedConnection, allowPromotion)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            connectionGate.Release();
+        }
+    }
+
+    private async Task CompleteBackgroundWakeReleaseUnderGateAsync(
+        HubConnection? leasedConnection,
+        bool allowPromotion)
+    {
+        if (leasedConnection is null || !ReferenceEquals(hub, leasedConnection)) return;
+        if (allowPromotion && lifecycle.IsForeground)
+        {
+            wantConnected = true;
+            replicationPoller?.Resume();
+            TryRegisterPushToken();
+            var identity = authenticatedReplicationConnectionIdentity;
+            if (identity is not null)
+                TrackBackground(RecoverOnlineDeliveryAsync(identity), "background wake promotion");
+            return;
+        }
+
+        await DisconnectCoreAsync(
+            clearConnectionIntent: false,
+            timeout: WakeDisconnectTimeout).ConfigureAwait(false);
+    }
+
+    private async Task ConnectCoreAsync(ConnectionPurpose purpose, CancellationToken ct)
+    {
         var requestedProfile = state.Profile;
         if (string.IsNullOrWhiteSpace(requestedProfile.Handle)
             || string.IsNullOrWhiteSpace(requestedProfile.RelayUrl)) return;
-        wantConnected = true;
-        if (!lifecycle.IsForeground) return;
+        if (purpose == ConnectionPurpose.Foreground) wantConnected = true;
+        if (!ConnectionPurposePolicy.AllowsConnection(purpose, lifecycle.IsForeground)) return;
 
-        await connectionGate.WaitAsync();
+        await connectionGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await DisconnectCoreAsync();
+            await DisconnectCoreAsync(
+                clearConnectionIntent: false,
+                timeout: purpose == ConnectionPurpose.BackgroundWake ? WakeDisconnectTimeout : null)
+                .ConfigureAwait(false);
             var p = state.Profile;
             if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
-            wantConnected = true;
-            if (!lifecycle.IsForeground) return;
-            if (!await DetectRelayCapabilitiesAsync(p.RelayUrl))
+            if (purpose == ConnectionPurpose.Foreground) wantConnected = true;
+            if (!ConnectionPurposePolicy.AllowsConnection(purpose, lifecycle.IsForeground)) return;
+            if (!await DetectRelayCapabilitiesAsync(p.RelayUrl, ct).ConfigureAwait(false))
             {
                 StateChanged?.Invoke();
-                return;
+                throw new OnlineReplicationError("The relay is missing required Protocol 9 capabilities.");
             }
 
             var normHandle = AppState.Norm(p.Handle);
@@ -401,12 +574,16 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             try
             {
                 var ownInfo = await ((IReplicationMetadataSource)this)
-                    .FetchHandleAsync(normHandle, CancellationToken.None);
+                    .FetchHandleAsync(normHandle, ct);
                 if (ownInfo is null)
                     throw new OnlineReplicationError(
                         "The relay did not return this account's replication authority.");
                 connectAuthGeneration = ownInfo.AuthGeneration;
                 connectCustodyHead = ownInfo.CustodyHead ?? "";
+            }
+            catch (OnlineReplicationError)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -418,6 +595,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             this.connectAuthGeneration = connectAuthGeneration;
             this.connectCustodyHead = connectCustodyHead;
 
+            var authenticationReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            connectionAuthentication = authenticationReady;
             var url = $"{p.RelayUrl.TrimEnd('/')}{MeshHubProtocol.Route}?handle={Uri.EscapeDataString(normHandle)}&protocolVersion={MeshProtocol.Version}&deviceId={Uri.EscapeDataString(connectDeviceId)}&authGeneration={connectAuthGeneration}&custodyHead={Uri.EscapeDataString(connectCustodyHead)}";
             var connection = new HubConnectionBuilder()
                 .WithUrl(url)
@@ -431,6 +610,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                     return;
                 authenticated = false;
                 authenticatedReplicationConnectionIdentity = null;
+                authenticationReady.TrySetException(new OnlineReplicationError(
+                    response.Error ?? $"Relay protocol mismatch: expected {MeshProtocol.Version}, got {response.ServerVersion}."));
                 Log?.Invoke(response.Error ?? $"relay protocol mismatch: expected {MeshProtocol.Version}, got {response.ServerVersion}");
                 TrackBackground(connection.StopAsync(), "protocol mismatch disconnect");
             });
@@ -452,7 +633,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                     var sig = IdentityService.Sign(state.Profile.PrivateKey, canonical);
                     await connection.SendAsync(MeshHubProtocol.Authenticate, state.Profile.PublicKey, sig);
                 }
-                catch (Exception ex) { Log?.Invoke($"auth failed: {ex.Message}"); }
+                catch (Exception ex) { authenticationReady.TrySetException(ex); Log?.Invoke($"auth failed: {ex.Message}"); }
             });
 
             connection.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, _ =>
@@ -461,19 +642,21 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 var identity = CaptureReplicationConnectionIdentity(connection);
                 authenticatedReplicationConnectionIdentity = identity;
                 Log?.Invoke("hub connected + authenticated");
+                authenticationReady.TrySetResult(true);
                 StateChanged?.Invoke();
-                if (!lifecycle.IsForeground) return;
-                TryRegisterPushToken();
-                if (identity is not null)
+                if (lifecycle.IsForeground)
                 {
-                    TrackBackground(RecoverOnlineDeliveryAsync(identity), "durable delivery recovery");
-                    TrackBackground(MaintainOnlineDeliveryAsync(identity), "durable delivery maintenance");
+                    TryRegisterPushToken();
+                    if (identity is not null)
+                    {
+                        TrackBackground(RecoverOnlineDeliveryAsync(identity), "durable delivery recovery");
+                        TrackBackground(MaintainOnlineDeliveryAsync(identity), "durable delivery maintenance");
+                    }
                 }
-                // Automatically arm Protocol-9 online replication for the authenticated active profile.
-                // This is the production entry point (never an external configuration call): it builds
-                // the real identity/roster and starts the presence poller. Foreground only; the poller
-                // is paused in the background where the transport itself is suspended.
-                TrackBackground(ArmReplicationAsync(), "online replication arm");
+                // Foreground connects arm asynchronously. A background wake is armed by its bounded
+                // EnsureConnectedAsync call so it cannot leave an unbounded duplicate task behind.
+                if (lifecycle.IsForeground)
+                    TrackBackground(ArmReplicationAsync(), "online replication arm");
             });
 
 
@@ -508,7 +691,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             };
             connection.Reconnected += _ =>
             {
-                StartAuthWatchdog(connection);
+                if (purpose == ConnectionPurpose.Foreground) StartAuthWatchdog(connection);
                 StateChanged?.Invoke();
                 return Task.CompletedTask;
             };
@@ -516,6 +699,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             {
                 authenticated = false;
                 authenticatedReplicationConnectionIdentity = null;
+                authenticationReady.TrySetException(new InvalidOperationException("The relay connection closed before authentication completed."));
                 StateChanged?.Invoke();
                 // SignalR's own auto-reconnect has given up by the time Closed fires. If the user still
                 // wants to be connected, keep trying ourselves so a long drop does not strand us offline.
@@ -528,15 +712,17 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             RegisterOnlineReplicationHandlers(connection);
             try
             {
-                await connection.StartAsync();
+                await connection.StartAsync(ct).ConfigureAwait(false);
                 StateChanged?.Invoke();
-                StartAuthWatchdog(connection);
+                if (purpose == ConnectionPurpose.Foreground) StartAuthWatchdog(connection);
             }
             catch (Exception ex)
             {
+                authenticationReady.TrySetException(ex);
                 Log?.Invoke($"hub connect failed: {ex.Message}");
                 StateChanged?.Invoke();
                 ScheduleRecovery();
+                if (purpose == ConnectionPurpose.BackgroundWake) throw;
             }
         }
         finally
@@ -596,7 +782,9 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             OnlineReplicationWakeCapabilityPolicy.IsSupported(capabilities));
     }
 
-    private async Task<bool> DetectRelayCapabilitiesAsync(string relayUrl)
+    private async Task<bool> DetectRelayCapabilitiesAsync(
+        string relayUrl,
+        CancellationToken ct = default)
     {
         supportsSendResults = false;
         supportsEphemeralDelivery = false;
@@ -605,9 +793,10 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         supportsDeviceRevocation = false;
         supportsAuthoritativeTopicState = false;
         supportsAgentHost = false;
+        supportsWakeConnect = false;
         try
         {
-            var capabilities = await ReadRelayCapabilitiesAsync(relayUrl);
+            var capabilities = await ReadRelayCapabilitiesAsync(relayUrl, ct).ConfigureAwait(false);
             if (capabilities.ProtocolVersion != MeshProtocol.Version)
             {
                 Log?.Invoke($"relay protocol mismatch: expected {MeshProtocol.Version}, got {capabilities.ProtocolVersion}");
@@ -628,6 +817,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             supportsDeviceRevocation = capabilities.DeviceRevocation;
             supportsAuthoritativeTopicState = capabilities.AuthoritativeTopicState;
             supportsAgentHost = capabilities.AgentHost;
+            supportsWakeConnect = capabilities.WakeConnect;
             return true;
         }
         catch (Exception ex)
@@ -664,7 +854,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     /// </summary>
     private void ScheduleRecovery()
     {
-        if (!wantConnected || !lifecycle.IsForeground) return;
+        if (MeshProcessContext.IsShuttingDown || Volatile.Read(ref shutdownRequested) != 0
+            || !wantConnected || !lifecycle.IsForeground) return;
         if (Interlocked.Exchange(ref reconnectScheduled, 1) == 1) return;
         TrackBackground(Task.Run(async () =>
         {
@@ -890,7 +1081,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 AddressedToAgent = true
             });
             state.MarkUnread(conv.Handle);
-            notifier.Notify($"{conv.ServiceName} replied", Preview(answer), NotifyKind.Message, "messages");
+            await PublishLegacyNotificationAsync($"message:{env.Id}", NotificationKind.ServiceResponse, conv.Handle, NotificationRoutes.Messages(conv.Handle), $"{conv.ServiceName} replied", answer, ct);
             return;
         }
 
@@ -911,7 +1102,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 Via = "person"
             });
             state.MarkUnread(from);
-            notifier.Notify("New report", Preview(rendered), NotifyKind.Message, "messages");
+            await PublishLegacyNotificationAsync($"message:{env.Id}", NotificationKind.Message, from, NotificationRoutes.Messages(from), "New report", rendered, ct);
             return;
         }
 
@@ -962,8 +1153,9 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         if (env.Kind == MeshKinds.DirectMessage)
         {
             state.MarkUnread(from);
-            if (ShouldNotify(contact))
-                notifier.Notify($"Message from {display}", Preview(text), NotifyKind.Message, "messages");
+            await PublishLegacyNotificationAsync(
+                $"message:{env.Id}", NotificationKind.Message, from, NotificationRoutes.Messages(from),
+                $"Message from {display}", text, ct);
         }
 
         // A response to this device's own outbound agent request is solicited traffic. It is shown
@@ -988,8 +1180,10 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                     isNew = true;
                 }
             });
-            if (isNew && !state.Profile.DoNotDisturb)
-                notifier.Notify($"Request from @{from}", Preview(text), NotifyKind.Request, "contacts");
+            if (isNew)
+                await PublishLegacyNotificationAsync(
+                    $"request:{from}", NotificationKind.ContactRequest, from, NotificationRoutes.Requests,
+                    $"Request from @{from}", text, ct);
             Log?.Invoke($"inbound from @{from} held for approval");
             StateChanged?.Invoke();
             return;
@@ -1131,17 +1325,19 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             var atomic = string.Equals(request.Kind, MeshKinds.AtomicAgentRequest, StringComparison.Ordinal);
             if (state.RequiresApproval(from))
             {
-                state.Mutate(x => x.Approvals.Add(new PendingApproval
+                var approval = new PendingApproval
                 {
                     From = from,
                     RequestBody = text,
                     DraftReply = reply,
                     AgentRequestId = atomic ? request.AgentRequestId : null,
                     FromDevice = atomic ? request.FromDevice : null
-                }));
-                if (!state.Profile.DoNotDisturb)
-                    notifier.Notify("Reply needs your approval",
-                        $"Your agent drafted a reply to {display}.", NotifyKind.Approval, "messages");
+                };
+                state.Mutate(x => x.Approvals.Add(approval));
+                await PublishLegacyNotificationAsync(
+                    $"approval:{approval.Id}", NotificationKind.ApprovalRequired, approval.Id,
+                    NotificationRoutes.Approvals, "Reply needs your approval",
+                    $"Your agent drafted a reply to {display}.", ct);
                 Log?.Invoke($"draft reply to @{from} awaiting approval");
                 return;
             }
@@ -1318,13 +1514,17 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 {
                     throw new InboundPermanentRejectException("topic_update_not_correlated");
                 }
-                if (mode == InboundProcessingMode.Background && update.Delta is { Length: > 0 })
+                if (mode == InboundProcessingMode.Background && TopicRunBackgroundPolicy.ShouldDefer(update))
                 {
+                    if (!state.SaveDeferredTopicRunUpdate(env.Id, update))
+                        throw new InboundRetryException("topic_update_defer_persistence_failed");
                     RememberReplay(topicEnvelopeReplay, env.Id);
                     return;
                 }
                 if (!state.TryApplyRemoteRunUpdate(update))
                     throw new InboundRetryException("topic_update_persistence_failed");
+                if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
+                    state.DeleteDeferredTopicRunUpdates(update.RunId);
                 RememberReplay(topicEnvelopeReplay, env.Id);
                 StateChanged?.Invoke();
                 break;
@@ -1935,9 +2135,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 throw new InvalidOperationException("Group membership updates are not supported in the MVP.");
 
             var group = state.ApplyGroupSnapshot(snapshot);
-            if (existing is null && ShouldNotify(state.FindContact(from)))
-                notifier.Notify($"Added to {group.GroupName}", $"Group created by @{from}.",
-                    NotifyKind.Message, "messages");
+            if (existing is null)
+                TrackBackground(PublishLegacyNotificationAsync(
+                    $"group:{group.GroupId}:invite", NotificationKind.ServiceInvite, group.Handle,
+                    NotificationRoutes.Messages(group.Handle), $"Added to {group.GroupName}",
+                    $"Group created by @{from}."), "group invitation notification");
         }
         catch (JsonException ex)
         {
@@ -1990,9 +2192,10 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 At = payload.SentAt
             });
             state.MarkUnread(group.Handle);
-            if (ShouldNotify(state.FindContact(sender)))
-                notifier.Notify(group.GroupName!, $"@{sender}: {Preview(payload.Text)}",
-                    NotifyKind.Message, "messages");
+            TrackBackground(PublishLegacyNotificationAsync(
+                $"message:{payload.MessageId}", NotificationKind.Message, group.Handle,
+                NotificationRoutes.Messages(group.Handle), group.GroupName!,
+                $"@{sender}: {payload.Text}"), "group message notification");
         }
         catch (JsonException ex)
         {
@@ -2793,12 +2996,39 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         return clean.Length > 120 ? clean[..120] + "…" : clean;
     }
 
-    // ---- Push notifications (Option 1: relay-composed wake alerts) --------------------------------
-    // After authenticating, hand this device's APNs/FCM token to the relay so it can send a metadata-only
-    // wake ("Message from @sender" / "New group message") when a message is queued for this device while it
-    // is offline. The relay never sees message contents, only the cleartext Kind and From it already routes
-    // on. No-op on platforms without push (Windows/Mac) or until native token acquisition is provisioned
-    // (IPushService returns null), so behavior is unchanged there.
+    private async Task PublishLegacyNotificationAsync(
+        string stableId,
+        NotificationKind kind,
+        string entityId,
+        string route,
+        string title,
+        string body,
+        CancellationToken ct = default)
+    {
+        await state.FlushPersistenceAsync(ct).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        var conversationId = route.StartsWith("mesh://messages/", StringComparison.OrdinalIgnoreCase)
+            ? entityId
+            : null;
+        await NotificationCoordinatorBridge.PublishAsync(new CommittedActivity(
+            stableId,
+            $"legacy:{stableId}",
+            kind,
+            entityId,
+            conversationId,
+            route,
+            title,
+            body,
+            now,
+            now,
+            IsHistorical: false,
+            NotifyRequested: true,
+            OriginAccount: null), ct).ConfigureAwait(false);
+    }
+    // ---- Contentless push wakes --------------------------------------------------------------------
+    // Register this device's APNs/FCM token so authenticated Protocol 9 peers can request an opaque sync
+    // wake while the device is offline. The relay receives no sender, route, title, body, or encrypted event
+    // in the push request. Platforms without mobile push return no token and keep this path disabled.
     private sealed record RegisteredPushIdentity(
         string RelayUrl,
         string Handle,
@@ -2806,6 +3036,13 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         string Platform,
         string Token,
         bool AlertsEnabled);
+
+    private sealed record PushUnregistrationIdentity(
+        string RelayUrl,
+        string Handle,
+        string DeviceId,
+        string PublicKey,
+        string PrivateKey);
 
     private RegisteredPushIdentity? registeredPushIdentity;
     private int pushRegistrationInProgress;
@@ -2829,10 +3066,11 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         }
     }
 
-    private async Task RegisterPushTokenAsync()
+    public async Task RegisterPushTokenAsync(CancellationToken ct = default)
     {
         PushRegistrationInfo? registration;
-        try { registration = await push.RegisterAsync(); }
+        try { registration = await push.RegisterAsync(ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex) { Log?.Invoke($"push token request failed: {ex.Message}"); return; }
         if (registration is null) return;
 
@@ -2841,6 +3079,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             || string.IsNullOrWhiteSpace(p.PublicKey)
             || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
         var platform = PlatformCaps.DevicePlatform;
+        var alertsEnabled = registration.AlertsEnabled && !p.DoNotDisturb;
         var deviceId = MyDeviceId;
         var identity = new RegisteredPushIdentity(
             p.RelayUrl.TrimEnd('/'),
@@ -2848,7 +3087,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             deviceId,
             platform,
             registration.Token,
-            registration.AlertsEnabled);
+            alertsEnabled);
         if (Equals(Volatile.Read(ref registeredPushIdentity), identity)) return;
 
         try
@@ -2864,7 +3103,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                     platform,
                     registration.Token,
                     signature,
-                    registration.AlertsEnabled));
+                    alertsEnabled),
+                ct);
             if (response.IsSuccessStatusCode)
             {
                 Volatile.Write(ref registeredPushIdentity, identity);
@@ -2875,6 +3115,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 Log?.Invoke($"push token registration rejected: {(int)response.StatusCode}");
             }
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex) { Log?.Invoke($"push token registration failed: {ex.Message}"); }
     }
 
@@ -2970,21 +3211,43 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     /// signed with the device key. Call before <see cref="DisconnectAsync"/> on an intentional sign-out (not
     /// on a transient reconnect, which also goes through DisconnectAsync).
     /// </summary>
-    public async Task UnregisterPushAsync()
+    public Task UnregisterPushAsync()
     {
         Volatile.Write(ref registeredPushIdentity, null);
-        if (!push.IsSupported) return;
+        var identity = CapturePushUnregistrationIdentity();
+        return identity is null ? Task.CompletedTask : UnregisterPushAsync(identity);
+    }
+
+    private PushUnregistrationIdentity? CapturePushUnregistrationIdentity()
+    {
+        if (!push.IsSupported) return null;
         var p = state.Profile;
-        if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.PublicKey)) return;
+        if (string.IsNullOrWhiteSpace(p.Handle)
+            || string.IsNullOrWhiteSpace(p.PublicKey)
+            || string.IsNullOrWhiteSpace(p.PrivateKey)
+            || string.IsNullOrWhiteSpace(p.RelayUrl))
+            return null;
+        return new PushUnregistrationIdentity(
+            p.RelayUrl.TrimEnd('/'),
+            AppState.Norm(p.Handle),
+            DeviceProtocol.DeviceId(p.PublicKey),
+            p.PublicKey,
+            p.PrivateKey);
+    }
+
+    private async Task UnregisterPushAsync(PushUnregistrationIdentity identity)
+    {
         try
         {
-            var h = AppState.Norm(p.Handle);
-            var deviceId = MyDeviceId;
-            var sig = IdentityService.Sign(p.PrivateKey, PushTokenProtocol.ClearMessage(p.Handle, deviceId));
+            var sig = IdentityService.Sign(
+                identity.PrivateKey,
+                PushTokenProtocol.ClearMessage(identity.Handle, identity.DeviceId));
             var http = httpFactory.CreateClient("relay");
-            using var req = new HttpRequestMessage(HttpMethod.Delete, $"{p.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/push")
+            using var req = new HttpRequestMessage(
+                HttpMethod.Delete,
+                $"{identity.RelayUrl}/handles/{Uri.EscapeDataString(identity.Handle)}/push")
             {
-                Content = JsonContent.Create(new DeleteDevicePushTokenRequest(p.PublicKey, sig))
+                Content = JsonContent.Create(new DeleteDevicePushTokenRequest(identity.PublicKey, sig))
             };
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             var resp = await http.SendAsync(req, cts.Token);
@@ -2992,6 +3255,19 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         }
         catch (Exception ex) { Log?.Invoke($"push token clear failed: {ex.Message}"); }
     }
+
+    public void BeginShutdown()
+    {
+        if (Interlocked.Exchange(ref shutdownRequested, 1) != 0) return;
+        wantConnected = false;
+        StopReplication();
+        foreach (var run in activeTopicRuns.Values)
+        {
+            try { run.Cancellation.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
     public async Task DisconnectAsync()
     {
         await connectionGate.WaitAsync();
@@ -3005,12 +3281,15 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         }
     }
 
-    private async Task DisconnectCoreAsync()
+    private async Task DisconnectCoreAsync(
+        bool clearConnectionIntent = true,
+        TimeSpan? timeout = null)
     {
-        // Clear intent first so the Closed handler from StopAsync does not trigger auto-recovery.
-        // ConnectAsync calls this then re-sets wantConnected, so a reconnect is unaffected.
-        wantConnected = false;
+        // Clear intent first on explicit disconnect so the Closed handler cannot trigger recovery.
+        if (clearConnectionIntent) wantConnected = false;
         authenticated = false;
+        connectionAuthentication?.TrySetCanceled();
+        connectionAuthentication = null;
         // Tear online replication down before the transport drops so peer sessions and the roster cache
         // never outlive the identity/connection they were established under. It re-arms on next auth.
         StopReplication();
@@ -3021,8 +3300,30 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         hub = null;
         if (current is not null)
         {
-            try { await current.StopAsync(); } catch { }
-            try { await current.DisposeAsync(); } catch { }
+            if (timeout is null)
+            {
+                try { await current.StopAsync().ConfigureAwait(false); } catch { }
+                try { await current.DisposeAsync().ConfigureAwait(false); } catch { }
+            }
+            else
+            {
+                using var cleanup = new CancellationTokenSource(timeout.Value);
+                try { await current.StopAsync(cleanup.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (cleanup.IsCancellationRequested)
+                {
+                    TraceTransport("background-disconnect-timeout", "connection stop timed out");
+                }
+                catch (Exception ex) { TraceTransport("background-disconnect-failed", ex.Message); }
+
+                var dispose = current.DisposeAsync().AsTask();
+                try { await dispose.WaitAsync(cleanup.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (cleanup.IsCancellationRequested)
+                {
+                    TraceTransport("background-dispose-timeout", "connection disposal timed out");
+                    TrackBackground(dispose, "late background connection disposal");
+                }
+                catch (Exception ex) { TraceTransport("background-dispose-failed", ex.Message); }
+            }
         }
         StateChanged?.Invoke();
     }

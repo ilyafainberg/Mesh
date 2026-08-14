@@ -80,7 +80,8 @@ public sealed partial class AppState : IAsyncDisposable
         string? ConversationId,
         string CausalVersion,
         string BodyJson,
-        IReadOnlyList<string> Targets);
+        IReadOnlyList<string> Targets,
+        NotificationIntent? NotificationIntent);
 
     private sealed record ProfileWork(
         MeshDb? Db,
@@ -314,12 +315,10 @@ public sealed partial class AppState : IAsyncDisposable
         // database is gone, so the descriptor is dropped rather than written to a swapped-in one.
         if (!ReferenceEquals(work.Db, activeDb)) return;
 
-        var envelope = new ReplicationPayloadCodec.DomainEnvelope(
-            work.Kind, work.Action, work.EntityId, work.ConversationId, work.CausalVersion, work.BodyJson);
-
         await ReplicateLocalAsync(
             work.Kind, work.Action, work.EntityId, work.ConversationId,
-            work.CausalVersion, work.BodyJson, work.Targets, ct: ct).ConfigureAwait(false);
+            work.CausalVersion, work.BodyJson, work.Targets, ct: ct,
+            notificationIntent: work.NotificationIntent).ConfigureAwait(false);
     }
 
     private void RecordError(Exception ex)

@@ -90,6 +90,10 @@ public sealed class DevicePushToken
     public DateTimeOffset? BackgroundPushWindowStartedAt { get; set; }
     public int BackgroundPushCount { get; set; }
     public DateTimeOffset? LastBackgroundPushAt { get; set; }
+    public DateTimeOffset? VisiblePushWindowStartedAt { get; set; }
+    public int VisiblePushCount { get; set; }
+    public DateTimeOffset? LastVisiblePushAt { get; set; }
+
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -201,10 +205,11 @@ public interface IRelayStore
         string handle, string deviceId, string platform, string token, bool alertsEnabled,
         CancellationToken ct = default);
 
-    /// <summary>Atomically reserves one rate-limited silent background wake for a device.</summary>
+    /// <summary>Atomically reserves one rate-limited, mode-specific synchronization wake for a device.</summary>
     Task<bool> TryAcquireBackgroundPushAsync(
         string handle,
         string deviceId,
+        PushWakeMode mode,
         DateTimeOffset now,
         TimeSpan minimumInterval,
         TimeSpan window,

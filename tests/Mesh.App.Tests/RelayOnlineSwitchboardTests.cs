@@ -400,7 +400,7 @@ public sealed class RelayOnlineSwitchboardTests
     [TestMethod]
     public void PushWake_PayloadIsContentlessSyncV9()
     {
-        var payload = ApnsPushSender.SerializeWakePayload();
+        var payload = ApnsPushSender.SerializeWakePayload(PushWakeMode.SyncOnly, "wake-1");
         using var doc = JsonDocument.Parse(payload);
         var root = doc.RootElement;
 
@@ -408,14 +408,138 @@ public sealed class RelayOnlineSwitchboardTests
         var mesh = root.GetProperty("mesh");
         Assert.AreEqual("sync", mesh.GetProperty("type").GetString());
         Assert.AreEqual(MeshProtocol.Version, mesh.GetProperty("v").GetInt32());
+        Assert.AreEqual("wake-1", mesh.GetProperty("wake_id").GetString());
+        Assert.IsFalse(root.GetProperty("aps").TryGetProperty("alert", out _));
 
-        // No sender, event, body, message id or frame id may appear anywhere.
-        foreach (var forbidden in new[] { "from", "sender", "body", "message", "messageId", "frameId", "ciphertext", "event" })
+        AssertContentlessWake(payload);
+    }
+
+    [TestMethod]
+    public void PushWake_VisiblePayloadAndFcmDataRemainGeneric()
+    {
+        var payload = ApnsPushSender.SerializeWakePayload(PushWakeMode.AlertAndSync, "wake-2");
+        using var doc = JsonDocument.Parse(payload);
+        var root = doc.RootElement;
+        var alert = root.GetProperty("aps").GetProperty("alert");
+
+        Assert.AreEqual("Mesh", alert.GetProperty("title").GetString());
+        Assert.AreEqual("New activity", alert.GetProperty("body").GetString());
+
+        AssertContentlessWake(payload);
+
+        var fcm = FcmPushSender.BuildWakeData(PushWakeMode.AlertAndSync, "wake-3");
+        Assert.AreEqual(MeshProtocol.Version.ToString(), fcm["mesh_version"]);
+        Assert.AreEqual("sync", fcm["mesh_type"]);
+        Assert.AreEqual("wake-3", fcm["wake_id"]);
+        Assert.AreEqual("1", fcm["show_alert"]);
+        AssertContentlessWake(JsonSerializer.Serialize(fcm));
+    }
+
+    private static void AssertContentlessWake(string payload)
+    {
+        foreach (var forbidden in new[] { "from", "sender", "messageId", "frameId", "ciphertext", "event" })
             Assert.IsFalse(payload.Contains(forbidden, StringComparison.OrdinalIgnoreCase), $"wake must not contain '{forbidden}'");
     }
 
     [TestMethod]
-    public async Task Relay_OfflineTargetWithPushTokenEmitsContentlessWake()
+    public void PushWake_ThrottleMatchesPerModeLimits()
+    {
+        Assert.AreEqual(TimeSpan.FromSeconds(5), PushDispatcher.VisibleWakeMinimumInterval);
+        Assert.AreEqual(TimeSpan.FromSeconds(30), PushDispatcher.SilentWakeMinimumInterval);
+        Assert.AreEqual(60, PushDispatcher.MaxVisibleWakesPerWindow);
+        Assert.AreEqual(12, PushDispatcher.MaxSilentWakesPerWindow);
+    }
+
+    [TestMethod]
+    public async Task PushWake_ModeThrottlesAreIndependentAndSurviveTokenRefresh()
+    {
+        var node = RelayNode.Create(withPush: true);
+        var (handle, deviceId, _) = await node.RegisterAsync("bob");
+        var now = DateTimeOffset.UtcNow;
+        await node.Store.SetDevicePushTokenAsync(
+            handle, deviceId, DevicePlatforms.IOS, "token-1", alertsEnabled: true);
+
+        Assert.IsTrue(await node.Store.TryAcquireBackgroundPushAsync(
+            handle, deviceId, PushWakeMode.SyncOnly, now,
+            PushDispatcher.SilentWakeMinimumInterval, TimeSpan.FromHours(1),
+            PushDispatcher.MaxSilentWakesPerWindow));
+        Assert.IsTrue(await node.Store.TryAcquireBackgroundPushAsync(
+            handle, deviceId, PushWakeMode.AlertAndSync, now,
+            PushDispatcher.VisibleWakeMinimumInterval, TimeSpan.FromHours(1),
+            PushDispatcher.MaxVisibleWakesPerWindow));
+
+        await node.Store.SetDevicePushTokenAsync(
+            handle, deviceId, DevicePlatforms.IOS, "token-2", alertsEnabled: true);
+
+        Assert.IsFalse(await node.Store.TryAcquireBackgroundPushAsync(
+            handle, deviceId, PushWakeMode.SyncOnly, now.AddSeconds(29),
+            PushDispatcher.SilentWakeMinimumInterval, TimeSpan.FromHours(1),
+            PushDispatcher.MaxSilentWakesPerWindow));
+        Assert.IsFalse(await node.Store.TryAcquireBackgroundPushAsync(
+            handle, deviceId, PushWakeMode.AlertAndSync, now.AddSeconds(4),
+            PushDispatcher.VisibleWakeMinimumInterval, TimeSpan.FromHours(1),
+            PushDispatcher.MaxVisibleWakesPerWindow));
+        Assert.IsTrue(await node.Store.TryAcquireBackgroundPushAsync(
+            handle, deviceId, PushWakeMode.SyncOnly, now.AddSeconds(30),
+            PushDispatcher.SilentWakeMinimumInterval, TimeSpan.FromHours(1),
+            PushDispatcher.MaxSilentWakesPerWindow));
+        Assert.IsTrue(await node.Store.TryAcquireBackgroundPushAsync(
+            handle, deviceId, PushWakeMode.AlertAndSync, now.AddSeconds(5),
+            PushDispatcher.VisibleWakeMinimumInterval, TimeSpan.FromHours(1),
+            PushDispatcher.MaxVisibleWakesPerWindow));
+    }
+
+    [TestMethod]
+    public async Task PushWake_StableIdCoalescesAcrossModeClaims()
+    {
+        var node = RelayNode.Create(withPush: true);
+        var sender = await node.ConnectAsync("alice");
+        var (handle, deviceId, _) = await node.RegisterAsync("bob");
+        await node.Store.SetDevicePushTokenAsync(
+            handle, deviceId, DevicePlatforms.IOS, "tok-123", alertsEnabled: true);
+
+        var silent = await sender.Hub.Wake(new OnlineWakeRequest(handle, deviceId, "same-wake"));
+        var visible = await sender.Hub.Wake(new OnlineWakeRequest(
+            handle, deviceId, "same-wake", NotificationWorthy: true));
+
+        Assert.IsTrue(silent.Accepted);
+        Assert.IsTrue(visible.Accepted);
+        Assert.AreEqual(1, node.PushSender!.Sent.Count);
+        Assert.AreEqual(PushWakeMode.SyncOnly, node.PushSender.Sent[0].Mode);
+    }
+
+    [TestMethod]
+    public async Task Wake_AuthenticatedCallerUsesDirectRateLimitAndPreciseResults()
+    {
+        var node = RelayNode.Create(rateLimiter: TightRateLimiter(), withPush: true);
+        var sender = await node.ConnectAsync("alice");
+        var (handle, deviceId, _) = await node.RegisterAsync("bob");
+        await node.Store.SetDevicePushTokenAsync(handle, deviceId, DevicePlatforms.IOS, "tok-123", alertsEnabled: true);
+
+        var accepted = await sender.Hub.Wake(new OnlineWakeRequest(handle, deviceId, "wake-1"));
+        var limited = await sender.Hub.Wake(new OnlineWakeRequest(handle, deviceId, "wake-2"));
+
+        Assert.IsTrue(accepted.Accepted);
+        Assert.AreEqual(OnlineWakeCodes.Accepted, accepted.Code);
+        Assert.IsFalse(limited.Accepted);
+        Assert.AreEqual(OnlineWakeCodes.RateLimited, limited.Code);
+        Assert.AreEqual(1, node.Metrics.Snapshot().RateLimitRejections);
+    }
+
+    [TestMethod]
+    public async Task Wake_KnownDeviceWithoutPushRegistrationIsUnavailable()
+    {
+        var node = RelayNode.Create(withPush: true);
+        var sender = await node.ConnectAsync("alice");
+        var (handle, deviceId, _) = await node.RegisterAsync("bob");
+
+        var result = await sender.Hub.Wake(new OnlineWakeRequest(handle, deviceId, "wake-1"));
+
+        Assert.IsFalse(result.Accepted);
+        Assert.AreEqual(OnlineWakeCodes.TargetUnavailable, result.Code);
+    }
+    [TestMethod]
+    public async Task Relay_OfflineTargetNeverTriggersPushImplicitly()
     {
         var node = RelayNode.Create(withPush: true);
         var sender = await node.ConnectAsync("alice");
@@ -426,7 +550,45 @@ public sealed class RelayOnlineSwitchboardTests
             "bob", deviceId, "wake-me", OnlinePushClasses.High, "c"));
 
         Assert.AreEqual(OnlineRelaySendCodes.NotOnline, result.Code, "a wake is never delivery; custody stays with sender");
-        Assert.AreEqual(1, node.Metrics.Snapshot().PushWakes);
+        Assert.AreEqual(0, node.Metrics.Snapshot().PushWakes);
+        Assert.AreEqual(0, node.PushSender!.Sent.Count);
+    }
+
+    [TestMethod]
+    public async Task Wake_NotificationWorthinessSelectsVisibleOrSilentMode()
+    {
+        var node = RelayNode.Create(withPush: true);
+        var sender = await node.ConnectAsync("alice");
+        var (handle, deviceId, _) = await node.RegisterAsync("bob");
+        await node.Store.SetDevicePushTokenAsync(
+            handle, deviceId, DevicePlatforms.IOS, "tok-123", alertsEnabled: true);
+
+        var silent = await sender.Hub.Wake(new OnlineWakeRequest(handle, deviceId, "silent-1"));
+        var visible = await sender.Hub.Wake(new OnlineWakeRequest(
+            handle, deviceId, "visible-1", NotificationWorthy: true));
+
+        Assert.IsTrue(silent.Accepted);
+        Assert.IsTrue(visible.Accepted);
+        CollectionAssert.AreEqual(
+            new[] { PushWakeMode.SyncOnly, PushWakeMode.AlertAndSync },
+            node.PushSender!.Sent.Select(item => item.Mode).ToArray());
+    }
+
+    [TestMethod]
+    public async Task Wake_OnlineTargetIsAcceptedWithoutPush()
+    {
+        var node = RelayNode.Create(withPush: true);
+        var sender = await node.ConnectAsync("alice");
+        var (handle, deviceId, keys) = await node.RegisterAsync("bob");
+        await node.Store.SetDevicePushTokenAsync(
+            handle, deviceId, DevicePlatforms.IOS, "tok-123", alertsEnabled: true);
+        _ = await node.ConnectExistingAsync(handle, deviceId, keys);
+
+        var result = await sender.Hub.Wake(new OnlineWakeRequest(
+            handle, deviceId, "online-1", NotificationWorthy: true));
+
+        Assert.IsTrue(result.Accepted);
+        Assert.AreEqual(0, node.PushSender!.Sent.Count);
     }
 
     // ---- Agent request uses the same opaque forwarding ----------------------
@@ -572,9 +734,19 @@ public sealed class RelayOnlineSwitchboardTests
 
     private sealed class RecordingPushSender : IPushSender
     {
+        private readonly ConcurrentQueue<(PushWakeMode Mode, string WakeId)> sent = new();
         public string Platform => DevicePlatforms.IOS;
-        public Task<PushSendResult> SendWakeAsync(string token, CancellationToken ct = default)
-            => Task.FromResult(PushSendResult.Sent());
+        public IReadOnlyList<(PushWakeMode Mode, string WakeId)> Sent => sent.ToArray();
+
+        public Task<PushSendResult> SendWakeAsync(
+            string token,
+            PushWakeMode mode,
+            string wakeId,
+            CancellationToken ct = default)
+        {
+            sent.Enqueue((mode, wakeId));
+            return Task.FromResult(PushSendResult.Sent());
+        }
     }
 
     private sealed class DeliverySink
@@ -778,6 +950,7 @@ public sealed class RelayOnlineSwitchboardTests
         public required RelayMetrics Metrics { get; init; }
         public required IMessageRateLimiter RateLimiter { get; init; }
         public required PushDispatcher Push { get; init; }
+        public RecordingPushSender? PushSender { get; init; }
         public required DeliverySink Sink { get; init; }
 
         public static RelayNode Create(
@@ -792,7 +965,9 @@ public sealed class RelayOnlineSwitchboardTests
             var registry = new ConnectionRegistry();
             var metrics = new RelayMetrics();
             var router = new MeshRouter(new RouterHubContext(sink), registry, backplane, metrics);
-            IEnumerable<IPushSender> senders = withPush ? new IPushSender[] { new RecordingPushSender() } : Array.Empty<IPushSender>();
+            var pushSender = withPush ? new RecordingPushSender() : null;
+            IEnumerable<IPushSender> senders = pushSender is null
+                ? Array.Empty<IPushSender>() : new IPushSender[] { pushSender };
             var push = new PushDispatcher(store, senders, NullLogger<PushDispatcher>.Instance);
             var node = new RelayNode
             {
@@ -804,6 +979,7 @@ public sealed class RelayOnlineSwitchboardTests
                 Metrics = metrics,
                 RateLimiter = rateLimiter ?? new AllowAllRateLimiter(),
                 Push = push,
+                PushSender = pushSender,
                 Sink = sink
             };
             backplane.StartAsync(node.Router.DeliverFromBackplaneAsync).GetAwaiter().GetResult();
