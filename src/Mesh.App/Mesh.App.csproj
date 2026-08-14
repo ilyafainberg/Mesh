@@ -90,7 +90,10 @@
         <MauiFont Include="Resources\Fonts\*" />
 
         <!-- Raw Assets (also remove the "Resources\Raw" prefix) -->
-        <MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
+        <MauiAsset Include="Resources\Raw\**" Exclude="Resources\Raw\BuiltIns\builtins.index.json"
+                   LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
+        <MauiAsset Include="Resources\Raw\BuiltIns\builtins.index.json" LogicalName="BuiltIns/builtins.index.json" />
+        <Content Remove="Resources\Raw\BuiltIns\builtins.index.json" />
     </ItemGroup>
 
     <ItemGroup>
@@ -127,7 +130,25 @@
 
     <ItemGroup>
       <ProjectReference Include="..\Mesh.Shared\Mesh.Shared.csproj" />
+      <ProjectReference Include="..\Mesh.BuiltIns.Compiler\Mesh.BuiltIns.Compiler.csproj"
+                        ReferenceOutputAssembly="false" Private="false" />
     </ItemGroup>
+
+    <PropertyGroup>
+        <BuiltInsRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/Resources/Raw/BuiltIns'))</BuiltInsRoot>
+        <BuiltInsIndex>$([System.IO.Path]::GetFullPath('$(BuiltInsRoot)/builtins.index.json'))</BuiltInsIndex>
+        <BuiltInsCompilerAssembly>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../Mesh.BuiltIns.Compiler/bin/$(Configuration)/net10.0/Mesh.BuiltIns.Compiler.dll'))</BuiltInsCompilerAssembly>
+    </PropertyGroup>
+
+    <Target Name="CompileBuiltInContent"
+            BeforeTargets="ResizetizeCollectItems"
+            DependsOnTargets="ResolveProjectReferences"
+            Condition="'$(DesignTimeBuild)' != 'true'">
+        <Error Condition="!Exists('$(BuiltInsCompilerAssembly)')"
+               Text="The Mesh built-in content compiler was not built: $(BuiltInsCompilerAssembly)" />
+        <Exec Command="dotnet &quot;$(BuiltInsCompilerAssembly)&quot; &quot;$(BuiltInsRoot)&quot; &quot;$(BuiltInsIndex)&quot;" />
+
+    </Target>
 
     <!-- Mobile push (Option 1 wake notifications). Off by default so the standard build needs no Firebase
          provisioning and no google-services.json. To enable Android FCM: build with MeshPushEnabled=true and

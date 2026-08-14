@@ -17,6 +17,15 @@ internal sealed record TokenOptimizedRequest(
 internal sealed record ContextSelection<T>(
     IReadOnlyList<T> Included,
     IReadOnlyList<T> Omitted);
+internal enum AgentContentKind
+{
+    Knowledge,
+    Skill
+}
+
+internal sealed record AgentContentSummary(
+    string Id, AgentContentKind Kind, string Title, string Summary,
+    int BodyBytes, long Recency, bool IsBuiltIn);
 
 /// <summary>
 /// Builds an ephemeral, smaller inference projection. Persisted conversations and tool results are
@@ -168,6 +177,65 @@ internal static class TokenOptimizer
             _ => 0);
     }
 
+    public static ContextSelection<AgentContentSummary> SelectAgentContent(
+        IReadOnlyList<AgentContentSummary> items,
+        string? query,
+        TokenOptimizationLevel level,
+        bool compact)
+    {
+        level = Normalize(level);
+        var maximumCount = AgentContentCountBudget(level);
+        var maximumBytes = AgentContentByteBudget(level, compact);
+        var queryTerms = Terms(query);
+        var includeWithoutQuery = level == TokenOptimizationLevel.Disabled && queryTerms.Count == 0;
+        var ranked = items
+            .Select((item, index) => new
+            {
+                Item = item,
+                Index = index,
+                Score = RelevanceScore(item.Title, item.Summary, queryTerms)
+            })
+            .Where(item => item.Score > 0 || includeWithoutQuery)
+            .OrderByDescending(item => item.Score)
+            .ThenByDescending(item => item.Item.Recency)
+            .ThenBy(item => item.Index)
+            .ToList();
+
+        var selected = new List<AgentContentSummary>();
+        var selectedIndices = new HashSet<int>();
+        long usedBytes = 0;
+        foreach (var item in ranked)
+        {
+            if (selected.Count >= maximumCount) break;
+            var bodyBytes = Math.Max(0, item.Item.BodyBytes);
+            if (maximumBytes != int.MaxValue && usedBytes + bodyBytes > maximumBytes) continue;
+            selected.Add(item.Item);
+            selectedIndices.Add(item.Index);
+            usedBytes += bodyBytes;
+        }
+
+        return new ContextSelection<AgentContentSummary>(
+            selected,
+            items.Where((_, index) => !selectedIndices.Contains(index)).ToList());
+    }
+
+    public static int AgentContentCountBudget(TokenOptimizationLevel level)
+        => Normalize(level) switch
+        {
+            TokenOptimizationLevel.Disabled => int.MaxValue,
+            TokenOptimizationLevel.MaxAccuracy => 16,
+            TokenOptimizationLevel.Balanced => 8,
+            _ => 4
+        };
+
+    public static int AgentContentByteBudget(TokenOptimizationLevel level, bool compact)
+        => Normalize(level) switch
+        {
+            TokenOptimizationLevel.Disabled => int.MaxValue,
+            TokenOptimizationLevel.MaxAccuracy => compact ? 24_000 : 64_000,
+            TokenOptimizationLevel.Balanced => compact ? 8_000 : 24_000,
+            _ => compact ? 3_000 : 8_000
+        };
     public static int KnowledgeContentLimit(TokenOptimizationLevel level, bool compact)
         => Normalize(level) switch
         {

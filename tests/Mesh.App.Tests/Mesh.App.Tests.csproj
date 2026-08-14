@@ -62,6 +62,8 @@
     <Compile Include="..\..\src\Mesh.App\Services\ToolDetailFormatter.cs" Link="ToolDetailFormatter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ToolApprovalService.cs" Link="ToolApprovalService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TokenOptimizer.cs" Link="TokenOptimizer.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\BuiltInContentProvider.cs" Link="BuiltInContentProvider.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\AgentPromptContentSelector.cs" Link="AgentPromptContentSelector.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProviderModelMetadata.cs" Link="ProviderModelMetadata.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\RuntimeDiagnostics.cs" Link="RuntimeDiagnostics.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MessageRenderWindow.cs" Link="MessageRenderWindow.cs" />
@@ -102,6 +104,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Mesh.Shared\Mesh.Shared.csproj" />
     <ProjectReference Include="..\..\src\Mesh.Relay\Mesh.Relay.csproj" />
+    <ProjectReference Include="..\..\src\Mesh.BuiltIns.Compiler\Mesh.BuiltIns.Compiler.csproj" />
   </ItemGroup>
 
 

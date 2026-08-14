@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Mesh.App/Mesh.App.csproj" />
     <Project Path="src/Mesh.Relay/Mesh.Relay.csproj" />
+    <Project Path="src/Mesh.BuiltIns.Compiler/Mesh.BuiltIns.Compiler.csproj" />
     <Project Path="src/Mesh.Shared/Mesh.Shared.csproj" />
   </Folder>
   <Folder Name="/tests/">

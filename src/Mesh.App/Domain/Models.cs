@@ -343,6 +343,8 @@ public sealed class KnowledgeItem
     public string Id { get; set; } = Guid.NewGuid().ToString("n");
     public string Title { get; set; } = "";
     public string Content { get; set; } = "";
+    [JsonIgnore]
+    public long ContentByteCount { get; set; }
     /// <summary>Who may use this item through the owner's agent.</summary>
     public string Visibility { get; set; } = "private";
     public KnowledgeSource Source { get; set; } = KnowledgeSource.Manual;
@@ -538,6 +540,8 @@ public sealed class Skill
     public string Description { get; set; } = "";
     /// <summary>Guidance the agent follows when performing this skill.</summary>
     public string Instructions { get; set; } = "";
+    [JsonIgnore]
+    public long ContentByteCount { get; set; }
     public string Visibility { get; set; } = "private";
     public bool Enabled { get; set; } = true;
 

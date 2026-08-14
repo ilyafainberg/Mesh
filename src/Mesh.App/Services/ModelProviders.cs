@@ -69,13 +69,19 @@ public interface IChatModel
         => CompleteAsync(systemPrompt, history, options, ct);
 }
 
+public sealed record ModelSkillContext(string Id, string Name, string Description, string Instructions);
+
+public sealed record ModelRequestContext(AgentRole Role, IReadOnlyList<ModelSkillContext> Skills);
+
 /// <summary>
 /// Per-call completion tuning. <see cref="MaxOutputTokens"/> caps the model's output: ordinary chat
 /// uses the default, while large generations (e.g. building a widget, which is a whole HTML+JS
 /// document) request a much higher cap so the reply is not truncated mid-code. A too-small cap was
 /// the root cause of widgets rendering as broken, dead documents.
 /// </summary>
-public sealed record CompletionOptions(int MaxOutputTokens = CompletionOptions.DefaultMaxOutputTokens)
+public sealed record CompletionOptions(
+    int MaxOutputTokens = CompletionOptions.DefaultMaxOutputTokens,
+    ModelRequestContext? Context = null)
 {
     public const int DefaultMaxOutputTokens = 20480;
 

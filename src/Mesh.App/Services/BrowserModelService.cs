@@ -6,7 +6,7 @@ using Microsoft.Playwright;
 namespace Mesh.App.Services;
 
 /// <summary>Windows-only, user-scripted provider that drives a web LLM in a persistent browser profile.</summary>
-public sealed class BrowserModelService(AppState state) : IAsyncDisposable
+public sealed class BrowserModelService : IAsyncDisposable
 {
     private readonly SemaphoreSlim gate = new(1, 1);
     private IPlaywright? playwright;
@@ -18,7 +18,7 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
 
     public async Task<string> CompleteAsync(ModelConfig cfg, string systemPrompt,
         IReadOnlyList<ChatLine> history, IReadOnlyList<IAgentTool>? tools,
-        CancellationToken ct)
+        CompletionOptions? options, CancellationToken ct)
     {
         if (!OperatingSystem.IsWindows()) return "[model error: Browser provider is available on Windows only.]";
         if (string.IsNullOrWhiteSpace(cfg.BrowserUrl)) return "[model error: Browser provider URL is missing.]";
@@ -41,12 +41,13 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
             var fullPrompt = RenderPrompt(systemPrompt, history);
             var currentTurn = LastUserMessage(history);
             var contextMode = NormalizeContextMode(cfg.BrowserContextMode);
-            var submissionText = contextMode == "CurrentTurn" ? currentTurn : fullPrompt;
+            if (contextMode == "CurrentTurn" && string.IsNullOrWhiteSpace(currentTurn))
+                return "[model error: Browser provider found no user message to send.]";
+            var submissionText = contextMode == "CurrentTurn"
+                ? RenderCurrentTurn(systemPrompt, currentTurn)
+                : fullPrompt;
             if (string.IsNullOrWhiteSpace(submissionText))
                 return "[model error: Browser provider found no user message to send.]";
-            // Lazily hydrate only the relevant, enabled skills within a conservative bound instead of
-            // serializing every summary (whose Instructions are blank after startup anyway).
-            var skillPayload = await BuildSkillPayloadAsync(currentTurn, ct).ConfigureAwait(false);
             var request = new
             {
                 requestId,
@@ -57,14 +58,25 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
                 contextMode,
                 systemPrompt,
                 messages = history.Select(x => new { role = x.Role, content = x.Text }).ToArray(),
-                skills = skillPayload,
+                skills = (options?.Context?.Skills ?? Array.Empty<ModelSkillContext>()).Select(skill => new
+                {
+                    id = skill.Id,
+                    name = skill.Name,
+                    description = skill.Description,
+                    instructions = skill.Instructions
+                }).ToArray(),
                 tools = (tools ?? Array.Empty<IAgentTool>()).Select(t => new
                 {
                     name = t.Name,
                     description = t.Description,
                     inputSchema = t.ParametersSchema
                 }).ToArray(),
-                metadata = new { model = cfg.Model, provider = "Browser" }
+                metadata = new
+                {
+                    model = cfg.Model,
+                    provider = "Browser",
+                    role = options?.Context?.Role.ToString().ToLowerInvariant()
+                }
             };
 
             var ticket = await RunScriptAsync(cfg.BrowserExecuteScript!, request, "Execute prompt", ct).ConfigureAwait(false);
@@ -186,32 +198,6 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
     private static string LastUserMessage(IReadOnlyList<ChatLine> history)
         => history.LastOrDefault(line => string.Equals(line.Role, "user", StringComparison.OrdinalIgnoreCase))?.Text ?? "";
 
-    /// <summary>
-    /// Builds the browser request's skill payload from fully loaded, relevant, ENABLED skills only,
-    /// within a conservative bound. After startup the profile's skill summaries carry blank Instructions;
-    /// this filters to enabled skills, pre-caps the candidate pool, ranks by relevance with the shared
-    /// TokenOptimizer, then bounded-loads just those bodies (AssetLoadBudget.Default => at most 64 items /
-    /// 4 MiB). It never serializes every skill body.
-    /// </summary>
-    private const int SkillSelectionCap = 200;
-
-    private async Task<object[]> BuildSkillPayloadAsync(string query, CancellationToken ct)
-    {
-        var enabled = state.Profile.Skills.Where(s => s.Enabled).ToList();
-        if (enabled.Count == 0) return Array.Empty<object>();
-        var pool = enabled.Count <= SkillSelectionCap ? enabled : enabled.Take(SkillSelectionCap).ToList();
-        var selection = TokenOptimizer.SelectSkills(pool, query, state.Profile.Model.TokenOptimization);
-        var ids = selection.Included.Select(s => s.Id).ToList();
-        if (ids.Count == 0) return Array.Empty<object>();
-        var loaded = await state.LoadSkillsAsync(ids, AssetLoadBudget.Default, ct).ConfigureAwait(false);
-        return loaded.Select(s => (object)new
-        {
-            name = s.Name,
-            description = s.Description,
-            instructions = s.Instructions
-        }).ToArray();
-    }
-
     private static bool IsBrowserMissing(Exception ex)
     {
         var message = ex.Message;
@@ -298,6 +284,9 @@ public sealed class BrowserModelService(AppState state) : IAsyncDisposable
         throw new InvalidOperationException("The configured Send button did not become enabled.");
     }
 
+    private static string RenderCurrentTurn(string systemPrompt, string currentTurn)
+        => "[SYSTEM]\n" + systemPrompt + "\n[USER]\n" + currentTurn;
+
     private static string RenderPrompt(string systemPrompt, IReadOnlyList<ChatLine> history)
     {
         var sb = new StringBuilder();
@@ -338,11 +327,11 @@ public sealed class BrowserChatModel(BrowserModelService service, ModelConfig cf
 {
     public Task<string> CompleteAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         CompletionOptions? options = null, CancellationToken ct = default)
-        => service.CompleteAsync(cfg, systemPrompt, history, null, ct);
+        => service.CompleteAsync(cfg, systemPrompt, history, null, options, ct);
 
     public Task<string> CompleteWithToolsAsync(string systemPrompt, IReadOnlyList<ChatLine> history,
         IReadOnlyList<IAgentTool> tools, IProgress<AgentStep>? progress = null,
         IProgress<AgentDelta>? delta = null,
         CompletionOptions? options = null, CancellationToken ct = default)
-        => service.CompleteAsync(cfg, systemPrompt, history, tools, ct);
+        => service.CompleteAsync(cfg, systemPrompt, history, tools, options, ct);
 }

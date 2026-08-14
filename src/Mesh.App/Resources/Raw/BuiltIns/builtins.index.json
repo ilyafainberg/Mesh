@@ -1,0 +1,320 @@
+{
+  "schemaVersion": 1,
+  "contentVersion": "sha256:142388cd7ea5673d",
+  "catalogHash": "142388cd7ea5673d8b04b6c02fbb92158c93ddf02378b4f811c415a629394e9b",
+  "items": [
+    {
+      "id": "builtin:knowledge:about-mesh",
+      "type": "knowledge",
+      "path": "Knowledge/about-mesh.md",
+      "sha256": "f7168e8224db71f262694da6b50e58e069f8aecf9f005eaae6878b22e2f1b51b",
+      "sizeBytes": 1429,
+      "roles": [
+        "guest",
+        "owner",
+        "service"
+      ],
+      "title": "About Mesh",
+      "name": null,
+      "description": "What Mesh is, where agent data lives, and how clients and the Relay work together.",
+      "keywords": [
+        "mesh",
+        "agent",
+        "relay",
+        "client",
+        "local-first",
+        "architecture"
+      ],
+      "triggers": [],
+      "priority": null
+    },
+    {
+      "id": "builtin:knowledge:contacts-circles-tools-and-skills",
+      "type": "knowledge",
+      "path": "Knowledge/contacts-circles-tools-and-skills.md",
+      "sha256": "947126b45e47efdfdf79480591bfbbaf855682b0ab59dfcc244e1c15673b831f",
+      "sizeBytes": 1594,
+      "roles": [
+        "guest",
+        "owner"
+      ],
+      "title": "Contacts, circles, tools, and skills",
+      "name": null,
+      "description": "How Mesh scopes reusable content and capabilities for owners, contacts, and services.",
+      "keywords": [
+        "contacts",
+        "circles",
+        "tools",
+        "skills",
+        "knowledge",
+        "visibility",
+        "sharing",
+        "permissions"
+      ],
+      "triggers": [],
+      "priority": null
+    },
+    {
+      "id": "builtin:knowledge:devices-and-replication",
+      "type": "knowledge",
+      "path": "Knowledge/devices-and-replication.md",
+      "sha256": "3d637333ef51ac8240d6a94b0bc78bbf1dadc0ead3070d1c5ffef4c527a38940",
+      "sizeBytes": 1464,
+      "roles": [
+        "guest",
+        "owner"
+      ],
+      "title": "Devices, replication, and custody",
+      "name": null,
+      "description": "How linked Mesh devices share encrypted state and preserve device authorization history.",
+      "keywords": [
+        "devices",
+        "replication",
+        "sync",
+        "custody",
+        "linking",
+        "recovery",
+        "revocation",
+        "history"
+      ],
+      "triggers": [],
+      "priority": null
+    },
+    {
+      "id": "builtin:knowledge:offline-delivery-limitations",
+      "type": "knowledge",
+      "path": "Knowledge/offline-delivery-limitations.md",
+      "sha256": "319c287df4dd7bf28a56d408fe4c34929af98337850f1190973cbc4230fafc31",
+      "sizeBytes": 1181,
+      "roles": [
+        "guest",
+        "owner",
+        "service"
+      ],
+      "title": "Offline delivery limitations",
+      "name": null,
+      "description": "What continues to work offline and which Mesh operations require reachable peers or providers.",
+      "keywords": [
+        "offline",
+        "delivery",
+        "pending",
+        "retry",
+        "relay",
+        "model",
+        "network",
+        "limitations"
+      ],
+      "triggers": [],
+      "priority": null
+    },
+    {
+      "id": "builtin:knowledge:online-only-architecture",
+      "type": "knowledge",
+      "path": "Knowledge/online-only-architecture.md",
+      "sha256": "86698e46904cd674fcef4c350c19b8102d163067d1ee26ddf3d63c7d0dbf2474",
+      "sizeBytes": 1348,
+      "roles": [
+        "guest",
+        "owner",
+        "service"
+      ],
+      "title": "Online-only architecture",
+      "name": null,
+      "description": "How live Mesh routing differs from durable local history and why online presence matters.",
+      "keywords": [
+        "online",
+        "relay",
+        "routing",
+        "delivery",
+        "availability",
+        "architecture"
+      ],
+      "triggers": [],
+      "priority": null
+    },
+    {
+      "id": "builtin:knowledge:security-and-local-storage",
+      "type": "knowledge",
+      "path": "Knowledge/security-and-local-storage.md",
+      "sha256": "049a7fca0e296032a0dc4971b1a56335671838f5b70db207c55c2b89a51ad174",
+      "sizeBytes": 1532,
+      "roles": [
+        "guest",
+        "owner"
+      ],
+      "title": "Security, privacy, and local storage",
+      "name": null,
+      "description": "Mesh encryption boundaries, local SQLCipher storage, device secrets, and metadata limits.",
+      "keywords": [
+        "security",
+        "privacy",
+        "encryption",
+        "e2ee",
+        "sqlcipher",
+        "keys",
+        "storage",
+        "metadata"
+      ],
+      "triggers": [],
+      "priority": null
+    },
+    {
+      "id": "builtin:policy:core",
+      "type": "policy",
+      "path": "Policies/core.md",
+      "sha256": "921a0f58a6c3544d8bd4cd819947fdc6daf25cd4140fa05755cdd6a1182df6c0",
+      "sizeBytes": 985,
+      "roles": [
+        "guest",
+        "owner",
+        "service"
+      ],
+      "title": "Mesh core behavior",
+      "name": null,
+      "description": null,
+      "keywords": [],
+      "triggers": [],
+      "priority": 100
+    },
+    {
+      "id": "builtin:policy:guest",
+      "type": "policy",
+      "path": "Policies/guest.md",
+      "sha256": "7d377e002c50676b882c2f827347733e3c4bd58253a3ffec855084512571e0a9",
+      "sizeBytes": 595,
+      "roles": [
+        "guest"
+      ],
+      "title": "Guest privacy behavior",
+      "name": null,
+      "description": null,
+      "keywords": [],
+      "triggers": [],
+      "priority": 90
+    },
+    {
+      "id": "builtin:policy:owner",
+      "type": "policy",
+      "path": "Policies/owner.md",
+      "sha256": "bc4e383157d2c27c2092bc943cf9d9a42397f5d6d4ccbf8f13772d27cf6020ad",
+      "sizeBytes": 823,
+      "roles": [
+        "owner"
+      ],
+      "title": "Owner behavior",
+      "name": null,
+      "description": null,
+      "keywords": [],
+      "triggers": [],
+      "priority": 90
+    },
+    {
+      "id": "builtin:policy:service",
+      "type": "policy",
+      "path": "Policies/service.md",
+      "sha256": "ae941aa7aaddc15c2ed014832854cbbf96ebfe9226f435d2a3e0fdc35ff995e4",
+      "sizeBytes": 767,
+      "roles": [
+        "service"
+      ],
+      "title": "Public service sandbox behavior",
+      "name": null,
+      "description": null,
+      "keywords": [],
+      "triggers": [],
+      "priority": 90
+    },
+    {
+      "id": "builtin:skill:configure-capabilities",
+      "type": "skill",
+      "path": "Skills/configure-capabilities/SKILL.md",
+      "sha256": "1110e0ee5c656ad388dd82f80f260410e069f5b24f7ea2cebbd95c2f77c2ca24",
+      "sizeBytes": 1213,
+      "roles": [
+        "owner"
+      ],
+      "title": null,
+      "name": "Configure contacts, circles, tools, and skills",
+      "description": "Set up the smallest practical Mesh capability scope for an owner, contact group, or service.",
+      "keywords": [],
+      "triggers": [
+        "add contact",
+        "create circle",
+        "share knowledge",
+        "configure tools",
+        "enable skill",
+        "publish service"
+      ],
+      "priority": null
+    },
+    {
+      "id": "builtin:skill:explain-privacy",
+      "type": "skill",
+      "path": "Skills/explain-privacy/SKILL.md",
+      "sha256": "8b6b62b632028f998b0d9519e9ef2d5d2f69579f12892d79f97d5fd85f3847b5",
+      "sizeBytes": 1209,
+      "roles": [
+        "guest",
+        "owner",
+        "service"
+      ],
+      "title": null,
+      "name": "Explain Mesh privacy and architecture",
+      "description": "Give an accurate, audience-appropriate explanation of Mesh data flow and trust boundaries.",
+      "keywords": [],
+      "triggers": [
+        "how mesh works",
+        "privacy",
+        "security",
+        "architecture",
+        "encryption",
+        "relay"
+      ],
+      "priority": null
+    },
+    {
+      "id": "builtin:skill:troubleshoot-relay",
+      "type": "skill",
+      "path": "Skills/troubleshoot-relay/SKILL.md",
+      "sha256": "f209ba20e8c99d87b157b028b07fda42ce8a32e75685798e5907e0f1ac4f98c7",
+      "sizeBytes": 1159,
+      "roles": [
+        "owner"
+      ],
+      "title": null,
+      "name": "Troubleshoot Relay connectivity",
+      "description": "Diagnose why a Mesh client cannot connect to or stay connected to its Relay.",
+      "keywords": [],
+      "triggers": [
+        "relay offline",
+        "cannot connect",
+        "connection failed",
+        "disconnected",
+        "network"
+      ],
+      "priority": null
+    },
+    {
+      "id": "builtin:skill:troubleshoot-sync",
+      "type": "skill",
+      "path": "Skills/troubleshoot-sync/SKILL.md",
+      "sha256": "d9eb96137b448a8f31d556b8305095727d1f5f6fc97f9b6718fc5682945c0a9f",
+      "sizeBytes": 1188,
+      "roles": [
+        "owner"
+      ],
+      "title": null,
+      "name": "Troubleshoot cross-device synchronization",
+      "description": "Diagnose missing or inconsistent Mesh state between linked devices.",
+      "keywords": [],
+      "triggers": [
+        "not syncing",
+        "missing messages",
+        "device connection",
+        "replication",
+        "linked devices"
+      ],
+      "priority": null
+    }
+  ]
+}

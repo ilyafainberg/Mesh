@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Maui.Storage;
 using Mesh.App.Services;
 using ZXing.Net.Maui.Controls;
 #if WINDOWS
@@ -89,6 +90,9 @@ public static class MauiProgram
 		builder.Services.AddSingleton<IPushService, NoopPushService>();
 #endif
 		builder.Services.AddSingleton<AppState>();
+		builder.Services.AddSingleton<IBuiltInContentProvider>(_ => new BuiltInContentProvider(
+			path => FileSystem.Current.OpenAppPackageFileAsync(path),
+			message => diagnostics.RecordEvent("built-in-content", message)));
 		builder.Services.AddScoped<IImageShareService, ImageShareService>();
 		builder.Services.AddSingleton<MobileOverlayState>();
 		builder.Services.AddSingleton<IMemoryState>(services => services.GetRequiredService<AppState>());
