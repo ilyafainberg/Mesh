@@ -5,28 +5,28 @@
 }
 
 .message-action-surface.desktop.copyable {
-    padding-right: 34px;
+    padding-right: 28px;
 }
 
-.message-copy-button,
-.message-more-button {
+.message-copy-button {
     position: absolute;
     z-index: 3;
     top: -6px;
     right: -8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    min-width: 30px;
+    height: 30px;
+    padding: 0;
     border: 1px solid var(--stroke-1, #d9dde3);
+    border-radius: 8px;
     background: var(--bg-1, #fff);
     color: var(--fg-2, #4d5661);
     box-shadow: var(--shadow-2, 0 2px 7px rgba(0, 0, 0, .12));
-}
-
-.message-copy-button {
-    min-width: 54px;
-    min-height: 30px;
-    padding: 4px 9px;
-    border-radius: 999px;
-    font-size: .72rem;
-    font-weight: 600;
+    font-size: .9rem;
+    line-height: 1;
     opacity: 0;
     pointer-events: none;
     transition: opacity .12s ease, background .12s ease;
@@ -40,43 +40,13 @@
 }
 
 .message-copy-button:hover,
-.message-copy-button:focus-visible,
-.message-more-button:hover,
-.message-more-button:focus-visible {
+.message-copy-button:focus-visible {
     background: var(--brand-tint, #f0eeff);
     color: var(--brand, #6750a4);
     outline: 2px solid var(--brand, #6750a4);
     outline-offset: 1px;
 }
 
-.message-more-button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 44px;
-    min-width: 44px;
-    height: 44px;
-    padding: 0;
-    border-radius: 50%;
-    font-size: 1.35rem;
-    line-height: 1;
-}
-
-.message-context-menu {
-    position: absolute;
-    top: 100%;
-    right: 0;
-    z-index: 110;
-    min-width: 130px;
-    margin-top: 4px;
-    padding: 5px;
-    border: 1px solid var(--stroke-1, #d9dde3);
-    border-radius: 9px;
-    background: var(--bg-1, #fff);
-    box-shadow: var(--shadow-8, 0 8px 24px rgba(0, 0, 0, .18));
-}
-
-.message-context-menu button,
 .message-sheet-copy {
     width: 100%;
     border: 0;
@@ -85,14 +55,6 @@
     text-align: left;
 }
 
-.message-context-menu button {
-    min-height: 36px;
-    padding: 7px 10px;
-    border-radius: 6px;
-}
-
-.message-context-menu button:hover,
-.message-context-menu button:focus-visible,
 .message-sheet-copy:hover,
 .message-sheet-copy:focus-visible {
     background: var(--brand-tint, #f0eeff);

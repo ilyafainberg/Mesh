@@ -116,18 +116,39 @@ public sealed class ReliableSynchronizationPolicyTests
     }
 
     [TestMethod]
-    public void ReplicationStatus_FormatsCompactMeTopicText()
+    public void ReplicationStatus_HidesRoutineProgressAndFormatsFailures()
     {
         var now = new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+        var routinePhases = new[]
+        {
+            ReplicationPhase.UpToDate,
+            ReplicationPhase.WaitingForPeer,
+            ReplicationPhase.Connecting,
+            ReplicationPhase.Synchronizing,
+            ReplicationPhase.Bootstrapping,
+            ReplicationPhase.DeferredByOperatingSystem
+        };
 
+        foreach (var phase in routinePhases)
+        {
+            var status = new ReplicationStatus(phase, 1, "peer", null, null);
+            Assert.IsFalse(ReplicationStatusDisplayPolicy.ShouldShow(status));
+            Assert.AreEqual(string.Empty, ReplicationStatusFormatter.Format(status, now));
+        }
+
+        var authenticationFailure = new ReplicationStatus(
+            ReplicationPhase.AuthenticationFailed, 0, "peer", null, "unauthorized");
+        Assert.IsTrue(ReplicationStatusDisplayPolicy.ShouldShow(authenticationFailure));
         Assert.AreEqual(
-            "Syncing 1 change",
-            ReplicationStatusFormatter.Format(new ReplicationStatus(
-                ReplicationPhase.Synchronizing, 1, "peer", null, null), now));
+            "Synchronization authentication failed",
+            ReplicationStatusFormatter.Format(authenticationFailure, now));
+
+        var failure = new ReplicationStatus(
+            ReplicationPhase.Failed, 0, "peer", now.AddMinutes(-5), "network");
+        Assert.IsTrue(ReplicationStatusDisplayPolicy.ShouldShow(failure));
         Assert.AreEqual(
             "Last synced 5 minutes ago",
-            ReplicationStatusFormatter.Format(new ReplicationStatus(
-                ReplicationPhase.Failed, 0, "peer", now.AddMinutes(-5), "network"), now));
+            ReplicationStatusFormatter.Format(failure, now));
     }
 
     [TestMethod]

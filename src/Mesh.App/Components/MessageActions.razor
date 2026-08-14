@@ -2,8 +2,7 @@
 @implements IDisposable
 
 <div class="message-action-surface @(IsMobile ? "mobile" : "desktop") @(CanCopy ? "copyable" : "")"
-     @oncontextmenu="OpenContextActions"
-     @oncontextmenu:preventDefault="CanCopy"
+     @oncontextmenu:preventDefault="IsMobile && CanCopy"
      @onpointerdown="BeginLongPress"
      @onpointermove="TrackLongPress"
      @onpointerup="EndLongPress"
@@ -12,37 +11,16 @@
      @onclick:preventDefault="suppressNextClick">
     @ChildContent
 
-    @if (CanCopy)
+    @if (CanCopy && !IsMobile)
     {
-        @if (IsMobile)
-        {
-            <button type="button"
-                    class="message-more-button"
-                    aria-label="Message actions"
-                    title="Message actions"
-                    @onclick="OpenMobileActions"
-                    @onclick:stopPropagation="true">
-                <span aria-hidden="true">⋯</span>
-            </button>
-        }
-        else
-        {
-            <button type="button"
-                    class="message-copy-button"
-                    aria-label="Copy message"
-                    title="Copy Markdown source"
-                    @onclick="CopyAsync"
-                    @onclick:stopPropagation="true">
-                @(copied ? "Copied" : "Copy")
-            </button>
-        }
-    }
-
-    @if (CanCopy && !IsMobile && desktopMenuOpen)
-    {
-        <div class="message-context-menu" role="menu" aria-label="Message actions">
-            <button type="button" role="menuitem" @onclick="CopyAsync">Copy</button>
-        </div>
+        <button type="button"
+                class="message-copy-button"
+                aria-label="Copy message"
+                title="Copy Markdown source"
+                @onclick="CopyAsync"
+                @onclick:stopPropagation="true">
+            <i class="@CopyIconClass" aria-hidden="true"></i>
+        </button>
     }
 </div>
 
@@ -86,7 +64,6 @@
 
     private bool copied;
     private bool copyFailed;
-    private bool desktopMenuOpen;
     private bool mobileSheetOpen;
     private bool suppressNextClick;
     private string? feedback;
@@ -97,22 +74,10 @@
 
     private bool CanCopy => !IsInternal && MessageCopyPolicy.HasVisibleContent(Markdown);
 
-    private void OpenContextActions(MouseEventArgs args)
-    {
-        if (!CanCopy) return;
-        if (IsMobile) mobileSheetOpen = true;
-        else desktopMenuOpen = true;
-    }
-
-    private void OpenMobileActions()
-    {
-        CancelLongPress();
-        mobileSheetOpen = true;
-    }
+    private string CopyIconClass => copied ? "bi bi-check-lg" : "bi bi-clipboard";
 
     private void CloseActions()
     {
-        desktopMenuOpen = false;
         mobileSheetOpen = false;
     }
 

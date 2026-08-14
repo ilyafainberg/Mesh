@@ -76,6 +76,15 @@ public sealed record ReplicationStatus(
     DateTimeOffset? LastSuccessfulSync,
     string? Reason);
 
+public static class ReplicationStatusDisplayPolicy
+{
+    public static bool ShouldShow(ReplicationStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        return status.Phase is ReplicationPhase.AuthenticationFailed or ReplicationPhase.Failed;
+    }
+}
+
 public static class ReplicationStatusFormatter
 {
     public static string Format(ReplicationStatus status, DateTimeOffset? now = null)
@@ -83,21 +92,11 @@ public static class ReplicationStatusFormatter
         ArgumentNullException.ThrowIfNull(status);
         return status.Phase switch
         {
-            ReplicationPhase.UpToDate => "Up to date",
-            ReplicationPhase.WaitingForPeer => status.PeerDeviceId is null
-                ? "Waiting for a linked device to come online"
-                : "Waiting for linked device to come online",
-            ReplicationPhase.Connecting => "Connecting for synchronization",
-            ReplicationPhase.Synchronizing => status.PendingEvents > 0
-                ? $"Syncing {status.PendingEvents} change{(status.PendingEvents == 1 ? "" : "s")}"
-                : "Synchronizing",
-            ReplicationPhase.Bootstrapping => "Preparing device history",
-            ReplicationPhase.DeferredByOperatingSystem => "Background synchronization unavailable",
             ReplicationPhase.AuthenticationFailed => "Synchronization authentication failed",
             ReplicationPhase.Failed => status.LastSuccessfulSync is { } last
                 ? $"Last synced {Relative(last, now ?? DateTimeOffset.Now)}"
                 : "Synchronization failed",
-            _ => "Synchronization unavailable"
+            _ => string.Empty
         };
     }
 

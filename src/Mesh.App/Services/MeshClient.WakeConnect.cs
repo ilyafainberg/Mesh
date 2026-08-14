@@ -31,9 +31,7 @@ public sealed partial class MeshClient
     public string ReplicationStatusText => ReplicationStatusFormatter.Format(CurrentReplicationStatus);
 
     public bool ShouldShowReplicationStatus
-        => CurrentReplicationStatus.PendingEvents > 0
-           || CurrentReplicationStatus.LastSuccessfulSync is not null
-           || state.HasReplicationSibling();
+        => ReplicationStatusDisplayPolicy.ShouldShow(CurrentReplicationStatus);
 
     private int CountPendingReplicationEvents(IReadOnlyCollection<string>? targetAccounts = null)
     {
