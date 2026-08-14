@@ -120,8 +120,6 @@ public sealed partial class MeshDb
                 FOREIGN KEY(event_id) REFERENCES replication_events(event_id));
             CREATE INDEX IF NOT EXISTS ix_replication_outbox_due
                 ON replication_outbox(target_account, state, event_id);
-            CREATE INDEX IF NOT EXISTS ix_replication_outbox_notification
-                ON replication_outbox(target_account, notification_worthy, event_id);
 
             CREATE TABLE IF NOT EXISTS replication_cursors(
                 origin_device_id TEXT PRIMARY KEY,

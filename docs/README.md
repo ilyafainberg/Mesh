@@ -13,6 +13,7 @@ agent, and its open-source relay.
 | [Relay deployment guide](RELAY-DEPLOYMENT.md) | Operators self-hosting a relay | Deploying the relay with Docker or binaries, putting it behind TLS, the full configuration reference, storage and scaling (Cosmos + Redis), health and metrics, and operational best practices. |
 | [Self-hosting (short version)](SELF-HOSTING.md) | Operators who want the quick path | A condensed quick start for running your own relay. See the deployment guide for the comprehensive version. |
 | [Push notifications and iOS background sync](PUSH-NOTIFICATIONS.md) | Operators and mobile client builders | Metadata-only alerts, bounded passive inbox synchronization on iOS, delivery limits and throttling, relay APNs/FCM configuration, and client provisioning. |
+| [Release process](RELEASE-PROCESS.md) | Human and agent release managers | Versioning, signing, validation, publishing, verification, recovery, and rollback for Windows, Android, iOS, Mac Catalyst, and the Linux-hosted Relay. |
 
 ## What is open source
 

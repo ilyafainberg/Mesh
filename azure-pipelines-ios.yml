@@ -27,12 +27,12 @@ parameters:
 - name: version
   displayName: App version
   type: string
-  default: '1.17.0'
+  default: '1.18.1'
 
 - name: buildNumber
   displayName: Apple build number (0 uses the unique Azure Pipeline build ID)
   type: number
-  default: 64
+  default: 66
 
 - name: pushTestFlight
   displayName: Validate and upload to TestFlight
@@ -42,7 +42,7 @@ parameters:
 variables:
   # Keep the .NET iOS workload and Xcode versions aligned. Do not let workload
   # install update to a newer manifest that requires an Xcode absent from the image.
-  DOTNET_VERSION: '10.0.302'
+  DOTNET_VERSION: '10.0.303'
   XCODE_PATH: '/Applications/Xcode_26.0.1.app/Contents/Developer'
 
 pool:

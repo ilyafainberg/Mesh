@@ -1111,6 +1111,47 @@ public sealed class OnlineReplicationFoundationTests
         }
     }
 
+    [TestMethod]
+    public void DatabaseUpgrade_From117Outbox_PreservesRowsAndCreatesNotificationIndex()
+    {
+        CreateVersion117Database();
+
+        using (var db = MeshDb.Open(databasePath, key))
+            Assert.IsNotNull(db.LoadProfile(), "The existing profile must remain loadable after migration.");
+
+        var columns = PragmaColumns("replication_outbox");
+        CollectionAssert.Contains(columns, "notification_worthy");
+        CollectionAssert.Contains(columns, "notification_id");
+
+        using (var conn = OpenRawConnection())
+        {
+            using var row = conn.CreateCommand();
+            row.CommandText = """
+                SELECT state, attempts, last_error, notification_worthy, notification_id
+                FROM replication_outbox
+                WHERE event_id = 'legacy-event' AND target_account = 'alice';
+                """;
+            using var reader = row.ExecuteReader();
+            Assert.IsTrue(reader.Read(), "The pre-existing outbox row must survive migration.");
+            Assert.AreEqual("pending", reader.GetString(0));
+            Assert.AreEqual(2L, reader.GetInt64(1));
+            Assert.AreEqual("offline", reader.GetString(2));
+            Assert.AreEqual(0L, reader.GetInt64(3));
+            Assert.IsTrue(reader.IsDBNull(4));
+
+            using var index = conn.CreateCommand();
+            index.CommandText = """
+                SELECT COUNT(*)
+                FROM sqlite_master
+                WHERE type = 'index' AND name = 'ix_replication_outbox_notification';
+                """;
+            Assert.AreEqual(1L, Convert.ToInt64(index.ExecuteScalar()));
+        }
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        Assert.IsNotNull(reopened.LoadProfile(), "Reopening the migrated database must be idempotent.");
+    }
+
     // ==================================================================
     // O. Central-storage invariant contract.
     // ==================================================================
@@ -1156,20 +1197,49 @@ public sealed class OnlineReplicationFoundationTests
 
     // ------------------------------------------------------------------
 
+    private void CreateVersion117Database()
+    {
+        using var conn = OpenRawConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            CREATE TABLE profile(id INTEGER PRIMARY KEY CHECK(id = 1), json TEXT NOT NULL);
+            INSERT INTO profile(id, json) VALUES(1, '{}');
+
+            CREATE TABLE replication_outbox(
+                event_id TEXT NOT NULL,
+                target_account TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                offered_at TEXT,
+                last_attempt_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                PRIMARY KEY(event_id, target_account));
+
+            INSERT INTO replication_outbox(
+                event_id, target_account, state, attempts, last_error)
+            VALUES('legacy-event', 'alice', 'pending', 2, 'offline');
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
+    private SqliteConnection OpenRawConnection()
+    {
+        SQLitePCL.Batteries_V2.Init();
+        var builder = new SqliteConnectionStringBuilder { DataSource = databasePath };
+        var conn = new SqliteConnection(builder.ToString());
+        conn.Open();
+        using var keyCmd = conn.CreateCommand();
+        keyCmd.CommandText = $"PRAGMA key = \"x'{Convert.ToHexString(key)}'\";";
+        keyCmd.ExecuteNonQuery();
+        return conn;
+    }
+
     private List<string> PragmaColumns(string table)
     {
         // The database file is the source of truth; read the schema back through a fresh
         // connection so the assertion is behavioural rather than reflective.
-        SQLitePCL.Batteries_V2.Init();
         var columns = new List<string>();
-        var builder = new SqliteConnectionStringBuilder { DataSource = databasePath };
-        using var conn = new SqliteConnection(builder.ToString());
-        conn.Open();
-        using (var keyCmd = conn.CreateCommand())
-        {
-            keyCmd.CommandText = $"PRAGMA key = \"x'{Convert.ToHexString(key)}'\";";
-            keyCmd.ExecuteNonQuery();
-        }
+        using var conn = OpenRawConnection();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = $"PRAGMA table_info({table});";
         using var r = cmd.ExecuteReader();

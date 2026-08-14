@@ -145,7 +145,13 @@ public sealed partial class AppState : IMemoryState
             }
             Profile = new MeshProfile();
         }
-        catch { Profile = new MeshProfile(); activeId = null; activeDb = null; }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("account-load", ex);
+            Profile = new MeshProfile();
+            activeId = null;
+            activeDb = null;
+        }
     }
 
     // Restore the in-memory unread set from the persisted profile (survives restarts).
@@ -2270,7 +2276,12 @@ public sealed partial class AppState : IMemoryState
             NotifyChanged();
             return true;
         }
-        catch { db?.Dispose(); return false; }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("account-switch", ex);
+            db?.Dispose();
+            return false;
+        }
     }
 
     /// <summary>Permanently remove a saved identity: its database file and its master key.</summary>
