@@ -10,11 +10,29 @@ namespace Mesh.App.Tests;
 public sealed class ReliableSynchronizationPolicyTests
 {
     [TestMethod]
-    public void ConnectionPurpose_BackgroundWakeBypassesOnlyForegroundGuard()
+    public void ConnectionPurpose_BackgroundWakeBypassesOnlyContinuousTransportGuard()
     {
-        Assert.IsFalse(ConnectionPurposePolicy.AllowsConnection(ConnectionPurpose.Foreground, isForeground: false));
-        Assert.IsTrue(ConnectionPurposePolicy.AllowsConnection(ConnectionPurpose.Foreground, isForeground: true));
-        Assert.IsTrue(ConnectionPurposePolicy.AllowsConnection(ConnectionPurpose.BackgroundWake, isForeground: false));
+        Assert.IsFalse(ConnectionPurposePolicy.AllowsConnection(
+            ConnectionPurpose.Foreground, isForeground: false, isMobile: true, isHeadless: false));
+        Assert.IsTrue(ConnectionPurposePolicy.AllowsConnection(
+            ConnectionPurpose.Foreground, isForeground: true, isMobile: true, isHeadless: false));
+        Assert.IsTrue(ConnectionPurposePolicy.AllowsConnection(
+            ConnectionPurpose.Foreground, isForeground: false, isMobile: false, isHeadless: false));
+        Assert.IsTrue(ConnectionPurposePolicy.AllowsConnection(
+            ConnectionPurpose.Foreground, isForeground: false, isMobile: true, isHeadless: true));
+        Assert.IsTrue(ConnectionPurposePolicy.AllowsConnection(
+            ConnectionPurpose.BackgroundWake, isForeground: false, isMobile: true, isHeadless: false));
+    }
+
+    [TestMethod]
+    public void ContinuousTransport_DesktopDeactivationAndHeadlessModeStayConnected()
+    {
+        Assert.IsTrue(ContinuousTransportPolicy.ShouldRun(
+            isMobile: false, isForeground: false, isHeadless: false));
+        Assert.IsTrue(ContinuousTransportPolicy.ShouldRun(
+            isMobile: false, isForeground: false, isHeadless: true));
+        Assert.IsFalse(ContinuousTransportPolicy.ShouldRun(
+            isMobile: true, isForeground: false, isHeadless: false));
     }
 
     [TestMethod]

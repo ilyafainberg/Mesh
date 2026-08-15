@@ -93,6 +93,44 @@ public sealed class OnlineReplicationRuntimeTests
         }
     }
 
+    private sealed class BlockingTransport : IReplicationTransport
+    {
+        public TaskCompletionSource<bool> Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<OnlineRelaySendResult> SendAsync(OnlineRelayFrame frame, CancellationToken ct)
+        {
+            Entered.TrySetResult(true);
+            await Release.Task.ConfigureAwait(false);
+            return new OnlineRelaySendResult(true, OnlineRelaySendCodes.Delivered);
+        }
+
+        public Task<OnlineWakeResult> WakeAsync(OnlineWakeRequest request, CancellationToken ct)
+            => Task.FromResult(new OnlineWakeResult(true, OnlineWakeCodes.Accepted));
+    }
+
+    private sealed class BlockingMetadataSource(HandleInfo handle) : IReplicationMetadataSource
+    {
+        public TaskCompletionSource<bool> Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<HandleInfo?> FetchHandleAsync(string requestedHandle, CancellationToken ct)
+        {
+            Entered.TrySetResult(true);
+            await Release.Task.ConfigureAwait(false);
+            return handle;
+        }
+
+        public Task<IReadOnlyList<RelayHandlePresence>> ResolvePresenceAsync(
+            IReadOnlyList<string> handles,
+            CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<RelayHandlePresence>>(Array.Empty<RelayHandlePresence>());
+    }
+
     private sealed class FakeMetadataSource : IReplicationMetadataSource
     {
         private readonly object gate = new();
@@ -201,6 +239,66 @@ public sealed class OnlineReplicationRuntimeTests
     // =====================================================================
     // Connect canonical parity with the REAL relay hub (production fix).
     // =====================================================================
+
+    [TestMethod]
+    public async Task Engine_DisposeWaitsForActivePeerOperationBeforeDisposingItsGate()
+    {
+        var mine = KeyPair.New();
+        var peer = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var peerDevice = DeviceProtocol.DeviceId(peer.PublicB64);
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        roster.Add(new ReplicationDevice("alice", peerDevice, peer.PublicB64, 0, false));
+        var transport = new BlockingTransport();
+        var engine = NewEngine("alice", myDevice, roster, transport, mine);
+
+        var operation = engine.StartSessionAsync("alice", peerDevice);
+        await transport.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var dispose = engine.DisposeAsync().AsTask();
+        await Task.Delay(50);
+        Assert.IsFalse(dispose.IsCompleted, "disposal must drain the active peer operation");
+
+        transport.Release.TrySetResult(true);
+        await Task.WhenAll(operation, dispose).WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [TestMethod]
+    public async Task Poller_DisposeAsyncWaitsForInFlightPollBeforeCompleting()
+    {
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var source = new BlockingMetadataSource(Dir("alice", 0, "", mine.PublicB64));
+        var roster = new RelayReplicationRoster(
+            source,
+            "alice",
+            ownAuthGeneration: 0,
+            ownCustodyHead: "",
+            localCustodyHead: _ => "",
+            surface: _ => { },
+            onOwnAuthorityChanged: () => { });
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var poller = new ReplicationPresencePoller(
+            engine,
+            roster,
+            source,
+            candidateHandles: () => new[] { "alice" },
+            hasDueOutbox: _ => false,
+            ownHandle: "alice",
+            ownDevice: myDevice,
+            surface: _ => { });
+
+        poller.Start();
+        await source.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var dispose = poller.DisposeAsync().AsTask();
+        await Task.Delay(50);
+        Assert.IsFalse(dispose.IsCompleted, "disposal must wait for the active poll iteration");
+
+        source.Release.TrySetResult(true);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(2));
+    }
 
     [TestMethod]
     public void Canonical_Matches_Relay_ForGenesisAuthority()

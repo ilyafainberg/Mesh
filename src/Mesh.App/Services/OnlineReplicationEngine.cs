@@ -179,6 +179,11 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     private readonly ConcurrentDictionary<string, PeerSession> sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> haltedOrigins = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource lifetime = new();
+    private readonly object disposalGate = new();
+    private Task? disposeTask;
+    private TaskCompletionSource<bool>? peerOperationsDrained;
+    private int activePeerOperations;
+    private bool disposed;
     private readonly object activityGate = new();
     private TaskCompletionSource<bool> activitySignal = NewActivitySignal();
     private long activityVersion;
@@ -267,10 +272,10 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     }
 
     public Task OfferPeerAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
-        => WithPeerLock(peerDevice, async () =>
+        => WithPeerLock(peerDevice, async operationCt =>
         {
             if (sessions.TryGetValue(peerDevice, out var session) && session.Established)
-                await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, ct).ConfigureAwait(false);
+                await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, operationCt).ConfigureAwait(false);
         }, ct);
 
     internal void ReportBootstrapActivity(
@@ -337,10 +342,10 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
     /// <summary>Opens a replication session by sending a signed session init to the peer.</summary>
     public Task StartSessionAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
-        => WithPeerLock(peerDevice, async () =>
+        => WithPeerLock(peerDevice, async operationCt =>
         {
             if (!ShouldStartSession(peerDevice, DateTimeOffset.UtcNow)) return;
-            await SendSessionInitAsync(peerHandle, peerDevice, ct).ConfigureAwait(false);
+            await SendSessionInitAsync(peerHandle, peerDevice, operationCt).ConfigureAwait(false);
         }, ct);
 
     /// <summary>
@@ -356,11 +361,11 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     /// local until the peer reconnects and receipts.
     /// </summary>
     public Task OnWakeAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
-        => WithPeerLock(peerDevice, async () =>
+        => WithPeerLock(peerDevice, async operationCt =>
         {
             if (sessions.TryGetValue(peerDevice, out var session) && session.Established)
             {
-                await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Silent, ct).ConfigureAwait(false);
+                await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Silent, operationCt).ConfigureAwait(false);
                 return;
             }
 
@@ -379,7 +384,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 return;
             }
 
-            var result = await transport.WakeAsync(request, ct).ConfigureAwait(false);
+            var result = await transport.WakeAsync(request, operationCt).ConfigureAwait(false);
             ObserveActivity(new ReplicationEngineActivity(
                 result.Accepted ? "wake.requested" : "wake.rejected",
                 peerHandle, peerDevice, ErrorCode: result.Accepted ? null : result.Code));
@@ -420,7 +425,8 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     public Task HandleDeliveryAsync(OnlineRelayDelivery delivery, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(delivery);
-        return WithPeerLock(delivery.FromDevice, () => DispatchAsync(delivery, ct), ct);
+        return WithPeerLock(
+            delivery.FromDevice, operationCt => DispatchAsync(delivery, operationCt), ct);
     }
 
     private async Task DispatchAsync(OnlineRelayDelivery delivery, CancellationToken ct)
@@ -1112,25 +1118,85 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         StateChanged?.Invoke(new ReplicationStateChange("", reason, error));
     }
 
-    private async Task WithPeerLock(string peerDevice, Func<Task> body, CancellationToken ct)
+    private async Task WithPeerLock(
+        string peerDevice,
+        Func<CancellationToken, Task> body,
+        CancellationToken ct)
     {
-        var gate = peerLocks.GetOrAdd(peerDevice, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(ct).ConfigureAwait(false);
-        try { await body().ConfigureAwait(false); }
-        finally { gate.Release(); }
+        SemaphoreSlim gate;
+        lock (disposalGate)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(OnlineReplicationEngine));
+            activePeerOperations++;
+            gate = peerLocks.GetOrAdd(peerDevice, _ => new SemaphoreSlim(1, 1));
+        }
+
+        var entered = false;
+        try
+        {
+            using var operation = CancellationTokenSource.CreateLinkedTokenSource(ct, lifetime.Token);
+            await gate.WaitAsync(operation.Token).ConfigureAwait(false);
+            entered = true;
+            await body(operation.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (entered) gate.Release();
+            ExitPeerOperation();
+        }
     }
 
-    private bool disposed;
+    private void ExitPeerOperation()
+    {
+        TaskCompletionSource<bool>? drained = null;
+        lock (disposalGate)
+        {
+            activePeerOperations--;
+            if (disposed && activePeerOperations == 0)
+                drained = peerOperationsDrained;
+        }
+        drained?.TrySetResult(true);
+    }
 
     public ValueTask DisposeAsync()
     {
-        if (disposed) return ValueTask.CompletedTask;
-        disposed = true;
-        lifetime.Cancel();
-        lifetime.Dispose();
-        lock (activityGate) activitySignal.TrySetCanceled();
-        foreach (var gate in peerLocks.Values) gate.Dispose();
-        return ValueTask.CompletedTask;
+        Task task;
+        Task drain;
+        TaskCompletionSource<bool> completion;
+        lock (disposalGate)
+        {
+            if (disposeTask is not null) return new ValueTask(disposeTask);
+
+            disposed = true;
+            drain = activePeerOperations == 0
+                ? Task.CompletedTask
+                : (peerOperationsDrained ??= new TaskCompletionSource<bool>(
+                    TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            completion = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            task = completion.Task;
+            disposeTask = task;
+        }
+
+        _ = CompleteDisposeAsync(drain, completion);
+        return new ValueTask(task);
+    }
+
+    private async Task CompleteDisposeAsync(Task drain, TaskCompletionSource<bool> completion)
+    {
+        try
+        {
+            lifetime.Cancel();
+            lock (activityGate) activitySignal.TrySetCanceled();
+            await drain.ConfigureAwait(false);
+            foreach (var gate in peerLocks.Values) gate.Dispose();
+            lifetime.Dispose();
+            completion.TrySetResult(true);
+        }
+        catch (Exception ex)
+        {
+            completion.TrySetException(ex);
+        }
     }
 
     private sealed class PeerSession(string peerHandle, string peerDevice, string sessionId, string localNonce)
@@ -1442,7 +1508,7 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
 /// and jitter; when idle it falls back to a slow interval (~20s). Pausing (background) stops the
 /// continuous loop; resuming (foreground) restarts it with an immediate poll.
 /// </summary>
-public sealed class ReplicationPresencePoller : IDisposable
+public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
 {
     private static readonly TimeSpan PendingInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan IdleInterval = TimeSpan.FromSeconds(20);
@@ -1466,6 +1532,8 @@ public sealed class ReplicationPresencePoller : IDisposable
     private Task? loopTask;
     private TaskCompletionSource<bool>? poke;
     private readonly Dictionary<string, DateTimeOffset> offlineWakes = new(StringComparer.Ordinal);
+    private Task? disposeTask;
+    private bool runningRequested;
     private int backoffStep;
     private volatile bool onlineAuthorizedPeer;
     private volatile bool immediatelyDeliverableWork;
@@ -1508,11 +1576,39 @@ public sealed class ReplicationPresencePoller : IDisposable
         lock (gate)
         {
             if (disposed) return;
-            if (loopTask is { IsCompleted: false }) return;
-            loopCts = new CancellationTokenSource();
-            poke = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            backoffStep = 0;
-            loopTask = Task.Run(() => RunAsync(loopCts.Token));
+            runningRequested = true;
+            StartLoopUnderLock();
+        }
+    }
+
+    private void StartLoopUnderLock()
+    {
+        if (disposed || loopTask is { IsCompleted: false }) return;
+        var cts = new CancellationTokenSource();
+        loopCts = cts;
+        poke = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        backoffStep = 0;
+        loopTask = Task.Run(() => RunOwnedLoopAsync(cts));
+    }
+
+    private async Task RunOwnedLoopAsync(CancellationTokenSource owner)
+    {
+        try
+        {
+            await RunAsync(owner.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (gate)
+            {
+                if (ReferenceEquals(loopCts, owner))
+                {
+                    loopCts = null;
+                    loopTask = null;
+                }
+                owner.Dispose();
+                if (runningRequested && !disposed) StartLoopUnderLock();
+            }
         }
     }
 
@@ -1525,12 +1621,10 @@ public sealed class ReplicationPresencePoller : IDisposable
         CancellationTokenSource? cts;
         lock (gate)
         {
+            runningRequested = false;
             cts = loopCts;
-            loopCts = null;
-            loopTask = null;
         }
-        try { cts?.Cancel(); } catch { }
-        cts?.Dispose();
+        try { cts?.Cancel(); } catch (ObjectDisposedException) { }
     }
 
     /// <summary>Requests an immediate poll on the next loop iteration.</summary>
@@ -1752,17 +1846,46 @@ public sealed class ReplicationPresencePoller : IDisposable
     }
 
     public void Dispose()
+        => DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    public ValueTask DisposeAsync()
     {
+        Task task;
+        Task? loop;
         CancellationTokenSource? cts;
+        TaskCompletionSource<bool> completion;
         lock (gate)
         {
-            if (disposed) return;
+            if (disposeTask is not null) return new ValueTask(disposeTask);
             disposed = true;
+            runningRequested = false;
             cts = loopCts;
-            loopCts = null;
-            loopTask = null;
+            loop = loopTask;
+            completion = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            task = completion.Task;
+            disposeTask = task;
         }
-        try { cts?.Cancel(); } catch { }
-        cts?.Dispose();
+
+        _ = CompleteDisposeAsync(cts, loop, completion);
+        return new ValueTask(task);
+    }
+
+    private static async Task CompleteDisposeAsync(
+        CancellationTokenSource? cts,
+        Task? loop,
+        TaskCompletionSource<bool> completion)
+    {
+        try
+        {
+            try { cts?.Cancel(); }
+            catch (ObjectDisposedException) { }
+            if (loop is not null) await loop.ConfigureAwait(false);
+            completion.TrySetResult(true);
+        }
+        catch (Exception ex)
+        {
+            completion.TrySetException(ex);
+        }
     }
 }

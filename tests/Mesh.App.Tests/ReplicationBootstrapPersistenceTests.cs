@@ -171,6 +171,56 @@ public sealed class ReplicationBootstrapPersistenceTests
     }
 
     [TestMethod]
+    public void BootstrapReceipt_StalledAt25PersistsAfterReceiptReachesBoundary()
+    {
+        var envelopes = CreateEnvelopes(30);
+        var snapshot = JsonSerializer.Serialize(envelopes);
+        const string bootstrapId = "receipt-25-recovery";
+
+        using var db = OpenDb();
+        var journal = OpenJournal(db);
+        db.CreateOrResumePeerBootstrap(target, bootstrapId, Hash(snapshot), snapshot, envelopes.Count);
+        journal.EmitLocalBatch(
+            envelopes,
+            new[] { "alice" },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, index) =>
+            {
+                if (index == envelopes.Count - 1)
+                    db.UpdatePeerBootstrapProgress(
+                        target, bootstrapId, envelopes.Count, envelopes.Count, evt.Seq, tx);
+            });
+
+        var marker = db.GetPeerBootstrap(target)!;
+        Assert.AreEqual(30UL, marker.BootstrapThroughSeq);
+        Assert.AreEqual(MeshDb.BootstrapStateEmitted, marker.State);
+
+        var stalledReceipt = OnlineReplicationProtocol.CreateReceipt(
+            target.PeerDeviceId,
+            identity.DeviceId,
+            identity.LogEpoch,
+            25,
+            Hash("cursor-25"),
+            Hash("batch-25"),
+            peerKeys.PrivateB64);
+        Assert.AreEqual(25, db.MarkOutboxPersistedFromReceipt(stalledReceipt, peerKeys.PublicB64, "alice"));
+        Assert.AreEqual(MeshDb.BootstrapStateEmitted, db.GetPeerBootstrap(target)!.State);
+
+        var completedReceipt = OnlineReplicationProtocol.CreateReceipt(
+            target.PeerDeviceId,
+            identity.DeviceId,
+            identity.LogEpoch,
+            marker.BootstrapThroughSeq,
+            Hash("cursor-30"),
+            Hash("batch-30"),
+            peerKeys.PrivateB64);
+        Assert.AreEqual(5, db.MarkOutboxPersistedFromReceipt(completedReceipt, peerKeys.PublicB64, "alice"));
+        marker = db.GetPeerBootstrap(target)!;
+        Assert.AreEqual(MeshDb.BootstrapStatePersisted, marker.State);
+        Assert.IsNotNull(marker.CompletedAt);
+    }
+
+    [TestMethod]
     public void BootstrapIdentityChanges_CreateIndependentOrResetMarkers()
     {
         const string snapshot = "[]";

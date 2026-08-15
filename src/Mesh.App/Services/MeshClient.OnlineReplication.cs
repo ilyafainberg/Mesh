@@ -17,7 +17,7 @@ namespace Mesh.App.Services;
 ///    thread, constructs the relay-backed roster, starts the engine through
 ///    <see cref="AppState.TryStartOnlineReplication"/> (which also attaches the concrete inbound
 ///    projection), and starts the bounded presence poller.
-///  * <see cref="StopReplication"/> tears the engine, roster and poller down on disconnect, sign-out
+///  * <see cref="StopReplicationAsync"/> tears the engine, roster and poller down on disconnect, sign-out
 ///    or account switch, so peer sessions never outlive the identity they were established under.
 ///
 /// There is no durable relay queue here: sending is a single opaque <c>Relay</c> invocation, and an
@@ -32,6 +32,9 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
     private volatile RelayReplicationRoster? replicationRoster;
     private volatile ReplicationPresencePoller? replicationPoller;
     private readonly SemaphoreSlim replicationArmGate = new(1, 1);
+    private readonly object replicationLifecycleGate = new();
+    private Task replicationTeardown = Task.CompletedTask;
+    private long replicationLifecycleVersion;
 
     // The relay authority this connection bound at connect time (from this handle's own directory
     // entry). The Challenge handler rebuilds the exact canonical connect string from these so the
@@ -163,14 +166,26 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
     /// </summary>
     internal async Task ArmReplicationAsync(CancellationToken ct = default)
     {
-        if (replicationEngine is not null) return;
-        var connection = hub;
-        if (connection is null || connection.State != HubConnectionState.Connected || !authenticated) return;
-
         await replicationArmGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (replicationEngine is not null) return;
+            Task teardown;
+            long lifecycleVersion;
+            lock (replicationLifecycleGate)
+            {
+                if (replicationEngine is not null) return;
+                teardown = replicationTeardown;
+                lifecycleVersion = replicationLifecycleVersion;
+            }
+
+            await teardown.WaitAsync(ct).ConfigureAwait(false);
+
+            var connection = hub;
+            if (connection is null || connection.State != HubConnectionState.Connected || !authenticated) return;
+            lock (replicationLifecycleGate)
+            {
+                if (lifecycleVersion != replicationLifecycleVersion || replicationEngine is not null) return;
+            }
 
             var ownHandle = AppState.Norm(state.Profile.Handle);
             if (ownHandle.Length == 0) return;
@@ -182,7 +197,6 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                     "The relay did not return this handle's directory entry; cannot establish custody authority.");
 
             var identity = state.BuildReplicationIdentity(own.AuthGeneration, own.CustodyHead);
-
             var roster = new RelayReplicationRoster(
                 source,
                 ownHandle,
@@ -190,43 +204,56 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                 identity.CustodyHead,
                 localCustodyHead: state.LocalCustodyHead,
                 surface: reason => Log?.Invoke($"replication roster: {reason}"),
-                onOwnAuthorityChanged: () => TrackBackground(ReArmReplicationAsync(), "replication re-arm"));
+                onOwnAuthorityChanged: () => TrackBackground(
+                    ReArmReplicationAsync("authority-changed"), "replication re-arm"));
 
-            var engine = state.TryStartOnlineReplication(this, roster, identity);
-            if (engine is null)
-                throw new OnlineReplicationError("No account database is open; replication cannot start.");
+            lock (replicationLifecycleGate)
+            {
+                if (lifecycleVersion != replicationLifecycleVersion
+                    || replicationEngine is not null
+                    || !ReferenceEquals(hub, connection)
+                    || connection.State != HubConnectionState.Connected
+                    || !authenticated
+                    || !string.Equals(AppState.Norm(state.Profile.Handle), ownHandle, StringComparison.Ordinal))
+                    return;
 
-            replicationRoster = roster;
-            replicationEngine = engine;
-            engine.LocalWorkPending += OnReplicationLocalWorkPending;
-            engine.Activity += OnReplicationEngineActivity;
+                var engine = state.TryStartOnlineReplication(this, roster, identity);
+                if (engine is null)
+                    throw new OnlineReplicationError("No account database is open; replication cannot start.");
 
-            var poller = new ReplicationPresencePoller(
-                engine,
-                roster,
-                source,
-                candidateHandles: state.ReplicationPeerCandidates,
-                hasDueOutbox: state.HasDueOutbox,
-                ownHandle: ownHandle,
-                ownDevice: identity.DeviceId,
-                surface: reason => TraceTransport("replication-poll", reason),
-                bootstrapPeer: state.EmitOwnerBootstrapSnapshotAsync,
-                pollCompleted: OnReplicationPresencePollCompleted);
-            replicationPoller = poller;
-            if (lifecycle.IsForeground) poller.Start();
+                replicationRoster = roster;
+                replicationEngine = engine;
+                engine.LocalWorkPending += OnReplicationLocalWorkPending;
+                engine.Activity += OnReplicationEngineActivity;
+
+                var poller = new ReplicationPresencePoller(
+                    engine,
+                    roster,
+                    source,
+                    candidateHandles: state.ReplicationPeerCandidates,
+                    hasDueOutbox: state.HasDueOutbox,
+                    ownHandle: ownHandle,
+                    ownDevice: identity.DeviceId,
+                    surface: reason => TraceTransport("replication-poll", reason),
+                    bootstrapPeer: state.EmitOwnerBootstrapSnapshotAsync,
+                    pollCompleted: OnReplicationPresencePollCompleted);
+                replicationPoller = poller;
+                if (ShouldMaintainContinuousTransport) poller.Start();
+            }
+
             RefreshReplicationStatus();
             TraceTransport("replication-armed", $"handle={ownHandle}; device={identity.DeviceId}");
         }
         catch (OnlineReplicationError ex)
         {
             TraceTransport("replication-arm-rejected", ex.Message);
-            StopReplication();
+            await StopReplicationAsync("arm-rejected").ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             TraceTransport("replication-arm-failed", ex.Message);
-            StopReplication();
+            await StopReplicationAsync("arm-failed").ConfigureAwait(false);
         }
         finally
         {
@@ -234,34 +261,60 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
         }
     }
 
-    /// <summary>Tears replication down and re-arms it (used when this handle's authority changes).</summary>
-    private async Task ReArmReplicationAsync()
+    /// <summary>Tears replication down and re-arms it when this handle's authority changes.</summary>
+    private async Task ReArmReplicationAsync(string reason)
     {
-        StopReplication();
+        TraceTransport("replication-rearm", $"reason={reason}");
+        await StopReplicationAsync(reason).ConfigureAwait(false);
         await ArmReplicationAsync().ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Stops the presence poller, detaches and disposes the engine, and clears the roster cache.
-    /// Idempotent; safe to call from disconnect, sign-out and account switch.
+    /// Stops the presence poller, detaches the engine, and returns the task that drains and disposes it.
+    /// New engines wait for that task, so sessions from different engine generations cannot overlap.
     /// </summary>
-    internal void StopReplication()
+    internal Task StopReplicationAsync(string reason)
     {
-        var poller = replicationPoller;
-        replicationPoller = null;
-        poller?.Dispose();
-
-        var attached = replicationEngine;
-        if (attached is not null)
+        Task teardown;
+        bool hadEngine;
+        bool hadPoller;
+        lock (replicationLifecycleGate)
         {
-            attached.LocalWorkPending -= OnReplicationLocalWorkPending;
-            attached.Activity -= OnReplicationEngineActivity;
+            replicationLifecycleVersion++;
+
+            var poller = replicationPoller;
+            replicationPoller = null;
+            hadPoller = poller is not null;
+            var pollerDispose = poller?.DisposeAsync().AsTask() ?? Task.CompletedTask;
+
+            var attached = replicationEngine;
+            replicationEngine = null;
+            if (attached is not null)
+            {
+                attached.LocalWorkPending -= OnReplicationLocalWorkPending;
+                attached.Activity -= OnReplicationEngineActivity;
+            }
+
+            replicationRoster = null;
+            var engine = state.DetachReplicationEngine() ?? attached;
+            hadEngine = engine is not null;
+            var engineDispose = engine?.DisposeAsync().AsTask() ?? Task.CompletedTask;
+            if (hadPoller || hadEngine)
+                replicationTeardown = Task.WhenAll(replicationTeardown, pollerDispose, engineDispose);
+            teardown = replicationTeardown;
         }
-        var engine = state.DetachReplicationEngine();
-        replicationEngine = null;
-        replicationRoster = null;
-        if (engine is not null)
-            TrackBackground(engine.DisposeAsync().AsTask(), "replication engine dispose");
+
+        TraceTransport(
+            "replication-stopped",
+            $"reason={reason}; engine={hadEngine}; poller={hadPoller}");
+        return teardown;
+    }
+
+    internal void StopReplication(string reason)
+    {
+        var teardown = StopReplicationAsync(reason);
+        if (!teardown.IsCompletedSuccessfully)
+            TrackBackground(teardown, $"replication stop ({reason})");
     }
 
     private void OnReplicationLocalWorkPending()
@@ -279,15 +332,14 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
     }
 
     /// <summary>
-    /// Foreground/background lifecycle for the poller (spec item 8). Foreground resumes continuous
-    /// polling; background stops continuous polling (the transport itself is also suspended in the
-    /// background, so no frames flow). Subscribed from the constructor start hook.
+    /// Mobile backgrounding pauses continuous polling. Desktop, tray, and headless instances retain
+    /// polling even when their window is deactivated or hidden.
     /// </summary>
     private void OnReplicationForegroundChanged(bool isForeground)
     {
         var poller = replicationPoller;
         if (poller is null) return;
-        if (isForeground) poller.Resume();
+        if (isForeground || ShouldMaintainContinuousTransport) poller.Resume();
         else poller.Pause();
     }
 

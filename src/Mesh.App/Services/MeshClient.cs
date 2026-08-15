@@ -85,7 +85,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     private void OnActiveAccountChanging()
     {
         var pushIdentity = CapturePushUnregistrationIdentity();
-        StopReplication();
+        StopReplicationAsync("active-account-changing").GetAwaiter().GetResult();
         Volatile.Write(ref registeredPushIdentity, null);
         if (pushIdentity is not null)
             TrackBackground(
@@ -400,7 +400,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         if (purpose == ConnectionPurpose.Foreground)
         {
             wantConnected = true;
-            if (!lifecycle.IsForeground)
+            if (!ShouldMaintainContinuousTransport)
                 return new ReplicationConnectionLease(purpose, isConnected: false);
         }
 
@@ -523,7 +523,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         bool allowPromotion)
     {
         if (leasedConnection is null || !ReferenceEquals(hub, leasedConnection)) return;
-        if (allowPromotion && lifecycle.IsForeground)
+        if (allowPromotion && ShouldMaintainContinuousTransport)
         {
             wantConnected = true;
             replicationPoller?.Resume();
@@ -536,7 +536,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
 
         await DisconnectCoreAsync(
             clearConnectionIntent: false,
-            timeout: WakeDisconnectTimeout).ConfigureAwait(false);
+            timeout: WakeDisconnectTimeout,
+            replicationStopReason: "background-wake-release").ConfigureAwait(false);
     }
 
     private async Task ConnectCoreAsync(ConnectionPurpose purpose, CancellationToken ct)
@@ -545,19 +546,28 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         if (string.IsNullOrWhiteSpace(requestedProfile.Handle)
             || string.IsNullOrWhiteSpace(requestedProfile.RelayUrl)) return;
         if (purpose == ConnectionPurpose.Foreground) wantConnected = true;
-        if (!ConnectionPurposePolicy.AllowsConnection(purpose, lifecycle.IsForeground)) return;
+        if (!ConnectionPurposePolicy.AllowsConnection(
+                purpose,
+                lifecycle.IsForeground,
+                PlatformCaps.IsMobile,
+                MeshProcessContext.IsHeadless)) return;
 
         await connectionGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             await DisconnectCoreAsync(
                 clearConnectionIntent: false,
-                timeout: purpose == ConnectionPurpose.BackgroundWake ? WakeDisconnectTimeout : null)
+                timeout: purpose == ConnectionPurpose.BackgroundWake ? WakeDisconnectTimeout : null,
+                replicationStopReason: "connection-replacement")
                 .ConfigureAwait(false);
             var p = state.Profile;
             if (string.IsNullOrWhiteSpace(p.Handle) || string.IsNullOrWhiteSpace(p.RelayUrl)) return;
             if (purpose == ConnectionPurpose.Foreground) wantConnected = true;
-            if (!ConnectionPurposePolicy.AllowsConnection(purpose, lifecycle.IsForeground)) return;
+            if (!ConnectionPurposePolicy.AllowsConnection(
+                    purpose,
+                    lifecycle.IsForeground,
+                    PlatformCaps.IsMobile,
+                    MeshProcessContext.IsHeadless)) return;
             if (!await DetectRelayCapabilitiesAsync(p.RelayUrl, ct).ConfigureAwait(false))
             {
                 StateChanged?.Invoke();
@@ -644,7 +654,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 Log?.Invoke("hub connected + authenticated");
                 authenticationReady.TrySetResult(true);
                 StateChanged?.Invoke();
-                if (lifecycle.IsForeground)
+                if (ShouldMaintainContinuousTransport)
                 {
                     TryRegisterPushToken();
                     if (identity is not null)
@@ -653,9 +663,9 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                         TrackBackground(MaintainOnlineDeliveryAsync(identity), "durable delivery maintenance");
                     }
                 }
-                // Foreground connects arm asynchronously. A background wake is armed by its bounded
-                // EnsureConnectedAsync call so it cannot leave an unbounded duplicate task behind.
-                if (lifecycle.IsForeground)
+                // Continuous desktop/mobile-foreground connects arm asynchronously. A background wake is
+                // armed by its bounded EnsureConnectedAsync call so it cannot leave a duplicate task behind.
+                if (ShouldMaintainContinuousTransport)
                     TrackBackground(ArmReplicationAsync(), "online replication arm");
             });
 
@@ -837,7 +847,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         {
             await Task.Delay(TimeSpan.FromSeconds(12));
             if (!ReferenceEquals(hub, connection)) return; // superseded by a newer connection
-            if (wantConnected && lifecycle.IsForeground
+            if (wantConnected && ShouldMaintainContinuousTransport
                 && !authenticated && connection.State == HubConnectionState.Connected)
             {
                 Log?.Invoke("auth watchdog: connected but not authenticated, reconnecting");
@@ -855,14 +865,14 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     private void ScheduleRecovery()
     {
         if (MeshProcessContext.IsShuttingDown || Volatile.Read(ref shutdownRequested) != 0
-            || !wantConnected || !lifecycle.IsForeground) return;
+            || !wantConnected || !ShouldMaintainContinuousTransport) return;
         if (Interlocked.Exchange(ref reconnectScheduled, 1) == 1) return;
         TrackBackground(Task.Run(async () =>
         {
             try
             {
                 var delay = TimeSpan.FromSeconds(2);
-                while (wantConnected && lifecycle.IsForeground)
+                while (wantConnected && ShouldMaintainContinuousTransport)
                 {
                     await Task.Delay(delay);
                     if (!wantConnected) break;
@@ -901,7 +911,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             finally
             {
                 Interlocked.Exchange(ref reconnectScheduled, 0);
-                if (wantConnected && lifecycle.IsForeground
+                if (wantConnected && ShouldMaintainContinuousTransport
                     && !Connected && hub?.State == HubConnectionState.Disconnected)
                     ScheduleRecovery();
             }
@@ -3260,7 +3270,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     {
         if (Interlocked.Exchange(ref shutdownRequested, 1) != 0) return;
         wantConnected = false;
-        StopReplication();
+        StopReplication("shutdown");
         foreach (var run in activeTopicRuns.Values)
         {
             try { run.Cancellation.Cancel(); }
@@ -3283,7 +3293,8 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
 
     private async Task DisconnectCoreAsync(
         bool clearConnectionIntent = true,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        string replicationStopReason = "disconnect")
     {
         // Clear intent first on explicit disconnect so the Closed handler cannot trigger recovery.
         if (clearConnectionIntent) wantConnected = false;
@@ -3292,7 +3303,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         connectionAuthentication = null;
         // Tear online replication down before the transport drops so peer sessions and the roster cache
         // never outlive the identity/connection they were established under. It re-arms on next auth.
-        StopReplication();
+        await StopReplicationAsync(replicationStopReason).ConfigureAwait(false);
         authenticatedReplicationConnectionIdentity = null;
         keyCache.Clear();
         keyCacheUpdated.Clear();

@@ -12,10 +12,21 @@ internal enum ConnectionPurpose
     BackgroundWake
 }
 
+internal static class ContinuousTransportPolicy
+{
+    public static bool ShouldRun(bool isMobile, bool isForeground, bool isHeadless)
+        => isHeadless || !isMobile || isForeground;
+}
+
 internal static class ConnectionPurposePolicy
 {
-    public static bool AllowsConnection(ConnectionPurpose purpose, bool isForeground)
-        => purpose == ConnectionPurpose.BackgroundWake || isForeground;
+    public static bool AllowsConnection(
+        ConnectionPurpose purpose,
+        bool isForeground,
+        bool isMobile,
+        bool isHeadless)
+        => purpose == ConnectionPurpose.BackgroundWake
+           || ContinuousTransportPolicy.ShouldRun(isMobile, isForeground, isHeadless);
 }
 
 internal static class WakeQuiescencePolicy

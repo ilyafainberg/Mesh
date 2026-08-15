@@ -12,6 +12,12 @@ public sealed partial class MeshClient
 {
     private static readonly TimeSpan DurableMaintenanceInterval = TimeSpan.FromSeconds(15);
 
+    private bool ShouldMaintainContinuousTransport
+        => ContinuousTransportPolicy.ShouldRun(
+            PlatformCaps.IsMobile,
+            lifecycle.IsForeground,
+            MeshProcessContext.IsHeadless);
+
     private void OnForegroundChanged(bool isForeground)
     {
         if (isForeground)
@@ -21,7 +27,13 @@ public sealed partial class MeshClient
             return;
         }
 
-        TrackBackground(SuspendForegroundTransportAsync(), "foreground transport suspension");
+        if (ShouldMaintainContinuousTransport)
+        {
+            TraceTransport("lifecycle-transport-retained", "desktop-or-headless-background");
+            return;
+        }
+
+        TrackBackground(SuspendForegroundTransportAsync(), "mobile background transport suspension");
     }
 
     private void DrainDeferredTopicRunUpdates()
@@ -47,12 +59,12 @@ public sealed partial class MeshClient
 
     private async Task SuspendForegroundTransportAsync()
     {
-        if (Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
+        if (ShouldMaintainContinuousTransport || Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
         await connectionGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (lifecycle.IsForeground || Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
-            StopReplication();
+            if (ShouldMaintainContinuousTransport || Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
+            await StopReplicationAsync("mobile-background").ConfigureAwait(false);
             var current = hub;
             hub = null;
             authenticated = false;
@@ -82,7 +94,7 @@ public sealed partial class MeshClient
     public void ResumeTransport()
     {
         if (MeshProcessContext.IsShuttingDown
-            || !wantConnected || !lifecycle.IsForeground) return;
+            || !wantConnected || !ShouldMaintainContinuousTransport) return;
         var identity = authenticatedReplicationConnectionIdentity;
         if (identity is not null && Connected && IsCurrentReplicationConnectionIdentity(identity))
         {
@@ -98,7 +110,8 @@ public sealed partial class MeshClient
 
     private void ScheduleOnlineDeliveryRetry()
     {
-        if (!wantConnected || !lifecycle.IsForeground || Interlocked.Exchange(ref onlineRetryScheduled, 1) == 1) return;
+        if (!wantConnected || !ShouldMaintainContinuousTransport
+            || Interlocked.Exchange(ref onlineRetryScheduled, 1) == 1) return;
         TrackBackground(Task.Run(async () =>
         {
             try
@@ -113,7 +126,7 @@ public sealed partial class MeshClient
             finally
             {
                 Interlocked.Exchange(ref onlineRetryScheduled, 0);
-                if (wantConnected && lifecycle.IsForeground && Connected && HasLocalDurableWork())
+                if (wantConnected && ShouldMaintainContinuousTransport && Connected && HasLocalDurableWork())
                     ScheduleOnlineDeliveryRetry();
             }
         }), "durable delivery retry");
@@ -127,7 +140,7 @@ public sealed partial class MeshClient
 
     private async Task MaintainOnlineDeliveryAsync(ReplicationConnectionIdentity identity)
     {
-        while (lifecycle.IsForeground && IsCurrentReplicationConnectionIdentity(identity))
+        while (ShouldMaintainContinuousTransport && IsCurrentReplicationConnectionIdentity(identity))
         {
             await Task.Delay(DurableMaintenanceInterval);
             if (!IsCurrentReplicationConnectionIdentity(identity)) return;
