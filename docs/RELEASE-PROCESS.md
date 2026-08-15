@@ -139,7 +139,7 @@ Expected:
 - JDK 21 and Android SDK for Android
 - Xcode on a supported Mac for iOS and Mac Catalyst
 
-Mesh 1.18.1 uses .NET SDK `10.0.303`. Keep local, pipeline, workload, and Xcode versions aligned.
+Mesh 1.18.2 uses .NET SDK `10.0.303`. Keep local, pipeline, workload, and Xcode versions aligned.
 Do not let workload installation silently select a manifest that requires a newer unavailable Xcode.
 
 ### 5.2 Credential names
