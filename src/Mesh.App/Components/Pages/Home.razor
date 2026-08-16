@@ -68,10 +68,6 @@
         </div>
         <div class="topic-list-scroll">
             <div class="thread-groups">
-                @if (Mesh.ShouldShowReplicationStatus)
-                {
-                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> @Mesh.ReplicationStatusText</div>
-                }
                 @if (PinnedThreads.Count > 0)
                 {
                     <div class="thread-group-label"><i class="bi bi-pin-angle-fill"></i> Pinned</div>
@@ -145,7 +141,7 @@
                     }
                 }
             </div>
-            @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsReplicationActive)
+            @if (State.Profile.OwnThreads.Count == 0)
             {
                 <div class="empty conv-empty">No chats yet. Start one with the + above, or just type below.</div>
             }

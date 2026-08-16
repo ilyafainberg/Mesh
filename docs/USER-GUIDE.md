@@ -62,7 +62,7 @@ A few things to know about handles:
 - One handle can live on **several devices** at once (for example, your laptop and your phone).
 - A handle is tied to a **relay** (see [Core Concepts](#3-core-concepts)). To message someone, you both need to be on the same relay.
 
-When Mesh reconnects for a full linked-device catch-up, the Messages and Me lists show a temporary **More chats are syncing...** row with a spinner. Ordinary live updates arrive silently.
+Linked-device catch-up runs silently, and chat lists remain usable while history arrives.
 
 ### Step 2: Choose a model for your agent
 

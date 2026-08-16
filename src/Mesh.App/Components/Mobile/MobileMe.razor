@@ -38,7 +38,7 @@
             </button>
         </div>
 
-        @if (State.Profile.OwnThreads.Count == 0 && !Mesh.IsReplicationActive)
+        @if (State.Profile.OwnThreads.Count == 0)
         {
             <div class="list-empty">
                 <i class="bi bi-chat-heart"></i>
@@ -49,10 +49,6 @@
         else
         {
             <div class="thread-rows" @ref="threadRowsEl">
-                @if (Mesh.ShouldShowReplicationStatus)
-                {
-                    <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> @Mesh.ReplicationStatusText</div>
-                }
                 @foreach (var section in ThreadSections)
                 {
                     <h3 class="thread-section-title">@section.Label</h3>

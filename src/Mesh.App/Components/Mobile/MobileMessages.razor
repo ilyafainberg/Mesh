@@ -59,10 +59,6 @@
             }
         </div>
         <div class="chat-rows" @ref="chatRowsEl">
-            @if (Mesh.IsReplicationActive)
-            {
-                <div class="list-syncing"><i class="bi bi-arrow-repeat"></i> More chats are syncing...</div>
-            }
             @foreach (var section in ConversationSections)
             {
                 var sectionHeadingId = $"mobile-{section.Id}-conversations";
@@ -108,7 +104,7 @@
             }
         </div>
 
-        @if (!FilteredConversations.Any() && !Mesh.IsReplicationActive)
+        @if (!FilteredConversations.Any())
         {
             <div class="empty conv-empty">@FilterEmptyText</div>
         }

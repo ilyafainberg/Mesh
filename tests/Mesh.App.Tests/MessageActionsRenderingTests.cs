@@ -61,6 +61,30 @@ public sealed class MessageActionsRenderingTests
             StringAssert.Contains(ReadRepoFile(path), "<MessageActions Markdown=\"@line.Text\"");
     }
 
+    [TestMethod]
+    public void RoutineReplicationStatus_IsSilentAndEmptyStatesRemainStable()
+    {
+        var surfaces = new[]
+        {
+            new[] { "src", "Mesh.App", "Components", "Pages", "Home.razor" },
+            new[] { "src", "Mesh.App", "Components", "Pages", "Messages.razor" },
+            new[] { "src", "Mesh.App", "Components", "Mobile", "MobileMe.razor" },
+            new[] { "src", "Mesh.App", "Components", "Mobile", "MobileMessages.razor" }
+        };
+
+        foreach (var path in surfaces)
+        {
+            var markup = ReadRepoFile(path);
+            Assert.IsFalse(markup.Contains("ShouldShowReplicationStatus", StringComparison.Ordinal));
+            Assert.IsFalse(markup.Contains("ReplicationStatusText", StringComparison.Ordinal));
+            Assert.IsFalse(markup.Contains("More chats are syncing", StringComparison.Ordinal));
+            Assert.IsFalse(markup.Contains("IsReplicationActive", StringComparison.Ordinal));
+        }
+
+        var guide = ReadRepoFile("docs", "USER-GUIDE.md");
+        Assert.IsFalse(guide.Contains("More chats are syncing", StringComparison.Ordinal));
+    }
+
     private static string Between(string source, string start, string end)
     {
         var startIndex = source.IndexOf(start, StringComparison.Ordinal);
