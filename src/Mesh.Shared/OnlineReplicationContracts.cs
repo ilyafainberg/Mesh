@@ -36,6 +36,9 @@ public static class OnlineReplicationLimits
     /// <summary>Maximum number of distinct origin logs a single replica tracks concurrently.</summary>
     public const int MaxTrackedOrigins = 64;
 
+    /// <summary>Maximum number of origin baselines attested by one compact snapshot.</summary>
+    public const int MaxSnapshotCoverageOrigins = MaxTrackedOrigins;
+
     /// <summary>Length, in hex characters, of a SHA-256 identifier or hash.</summary>
     public const int HashHexLength = 64;
 }
@@ -259,12 +262,32 @@ public sealed record ReplicationCursorEntry(
     ulong Contiguous,
     byte[] AheadBits);
 
+/// <summary>An origin position whose current state is represented by a sibling snapshot.</summary>
+public sealed record ReplicationSnapshotCoverage(
+    string OriginDeviceId,
+    string LogEpoch,
+    ulong ThroughSeq);
+
+/// <summary>A signed, receiver-specific baseline for a complete sibling snapshot.</summary>
+public sealed record ReplicationSnapshotManifest(
+    string SnapshotId,
+    string ReceiverDeviceId,
+    string OriginDeviceId,
+    string LogEpoch,
+    ulong BaselineFrom,
+    ulong SnapshotThrough,
+    string StateHash,
+    long AuthGeneration,
+    string Signature,
+    IReadOnlyList<ReplicationSnapshotCoverage>? Coverage = null);
+
 /// <summary>An offer of the available sequence span in an origin log.</summary>
 public sealed record ReplicationOffer(
     string OriginDeviceId,
     string LogEpoch,
     ulong AvailableFrom,
-    ulong AvailableThrough);
+    ulong AvailableThrough,
+    ReplicationSnapshotManifest? Snapshot = null);
 
 /// <summary>An inclusive sequence range.</summary>
 public sealed record ReplicationRange(

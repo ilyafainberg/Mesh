@@ -883,6 +883,461 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         Assert.AreEqual((ulong)n, b.Db.GetCursor("a1")!.Contiguous);
     }
 
+    [TestMethod]
+    public async Task Snapshot_FreshSiblingSkipsHistoryAndDoesNotStarveReverseWork()
+    {
+        var a = NewNode(
+            "alice",
+            "a1",
+            flow: new ReplicationFlow(1, OnlineReplicationLimits.MaxBatchOps, OnlineReplicationLimits.MaxBatchBytes),
+            deferSiblingOffersUntilBootstrap: true);
+        var b = NewNode("alice", "a2", deferSiblingOffersUntilBootstrap: true);
+
+        string? historicalId = null;
+        for (var i = 1; i <= 130; i++)
+            historicalId = await a.Engine.EmitLocalAsync(Msg($"history-{i}"), new[] { a.Handle });
+
+        var peerB = Roster.ResolveDevice(b.Handle, b.Device)!;
+        var targetB = ReplicationBootstrapTarget.Create(peerB, a.Engine.LocalIdentity);
+        var snapshot = Enumerable.Range(1, 70)
+            .Select(index => Msg($"snapshot-{index}"))
+            .ToList();
+        const string bootstrapId = "fresh-sibling-snapshot";
+        a.Db.CreateOrResumePeerBootstrap(
+            targetB,
+            bootstrapId,
+            OnlineReplicationProtocol.HashText("snapshot-state"),
+            "snapshot-state",
+            snapshot.Count);
+        ulong firstSnapshotSeq = 0;
+        var snapshotIds = a.Engine.Journal.EmitLocalBatch(
+            snapshot,
+            new[] { a.Handle },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, index) =>
+            {
+                if (index == 0) firstSnapshotSeq = evt.Seq;
+                if (index == snapshot.Count - 1)
+                    a.Db.UpdatePeerBootstrapProgress(
+                        targetB,
+                        bootstrapId,
+                        snapshot.Count,
+                        snapshot.Count,
+                        firstSnapshotSeq,
+                        evt.Seq,
+                        tx);
+            });
+
+        var peerA = Roster.ResolveDevice(a.Handle, a.Device)!;
+        var targetA = ReplicationBootstrapTarget.Create(peerA, b.Engine.LocalIdentity);
+        var emptyBootstrap = b.Db.CreateOrResumePeerBootstrap(
+            targetA,
+            "empty-before-concurrent-change",
+            OnlineReplicationProtocol.HashText("[]"),
+            "[]",
+            totalItems: 0);
+        b.Db.CompleteEmptyPeerBootstrap(
+            targetA,
+            emptyBootstrap.BootstrapId,
+            b.Db.GetLocalOriginNextSeq(b.Device, "epoch-1"));
+        var reverseId = await b.Engine.EmitLocalAsync(Msg("reverse-work"), new[] { b.Handle });
+
+        await ConnectAsync(a, b);
+
+        Assert.AreEqual(200UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        Assert.IsNull(b.Db.GetEvent(historicalId!), "pre-snapshot history must not be replayed");
+        Assert.IsTrue(snapshotIds.All(id => b.Db.GetEvent(id) is not null));
+        Assert.IsNotNull(a.Db.GetEvent(reverseId), "reverse-direction work must converge during bootstrap");
+        Assert.AreEqual(MeshDb.BootstrapStatePersisted, a.Db.GetPeerBootstrap(targetB)!.State);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_WrongReceiverManifestIsRejected()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("alice", "a2");
+        await EstablishAsync(a, b);
+
+        var manifest = OnlineReplicationProtocol.CreateSnapshotManifest(
+            "wrong-receiver",
+            "another-device",
+            a.Device,
+            "epoch-1",
+            5,
+            5,
+            OnlineReplicationProtocol.HashText("state"),
+            0,
+            a.Keys.PrivateB64);
+        await RawControlAsync(a, b, E2EFrameKind.Offer,
+            new ReplicationOffer(a.Device, "epoch-1", 5, 5, manifest));
+
+        Assert.IsNull(b.Db.GetCursor(a.Device));
+        StringAssert.Contains(b.Engine.LastError ?? "", "not authorised");
+    }
+
+    [TestMethod]
+    public async Task Snapshot_ForgedManifestSignatureIsRejected()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("alice", "a2");
+        await EstablishAsync(a, b);
+
+        var forged = OnlineReplicationProtocol.CreateSnapshotManifest(
+            "forged",
+            b.Device,
+            a.Device,
+            "epoch-1",
+            5,
+            5,
+            OnlineReplicationProtocol.HashText("state"),
+            0,
+            b.Keys.PrivateB64);
+        await RawControlAsync(a, b, E2EFrameKind.Offer,
+            new ReplicationOffer(a.Device, "epoch-1", 5, 5, forged));
+
+        Assert.IsNull(b.Db.GetCursor(a.Device));
+        StringAssert.Contains(b.Engine.LastError ?? "", "signature failed");
+    }
+
+    [TestMethod]
+    public async Task Snapshot_EmptyStateSkipsHistoryAndReceivesNextChange()
+    {
+        var a = NewNode("alice", "a1", deferSiblingOffersUntilBootstrap: true);
+        var b = NewNode("alice", "a2", deferSiblingOffersUntilBootstrap: true);
+        string? historicalId = null;
+        for (var i = 0; i < 100; i++)
+            historicalId = await a.Engine.EmitLocalAsync(Msg($"history-{i}"), new[] { a.Handle });
+
+        var peerB = Roster.ResolveDevice(b.Handle, b.Device)!;
+        var targetB = ReplicationBootstrapTarget.Create(peerB, a.Engine.LocalIdentity);
+        var marker = a.Db.CreateOrResumePeerBootstrap(
+            targetB,
+            "empty-snapshot",
+            OnlineReplicationProtocol.HashText("[]"),
+            "[]",
+            totalItems: 0);
+        a.Db.CompleteEmptyPeerBootstrap(
+            targetB,
+            marker.BootstrapId,
+            a.Db.GetLocalOriginNextSeq(a.Device, "epoch-1"));
+
+        await ConnectAsync(a, b);
+
+        Assert.AreEqual(100UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        Assert.IsNull(b.Db.GetEvent(historicalId!), "empty state must not replay prior history");
+        Assert.AreEqual(MeshDb.BootstrapStatePersisted, a.Db.GetPeerBootstrap(targetB)!.State);
+
+        var nextId = await a.Engine.EmitLocalAsync(Msg("after-empty-snapshot"), new[] { a.Handle });
+        await Fabric.DrainAsync();
+
+        Assert.IsNotNull(b.Db.GetEvent(nextId));
+        Assert.AreEqual(101UL, b.Db.GetCursor(a.Device)!.Contiguous);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_EmptyReceiptMustAcknowledgeCurrentManifest()
+    {
+        var a = NewNode("alice", "a1", deferSiblingOffersUntilBootstrap: true);
+        var b = NewNode("alice", "a2", deferSiblingOffersUntilBootstrap: true);
+        var peerB = Roster.ResolveDevice(b.Handle, b.Device)!;
+        var targetB = ReplicationBootstrapTarget.Create(peerB, a.Engine.LocalIdentity);
+        var marker = a.Db.CreateOrResumePeerBootstrap(
+            targetB,
+            "empty-current-manifest",
+            OnlineReplicationProtocol.HashText("[]"),
+            "[]",
+            totalItems: 0);
+        a.Db.CompleteEmptyPeerBootstrap(
+            targetB,
+            marker.BootstrapId,
+            a.Db.GetLocalOriginNextSeq(a.Device, "epoch-1"));
+
+        Fabric.DropAcceptedFrame = (fromDevice, frame) =>
+            string.Equals(fromDevice, b.Device, StringComparison.Ordinal)
+            && ReplicationPayloadCodec.DecodeFrame(frame.Ciphertext)?.Kind == E2EFrameKind.Receipt;
+        await ConnectAsync(a, b);
+        Assert.AreEqual(MeshDb.BootstrapStateEmitted, a.Db.GetPeerBootstrap(targetB)!.State);
+
+        var staleReceipt = OnlineReplicationProtocol.CreateReceipt(
+            b.Device,
+            a.Device,
+            "epoch-1",
+            0,
+            OnlineReplicationProtocol.HashText("cursor-zero"),
+            OnlineReplicationProtocol.HashText("another-empty-manifest"),
+            b.Keys.PrivateB64);
+        await RawControlAsync(b, a, E2EFrameKind.Receipt, staleReceipt);
+
+        Assert.AreEqual(MeshDb.BootstrapStateEmitted, a.Db.GetPeerBootstrap(targetB)!.State);
+        StringAssert.Contains(a.Engine.LastError ?? "", "active manifest");
+
+        Fabric.DropAcceptedFrame = null;
+        await a.Engine.OfferPeerAsync(b.Handle, b.Device);
+        await Fabric.DrainAsync();
+        Assert.AreEqual(MeshDb.BootstrapStatePersisted, a.Db.GetPeerBootstrap(targetB)!.State);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_VerifiedCoverageSkipsThirdOriginHistory()
+    {
+        var a = NewNode("alice", "a1", deferSiblingOffersUntilBootstrap: true);
+        var b = NewNode("alice", "a2", deferSiblingOffersUntilBootstrap: true);
+        var third = AddOrigin("alice", "z3");
+        string? historicalId = null;
+        for (ulong seq = 1; seq <= 100; seq++)
+        {
+            var evt = MakeEvent(
+                third,
+                "alice",
+                "z3",
+                seq,
+                Msg($"third-history-{seq}"),
+                new[] { a.Keys.PublicB64, b.Keys.PublicB64 });
+            a.Db.AppendEvent(evt);
+            historicalId = evt.EventId;
+        }
+        a.Db.UpsertCursor(
+            "z3",
+            new ReplicationCursorEntry(
+                "epoch-1",
+                100,
+                new byte[OnlineReplicationLimits.AheadBitsBytes]));
+
+        var peerB = Roster.ResolveDevice(b.Handle, b.Device)!;
+        var targetB = ReplicationBootstrapTarget.Create(peerB, a.Engine.LocalIdentity);
+        var coverageJson = ReplicationPayloadCodec.SerializeControl(new List<ReplicationSnapshotCoverage>
+        {
+            new("z3", "epoch-1", 100)
+        });
+        const string bootstrapId = "third-origin-coverage";
+        a.Db.CreateOrResumePeerBootstrap(
+            targetB,
+            bootstrapId,
+            OnlineReplicationProtocol.HashText("snapshot"),
+            "snapshot",
+            totalItems: 1,
+            coverageJson: coverageJson);
+        a.Engine.Journal.EmitLocalBatch(
+            new[] { Msg("current-state") },
+            new[] { a.Handle },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, _) =>
+                a.Db.UpdatePeerBootstrapProgress(
+                    targetB,
+                    bootstrapId,
+                    1,
+                    1,
+                    evt.Seq,
+                    evt.Seq,
+                    tx));
+        var afterSnapshotId = await a.Engine.EmitLocalAsync(
+            Msg("after-snapshot-capture"),
+            new[] { a.Handle });
+
+        await ConnectAsync(a, b);
+
+        Assert.IsNotNull(b.Db.GetEvent(afterSnapshotId));
+        Assert.AreEqual(100UL, b.Db.GetCursor("z3")!.Contiguous);
+        Assert.IsNull(b.Db.GetEvent(historicalId!), "covered third-origin history must not replay");
+        Assert.AreEqual(MeshDb.BootstrapStatePersisted, a.Db.GetPeerBootstrap(targetB)!.State);
+
+        var next = MakeEvent(
+            third,
+            "alice",
+            "z3",
+            101,
+            Msg("third-next"),
+            new[] { a.Keys.PublicB64, b.Keys.PublicB64 });
+        a.Db.AppendEvent(next);
+        await a.Engine.OnWakeAsync(b.Handle, b.Device);
+        await Fabric.DrainAsync();
+
+        Assert.IsNotNull(b.Db.GetEvent(next.EventId));
+        Assert.AreEqual(101UL, b.Db.GetCursor("z3")!.Contiguous);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_OlderEmptyManifestDoesNotInstallStaleCoverage()
+    {
+        var a = NewNode("alice", "a1", deferSiblingOffersUntilBootstrap: true);
+        var b = NewNode("alice", "a2", deferSiblingOffersUntilBootstrap: true);
+        string? historicalId = null;
+        for (var index = 1; index <= 10; index++)
+            historicalId = await a.Engine.EmitLocalAsync(Msg($"old-{index}"), new[] { a.Handle });
+
+        var peerB = Roster.ResolveDevice(b.Handle, b.Device)!;
+        var targetB = ReplicationBootstrapTarget.Create(peerB, a.Engine.LocalIdentity);
+        var marker = a.Db.CreateOrResumePeerBootstrap(
+            targetB,
+            "older-empty-than-coverage",
+            OnlineReplicationProtocol.HashText("[]"),
+            "[]",
+            totalItems: 0,
+            coverageJson: ReplicationPayloadCodec.SerializeControl(new List<ReplicationSnapshotCoverage>
+            {
+                new("z3", "epoch-1", 50)
+            }));
+        a.Db.CompleteEmptyPeerBootstrap(
+            targetB,
+            marker.BootstrapId,
+            a.Db.GetLocalOriginNextSeq(a.Device, "epoch-1"));
+        b.Db.UpsertCursor(
+            a.Device,
+            new ReplicationCursorEntry(
+                "epoch-1",
+                10,
+                new byte[OnlineReplicationLimits.AheadBitsBytes]));
+
+        await ConnectAsync(a, b);
+
+        Assert.IsNull(b.Db.GetEvent(historicalId!));
+        Assert.IsNull(b.Db.GetCursor("z3"), "coverage from an obsolete empty manifest must not be installed");
+        Assert.AreEqual(MeshDb.BootstrapStatePersisted, a.Db.GetPeerBootstrap(targetB)!.State);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_OlderManifestDoesNotOverrideNewerCoverageCursor()
+    {
+        var a = NewNode("alice", "a1", deferSiblingOffersUntilBootstrap: true);
+        var b = NewNode("alice", "a2", deferSiblingOffersUntilBootstrap: true);
+        var peerB = Roster.ResolveDevice(b.Handle, b.Device)!;
+        var targetB = ReplicationBootstrapTarget.Create(peerB, a.Engine.LocalIdentity);
+        const string bootstrapId = "older-than-coverage";
+        a.Db.CreateOrResumePeerBootstrap(
+            targetB,
+            bootstrapId,
+            OnlineReplicationProtocol.HashText("older-snapshot"),
+            "older-snapshot",
+            totalItems: 5,
+            coverageJson: ReplicationPayloadCodec.SerializeControl(new List<ReplicationSnapshotCoverage>
+            {
+                new("z3", "epoch-1", 50)
+            }));
+        var oldSnapshotIds = a.Engine.Journal.EmitLocalBatch(
+            Enumerable.Range(1, 5).Select(index => Msg($"old-snapshot-{index}")).ToList(),
+            new[] { a.Handle },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, index) =>
+            {
+                if (index == 4)
+                    a.Db.UpdatePeerBootstrapProgress(
+                        targetB,
+                        bootstrapId,
+                        5,
+                        5,
+                        1,
+                        evt.Seq,
+                        tx);
+            });
+
+        string? latestId = null;
+        for (var index = 6; index <= 11; index++)
+            latestId = await a.Engine.EmitLocalAsync(Msg($"current-{index}"), new[] { a.Handle });
+        b.Db.UpsertCursor(
+            a.Device,
+            new ReplicationCursorEntry(
+                "epoch-1",
+                10,
+                new byte[OnlineReplicationLimits.AheadBitsBytes]));
+
+        await ConnectAsync(a, b);
+
+        Assert.IsFalse(b.Engine.IsHalted(a.Device));
+        Assert.AreEqual(11UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        Assert.IsNotNull(b.Db.GetEvent(latestId!));
+        Assert.IsTrue(oldSnapshotIds.All(id => b.Db.GetEvent(id) is null));
+        Assert.IsNull(b.Db.GetCursor("z3"), "coverage from an obsolete manifest must not be installed");
+    }
+
+    [TestMethod]
+    public async Task Snapshot_StateHashMismatchHaltsBeforeCoverageInstall()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("alice", "a2");
+        var eventOne = MakeEventForNode(a, 1, Msg("snapshot-event"), b.Keys.PublicB64);
+        a.Db.AppendEvent(eventOne);
+        await EstablishAsync(a, b);
+
+        var manifest = OnlineReplicationProtocol.CreateSnapshotManifest(
+            "bad-state-hash",
+            b.Device,
+            a.Device,
+            "epoch-1",
+            1,
+            1,
+            OnlineReplicationProtocol.HashText("not-the-event-range"),
+            0,
+            a.Keys.PrivateB64,
+            new[] { new ReplicationSnapshotCoverage("z3", "epoch-1", 10) });
+        await RawControlAsync(a, b, E2EFrameKind.Offer,
+            new ReplicationOffer(a.Device, "epoch-1", 1, 1, manifest));
+        await Fabric.DrainAsync();
+
+        Assert.IsNull(b.Db.GetCursor("z3"));
+        StringAssert.Contains(b.Engine.LastError ?? "", "did not match its signed event range");
+    }
+
+    [TestMethod]
+    public async Task Request_AcceptedButLostBatchRetriesAfterBoundedInterval()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode(
+            "bob",
+            "b1",
+            requestRetryInterval: TimeSpan.FromMilliseconds(25));
+        await EstablishAsync(a, b);
+
+        Fabric.DropAcceptedFrame = (fromDevice, frame) =>
+            string.Equals(fromDevice, a.Device, StringComparison.Ordinal)
+            && ReplicationPayloadCodec.DecodeFrame(frame.Ciphertext)?.Kind == E2EFrameKind.Batch;
+        var eventId = await a.Engine.EmitLocalAsync(Msg("lost-batch"), new[] { b.Handle });
+        await Fabric.DrainAsync();
+        Assert.IsNull(b.Db.GetEvent(eventId));
+        Assert.IsTrue(Fabric.DroppedAccepted > 0);
+
+        Fabric.DropAcceptedFrame = null;
+        await Task.Delay(75);
+        await a.Engine.OfferPeerAsync(b.Handle, b.Device);
+        await Fabric.DrainAsync();
+
+        Assert.IsNotNull(b.Db.GetEvent(eventId));
+        Assert.AreEqual(1UL, b.Db.GetCursor(a.Device)!.Contiguous);
+    }
+
+    [TestMethod]
+    public async Task ProjectionBoundary_BlocksInboundCommitUntilSnapshotCaptureReleases()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        await EstablishAsync(a, b);
+        var evt = MakeEventForNode(a, 1, Msg("blocked-commit"), b.Keys.PublicB64);
+
+        var boundary = await b.Engine.EnterProjectionBoundaryAsync(CancellationToken.None);
+        var delivery = DeliverBatchAsync(a, b, Batch(a.Device, new[] { evt }));
+        await Task.Delay(25);
+        Assert.IsFalse(delivery.IsCompleted, "inbound projection crossed the snapshot boundary");
+        boundary.Dispose();
+        await delivery;
+
+        Assert.IsNotNull(b.Db.GetEvent(evt.EventId));
+    }
+
+    [TestMethod]
+    public async Task Batch_PostCommitHookRunsOnceForAllWinningEvents()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        await EstablishAsync(a, b);
+        var events = Enumerable.Range(1, 3)
+            .Select(index => MakeEventForNode(a, (ulong)index, Msg($"batch-{index}"), b.Keys.PublicB64))
+            .ToList();
+
+        await DeliverBatchAsync(a, b, Batch(a.Device, events));
+
+        Assert.AreEqual(3, b.Applier.Count);
+        Assert.AreEqual(1, b.Applier.AfterCommitBatchCalls);
+    }
+
     // =====================================================================
     // 13. Scale / vector bounds and concurrency.
     // =====================================================================
@@ -916,6 +1371,11 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
     {
         var a = NewNode("alice", "a1");
         var b = NewNode("bob", "b1");
+        var requests = 0;
+        a.Engine.Activity += activity =>
+        {
+            if (activity.Name == "request.received") requests++;
+        };
         const int n = 200;
         await ConnectAsync(a, b);
         for (var i = 1; i <= n; i++)
@@ -925,6 +1385,7 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
 
         Assert.AreEqual((ulong)n, b.Db.GetCursor("a1")!.Contiguous);
         Assert.AreEqual(n, b.Applier.Count);
+        Assert.IsTrue(requests <= 2, "queued offers were not coalesced behind the in-flight request");
     }
 
     [TestMethod]
@@ -1232,13 +1693,33 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
     }
 
     [TestMethod]
-    public async Task Range_ServedBacklogAboveLimitConvergesInBoundedBatches()
+    public async Task Range_ServedBacklogAboveLimitConvergesWithinTotalCredits()
     {
-        var a = NewNode("alice", "a1");
+        var a = NewNode(
+            "alice",
+            "a1",
+            flow: new ReplicationFlow(2, OnlineReplicationLimits.MaxBatchOps, OnlineReplicationLimits.MaxBatchBytes));
         var b = NewNode("bob", "b1");
         await EstablishAsync(a, b);
 
-        const ulong n = 130; // > 2 * MaxBatchOps, forces multiple served batches.
+        var requestCount = 0;
+        var batchesInRequest = 0;
+        var maxBatchesInRequest = 0;
+        a.Engine.Activity += activity =>
+        {
+            if (activity.Name == "request.received")
+            {
+                requestCount++;
+                batchesInRequest = 0;
+            }
+            else if (activity.Name == "batch.sent")
+            {
+                batchesInRequest++;
+                maxBatchesInRequest = Math.Max(maxBatchesInRequest, batchesInRequest);
+            }
+        };
+
+        const ulong n = 130;
         for (ulong s = 1; s <= n; s++)
             a.Db.AppendEvent(MakeEventForNode(a, s, Msg($"m{s}"), b.Keys.PublicB64));
 
@@ -1246,6 +1727,8 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         await Fabric.DrainAsync(TimeSpan.FromMinutes(2));
 
         Assert.AreEqual(n, b.Db.GetCursor("a1")!.Contiguous);
+        Assert.IsTrue(requestCount >= 2, "the receiver must renew its request after consuming credits");
+        Assert.IsTrue(maxBatchesInRequest <= 2, "one request exceeded the advertised total credit window");
     }
 
     [TestMethod]

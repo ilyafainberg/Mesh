@@ -17,13 +17,19 @@ namespace Mesh.App.Services;
 /// never claim replication success if journaling failed, and can never leave a sequence hole.
 ///
 /// Inbound events are materialised onto the same actual domain tables inside the transaction that
-/// appends the event and advances the cursor, and the committed change is then applied to the
-/// in-memory profile on a serialized state gate before a single UI notification.
+/// appends the event and advances the cursor, and each committed wire batch is then applied to the
+/// in-memory profile on a serialized state gate before one coalesced UI notification.
 /// </summary>
 public sealed partial class AppState
 {
     private OnlineReplicationEngine? replicationEngine;
     private readonly SemaphoreSlim ownerBootstrapGate = new(1, 1);
+    private readonly AsyncLocal<ReplicationNotificationBatch?> replicationNotificationBatch = new();
+
+    private sealed class ReplicationNotificationBatch
+    {
+        public bool Pending { get; set; }
+    }
 
     /// <summary>
     /// The database the attached engine was started against. A post-commit callback whose database
@@ -75,7 +81,8 @@ public sealed partial class AppState
 
         var engine = new OnlineReplicationEngine(
             db, identity, transport, roster, CreateReplicationApplier(),
-            deviceIsDesktop: !PlatformCaps.IsMobile);
+            deviceIsDesktop: !PlatformCaps.IsMobile,
+            deferSiblingOffersUntilBootstrap: true);
         engine.StateChanged += change =>
             RuntimeDiagnostics.Current?.RecordEvent(
                 "replication",
@@ -452,24 +459,72 @@ public sealed partial class AppState
             }
             if (!engine.IsSessionEstablished(target.PeerDeviceId)) return;
 
+            const int chunkSize = 50;
             var marker = db.GetPeerBootstrap(target);
-            if (marker is null
+            var needsFreshSnapshot = marker is null
                 || !string.Equals(marker.LocalOriginDeviceId, target.LocalOriginDeviceId, StringComparison.Ordinal)
-                || !string.Equals(marker.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal))
+                || !string.Equals(marker.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal)
+                || marker.BootstrapFromSeq == 0;
+
+            if (needsFreshSnapshot)
             {
-                var snapshot = CaptureOwnerBootstrapSnapshot(target.PeerHandle);
-                var snapshotJson = JsonSerializer.Serialize(snapshot, ReplicationJson);
-                var stateHash = Convert.ToHexString(
-                    SHA256.HashData(Encoding.UTF8.GetBytes(snapshotJson))).ToLowerInvariant();
-                marker = db.CreateOrResumePeerBootstrap(
-                    target,
-                    Guid.NewGuid().ToString("n"),
-                    stateHash,
-                    snapshotJson,
-                    snapshot.Count);
+                using var projectionBoundary = await engine.EnterProjectionBoundaryAsync(ct).ConfigureAwait(false);
+                lock (profileSyncGate)
+                {
+                    if (!ReferenceEquals(db, activeDb)
+                        || !ReferenceEquals(engine, replicationEngine)
+                        || !engine.IsSessionEstablished(target.PeerDeviceId)
+                        || !string.Equals(Norm(target.PeerHandle), Norm(Profile.Handle), StringComparison.Ordinal))
+                        return;
+
+                    using var journalLock = db.EnterLocalOriginJournalLock();
+                    var snapshot = CaptureOwnerBootstrapSnapshot(target.PeerHandle);
+                    var snapshotJson = JsonSerializer.Serialize(snapshot, ReplicationJson);
+                    var coverageJson = JsonSerializer.Serialize(
+                        db.GetSnapshotCoverage(target.LocalOriginDeviceId),
+                        ReplicationJson);
+                    var stateHash = Convert.ToHexString(
+                        SHA256.HashData(Encoding.UTF8.GetBytes(snapshotJson))).ToLowerInvariant();
+                    marker = db.CreateOrResumePeerBootstrap(
+                        target,
+                        Guid.NewGuid().ToString("n"),
+                        stateHash,
+                        snapshotJson,
+                        snapshot.Count,
+                        coverageJson);
+
+                    if (snapshot.Count > 0 && marker.State != MeshDb.BootstrapStatePersisted)
+                    {
+                        var firstChunk = snapshot.Take(chunkSize).ToList();
+                        EmitBootstrapChunk(
+                            engine,
+                            db,
+                            target,
+                            marker,
+                            firstChunk,
+                            firstChunk.Count,
+                            snapshot.Count);
+                        marker = db.GetPeerBootstrap(target)
+                            ?? throw new InvalidOperationException("The bootstrap marker disappeared after its first chunk committed.");
+                    }
+                    else if (snapshot.Count == 0)
+                    {
+                        marker = db.CompleteEmptyPeerBootstrap(
+                            target,
+                            marker.BootstrapId,
+                            db.GetLocalOriginNextSeq(target.LocalOriginDeviceId, target.LocalLogEpoch));
+                    }
+                }
             }
 
-            if (marker.State == MeshDb.BootstrapStatePersisted) return;
+            if (marker is null) return;
+            engine.ReportBootstrapActivity("bootstrap.started", target, marker.BootstrapId);
+            if (marker.State == MeshDb.BootstrapStatePersisted)
+            {
+                engine.ReportBootstrapActivity("bootstrap.persisted", target, marker.BootstrapId, marker.TotalItems);
+                return;
+            }
+
             var actualStateHash = Convert.ToHexString(
                 SHA256.HashData(Encoding.UTF8.GetBytes(marker.SnapshotJson))).ToLowerInvariant();
             if (!string.Equals(actualStateHash, marker.StateHash, StringComparison.Ordinal))
@@ -482,19 +537,26 @@ public sealed partial class AppState
                 throw new InvalidOperationException("The saved bootstrap snapshot count is inconsistent.");
             if (marker.EmittedItems < 0 || marker.EmittedItems > items.Count)
                 throw new InvalidOperationException("The saved bootstrap progress is inconsistent.");
+            if (marker.EmittedItems > 0 && marker.BootstrapFromSeq == 0)
+                throw new InvalidOperationException("The saved bootstrap is missing its first emitted sequence.");
 
-            engine.ReportBootstrapActivity("bootstrap.started", target, marker.BootstrapId);
             if (items.Count == 0)
             {
-                marker = db.CompleteEmptyPeerBootstrap(target, marker.BootstrapId);
-                engine.ReportBootstrapActivity(
-                    "bootstrap.persisted",
-                    target,
-                    marker.BootstrapId);
+                engine.ReportBootstrapActivity("bootstrap.emitted", target, marker.BootstrapId);
+                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
                 return;
             }
 
-            const int chunkSize = 50;
+            if (needsFreshSnapshot && marker.EmittedItems > 0)
+            {
+                engine.ReportBootstrapActivity(
+                    "bootstrap.progress",
+                    target,
+                    marker.BootstrapId,
+                    marker.EmittedItems);
+                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
+            }
+
             for (var offset = marker.EmittedItems; offset < items.Count; offset += chunkSize)
             {
                 ct.ThrowIfCancellationRequested();
@@ -506,21 +568,14 @@ public sealed partial class AppState
 
                 var chunk = items.Skip(offset).Take(chunkSize).ToList();
                 var emittedThrough = offset + chunk.Count;
-                await Task.Run(() => engine.Journal.EmitLocalBatch(
+                await Task.Run(() => EmitBootstrapChunk(
+                    engine,
+                    db,
+                    target,
+                    marker,
                     chunk,
-                    new[] { target.PeerHandle },
-                    domainWork: static (_, _, _) => { },
-                    eventWork: (_, tx, evt, index) =>
-                    {
-                        if (index == chunk.Count - 1)
-                            db.UpdatePeerBootstrapProgress(
-                                target,
-                                marker.BootstrapId,
-                                emittedThrough,
-                                items.Count,
-                                evt.Seq,
-                                tx);
-                    }), ct).ConfigureAwait(false);
+                    emittedThrough,
+                    items.Count), ct).ConfigureAwait(false);
 
                 engine.ReportBootstrapActivity(
                     "bootstrap.progress",
@@ -531,20 +586,47 @@ public sealed partial class AppState
                 await Task.Yield();
             }
 
-            if (items.Count > 0)
-            {
-                engine.ReportBootstrapActivity(
-                    "bootstrap.emitted",
-                    target,
-                    marker.BootstrapId,
-                    items.Count);
-                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
-            }
+            engine.ReportBootstrapActivity(
+                "bootstrap.emitted",
+                target,
+                marker.BootstrapId,
+                items.Count);
+            await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
         }
         finally
         {
             ownerBootstrapGate.Release();
         }
+    }
+
+    private static void EmitBootstrapChunk(
+        OnlineReplicationEngine engine,
+        MeshDb db,
+        ReplicationBootstrapTarget target,
+        MeshDb.ReplicationPeerBootstrap marker,
+        IReadOnlyList<ReplicationPayloadCodec.DomainEnvelope> chunk,
+        int emittedThrough,
+        int totalItems)
+    {
+        var bootstrapFrom = marker.BootstrapFromSeq;
+        engine.Journal.EmitLocalBatch(
+            chunk,
+            new[] { target.PeerHandle },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, index) =>
+            {
+                if (index == 0 && bootstrapFrom == 0)
+                    bootstrapFrom = evt.Seq;
+                if (index == chunk.Count - 1)
+                    db.UpdatePeerBootstrapProgress(
+                        target,
+                        marker.BootstrapId,
+                        emittedThrough,
+                        totalItems,
+                        bootstrapFrom,
+                        evt.Seq,
+                        tx);
+            });
     }
     private List<ReplicationPayloadCodec.DomainEnvelope> CaptureOwnerBootstrapSnapshot(string accountHandle)
     {
@@ -819,8 +901,8 @@ public sealed partial class AppState
     }
 
     /// <summary>
-    /// Applies a COMMITTED replicated envelope to the live in-memory profile on the serialized
-    /// state gate, then raises exactly one change notification. Ignored when the callback belongs
+    /// Applies one COMMITTED replicated envelope to the live in-memory profile on the serialized
+    /// state gate. The batch wrapper coalesces any resulting change notifications. Ignored when the callback belongs
     /// to a database that is no longer active (account switch, sign-out or disconnect), so stale
     /// replication traffic can never mutate the new account's state.
     ///
@@ -923,6 +1005,35 @@ public sealed partial class AppState
         if (changed) NotifyChanged();
     }
 
+    private async Task ApplyReplicatedStateBatchAfterCommitAsync(
+        MeshDb? sourceDb,
+        IReadOnlyList<ReplicationCommittedDomainEvent> committed)
+    {
+        ArgumentNullException.ThrowIfNull(committed);
+        if (committed.Count == 0) return;
+
+        var previous = replicationNotificationBatch.Value;
+        var batch = new ReplicationNotificationBatch();
+        replicationNotificationBatch.Value = batch;
+        try
+        {
+            foreach (var item in committed)
+                await ApplyReplicatedStateAfterCommitAsync(
+                    sourceDb,
+                    item.Event,
+                    item.Envelope).ConfigureAwait(false);
+        }
+        finally
+        {
+            replicationNotificationBatch.Value = previous;
+            if (batch.Pending)
+            {
+                if (previous is null) Changed?.Invoke();
+                else previous.Pending = true;
+            }
+        }
+    }
+
     private static Task PublishNotificationAfterCommitAsync(
         ReplicationEvent evt,
         ReplicationPayloadCodec.DomainEnvelope envelope)
@@ -988,6 +1099,13 @@ public sealed partial class AppState
                 owner.replicationEngineDb,
                 evt,
                 envelope);
+
+        public Task AfterCommitBatchAsync(
+            IReadOnlyList<ReplicationCommittedDomainEvent> committed,
+            bool deviceIsDesktop)
+            => owner.ApplyReplicatedStateBatchAfterCommitAsync(
+                owner.replicationEngineDb,
+                committed);
     }
 }
 

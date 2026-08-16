@@ -105,6 +105,11 @@ public interface IReplicationTransport
 
 }
 
+/// <summary>One causally winning domain envelope whose inbound transaction committed.</summary>
+public sealed record ReplicationCommittedDomainEvent(
+    ReplicationEvent Event,
+    ReplicationPayloadCodec.DomainEnvelope Envelope);
+
 /// <summary>
 /// Domain projection seam. <see cref="Apply"/> is invoked inside the same transaction that appends
 /// an inbound event, so the projection commits or rolls back atomically with the log and cursor.
@@ -135,6 +140,16 @@ public interface IReplicationDomainApplier
         ReplicationPayloadCodec.DomainEnvelope envelope,
         bool deviceIsDesktop)
         => Task.CompletedTask;
+
+    /// <summary>Called once after every winning event in one inbound batch committed.</summary>
+    async Task AfterCommitBatchAsync(
+        IReadOnlyList<ReplicationCommittedDomainEvent> committed,
+        bool deviceIsDesktop)
+    {
+        ArgumentNullException.ThrowIfNull(committed);
+        foreach (var item in committed)
+            await AfterCommitAsync(item.Event, item.Envelope, deviceIsDesktop).ConfigureAwait(false);
+    }
 }
 
 /// <summary>The UI-facing delivery state of one outbound event toward one target account.</summary>
@@ -173,9 +188,13 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     private readonly int maxSendAttempts;
     private readonly long snapshotByteBudget;
     private readonly TimeSpan sessionInitRetryInterval;
+    private readonly TimeSpan requestRetryInterval;
+    private readonly bool deferSiblingOffersUntilBootstrap;
     internal static readonly TimeSpan SessionInitRetryInterval = TimeSpan.FromSeconds(3);
+    internal static readonly TimeSpan RequestRetryInterval = TimeSpan.FromSeconds(10);
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim> peerLocks = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim projectionBoundary = new(1, 1);
     private readonly ConcurrentDictionary<string, PeerSession> sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> haltedOrigins = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource lifetime = new();
@@ -204,7 +223,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         TimeSpan? sendTimeout = null,
         int maxSendAttempts = 4,
         long snapshotByteBudget = 256L * 1024 * 1024,
-        TimeSpan? sessionInitRetryInterval = null)
+        TimeSpan? sessionInitRetryInterval = null,
+        TimeSpan? requestRetryInterval = null,
+        bool deferSiblingOffersUntilBootstrap = false)
     {
         this.db = db ?? throw new ArgumentNullException(nameof(db));
         this.identity = identity ?? throw new ArgumentNullException(nameof(identity));
@@ -219,8 +240,12 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         this.maxSendAttempts = Math.Max(1, maxSendAttempts);
         this.snapshotByteBudget = snapshotByteBudget;
         this.sessionInitRetryInterval = sessionInitRetryInterval ?? SessionInitRetryInterval;
+        this.requestRetryInterval = requestRetryInterval ?? RequestRetryInterval;
+        this.deferSiblingOffersUntilBootstrap = deferSiblingOffersUntilBootstrap;
         if (this.sessionInitRetryInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(sessionInitRetryInterval));
+        if (this.requestRetryInterval <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(requestRetryInterval));
     }
 
     /// <summary>The most recent replication error surfaced (fork, verification failure, ...).</summary>
@@ -277,6 +302,17 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             if (sessions.TryGetValue(peerDevice, out var session) && session.Established)
                 await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, operationCt).ConfigureAwait(false);
         }, ct);
+
+    internal async Task<IDisposable> EnterProjectionBoundaryAsync(CancellationToken ct)
+    {
+        lock (disposalGate)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(OnlineReplicationEngine));
+        }
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(ct, lifetime.Token);
+        await projectionBoundary.WaitAsync(operation.Token).ConfigureAwait(false);
+        return new SemaphoreLease(projectionBoundary);
+    }
 
     internal void ReportBootstrapActivity(
         string name,
@@ -473,10 +509,10 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
         switch (frame.Kind)
         {
-            case E2EFrameKind.Offer: await OnOfferAsync(session, plaintext, ct).ConfigureAwait(false); break;
+            case E2EFrameKind.Offer: await OnOfferAsync(session, peerDevice, plaintext, ct).ConfigureAwait(false); break;
             case E2EFrameKind.Request: await OnRequestAsync(session, plaintext, ct).ConfigureAwait(false); break;
             case E2EFrameKind.Batch: await OnBatchAsync(session, delivery, plaintext, ct).ConfigureAwait(false); break;
-            case E2EFrameKind.Receipt: OnReceipt(delivery, plaintext, peerDevice); break;
+            case E2EFrameKind.Receipt: await OnReceiptAsync(session, delivery, plaintext, peerDevice, ct).ConfigureAwait(false); break;
             case E2EFrameKind.ResyncRequest: await OnResyncRequestAsync(session, plaintext, ct).ConfigureAwait(false); break;
             case E2EFrameKind.ResyncSnapshot: await OnBatchAsync(session, delivery, plaintext, ct).ConfigureAwait(false); break;
             case E2EFrameKind.ReadWatermark: OnReadWatermark(plaintext); break;
@@ -542,30 +578,204 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
     private async Task TryOfferLocalOriginsAsync(PeerSession session, string pushClass, CancellationToken ct)
     {
-        foreach (var offer in db.GetServeableOrigins())
+        var sibling = string.Equals(
+            ReplicationHandle.Norm(session.PeerHandle),
+            ReplicationHandle.Norm(identity.Handle),
+            StringComparison.Ordinal);
+        var peer = sibling ? roster.ResolveDevice(session.PeerHandle, session.PeerDevice) : null;
+        MeshDb.ReplicationPeerBootstrap? bootstrap = null;
+        if (peer is not null && !peer.Revoked)
+            bootstrap = db.GetPeerBootstrap(ReplicationBootstrapTarget.Create(peer, identity));
+
+        var availableOrigins = db.GetServeableOrigins().ToList();
+        if (sibling
+            && bootstrap is { BootstrapFromSeq: > 0 }
+            && !availableOrigins.Any(origin =>
+                string.Equals(origin.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal)
+                && string.Equals(origin.LogEpoch, identity.LogEpoch, StringComparison.Ordinal)))
         {
-            if (offer.AvailableThrough == 0) continue;
+            availableOrigins.Add(new MeshDb.ServeableOrigin(
+                identity.DeviceId,
+                identity.LogEpoch,
+                bootstrap.BootstrapFromSeq,
+                bootstrap.BootstrapThroughSeq));
+        }
+
+        foreach (var available in availableOrigins
+                     .OrderBy(origin => string.Equals(origin.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal) ? 0 : 1)
+                     .ThenBy(origin => origin.OriginDeviceId, StringComparer.Ordinal))
+        {
+            var availableFrom = available.AvailableFrom;
+            var availableThrough = available.AvailableThrough;
+            var isLocalOrigin = string.Equals(available.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal);
+            if (sibling
+                && !isLocalOrigin
+                && deferSiblingOffersUntilBootstrap
+                && bootstrap?.State != MeshDb.BootstrapStatePersisted)
+                continue;
+            ReplicationSnapshotManifest? snapshot = null;
+            if (sibling
+                && string.Equals(available.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal)
+                && string.Equals(available.LogEpoch, identity.LogEpoch, StringComparison.Ordinal))
+            {
+                if (deferSiblingOffersUntilBootstrap
+                    && (bootstrap is null || bootstrap.BootstrapFromSeq == 0))
+                    continue;
+
+                if (bootstrap is { BootstrapFromSeq: > 0 }
+                    && string.Equals(bootstrap.LocalLogEpoch, identity.LogEpoch, StringComparison.Ordinal)
+                    && (bootstrap.BootstrapThroughSeq >= bootstrap.BootstrapFromSeq
+                        || bootstrap.BootstrapThroughSeq + 1 == bootstrap.BootstrapFromSeq))
+                {
+                    availableFrom = bootstrap.BootstrapFromSeq;
+                    availableThrough = Math.Max(availableThrough, bootstrap.BootstrapThroughSeq);
+                    var snapshotEvents = ReadSnapshotEvents(
+                        identity.DeviceId,
+                        identity.LogEpoch,
+                        bootstrap.BootstrapFromSeq,
+                        bootstrap.BootstrapThroughSeq);
+                    if (snapshotEvents is null)
+                    {
+                        Surface("snapshot", "The durable bootstrap range is incomplete.");
+                        continue;
+                    }
+
+                    IReadOnlyList<ReplicationSnapshotCoverage> coverage = Array.Empty<ReplicationSnapshotCoverage>();
+                    var snapshotComplete = bootstrap.EmittedItems == bootstrap.TotalItems
+                        && bootstrap.State is MeshDb.BootstrapStateEmitted or MeshDb.BootstrapStatePersisted;
+                    if (snapshotComplete)
+                    {
+                        coverage = ReplicationPayloadCodec.DeserializeControl<List<ReplicationSnapshotCoverage>>(
+                            bootstrap.CoverageJson)
+                            ?? throw new InvalidOperationException("The durable bootstrap coverage is invalid.");
+                    }
+
+                    snapshot = OnlineReplicationProtocol.CreateSnapshotManifest(
+                        bootstrap.BootstrapId,
+                        session.PeerDevice,
+                        identity.DeviceId,
+                        identity.LogEpoch,
+                        bootstrap.BootstrapFromSeq,
+                        bootstrap.BootstrapThroughSeq,
+                        OnlineReplicationProtocol.ComputeSnapshotStateHash(snapshotEvents),
+                        identity.AuthGeneration,
+                        identity.PrivateKeyB64,
+                        coverage);
+                }
+            }
+
+            if (availableThrough == 0 && snapshot is null) continue;
             await SendControlAsync(session.PeerHandle, session.PeerDevice, E2EFrameKind.Offer, session.SessionId,
                 ReplicationPayloadCodec.SerializeControl(new ReplicationOffer(
-                    offer.OriginDeviceId, offer.LogEpoch, offer.AvailableFrom, offer.AvailableThrough)),
+                    available.OriginDeviceId,
+                    available.LogEpoch,
+                    availableFrom,
+                    availableThrough,
+                    snapshot)),
                 pushClass, ct).ConfigureAwait(false);
         }
     }
 
-    private async Task OnOfferAsync(PeerSession session, string plaintext, CancellationToken ct)
+    private IReadOnlyList<ReplicationEvent>? ReadSnapshotEvents(
+        string originDeviceId,
+        string logEpoch,
+        ulong fromSeq,
+        ulong throughSeq)
+    {
+        if (throughSeq + 1 == fromSeq) return Array.Empty<ReplicationEvent>();
+        if (throughSeq < fromSeq) return null;
+
+        var events = new List<ReplicationEvent>();
+        var expected = fromSeq;
+        while (expected <= throughSeq)
+        {
+            var page = db.QueryEvents(
+                originDeviceId,
+                logEpoch,
+                expected,
+                throughSeq,
+                OnlineReplicationLimits.MaxBatchOps);
+            if (page.Count == 0) return null;
+            foreach (var evt in page)
+            {
+                if (evt.Seq != expected) return null;
+                events.Add(evt);
+                if (evt.Seq == throughSeq) return events;
+                expected = evt.Seq + 1;
+            }
+        }
+        return events;
+    }
+
+    private async Task OnOfferAsync(
+        PeerSession session,
+        ReplicationDevice peer,
+        string plaintext,
+        CancellationToken ct)
     {
         var offer = ReplicationPayloadCodec.DeserializeControl<ReplicationOffer>(plaintext);
         if (offer is null || !OnlineReplicationProtocol.ValidateOffer(offer, out _)) { Surface("route", "Malformed offer."); return; }
         if (IsHalted(offer.OriginDeviceId)) return;
 
+        if (offer.Snapshot is { } snapshot)
+        {
+            var currentGeneration = roster.AuthGeneration(identity.Handle);
+            if (!string.Equals(ReplicationHandle.Norm(session.PeerHandle), ReplicationHandle.Norm(identity.Handle), StringComparison.Ordinal)
+                || !string.Equals(snapshot.ReceiverDeviceId, identity.DeviceId, StringComparison.Ordinal)
+                || !string.Equals(snapshot.OriginDeviceId, peer.DeviceId, StringComparison.Ordinal)
+                || snapshot.AuthGeneration != identity.AuthGeneration
+                || (currentGeneration >= 0 && snapshot.AuthGeneration != currentGeneration))
+            {
+                Surface("auth", "Snapshot manifest is not authorised for this receiver.");
+                return;
+            }
+            if (!OnlineReplicationProtocol.VerifySnapshotManifest(snapshot, peer.PublicKeyB64))
+            {
+                Surface("auth", "Snapshot manifest signature failed verification.");
+                return;
+            }
+            var baselineInstalled = db.TryInstallSnapshotBaseline(snapshot);
+            session.PendingSnapshots[offer.OriginDeviceId] = new PendingSnapshot(snapshot, baselineInstalled);
+            if (baselineInstalled)
+            {
+                ObserveActivity(new ReplicationEngineActivity(
+                    "snapshot.baseline_installed",
+                    session.PeerHandle,
+                    session.PeerDevice,
+                    BootstrapId: snapshot.SnapshotId));
+            }
+            if (!TryFinalizePendingSnapshot(session, offer.OriginDeviceId)) return;
+            if (snapshot.SnapshotThrough + 1 == snapshot.BaselineFrom)
+                await SendSnapshotReceiptAsync(session, snapshot, ct).ConfigureAwait(false);
+        }
+
         var cursor = db.GetCursor(offer.OriginDeviceId) ?? OnlineReplicationProtocol.EmptyCursor();
+        if (session.OutstandingRequests.TryGetValue(offer.OriginDeviceId, out var outstanding))
+        {
+            if (string.Equals(outstanding.LogEpoch, offer.LogEpoch, StringComparison.Ordinal)
+                && cursor.Contiguous <= outstanding.CursorAtRequest
+                && DateTimeOffset.UtcNow - outstanding.RequestedAt < requestRetryInterval)
+                return;
+            session.OutstandingRequests.Remove(offer.OriginDeviceId);
+        }
+
         var plan = OnlineReplicationProtocol.PlanReplication(cursor, offer);
         if (plan.RequiresResync)
         {
-            await SendControlAsync(session.PeerHandle, session.PeerDevice, E2EFrameKind.ResyncRequest, session.SessionId,
+            var sent = await SendControlAsync(
+                session.PeerHandle,
+                session.PeerDevice,
+                E2EFrameKind.ResyncRequest,
+                session.SessionId,
                 ReplicationPayloadCodec.SerializeControl(new ReplicationResyncRequest(
                     offer.OriginDeviceId, offer.LogEpoch, cursor.Contiguous + 1)),
-                OnlinePushClasses.Normal, ct).ConfigureAwait(false);
+                OnlinePushClasses.Normal,
+                ct).ConfigureAwait(false);
+            if (sent.Accepted)
+                session.OutstandingRequests[offer.OriginDeviceId] = new OutstandingRequest(
+                    offer.LogEpoch,
+                    cursor.Contiguous,
+                    DateTimeOffset.UtcNow);
             return;
         }
         if (plan.Ranges.Count == 0)
@@ -588,9 +798,120 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             return;
         }
 
-        await SendControlAsync(session.PeerHandle, session.PeerDevice, E2EFrameKind.Request, session.SessionId,
-            ReplicationPayloadCodec.SerializeControl(new ReplicationRequest(offer.OriginDeviceId, offer.LogEpoch, plan.Ranges)),
-            OnlinePushClasses.Normal, ct).ConfigureAwait(false);
+        var requestSent = await SendControlAsync(
+            session.PeerHandle,
+            session.PeerDevice,
+            E2EFrameKind.Request,
+            session.SessionId,
+            ReplicationPayloadCodec.SerializeControl(new ReplicationRequest(
+                offer.OriginDeviceId,
+                offer.LogEpoch,
+                plan.Ranges)),
+            OnlinePushClasses.Normal,
+            ct).ConfigureAwait(false);
+        if (requestSent.Accepted)
+            session.OutstandingRequests[offer.OriginDeviceId] = new OutstandingRequest(
+                offer.LogEpoch,
+                cursor.Contiguous,
+                DateTimeOffset.UtcNow);
+    }
+
+    private bool TryFinalizePendingSnapshot(PeerSession session, string originDeviceId)
+    {
+        if (!session.PendingSnapshots.TryGetValue(originDeviceId, out var pending)) return true;
+        var snapshot = pending.Manifest;
+        var cursor = db.GetCursor(originDeviceId);
+        if (cursor is null
+            || !string.Equals(cursor.LogEpoch, snapshot.LogEpoch, StringComparison.Ordinal)
+            || cursor.Contiguous < snapshot.SnapshotThrough)
+            return true;
+
+        if (!pending.BaselineInstalled
+            && snapshot.SnapshotThrough + 1 == snapshot.BaselineFrom)
+        {
+            session.PendingSnapshots.Remove(originDeviceId);
+            ObserveActivity(new ReplicationEngineActivity(
+                "snapshot.superseded",
+                session.PeerHandle,
+                session.PeerDevice,
+                BootstrapId: snapshot.SnapshotId));
+            return true;
+        }
+
+        var events = ReadSnapshotEvents(
+            snapshot.OriginDeviceId,
+            snapshot.LogEpoch,
+            snapshot.BaselineFrom,
+            snapshot.SnapshotThrough);
+        if (events is null && !pending.BaselineInstalled)
+        {
+            session.PendingSnapshots.Remove(originDeviceId);
+            ObserveActivity(new ReplicationEngineActivity(
+                "snapshot.superseded",
+                session.PeerHandle,
+                session.PeerDevice,
+                BootstrapId: snapshot.SnapshotId));
+            return true;
+        }
+        var actualHash = events is null
+            ? ""
+            : OnlineReplicationProtocol.ComputeSnapshotStateHash(events);
+        if (!string.Equals(actualHash, snapshot.StateHash, StringComparison.Ordinal))
+        {
+            session.PendingSnapshots.Remove(originDeviceId);
+            Halt(
+                originDeviceId,
+                "snapshot-hash",
+                $"Snapshot {snapshot.SnapshotId} did not match its signed event range.");
+            return false;
+        }
+
+        var installed = db.TryInstallSnapshotCoverage(snapshot);
+        session.PendingSnapshots.Remove(originDeviceId);
+        ObserveActivity(new ReplicationEngineActivity(
+            "snapshot.verified",
+            session.PeerHandle,
+            session.PeerDevice,
+            installed,
+            BootstrapId: snapshot.SnapshotId));
+        return true;
+    }
+
+    private async Task SendSnapshotReceiptAsync(
+        PeerSession session,
+        ReplicationSnapshotManifest snapshot,
+        CancellationToken ct)
+    {
+        var cursor = db.GetCursor(snapshot.OriginDeviceId);
+        if (cursor is null
+            || !string.Equals(cursor.LogEpoch, snapshot.LogEpoch, StringComparison.Ordinal)
+            || cursor.Contiguous < snapshot.SnapshotThrough)
+        {
+            Surface("snapshot", "The empty snapshot baseline was not installed.");
+            return;
+        }
+        if (cursor.Contiguous > snapshot.SnapshotThrough) return;
+
+        var receipt = OnlineReplicationProtocol.CreateReceipt(
+            identity.DeviceId,
+            snapshot.OriginDeviceId,
+            snapshot.LogEpoch,
+            snapshot.SnapshotThrough,
+            OnlineReplicationProtocol.ComputeCursorHash(cursor),
+            OnlineReplicationProtocol.ComputeSnapshotManifestHash(snapshot),
+            identity.PrivateKeyB64);
+        db.StoreReceipt(receipt);
+        var sent = await SendControlAsync(
+            session.PeerHandle,
+            session.PeerDevice,
+            E2EFrameKind.Receipt,
+            session.SessionId,
+            ReplicationPayloadCodec.SerializeControl(receipt),
+            OnlinePushClasses.Normal,
+            ct).ConfigureAwait(false);
+        if (sent.Accepted)
+            ObserveActivity(new ReplicationEngineActivity(
+                "receipt.sent", session.PeerHandle, session.PeerDevice));
     }
 
     private async Task OnRequestAsync(PeerSession session, string plaintext, CancellationToken ct)
@@ -599,7 +920,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         if (request is null || !OnlineReplicationProtocol.ValidateRequest(request, out _)) { Surface("route", "Malformed request."); return; }
         ObserveActivity(new ReplicationEngineActivity(
             "request.received", session.PeerHandle, session.PeerDevice));
-        await ServeRangesAsync(session, request.OriginDeviceId, request.LogEpoch, request.Ranges, long.MaxValue, ct).ConfigureAwait(false);
+        var truncated = await ServeRangesAsync(
+            session,
+            request.OriginDeviceId,
+            request.LogEpoch,
+            request.Ranges,
+            long.MaxValue,
+            ct).ConfigureAwait(false);
+        var requestThrough = request.Ranges.Max(static range => range.ToSeq);
+        if (truncated || db.GetLocalOriginThrough(request.OriginDeviceId) > requestThrough)
+            await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, ct).ConfigureAwait(false);
     }
 
     private async Task OnResyncRequestAsync(PeerSession session, string plaintext, CancellationToken ct)
@@ -609,34 +939,60 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         var through = db.GetLocalOriginThrough(resync.OriginDeviceId);
         if (through < resync.FromSeq) return;
         var ranges = new[] { new ReplicationRange(resync.FromSeq == 0 ? 1 : resync.FromSeq, through) };
-        // Online snapshot: stream the log directly as E2E batches, bounded by a byte budget.
-        await ServeRangesAsync(session, resync.OriginDeviceId, resync.LogEpoch, ranges, snapshotByteBudget, ct).ConfigureAwait(false);
+        var truncated = await ServeRangesAsync(
+            session,
+            resync.OriginDeviceId,
+            resync.LogEpoch,
+            ranges,
+            snapshotByteBudget,
+            ct).ConfigureAwait(false);
+        if (truncated || db.GetLocalOriginThrough(resync.OriginDeviceId) > through)
+            await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, ct).ConfigureAwait(false);
     }
 
-    private async Task ServeRangesAsync(
+    private async Task<bool> ServeRangesAsync(
         PeerSession session, string origin, string epoch,
         IReadOnlyList<ReplicationRange> ranges, long byteBudget, CancellationToken ct)
     {
         long streamed = 0;
-        foreach (var range in ranges)
+        var creditsLeft = flow.Credits;
+        for (var rangeIndex = 0; rangeIndex < ranges.Count; rangeIndex++)
         {
+            var range = ranges[rangeIndex];
             var from = range.FromSeq;
-            while (from <= range.ToSeq)
+            while (from <= range.ToSeq && creditsLeft > 0)
             {
                 var page = db.QueryEvents(origin, epoch, from, range.ToSeq, OnlineReplicationLimits.MaxBatchOps);
                 if (page.Count == 0) break;
-                foreach (var batch in OnlineReplicationState.BuildBatches(origin, epoch, page, flow))
+                var batches = OnlineReplicationState.BuildBatches(
+                    origin,
+                    epoch,
+                    page,
+                    flow with { Credits = creditsLeft });
+                if (batches.Count == 0) return false;
+
+                foreach (var batch in batches)
                 {
-                    streamed += batch.Events.Sum(e => (long)System.Text.Encoding.UTF8.GetByteCount(e.Ciphertext) + 256);
-                    await SendControlAsync(session.PeerHandle, session.PeerDevice, E2EFrameKind.Batch, session.SessionId,
-                        ReplicationPayloadCodec.SerializeControl(batch), OnlinePushClasses.Normal, ct).ConfigureAwait(false);
-                    if (streamed >= byteBudget) return;
+                    var sent = await SendControlAsync(
+                        session.PeerHandle,
+                        session.PeerDevice,
+                        E2EFrameKind.Batch,
+                        session.SessionId,
+                        ReplicationPayloadCodec.SerializeControl(batch),
+                        OnlinePushClasses.Normal,
+                        ct).ConfigureAwait(false);
+                    if (!sent.Accepted) return false;
+
+                    streamed += batch.Events.Sum(e => (long)Encoding.UTF8.GetByteCount(e.Ciphertext) + 256);
+                    creditsLeft--;
+                    from = batch.Events[^1].Seq + 1;
+                    if (streamed >= byteBudget || creditsLeft == 0)
+                        return from <= range.ToSeq || rangeIndex + 1 < ranges.Count;
                 }
-                from = page[^1].Seq + 1;
             }
         }
+        return false;
     }
-
     private async Task OnBatchAsync(PeerSession session, OnlineRelayDelivery delivery, string plaintext, CancellationToken ct)
     {
         var batch = ReplicationPayloadCodec.DeserializeControl<ReplicationBatch>(plaintext);
@@ -654,81 +1010,94 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             await refreshable.RefreshAsync(originAccounts, ct).ConfigureAwait(false);
         }
 
-        var committedCount = 0;
-        foreach (var evt in batch.Events)
+        var projectionLease = await EnterProjectionBoundaryAsync(ct).ConfigureAwait(false);
+        try
         {
-            var originDevice = roster.ResolveDevice(evt.OriginAccount, evt.OriginDeviceId);
-            if (originDevice is null || originDevice.Revoked)
+            var committedCount = 0;
+            var committedEvents = new List<ReplicationCommittedDomainEvent>();
+            foreach (var evt in batch.Events)
             {
-                Surface("auth", $"Event from unknown/revoked origin device {evt.OriginDeviceId}.");
-                return;
-            }
-            if (evt.AuthGeneration > roster.AuthGeneration(evt.OriginAccount) && roster.AuthGeneration(evt.OriginAccount) >= 0)
-            {
-                Surface("auth", $"Event carried a future auth generation {evt.AuthGeneration}.");
-                return;
-            }
-            if (!OnlineReplicationProtocol.VerifyEvent(evt, originDevice.PublicKeyB64))
-            {
-                Surface("auth", $"Event {evt.EventId} failed signature verification.");
-                return;
-            }
-
-            var cursor = db.GetCursor(evt.OriginDeviceId) ?? OnlineReplicationProtocol.EmptyCursor();
-            var apply = OnlineReplicationProtocol.ApplyToCursor(cursor, evt.LogEpoch, evt.Seq, out var updated);
-            switch (apply)
-            {
-                case CursorApplyResult.Duplicate:
-                    continue; // Exact duplicate: never re-project the domain.
-                case CursorApplyResult.RejectedTooFarAhead:
-                    continue; // Outside the reorder window; a follow-up request refetches.
-                case CursorApplyResult.RejectedEpochMismatch:
-                    Halt(evt.OriginDeviceId, "epoch-mismatch", $"Epoch changed for {evt.OriginDeviceId}.");
+                var originDevice = roster.ResolveDevice(evt.OriginAccount, evt.OriginDeviceId);
+                if (originDevice is null || originDevice.Revoked)
+                {
+                    Surface("auth", $"Event from unknown/revoked origin device {evt.OriginDeviceId}.");
                     return;
-                case CursorApplyResult.RejectedInvalid:
-                    Surface("route", $"Event {evt.EventId} rejected by cursor.");
+                }
+                if (evt.AuthGeneration > roster.AuthGeneration(evt.OriginAccount) && roster.AuthGeneration(evt.OriginAccount) >= 0)
+                {
+                    Surface("auth", $"Event carried a future auth generation {evt.AuthGeneration}.");
                     return;
+                }
+                if (!OnlineReplicationProtocol.VerifyEvent(evt, originDevice.PublicKeyB64))
+                {
+                    Surface("auth", $"Event {evt.EventId} failed signature verification.");
+                    return;
+                }
+
+                var cursor = db.GetCursor(evt.OriginDeviceId) ?? OnlineReplicationProtocol.EmptyCursor();
+                var apply = OnlineReplicationProtocol.ApplyToCursor(cursor, evt.LogEpoch, evt.Seq, out var updated);
+                switch (apply)
+                {
+                    case CursorApplyResult.Duplicate:
+                        continue; // Exact duplicate: never re-project the domain.
+                    case CursorApplyResult.RejectedTooFarAhead:
+                        continue; // Outside the reorder window; a follow-up request refetches.
+                    case CursorApplyResult.RejectedEpochMismatch:
+                        Halt(evt.OriginDeviceId, "epoch-mismatch", $"Epoch changed for {evt.OriginDeviceId}.");
+                        return;
+                    case CursorApplyResult.RejectedInvalid:
+                        Surface("route", $"Event {evt.EventId} rejected by cursor.");
+                        return;
+                }
+
+                ReplicationPayloadCodec.DomainEnvelope? committed = null;
+                try
+                {
+                    var append = db.ApplyInboundEvent(
+                        evt,
+                        updated,
+                        (conn, tx) => committed = ProjectDomain(conn, tx, evt));
+                    if (append == MeshDb.ReplicationAppendResult.Inserted) committedCount++;
+                }
+                catch (MeshDb.ReplicationForkException fork)
+                {
+                    Halt(evt.OriginDeviceId, "fork", fork.Message);
+                    return;
+                }
+                catch (ReplicationProjectionException projection)
+                {
+                    // A permanent, unrecoverable domain-projection failure (unknown/invalid/
+                    // unauthorised payload). The transaction has already rolled back, so the event
+                    // is not stored and the cursor did not advance. Halt this origin so we never
+                    // silently skip the event or advance past it (spec items 4 & 6: fail closed).
+                    Halt(evt.OriginDeviceId, "projection", projection.Message);
+                    return;
+                }
+
+                // The transaction committed. Defer in-memory refresh until every event in this wire
+                // batch has committed so UI-backed appliers can publish one visible state change.
+                if (committed is not null)
+                    committedEvents.Add(new ReplicationCommittedDomainEvent(evt, committed));
             }
 
-            ReplicationPayloadCodec.DomainEnvelope? committed = null;
-            try
-            {
-                var append = db.ApplyInboundEvent(
-                    evt,
-                    updated,
-                    (conn, tx) => committed = ProjectDomain(conn, tx, evt));
-                if (append == MeshDb.ReplicationAppendResult.Inserted) committedCount++;
-            }
-            catch (MeshDb.ReplicationForkException fork)
-            {
-                Halt(evt.OriginDeviceId, "fork", fork.Message);
-                return;
-            }
-            catch (ReplicationProjectionException projection)
-            {
-                // A permanent, unrecoverable domain-projection failure (unknown/invalid/
-                // unauthorised payload). The transaction has already rolled back, so the event
-                // is not stored and the cursor did not advance. Halt this origin so we never
-                // silently skip the event or advance past it (spec items 4 & 6: fail closed).
-                Halt(evt.OriginDeviceId, "projection", projection.Message);
-                return;
-            }
+            if (committedEvents.Count > 0)
+                await applier.AfterCommitBatchAsync(committedEvents, deviceIsDesktop).ConfigureAwait(false);
 
-            // The transaction committed. Only now may in-memory state be refreshed and the UI
-            // notified, so a rolled-back apply can never leave the UI showing phantom state.
-            if (committed is not null)
-                await applier.AfterCommitAsync(evt, committed, deviceIsDesktop).ConfigureAwait(false);
+            if (committedCount > 0)
+            {
+                db.RecordPeerSync(session.PeerHandle, session.PeerDevice);
+                ObserveActivity(new ReplicationEngineActivity(
+                    "batch.committed",
+                    session.PeerHandle,
+                    session.PeerDevice,
+                    committedCount,
+                    Encoding.UTF8.GetByteCount(plaintext)));
+            }
+            if (!TryFinalizePendingSnapshot(session, batch.OriginDeviceId)) return;
         }
-
-        if (committedCount > 0)
+        finally
         {
-            db.RecordPeerSync(session.PeerHandle, session.PeerDevice);
-            ObserveActivity(new ReplicationEngineActivity(
-                "batch.committed",
-                session.PeerHandle,
-                session.PeerDevice,
-                committedCount,
-                Encoding.UTF8.GetByteCount(plaintext)));
+            projectionLease.Dispose();
         }
         await SendReceiptAsync(session, delivery, batch, ct).ConfigureAwait(false);
     }
@@ -771,7 +1140,33 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 "receipt.sent", session.PeerHandle, session.PeerDevice));
     }
 
-    private void OnReceipt(OnlineRelayDelivery delivery, string plaintext, ReplicationDevice peer)
+    private string ComputeEmptySnapshotAckHash(
+        MeshDb.ReplicationPeerBootstrap bootstrap,
+        string receiverDeviceId)
+    {
+        var coverage = ReplicationPayloadCodec.DeserializeControl<List<ReplicationSnapshotCoverage>>(
+            bootstrap.CoverageJson)
+            ?? throw new InvalidOperationException("The durable bootstrap coverage is invalid.");
+        var manifest = new ReplicationSnapshotManifest(
+            bootstrap.BootstrapId,
+            receiverDeviceId,
+            bootstrap.LocalOriginDeviceId,
+            bootstrap.LocalLogEpoch,
+            bootstrap.BootstrapFromSeq,
+            bootstrap.BootstrapThroughSeq,
+            OnlineReplicationProtocol.ComputeSnapshotStateHash(Array.Empty<ReplicationEvent>()),
+            identity.AuthGeneration,
+            "",
+            coverage);
+        return OnlineReplicationProtocol.ComputeSnapshotManifestHash(manifest);
+    }
+
+    private async Task OnReceiptAsync(
+        PeerSession session,
+        OnlineRelayDelivery delivery,
+        string plaintext,
+        ReplicationDevice peer,
+        CancellationToken ct)
     {
         var receipt = ReplicationPayloadCodec.DeserializeControl<PersistenceReceipt>(plaintext);
         if (receipt is null) { Surface("route", "Malformed receipt."); return; }
@@ -785,6 +1180,18 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             // Custody is cleared when one authorised recipient device proves durable persistence.
             var bootstrapTarget = ReplicationBootstrapTarget.Create(peer, identity);
             var bootstrapBefore = db.GetPeerBootstrap(bootstrapTarget);
+            if (bootstrapBefore is { State: MeshDb.BootstrapStateEmitted, TotalItems: 0 }
+                && receipt.ThroughSeq == bootstrapBefore.BootstrapThroughSeq
+                && string.Equals(receipt.OriginDeviceId, bootstrapBefore.LocalOriginDeviceId, StringComparison.Ordinal)
+                && string.Equals(receipt.LogEpoch, bootstrapBefore.LocalLogEpoch, StringComparison.Ordinal)
+                && !string.Equals(
+                    receipt.BatchHash,
+                    ComputeEmptySnapshotAckHash(bootstrapBefore, peer.DeviceId),
+                    StringComparison.Ordinal))
+            {
+                Surface("auth", "Empty snapshot receipt did not acknowledge the active manifest.");
+                return;
+            }
             var advanced = db.MarkOutboxPersistedFromReceipt(receipt, peer.PublicKeyB64, delivery.FromHandle);
             ObserveActivity(new ReplicationEngineActivity(
                 "receipt.received",
@@ -800,6 +1207,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                     bootstrapTarget,
                     bootstrapAfter.BootstrapId,
                     bootstrapAfter.TotalItems);
+                await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, ct).ConfigureAwait(false);
             }
         }
         catch (ArgumentException)
@@ -1199,6 +1607,26 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         }
     }
 
+    private sealed class SemaphoreLease(SemaphoreSlim gate) : IDisposable
+    {
+        private SemaphoreSlim? heldGate = gate;
+
+        public void Dispose()
+        {
+            var current = Interlocked.Exchange(ref heldGate, null);
+            current?.Release();
+        }
+    }
+
+    private sealed record OutstandingRequest(
+        string LogEpoch,
+        ulong CursorAtRequest,
+        DateTimeOffset RequestedAt);
+
+    private sealed record PendingSnapshot(
+        ReplicationSnapshotManifest Manifest,
+        bool BaselineInstalled);
+
     private sealed class PeerSession(string peerHandle, string peerDevice, string sessionId, string localNonce)
     {
         public string PeerHandle { get; } = peerHandle;
@@ -1206,6 +1634,8 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         public string SessionId { get; set; } = sessionId;
         public string LocalNonce { get; } = localNonce;
         public bool Established { get; set; }
+        public Dictionary<string, OutstandingRequest> OutstandingRequests { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, PendingSnapshot> PendingSnapshots { get; } = new(StringComparer.Ordinal);
         public DateTimeOffset LastInitAttemptAt { get; set; } = DateTimeOffset.UtcNow;
     }
 }

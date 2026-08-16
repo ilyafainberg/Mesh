@@ -1,3 +1,5 @@
+using Mesh.Shared;
+
 namespace Mesh.App.Services;
 
 public sealed partial class MeshDb
@@ -33,6 +35,42 @@ public sealed partial class MeshDb
         while (r.Read())
             result.Add(new ServeableOrigin(
                 r.GetString(0), r.GetString(1), (ulong)r.GetInt64(2), (ulong)r.GetInt64(3)));
+        return result;
+    }
+
+    /// <summary>Returns the next sequence reserved for this device's local origin.</summary>
+    internal ulong GetLocalOriginNextSeq(string originDeviceId, string logEpoch)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT log_epoch, next_seq FROM replication_local_origins WHERE origin_device_id = $origin;";
+        cmd.Parameters.AddWithValue("$origin", originDeviceId);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) throw new InvalidOperationException("The local origin log has not been registered.");
+        if (!string.Equals(reader.GetString(0), logEpoch, StringComparison.Ordinal))
+            throw new InvalidOperationException("The local origin epoch changed unexpectedly.");
+        var next = reader.GetInt64(1);
+        if (next <= 0) throw new InvalidOperationException("The local origin sequence is invalid.");
+        return (ulong)next;
+    }
+
+    /// <summary>Captures fully contiguous positions for non-local origins represented by a compact state snapshot.</summary>
+    internal IReadOnlyList<ReplicationSnapshotCoverage> GetSnapshotCoverage(string localOriginDeviceId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT origin_device_id, log_epoch, contiguous
+            FROM replication_cursors
+            WHERE origin_device_id != $local AND contiguous > 0
+            ORDER BY origin_device_id ASC
+            LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$local", localOriginDeviceId);
+        cmd.Parameters.AddWithValue("$limit", OnlineReplicationLimits.MaxSnapshotCoverageOrigins);
+        var result = new List<ReplicationSnapshotCoverage>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            result.Add(new ReplicationSnapshotCoverage(
+                reader.GetString(0), reader.GetString(1), (ulong)reader.GetInt64(2)));
         return result;
     }
 

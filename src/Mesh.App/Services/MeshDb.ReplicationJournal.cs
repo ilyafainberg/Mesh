@@ -12,6 +12,25 @@ namespace Mesh.App.Services;
 /// </summary>
 public sealed partial class MeshDb
 {
+    private readonly object localOriginJournalGate = new();
+
+    internal IDisposable EnterLocalOriginJournalLock()
+    {
+        Monitor.Enter(localOriginJournalGate);
+        return new LocalOriginJournalLease(localOriginJournalGate);
+    }
+
+    private sealed class LocalOriginJournalLease(object gate) : IDisposable
+    {
+        private object? heldGate = gate;
+
+        public void Dispose()
+        {
+            var current = Interlocked.Exchange(ref heldGate, null);
+            if (current is not null) Monitor.Exit(current);
+        }
+    }
+
     /// <summary>
     /// Allocates the next local sequence, creates and appends its signed event, enqueues target
     /// references, applies the domain change and advances <c>next_seq</c> in one transaction.
@@ -28,6 +47,7 @@ public sealed partial class MeshDb
         ArgumentNullException.ThrowIfNull(eventFactory);
         ArgumentNullException.ThrowIfNull(targetAccounts);
 
+        using var journalLock = EnterLocalOriginJournalLock();
         using var tx = conn.BeginTransaction(deferred: false);
         string epoch;
         long next;
@@ -112,6 +132,7 @@ public sealed partial class MeshDb
         if (eventFactories.Count == 0)
             throw new ArgumentException("At least one event factory is required.", nameof(eventFactories));
 
+        using var journalLock = EnterLocalOriginJournalLock();
         using var tx = conn.BeginTransaction(deferred: false);
         string epoch;
         long next;

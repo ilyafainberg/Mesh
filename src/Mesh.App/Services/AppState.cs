@@ -572,7 +572,16 @@ public sealed partial class AppState : IMemoryState
         }
     }
 
-    public void NotifyChanged() => Changed?.Invoke();
+    public void NotifyChanged()
+    {
+        var batch = replicationNotificationBatch.Value;
+        if (batch is not null)
+        {
+            batch.Pending = true;
+            return;
+        }
+        Changed?.Invoke();
+    }
 
     // ---- chat history (append-only rows) ----------------------------------
 

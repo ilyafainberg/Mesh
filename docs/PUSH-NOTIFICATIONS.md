@@ -98,6 +98,26 @@ entity. Per-conversation mute suppresses the contextual local banner after synch
 cannot retract a generic alert that APNs or Android already displayed. Device do-not-disturb disables
 relay-visible alert mode and therefore uses silent wakes.
 
+## Fresh-device replication bootstrap
+
+A newly linked sibling does not replay the complete historical event log. The origin captures current
+owner state behind the inbound-projection and local-journal boundaries, so the snapshot, its first
+sequence, and its per-origin coverage vector describe one ordered state. It then advertises a signed
+manifest bound to the receiver, snapshot origin and epoch, authorization generation, exact event
+range hash, and the fully contiguous positions represented for other origins.
+
+The receiver installs the snapshot baseline only for its own device and only when it has no stored
+events for that origin. After the exact signed range is present, it recomputes the range hash before
+installing any third-origin coverage. Other origin offers remain deferred until the receiver's signed
+receipt proves that verification completed. Empty state uses a zero-length baseline and an explicit
+signed receipt, so old history is skipped without inventing a visible domain event. Existing replicas
+never discard stored history, and legacy markers without a baseline are rebuilt.
+
+Range responses consume one total flow-credit window across all pages. A truncated response continues
+through a fresh offer/request cycle; overlapping offers are coalesced only for a bounded interval, so
+an accepted but lost batch is requested again. Each committed wire batch updates live state with one
+coalesced UI notification.
+
 ## Background synchronization
 
 When iOS or Android backgrounds Mesh, the foreground SignalR connection is stopped. A push wake

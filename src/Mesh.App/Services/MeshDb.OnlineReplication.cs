@@ -51,11 +51,13 @@ public sealed partial class MeshDb
         string LocalOriginDeviceId,
         string LocalLogEpoch,
         string BootstrapId,
+        ulong BootstrapFromSeq,
         ulong BootstrapThroughSeq,
         string StateHash,
         string State,
         int EmittedItems,
         int TotalItems,
+        string CoverageJson,
         string SnapshotJson,
         DateTimeOffset CreatedAt,
         DateTimeOffset UpdatedAt,
@@ -178,11 +180,13 @@ public sealed partial class MeshDb
                 local_origin_device_id TEXT NOT NULL,
                 local_log_epoch TEXT NOT NULL,
                 bootstrap_id TEXT NOT NULL,
+                bootstrap_from_seq INTEGER NOT NULL DEFAULT 0,
                 bootstrap_through_seq INTEGER NOT NULL,
                 state_hash TEXT NOT NULL,
                 state TEXT NOT NULL,
                 emitted_items INTEGER NOT NULL,
                 total_items INTEGER NOT NULL,
+                coverage_json TEXT NOT NULL DEFAULT '[]',
                 snapshot_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -192,6 +196,8 @@ public sealed partial class MeshDb
 
         AddColumnIfMissing("replication_outbox", "notification_worthy", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("replication_outbox", "notification_id", "TEXT");
+        AddColumnIfMissing("replication_peer_bootstrap", "bootstrap_from_seq", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("replication_peer_bootstrap", "coverage_json", "TEXT NOT NULL DEFAULT '[]'");
         Exec("CREATE INDEX IF NOT EXISTS ix_replication_outbox_notification ON replication_outbox(target_account, notification_worthy, event_id);");
     }
 
@@ -223,6 +229,7 @@ public sealed partial class MeshDb
     /// </summary>
     public (string LogEpoch, ulong Seq) AllocateNextSequence(string originDeviceId)
     {
+        using var journalLock = EnterLocalOriginJournalLock();
         using var tx = conn.BeginTransaction(deferred: false);
         string epoch;
         long next;
@@ -460,6 +467,92 @@ public sealed partial class MeshDb
         if (!r.Read()) return null;
         var bits = (byte[])r.GetValue(2);
         return new ReplicationCursorEntry(r.GetString(0), (ulong)r.GetInt64(1), bits);
+    }
+
+    /// <summary>
+    /// Installs a verified snapshot baseline only while this device holds no events for the origin.
+    /// A previously installed empty baseline may advance, but existing replicated history is never
+    /// discarded or moved backward.
+    /// </summary>
+    internal bool TryInstallSnapshotBaseline(ReplicationSnapshotManifest manifest)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        if (!OnlineReplicationProtocol.ValidateSnapshotManifestShape(manifest, out var error))
+            throw new ArgumentException(error, nameof(manifest));
+
+        using var tx = conn.BeginTransaction(deferred: false);
+        var installed = TryInstallCursorBaselineCore(
+            manifest.OriginDeviceId,
+            manifest.LogEpoch,
+            manifest.BaselineFrom - 1,
+            tx);
+        tx.Commit();
+        return installed;
+    }
+
+    /// <summary>Installs verified sibling-snapshot coverage for origins with no local history.</summary>
+    internal int TryInstallSnapshotCoverage(ReplicationSnapshotManifest manifest)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        if (!OnlineReplicationProtocol.ValidateSnapshotManifestShape(manifest, out var error))
+            throw new ArgumentException(error, nameof(manifest));
+
+        var installed = 0;
+        using var tx = conn.BeginTransaction(deferred: false);
+        foreach (var coverage in manifest.Coverage ?? Array.Empty<ReplicationSnapshotCoverage>())
+        {
+            if (TryInstallCursorBaselineCore(
+                    coverage.OriginDeviceId,
+                    coverage.LogEpoch,
+                    coverage.ThroughSeq,
+                    tx))
+                installed++;
+        }
+        tx.Commit();
+        return installed;
+    }
+
+    private bool TryInstallCursorBaselineCore(
+        string originDeviceId,
+        string logEpoch,
+        ulong baseline,
+        SqliteTransaction tx)
+    {
+        using (var events = conn.CreateCommand())
+        {
+            events.Transaction = tx;
+            events.CommandText = "SELECT COUNT(*) FROM replication_events WHERE origin_device_id = $origin;";
+            events.Parameters.AddWithValue("$origin", originDeviceId);
+            if (Convert.ToInt64(events.ExecuteScalar()) != 0) return false;
+        }
+
+        using (var existing = conn.CreateCommand())
+        {
+            existing.Transaction = tx;
+            existing.CommandText = "SELECT log_epoch, contiguous, ahead_bits FROM replication_cursors WHERE origin_device_id = $origin;";
+            existing.Parameters.AddWithValue("$origin", originDeviceId);
+            using var reader = existing.ExecuteReader();
+            if (reader.Read())
+            {
+                var epoch = reader.GetString(0);
+                var contiguous = (ulong)reader.GetInt64(1);
+                var aheadBits = (byte[])reader.GetValue(2);
+                if (!string.Equals(epoch, logEpoch, StringComparison.Ordinal)
+                    || contiguous > baseline
+                    || aheadBits.Any(static value => value != 0))
+                    return false;
+                if (contiguous == baseline) return false;
+            }
+        }
+
+        UpsertCursorCore(
+            originDeviceId,
+            new ReplicationCursorEntry(
+                logEpoch,
+                baseline,
+                new byte[OnlineReplicationLimits.AheadBitsBytes]),
+            tx);
+        return true;
     }
 
     /// <summary>Upserts the replication cursor for an origin log.</summary>
@@ -784,27 +877,30 @@ public sealed partial class MeshDb
         string bootstrapId,
         string stateHash,
         string snapshotJson,
-        int totalItems)
+        int totalItems,
+        string coverageJson = "[]")
     {
         ArgumentNullException.ThrowIfNull(target);
         ArgumentException.ThrowIfNullOrWhiteSpace(bootstrapId);
         ArgumentException.ThrowIfNullOrWhiteSpace(stateHash);
         ArgumentNullException.ThrowIfNull(snapshotJson);
+        ArgumentNullException.ThrowIfNull(coverageJson);
         if (totalItems < 0) throw new ArgumentOutOfRangeException(nameof(totalItems));
 
         using var tx = conn.BeginTransaction(deferred: false);
         var existing = GetPeerBootstrapCore(target, tx);
         if (existing is not null
             && string.Equals(existing.LocalOriginDeviceId, target.LocalOriginDeviceId, StringComparison.Ordinal)
-            && string.Equals(existing.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal))
+            && string.Equals(existing.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal)
+            && existing.BootstrapFromSeq > 0)
         {
             tx.Commit();
             return existing;
         }
 
         var now = DateTimeOffset.UtcNow;
-        var initialState = totalItems == 0 ? BootstrapStatePersisted : BootstrapStatePending;
-        var completedAt = totalItems == 0 ? now.ToString("O") : null;
+        const string initialState = BootstrapStatePending;
+        string? completedAt = null;
         using (var cmd = conn.CreateCommand())
         {
             cmd.Transaction = tx;
@@ -812,19 +908,21 @@ public sealed partial class MeshDb
                 INSERT INTO replication_peer_bootstrap(
                     peer_handle, peer_device_id, peer_key_hash, auth_generation,
                     local_origin_device_id, local_log_epoch, bootstrap_id,
-                    bootstrap_through_seq, state_hash, state, emitted_items, total_items,
-                    snapshot_json, created_at, updated_at, completed_at)
+                    bootstrap_from_seq, bootstrap_through_seq, state_hash, state, emitted_items, total_items,
+                    coverage_json, snapshot_json, created_at, updated_at, completed_at)
                 VALUES($handle, $device, $keyHash, $generation, $origin, $epoch, $bootstrap,
-                    0, $stateHash, $state, 0, $total, $snapshot, $created, $updated, $completed)
+                    0, 0, $stateHash, $state, 0, $total, $coverage, $snapshot, $created, $updated, $completed)
                 ON CONFLICT(peer_handle, peer_device_id, peer_key_hash, auth_generation) DO UPDATE SET
                     local_origin_device_id = excluded.local_origin_device_id,
                     local_log_epoch = excluded.local_log_epoch,
                     bootstrap_id = excluded.bootstrap_id,
+                    bootstrap_from_seq = excluded.bootstrap_from_seq,
                     bootstrap_through_seq = 0,
                     state_hash = excluded.state_hash,
                     state = excluded.state,
                     emitted_items = 0,
                     total_items = excluded.total_items,
+                    coverage_json = excluded.coverage_json,
                     snapshot_json = excluded.snapshot_json,
                     created_at = excluded.created_at,
                     updated_at = excluded.updated_at,
@@ -840,14 +938,13 @@ public sealed partial class MeshDb
             cmd.Parameters.AddWithValue("$stateHash", stateHash);
             cmd.Parameters.AddWithValue("$state", initialState);
             cmd.Parameters.AddWithValue("$total", totalItems);
+            cmd.Parameters.AddWithValue("$coverage", coverageJson);
             cmd.Parameters.AddWithValue("$snapshot", snapshotJson);
             cmd.Parameters.AddWithValue("$created", now.ToString("O"));
             cmd.Parameters.AddWithValue("$updated", now.ToString("O"));
             cmd.Parameters.AddWithValue("$completed", (object?)completedAt ?? DBNull.Value);
             cmd.ExecuteNonQuery();
         }
-        if (totalItems == 0)
-            RecordPeerSyncCore(target.PeerHandle, target.PeerDeviceId, now, tx);
         var created = GetPeerBootstrapCore(target, tx)
             ?? throw new InvalidOperationException("The bootstrap marker was not persisted.");
         tx.Commit();
@@ -856,27 +953,36 @@ public sealed partial class MeshDb
 
     internal ReplicationPeerBootstrap CompleteEmptyPeerBootstrap(
         ReplicationBootstrapTarget target,
-        string bootstrapId)
+        string bootstrapId,
+        ulong baselineFrom)
     {
         ArgumentNullException.ThrowIfNull(target);
         ArgumentException.ThrowIfNullOrWhiteSpace(bootstrapId);
+        if (baselineFrom == 0 || baselineFrom > long.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(baselineFrom));
 
         using var tx = conn.BeginTransaction(deferred: false);
         var existing = GetPeerBootstrapCore(target, tx)
             ?? throw new InvalidOperationException("The empty bootstrap marker no longer exists.");
         if (!string.Equals(existing.BootstrapId, bootstrapId, StringComparison.Ordinal))
             throw new InvalidOperationException("The empty bootstrap marker changed unexpectedly.");
-        if (existing.TotalItems != 0 || existing.EmittedItems != 0 || existing.BootstrapThroughSeq != 0)
-            throw new InvalidOperationException("Only an empty, un-emitted bootstrap can complete without a receipt.");
+        if (existing.TotalItems != 0 || existing.EmittedItems != 0)
+            throw new InvalidOperationException("Only an empty, un-emitted bootstrap can establish an empty snapshot range.");
+        if (existing.BootstrapFromSeq != 0 && existing.BootstrapFromSeq != baselineFrom)
+            throw new InvalidOperationException("The empty bootstrap baseline changed unexpectedly.");
 
-        if (existing.State != BootstrapStatePersisted)
+        if (existing.State != BootstrapStateEmitted || existing.BootstrapFromSeq == 0)
         {
-            var completedAt = DateTimeOffset.UtcNow;
+            var updatedAt = DateTimeOffset.UtcNow;
             using var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = """
                 UPDATE replication_peer_bootstrap
-                SET state = 'persisted', updated_at = $at, completed_at = $at
+                SET bootstrap_from_seq = $from,
+                    bootstrap_through_seq = $through,
+                    state = 'emitted',
+                    updated_at = $at,
+                    completed_at = NULL
                 WHERE peer_handle = $handle
                   AND peer_device_id = $device
                   AND peer_key_hash = $keyHash
@@ -884,10 +990,11 @@ public sealed partial class MeshDb
                   AND bootstrap_id = $bootstrap
                   AND total_items = 0
                   AND emitted_items = 0
-                  AND bootstrap_through_seq = 0
-                  AND state != 'persisted';
+                  AND (bootstrap_from_seq = 0 OR bootstrap_from_seq = $from);
                 """;
-            cmd.Parameters.AddWithValue("$at", completedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$from", (long)baselineFrom);
+            cmd.Parameters.AddWithValue("$through", (long)(baselineFrom - 1));
             cmd.Parameters.AddWithValue("$handle", target.PeerHandle);
             cmd.Parameters.AddWithValue("$device", target.PeerDeviceId);
             cmd.Parameters.AddWithValue("$keyHash", target.PeerKeyHash);
@@ -895,7 +1002,7 @@ public sealed partial class MeshDb
             cmd.Parameters.AddWithValue("$bootstrap", bootstrapId);
             if (cmd.ExecuteNonQuery() != 1)
                 throw new InvalidOperationException("The empty bootstrap marker changed unexpectedly.");
-            RecordPeerSyncCore(target.PeerHandle, target.PeerDeviceId, completedAt, tx);
+
         }
 
         var completed = GetPeerBootstrapCore(target, tx)
@@ -909,6 +1016,7 @@ public sealed partial class MeshDb
         string bootstrapId,
         int emittedItems,
         int totalItems,
+        ulong fromSeq,
         ulong throughSeq,
         SqliteTransaction tx)
     {
@@ -916,12 +1024,18 @@ public sealed partial class MeshDb
         ArgumentNullException.ThrowIfNull(tx);
         if (emittedItems < 0 || emittedItems > totalItems)
             throw new ArgumentOutOfRangeException(nameof(emittedItems));
+        if (fromSeq == 0 || fromSeq > throughSeq || throughSeq > long.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(fromSeq));
         var state = emittedItems == totalItems ? BootstrapStateEmitted : BootstrapStatePending;
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
             UPDATE replication_peer_bootstrap
             SET emitted_items = $emitted,
+                bootstrap_from_seq = CASE
+                    WHEN bootstrap_from_seq = 0 THEN $from
+                    ELSE bootstrap_from_seq
+                END,
                 bootstrap_through_seq = $through,
                 state = $state,
                 updated_at = $updated
@@ -933,6 +1047,7 @@ public sealed partial class MeshDb
               AND emitted_items <= $emitted;
             """;
         cmd.Parameters.AddWithValue("$emitted", emittedItems);
+        cmd.Parameters.AddWithValue("$from", (long)fromSeq);
         cmd.Parameters.AddWithValue("$through", (long)throughSeq);
         cmd.Parameters.AddWithValue("$state", state);
         cmd.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O"));
@@ -954,8 +1069,8 @@ public sealed partial class MeshDb
         cmd.CommandText = """
             SELECT peer_handle, peer_device_id, peer_key_hash, auth_generation,
                    local_origin_device_id, local_log_epoch, bootstrap_id,
-                   bootstrap_through_seq, state_hash, state, emitted_items, total_items,
-                   snapshot_json, created_at, updated_at, completed_at
+                   bootstrap_from_seq, bootstrap_through_seq, state_hash, state, emitted_items, total_items,
+                   coverage_json, snapshot_json, created_at, updated_at, completed_at
             FROM replication_peer_bootstrap
             WHERE peer_handle = $handle
               AND peer_device_id = $device
@@ -971,10 +1086,10 @@ public sealed partial class MeshDb
         return new ReplicationPeerBootstrap(
             reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetInt64(3),
             reader.GetString(4), reader.GetString(5), reader.GetString(6), (ulong)reader.GetInt64(7),
-            reader.GetString(8), reader.GetString(9), reader.GetInt32(10), reader.GetInt32(11),
-            reader.GetString(12), DateTimeOffset.Parse(reader.GetString(13)),
-            DateTimeOffset.Parse(reader.GetString(14)),
-            reader.IsDBNull(15) ? null : DateTimeOffset.Parse(reader.GetString(15)));
+            (ulong)reader.GetInt64(8), reader.GetString(9), reader.GetString(10), reader.GetInt32(11),
+            reader.GetInt32(12), reader.GetString(13), reader.GetString(14), DateTimeOffset.Parse(reader.GetString(15)),
+            DateTimeOffset.Parse(reader.GetString(16)),
+            reader.IsDBNull(17) ? null : DateTimeOffset.Parse(reader.GetString(17)));
     }
 
     private bool MarkPeerBootstrapPersistedCore(

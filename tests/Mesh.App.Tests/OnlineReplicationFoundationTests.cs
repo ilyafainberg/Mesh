@@ -551,6 +551,19 @@ public sealed class OnlineReplicationFoundationTests
     }
 
     [TestMethod]
+    public void Receipt_ZeroLengthSnapshotAckRoundTrips()
+    {
+        var receiver = NewKeyPair();
+        var receipt = OnlineReplicationProtocol.CreateReceipt(
+            "recv-dev", "dev-a", "epoch-1", 0,
+            OnlineReplicationProtocol.HashText("cursor-zero"),
+            OnlineReplicationProtocol.HashText("empty-snapshot"),
+            receiver.PrivateB64);
+
+        Assert.IsTrue(OnlineReplicationProtocol.VerifyReceipt(receipt, receiver.PublicB64));
+    }
+
+    [TestMethod]
     public void Receipt_Verify_FailsWhenTampered()
     {
         var receiver = NewKeyPair();
@@ -895,6 +908,35 @@ public sealed class OnlineReplicationFoundationTests
     {
         var offer = new ReplicationOffer("dev-a", "epoch-1", AvailableFrom: 10, AvailableThrough: 5);
         Assert.IsFalse(OnlineReplicationProtocol.ValidateOffer(offer, out _));
+    }
+
+    [TestMethod]
+    public void ValidateOffer_AcceptsEmptySnapshotRangeAndRejectsDuplicateCoverage()
+    {
+        var keys = NewKeyPair();
+        var valid = OnlineReplicationProtocol.CreateSnapshotManifest(
+            "empty",
+            "receiver",
+            "dev-a",
+            "epoch-1",
+            1,
+            0,
+            OnlineReplicationProtocol.ComputeSnapshotStateHash(Array.Empty<ReplicationEvent>()),
+            0,
+            keys.PrivateB64,
+            new[] { new ReplicationSnapshotCoverage("dev-b", "epoch-1", 4) });
+        Assert.IsTrue(OnlineReplicationProtocol.ValidateOffer(
+            new ReplicationOffer("dev-a", "epoch-1", 1, 0, valid), out _));
+
+        var duplicate = valid with
+        {
+            Coverage = new[]
+            {
+                new ReplicationSnapshotCoverage("dev-b", "epoch-1", 4),
+                new ReplicationSnapshotCoverage("dev-b", "epoch-2", 5)
+            }
+        };
+        Assert.IsFalse(OnlineReplicationProtocol.ValidateSnapshotManifestShape(duplicate, out _));
     }
 
     [TestMethod]

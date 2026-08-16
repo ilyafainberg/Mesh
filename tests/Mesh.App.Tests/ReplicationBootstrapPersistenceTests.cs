@@ -78,12 +78,13 @@ public sealed class ReplicationBootstrapPersistenceTests
                 {
                     if (index == firstChunk.Count - 1)
                         db.UpdatePeerBootstrapProgress(
-                            target, bootstrapId, firstChunk.Count, envelopes.Count, evt.Seq, tx);
+                            target, bootstrapId, firstChunk.Count, envelopes.Count, 1, evt.Seq, tx);
                 });
 
             var marker = db.GetPeerBootstrap(target)!;
             Assert.AreEqual(MeshDb.BootstrapStatePending, marker.State);
             Assert.AreEqual(2, marker.EmittedItems);
+            Assert.AreEqual(1UL, marker.BootstrapFromSeq);
             Assert.AreEqual(2UL, marker.BootstrapThroughSeq);
         }
 
@@ -105,12 +106,13 @@ public sealed class ReplicationBootstrapPersistenceTests
                 {
                     if (index == finalChunk.Count - 1)
                         db.UpdatePeerBootstrapProgress(
-                            target, bootstrapId, envelopes.Count, envelopes.Count, evt.Seq, tx);
+                            target, bootstrapId, envelopes.Count, envelopes.Count, marker.BootstrapFromSeq, evt.Seq, tx);
                 });
 
             marker = db.GetPeerBootstrap(target)!;
             Assert.AreEqual(MeshDb.BootstrapStateEmitted, marker.State);
             Assert.AreEqual(3, marker.EmittedItems);
+            Assert.AreEqual(1UL, marker.BootstrapFromSeq);
             Assert.AreEqual(3UL, marker.BootstrapThroughSeq);
             Assert.AreEqual(3, db.QueryEvents(identity.DeviceId, identity.LogEpoch, 1, 10).Count);
         }
@@ -133,7 +135,7 @@ public sealed class ReplicationBootstrapPersistenceTests
                 new[] { "alice" },
                 domainWork: static (_, _, _) => { },
                 eventWork: (_, tx, evt, _) =>
-                    db.UpdatePeerBootstrapProgress(target, bootstrapId, 1, 1, evt.Seq, tx));
+                    db.UpdatePeerBootstrapProgress(target, bootstrapId, 1, 1, evt.Seq, evt.Seq, tx));
             through = db.GetPeerBootstrap(target)!.BootstrapThroughSeq;
             Assert.IsNull(db.GetLastSuccessfulReplication());
         }
@@ -188,7 +190,7 @@ public sealed class ReplicationBootstrapPersistenceTests
             {
                 if (index == envelopes.Count - 1)
                     db.UpdatePeerBootstrapProgress(
-                        target, bootstrapId, envelopes.Count, envelopes.Count, evt.Seq, tx);
+                        target, bootstrapId, envelopes.Count, envelopes.Count, 1, evt.Seq, tx);
             });
 
         var marker = db.GetPeerBootstrap(target)!;
@@ -253,16 +255,37 @@ public sealed class ReplicationBootstrapPersistenceTests
     }
 
     [TestMethod]
-    public void EmptyBootstrap_CompletesWithoutWaitingForImpossibleReceipt()
+    public void EmptyBootstrap_UsesSignedZeroLengthReceipt()
     {
         const string snapshot = "[]";
         using (var db = OpenDb())
         {
-            var marker = db.CreateOrResumePeerBootstrap(
+            var pending = db.CreateOrResumePeerBootstrap(
                 target, "empty", Hash(snapshot), snapshot, totalItems: 0);
+            var marker = db.CompleteEmptyPeerBootstrap(target, pending.BootstrapId, baselineFrom: 1);
 
-            Assert.AreEqual(MeshDb.BootstrapStatePersisted, marker.State);
+            Assert.AreEqual(MeshDb.BootstrapStateEmitted, marker.State);
             Assert.AreEqual(0, marker.EmittedItems);
+            Assert.AreEqual(1UL, marker.BootstrapFromSeq);
+            Assert.AreEqual(0UL, marker.BootstrapThroughSeq);
+            Assert.IsNull(marker.CompletedAt);
+            Assert.IsNull(db.GetLastSuccessfulReplication());
+
+            var cursor = new ReplicationCursorEntry(
+                identity.LogEpoch,
+                0,
+                new byte[OnlineReplicationLimits.AheadBitsBytes]);
+            var receipt = OnlineReplicationProtocol.CreateReceipt(
+                target.PeerDeviceId,
+                identity.DeviceId,
+                identity.LogEpoch,
+                0,
+                OnlineReplicationProtocol.ComputeCursorHash(cursor),
+                Hash("empty-range"),
+                peerKeys.PrivateB64);
+            db.MarkOutboxPersistedFromReceipt(receipt, peerKeys.PublicB64, target.PeerHandle);
+            marker = db.GetPeerBootstrap(target)!;
+            Assert.AreEqual(MeshDb.BootstrapStatePersisted, marker.State);
             Assert.IsNotNull(marker.CompletedAt);
             Assert.AreEqual(target.PeerDeviceId, db.GetLastSuccessfulReplication()!.PeerDeviceId);
         }
@@ -298,10 +321,195 @@ public sealed class ReplicationBootstrapPersistenceTests
 
         SqliteConnection.ClearAllPools();
         using var reopened = OpenDb();
-        var repaired = reopened.CompleteEmptyPeerBootstrap(target, "legacy-empty");
-        Assert.AreEqual(MeshDb.BootstrapStatePersisted, repaired.State);
-        Assert.IsNotNull(repaired.CompletedAt);
-        Assert.AreEqual(target.PeerDeviceId, reopened.GetLastSuccessfulReplication()!.PeerDeviceId);
+        var repaired = reopened.CompleteEmptyPeerBootstrap(target, "legacy-empty", baselineFrom: 1);
+        Assert.AreEqual(MeshDb.BootstrapStateEmitted, repaired.State);
+        Assert.AreEqual(1UL, repaired.BootstrapFromSeq);
+        Assert.AreEqual(0UL, repaired.BootstrapThroughSeq);
+        Assert.IsNull(repaired.CompletedAt);
+        Assert.IsNull(reopened.GetLastSuccessfulReplication());
+    }
+
+    [TestMethod]
+    public void LegacyEmittedBootstrapWithoutBaseline_IsRebuiltBeforeReuse()
+    {
+        var envelopes = CreateEnvelopes(1);
+        const string oldId = "legacy-without-baseline";
+        using (var db = OpenDb())
+        {
+            var journal = OpenJournal(db);
+            db.CreateOrResumePeerBootstrap(
+                target, oldId, Hash("old"), "old", envelopes.Count);
+            journal.EmitLocalBatch(
+                envelopes,
+                new[] { "alice" },
+                domainWork: static (_, _, _) => { },
+                eventWork: (_, tx, evt, _) =>
+                    db.UpdatePeerBootstrapProgress(target, oldId, 1, 1, evt.Seq, evt.Seq, tx));
+
+            using var cmd = db.RawConnectionForTest.CreateCommand();
+            cmd.CommandText = "UPDATE replication_peer_bootstrap SET bootstrap_from_seq = 0 WHERE bootstrap_id = $id;";
+            cmd.Parameters.AddWithValue("$id", oldId);
+            Assert.AreEqual(1, cmd.ExecuteNonQuery());
+        }
+
+        SqliteConnection.ClearAllPools();
+        using var reopened = OpenDb();
+        var replacement = reopened.CreateOrResumePeerBootstrap(
+            target, "replacement", Hash("new"), "new", totalItems: 1);
+
+        Assert.AreEqual("replacement", replacement.BootstrapId);
+        Assert.AreEqual(MeshDb.BootstrapStatePending, replacement.State);
+        Assert.AreEqual(0, replacement.EmittedItems);
+        Assert.AreEqual(0UL, replacement.BootstrapFromSeq);
+        Assert.AreEqual(0UL, replacement.BootstrapThroughSeq);
+    }
+
+    [TestMethod]
+    public async Task BootstrapJournalLock_AllocatesSnapshotBeforeConcurrentLocalWrite()
+    {
+        using var db = OpenDb();
+        var journal = OpenJournal(db);
+        var snapshotEnvelope = CreateEnvelopes(1);
+        const string bootstrapId = "atomic-first-sequence";
+        db.CreateOrResumePeerBootstrap(
+            target, bootstrapId, Hash("snapshot"), "snapshot", totalItems: 1);
+
+        using var started = new ManualResetEventSlim();
+        Task<string> concurrent;
+        IReadOnlyList<string> snapshotIds;
+        using (db.EnterLocalOriginJournalLock())
+        {
+            concurrent = Task.Run(() =>
+            {
+                started.Set();
+                return journal.EmitLocal(
+                    CreateEnvelopes(1)[0] with { EntityId = "concurrent" },
+                    new[] { "alice" });
+            });
+            Assert.IsTrue(started.Wait(TimeSpan.FromSeconds(5)));
+            Thread.Sleep(25);
+            Assert.IsFalse(concurrent.IsCompleted, "the concurrent writer must wait behind the bootstrap boundary");
+
+            snapshotIds = journal.EmitLocalBatch(
+                snapshotEnvelope,
+                new[] { "alice" },
+                domainWork: static (_, _, _) => { },
+                eventWork: (_, tx, evt, _) =>
+                    db.UpdatePeerBootstrapProgress(
+                        target, bootstrapId, 1, 1, evt.Seq, evt.Seq, tx));
+        }
+
+        var concurrentId = await concurrent;
+        var snapshotEvent = db.GetEvent(snapshotIds[0])!;
+        var concurrentEvent = db.GetEvent(concurrentId)!;
+        Assert.AreEqual(1UL, snapshotEvent.Seq);
+        Assert.AreEqual(2UL, concurrentEvent.Seq);
+        Assert.AreEqual(1UL, db.GetPeerBootstrap(target)!.BootstrapFromSeq);
+    }
+
+    [TestMethod]
+    public void SnapshotBaseline_OnlyAdvancesAnEmptyOrigin()
+    {
+        using var db = OpenDb();
+        var manifest = OnlineReplicationProtocol.CreateSnapshotManifest(
+            "snapshot",
+            target.PeerDeviceId,
+            identity.DeviceId,
+            identity.LogEpoch,
+            25,
+            30,
+            Hash("state"),
+            identity.AuthGeneration,
+            localKeys.PrivateB64);
+
+        Assert.IsTrue(db.TryInstallSnapshotBaseline(manifest));
+        Assert.AreEqual(24UL, db.GetCursor(identity.DeviceId)!.Contiguous);
+
+        var evt = OnlineReplicationProtocol.CreateEvent(
+            identity.DeviceId,
+            identity.LogEpoch,
+            25,
+            identity.Handle,
+            identity.AuthGeneration,
+            ReplicationOpKinds.Topic,
+            "topic",
+            "topic",
+            "v1",
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ReplicationPayloadCodec.Encrypt(
+                ReplicationPayloadCodec.EncodeEnvelope(CreateEnvelopes(1)[0]),
+                new[] { localKeys.PublicB64 }),
+            localKeys.PrivateB64);
+        db.AppendEvent(evt);
+
+        var later = manifest with { BaselineFrom = 40, SnapshotThrough = 45 };
+        Assert.IsFalse(db.TryInstallSnapshotBaseline(later));
+        Assert.AreEqual(24UL, db.GetCursor(identity.DeviceId)!.Contiguous);
+    }
+
+    [TestMethod]
+    public void SnapshotCoverage_AdvancesOnlyOriginsWithoutStoredEvents()
+    {
+        using var db = OpenDb();
+        var existing = OnlineReplicationProtocol.CreateEvent(
+            "with-history",
+            "epoch-1",
+            1,
+            identity.Handle,
+            identity.AuthGeneration,
+            ReplicationOpKinds.Topic,
+            "existing",
+            "existing",
+            "v1",
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ReplicationPayloadCodec.Encrypt(
+                ReplicationPayloadCodec.EncodeEnvelope(CreateEnvelopes(1)[0]),
+                new[] { localKeys.PublicB64 }),
+            localKeys.PrivateB64);
+        db.AppendEvent(existing);
+
+        var manifest = OnlineReplicationProtocol.CreateSnapshotManifest(
+            "coverage",
+            target.PeerDeviceId,
+            identity.DeviceId,
+            identity.LogEpoch,
+            1,
+            1,
+            Hash("state"),
+            identity.AuthGeneration,
+            localKeys.PrivateB64,
+            new[]
+            {
+                new ReplicationSnapshotCoverage("empty-origin", "epoch-1", 10),
+                new ReplicationSnapshotCoverage("with-history", "epoch-1", 10)
+            });
+
+        Assert.AreEqual(1, db.TryInstallSnapshotCoverage(manifest));
+        Assert.AreEqual(10UL, db.GetCursor("empty-origin")!.Contiguous);
+        Assert.IsNull(db.GetCursor("with-history"));
+    }
+
+    [TestMethod]
+    public void BootstrapCoverage_SurvivesReopen()
+    {
+        var coverageJson = ReplicationPayloadCodec.SerializeControl(new List<ReplicationSnapshotCoverage>
+        {
+            new("third", "epoch-1", 42)
+        });
+        using (var db = OpenDb())
+        {
+            db.CreateOrResumePeerBootstrap(
+                target,
+                "coverage-restart",
+                Hash("snapshot"),
+                "snapshot",
+                totalItems: 1,
+                coverageJson: coverageJson);
+        }
+
+        SqliteConnection.ClearAllPools();
+        using var reopened = OpenDb();
+        Assert.AreEqual(coverageJson, reopened.GetPeerBootstrap(target)!.CoverageJson);
     }
 
     [TestMethod]

@@ -109,6 +109,7 @@ internal sealed class RecordingApplier : IReplicationDomainApplier
 
     /// <summary>Post-commit hook: fired only after the inbound transaction has committed.</summary>
     public Action<ReplicationEvent, ReplicationPayloadCodec.DomainEnvelope>? OnAfterCommit;
+    public int AfterCommitBatchCalls;
 
     public Task AfterCommitAsync(
         ReplicationEvent evt,
@@ -117,6 +118,15 @@ internal sealed class RecordingApplier : IReplicationDomainApplier
     {
         OnAfterCommit?.Invoke(evt, envelope);
         return Task.CompletedTask;
+    }
+
+    public async Task AfterCommitBatchAsync(
+        IReadOnlyList<ReplicationCommittedDomainEvent> committed,
+        bool deviceIsDesktop)
+    {
+        Interlocked.Increment(ref AfterCommitBatchCalls);
+        foreach (var item in committed)
+            await AfterCommitAsync(item.Event, item.Envelope, deviceIsDesktop).ConfigureAwait(false);
     }
 }
 
@@ -129,8 +139,10 @@ internal sealed class ReplicationFabric
 
     public int Delivered { get; private set; }
     public int DroppedOffline { get; private set; }
+    public int DroppedAccepted { get; private set; }
     public int Unknown { get; private set; }
     public Func<string, OnlineRelayFrame, bool>? DropFrame { get; set; }
+    public Func<string, OnlineRelayFrame, bool>? DropAcceptedFrame { get; set; }
 
     private sealed class Node(string handle, string device, OnlineReplicationEngine engine)
     {
@@ -172,6 +184,12 @@ internal sealed class ReplicationFabric
             {
                 DroppedOffline++;
                 return new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline);
+            }
+            if (DropAcceptedFrame?.Invoke(fromDevice, frame) == true)
+            {
+                DroppedAccepted++;
+                Delivered++;
+                return new OnlineRelaySendResult(true, OnlineRelaySendCodes.Delivered);
             }
             var delivery = new OnlineRelayDelivery(
                 fromHandle, fromDevice, frame.ToHandle, frame.ToDevice, frame.FrameId, frame.PushClass, frame.Ciphertext);
@@ -271,7 +289,10 @@ public abstract class ReplicationTestBase
         long authGeneration = 0,
         string logEpoch = "epoch-1",
         int maxSendAttempts = 3,
-        TimeSpan? sendTimeout = null)
+        TimeSpan? sendTimeout = null,
+        ReplicationFlow? flow = null,
+        TimeSpan? requestRetryInterval = null,
+        bool deferSiblingOffersUntilBootstrap = false)
     {
         var keys = KeyPair.New();
         var dbPath = Path.Combine(root, device + ".meshdb");
@@ -281,7 +302,12 @@ public abstract class ReplicationTestBase
             handle, device, keys.PublicB64, keys.PrivateB64, logEpoch, authGeneration, OnlineReplicationProtocol.ZeroHash);
         var engine = new OnlineReplicationEngine(
             db, identity, Fabric.TransportFor(handle, device), Roster, applier,
-            deviceIsDesktop: desktop, sendTimeout: sendTimeout ?? TimeSpan.FromSeconds(5), maxSendAttempts: maxSendAttempts);
+            deviceIsDesktop: desktop,
+            sendTimeout: sendTimeout ?? TimeSpan.FromSeconds(5),
+            maxSendAttempts: maxSendAttempts,
+            flow: flow,
+            requestRetryInterval: requestRetryInterval,
+            deferSiblingOffersUntilBootstrap: deferSiblingOffersUntilBootstrap);
         engine.EnsureLocalOrigin();
         Roster.Add(handle, new ReplicationDevice(handle, device, keys.PublicB64, authGeneration, Revoked: false));
         Fabric.Register(handle, device, engine);
