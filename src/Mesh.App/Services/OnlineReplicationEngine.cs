@@ -95,6 +95,13 @@ public interface IReplicationRoster
 public interface IRefreshableReplicationRoster : IReplicationRoster
 {
     Task RefreshAsync(IReadOnlyList<string> handles, CancellationToken ct);
+
+    /// <summary>
+    /// Re-fetches the supplied handles even when their cached entries are still fresh. Implementations
+    /// must coalesce concurrent requests so one newly linked device cannot trigger duplicate directory
+    /// reads while its first authenticated frame is being revalidated.
+    /// </summary>
+    Task RefreshAuthoritativeAsync(IReadOnlyList<string> handles, CancellationToken ct);
 }
 
 /// <summary>Opaque relay forwarder seam. Implemented over the hub by <c>MeshClient</c>.</summary>
@@ -189,14 +196,20 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     private readonly long snapshotByteBudget;
     private readonly TimeSpan sessionInitRetryInterval;
     private readonly TimeSpan requestRetryInterval;
+    private readonly TimeSpan receiptRetryInterval;
     private readonly bool deferSiblingOffersUntilBootstrap;
     internal static readonly TimeSpan SessionInitRetryInterval = TimeSpan.FromSeconds(3);
     internal static readonly TimeSpan RequestRetryInterval = TimeSpan.FromSeconds(10);
+    internal static readonly TimeSpan ReceiptRetryInterval = TimeSpan.FromSeconds(10);
 
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> peerLocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, PriorityOperationGate> peerLocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> peerSessionLocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> peerReceiptLocks = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim projectionBoundary = new(1, 1);
     private readonly ConcurrentDictionary<string, PeerSession> sessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> latestSessionInitTickets = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> haltedOrigins = new(StringComparer.Ordinal);
+    private long nextSessionInitTicket;
     private readonly CancellationTokenSource lifetime = new();
     private readonly object disposalGate = new();
     private Task? disposeTask;
@@ -225,6 +238,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         long snapshotByteBudget = 256L * 1024 * 1024,
         TimeSpan? sessionInitRetryInterval = null,
         TimeSpan? requestRetryInterval = null,
+        TimeSpan? receiptRetryInterval = null,
         bool deferSiblingOffersUntilBootstrap = false)
     {
         this.db = db ?? throw new ArgumentNullException(nameof(db));
@@ -241,11 +255,14 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         this.snapshotByteBudget = snapshotByteBudget;
         this.sessionInitRetryInterval = sessionInitRetryInterval ?? SessionInitRetryInterval;
         this.requestRetryInterval = requestRetryInterval ?? RequestRetryInterval;
+        this.receiptRetryInterval = receiptRetryInterval ?? ReceiptRetryInterval;
         this.deferSiblingOffersUntilBootstrap = deferSiblingOffersUntilBootstrap;
         if (this.sessionInitRetryInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(sessionInitRetryInterval));
         if (this.requestRetryInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(requestRetryInterval));
+        if (this.receiptRetryInterval <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(receiptRetryInterval));
     }
 
     /// <summary>The most recent replication error surfaced (fork, verification failure, ...).</summary>
@@ -297,11 +314,25 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     }
 
     public Task OfferPeerAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
+        => OfferPeerAsync(peerHandle, peerDevice, OnlinePushClasses.Normal, ct);
+
+    private Task OfferPeerAsync(
+        string peerHandle,
+        string peerDevice,
+        string pushClass,
+        CancellationToken ct)
         => WithPeerLock(peerDevice, async operationCt =>
         {
             if (sessions.TryGetValue(peerDevice, out var session) && session.Established)
-                await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, operationCt).ConfigureAwait(false);
-        }, ct);
+                await TryOfferLocalOriginsAsync(session, pushClass, operationCt).ConfigureAwait(false);
+        }, ct, prioritize: true);
+
+    private Task OfferPeerAsync(PeerSession session, string pushClass, CancellationToken ct)
+        => WithPeerLock(session.PeerDevice, async operationCt =>
+        {
+            if (IsCurrentEstablishedSession(session))
+                await TryOfferLocalOriginsAsync(session, pushClass, operationCt).ConfigureAwait(false);
+        }, ct, prioritize: true);
 
     internal async Task<IDisposable> EnterProjectionBoundaryAsync(CancellationToken ct)
     {
@@ -360,14 +391,24 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         // local change is always durably recorded before any transport is attempted.
         var eventId = journal.EmitLocal(envelope, targetAccounts, domainWork);
 
+#if ANDROID
+        var localSpan = db.GetServeableOrigins().FirstOrDefault(origin =>
+            string.Equals(origin.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal)
+            && string.Equals(origin.LogEpoch, identity.LogEpoch, StringComparison.Ordinal));
+        Android.Util.Log.Info(
+            "MeshRuntime",
+            $"[replication-local] emitted;origin={identity.DeviceId};available_through={localSpan?.AvailableThrough ?? 0};targets={targetAccounts.Count};sessions={sessions.Count}");
+#endif
+
         if (targetAccounts.Count > 0)
             LocalWorkPending?.Invoke();
 
         // Best-effort immediate offer to any peer with a live established session. Offline this
         // simply finds no sessions and leaves the outbox pending for a later drain.
         var established = sessions.Values.Where(session => session.Established).ToArray();
-        foreach (var session in established)
-            await TryOfferLocalOriginsAsync(session, pushClass, ct).ConfigureAwait(false);
+        await Task.WhenAll(established.Select(session =>
+                OfferPeerAsync(session.PeerHandle, session.PeerDevice, pushClass, ct)))
+            .ConfigureAwait(false);
 
         return eventId;
     }
@@ -378,7 +419,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
     /// <summary>Opens a replication session by sending a signed session init to the peer.</summary>
     public Task StartSessionAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
-        => WithPeerLock(peerDevice, async operationCt =>
+        => WithOperationLock(peerSessionLocks, peerDevice, async operationCt =>
         {
             if (!ShouldStartSession(peerDevice, DateTimeOffset.UtcNow)) return;
             await SendSessionInitAsync(peerHandle, peerDevice, operationCt).ConfigureAwait(false);
@@ -424,7 +465,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             ObserveActivity(new ReplicationEngineActivity(
                 result.Accepted ? "wake.requested" : "wake.rejected",
                 peerHandle, peerDevice, ErrorCode: result.Accepted ? null : result.Code));
-        }, ct);
+        }, ct, prioritize: true);
 
     private bool ShouldStartSession(string peerDevice, DateTimeOffset now)
         => !sessions.TryGetValue(peerDevice, out var existing)
@@ -432,15 +473,21 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
     private async Task SendSessionInitAsync(string peerHandle, string peerDevice, CancellationToken ct)
     {
-        var sessionId = Guid.NewGuid().ToString("n");
-        var nonce = MeshCrypto.NewNonce();
-        var init = OnlineReplicationProtocol.CreateSessionInit(
-            sessionId, identity.DeviceId, peerDevice, nonce,
-            identity.CustodyHead, identity.AuthGeneration, identity.PrivateKeyB64);
-        var session = new PeerSession(peerHandle, peerDevice, sessionId, nonce) { Established = false };
+        var retrying = sessions.TryGetValue(peerDevice, out var existing) && !existing.Established;
+        var session = retrying
+            ? existing!
+            : new PeerSession(
+                peerHandle, peerDevice, Guid.NewGuid().ToString("n"), MeshCrypto.NewNonce())
+            {
+                Established = false
+            };
         sessions[peerDevice] = session;
-        ObserveActivity(new ReplicationEngineActivity("session.started", peerHandle, peerDevice));
-        await SendControlAsync(peerHandle, peerDevice, E2EFrameKind.SessionInit, sessionId,
+        var init = OnlineReplicationProtocol.CreateSessionInit(
+            session.SessionId, identity.DeviceId, peerDevice, session.LocalNonce,
+            identity.CustodyHead, identity.AuthGeneration, identity.PrivateKeyB64);
+        ObserveActivity(new ReplicationEngineActivity(
+            retrying ? "session.retried" : "session.started", peerHandle, peerDevice));
+        await SendControlAsync(peerHandle, peerDevice, E2EFrameKind.SessionInit, session.SessionId,
             ReplicationPayloadCodec.SerializeControl(init), OnlinePushClasses.High, ct).ConfigureAwait(false);
         if (sessions.TryGetValue(peerDevice, out var current)
             && ReferenceEquals(current, session)
@@ -455,20 +502,86 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     /// <summary>
     /// Handles one relay delivery. The relay-stamped <see cref="OnlineRelayDelivery.FromHandle"/>
     /// / <see cref="OnlineRelayDelivery.FromDevice"/> are the trusted route identity and are
-    /// validated against the session peer; the opaque frame body is decoded, decrypted and
-    /// dispatched by kind under the per-peer lock.
+    /// validated against the session peer. Handshake and receipt frames use dedicated per-peer lanes;
+    /// remaining work stays serialized, with fresh offers prioritized ahead of queued bulk traffic.
     /// </summary>
     public Task HandleDeliveryAsync(OnlineRelayDelivery delivery, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(delivery);
+        var frame = ReplicationPayloadCodec.DecodeFrame(delivery.Ciphertext);
+        var sessionInitTicket = 0L;
+        if (frame?.Kind == E2EFrameKind.SessionInit)
+        {
+            sessionInitTicket = Interlocked.Increment(ref nextSessionInitTicket);
+            latestSessionInitTickets[delivery.FromDevice] = sessionInitTicket;
+        }
+        if (frame?.Kind is E2EFrameKind.SessionInit or E2EFrameKind.SessionAck)
+            return HandleSessionDeliveryAsync(delivery, frame, sessionInitTicket, ct);
+
+        if (frame?.Kind == E2EFrameKind.Receipt)
+        {
+            return WithOperationLock(
+                peerReceiptLocks,
+                delivery.FromDevice,
+                async operationCt =>
+                {
+                    _ = await DispatchAsync(delivery, frame, sessionInitTicket, operationCt).ConfigureAwait(false);
+                },
+                ct);
+        }
+
         return WithPeerLock(
-            delivery.FromDevice, operationCt => DispatchAsync(delivery, operationCt), ct);
+            delivery.FromDevice,
+            async operationCt =>
+            {
+                _ = await DispatchAsync(delivery, frame, sessionInitTicket, operationCt).ConfigureAwait(false);
+            },
+            ct,
+            prioritize: frame?.Kind == E2EFrameKind.Offer);
     }
 
-    private async Task DispatchAsync(OnlineRelayDelivery delivery, CancellationToken ct)
+    private async Task HandleSessionDeliveryAsync(
+        OnlineRelayDelivery delivery,
+        E2EFrame? frame,
+        long sessionInitTicket,
+        CancellationToken ct)
     {
-        var frame = ReplicationPayloadCodec.DecodeFrame(delivery.Ciphertext);
-        if (frame is null) { Surface("route", "Malformed E2E frame."); return; }
+        PeerSession? initialOfferSession = null;
+        await WithOperationLock(
+            peerSessionLocks,
+            delivery.FromDevice,
+            async operationCt =>
+            {
+                var offerAfterHandshake = await DispatchAsync(
+                    delivery, frame, sessionInitTicket, operationCt).ConfigureAwait(false);
+                if (offerAfterHandshake)
+                    sessions.TryGetValue(delivery.FromDevice, out initialOfferSession);
+            },
+            ct).ConfigureAwait(false);
+
+        if (initialOfferSession is null) return;
+        try
+        {
+            await OfferPeerAsync(
+                initialOfferSession,
+                OnlinePushClasses.Normal,
+                ct).ConfigureAwait(false);
+            initialOfferSession.CompleteInitialOffers();
+        }
+        catch
+        {
+            initialOfferSession.ResetInitialOffers();
+            throw;
+        }
+    }
+
+    private async Task<bool> DispatchAsync(
+        OnlineRelayDelivery delivery,
+        E2EFrame? frame,
+        long sessionInitTicket,
+        CancellationToken ct)
+    {
+        if (frame is null) { Surface("route", "Malformed E2E frame."); return false; }
         ObserveActivity(new ReplicationEngineActivity(
             "protocol.frame_received",
             delivery.FromHandle,
@@ -476,10 +589,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             ByteCount: Encoding.UTF8.GetByteCount(delivery.Ciphertext)));
 
         var peerDevice = roster.ResolveDevice(delivery.FromHandle, delivery.FromDevice);
+        if (peerDevice is null && roster is IRefreshableReplicationRoster refreshable)
+        {
+            await refreshable.RefreshAuthoritativeAsync(
+                new[] { delivery.FromHandle }, ct).ConfigureAwait(false);
+            peerDevice = roster.ResolveDevice(delivery.FromHandle, delivery.FromDevice);
+        }
         if (peerDevice is null || peerDevice.Revoked)
         {
             Surface("auth", $"Delivery from unauthorised or revoked device {delivery.FromDevice}.");
-            return;
+            return false;
         }
 
         // Session handshake frames are verified by their own signatures; other frames must
@@ -487,11 +606,10 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         switch (frame.Kind)
         {
             case E2EFrameKind.SessionInit:
-                await OnSessionInitAsync(delivery, frame, peerDevice, ct).ConfigureAwait(false);
-                return;
+                return await OnSessionInitAsync(
+                    delivery, frame, peerDevice, sessionInitTicket, ct).ConfigureAwait(false);
             case E2EFrameKind.SessionAck:
-                await OnSessionAckAsync(delivery, frame, peerDevice, ct).ConfigureAwait(false);
-                return;
+                return await OnSessionAckAsync(delivery, frame, peerDevice, ct).ConfigureAwait(false);
         }
 
         // Data frames must ride an established session with the stamped peer device. We match
@@ -501,11 +619,11 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         if (!sessions.TryGetValue(delivery.FromDevice, out var session) || !session.Established)
         {
             Surface("route", $"Frame {frame.Kind} for peer {delivery.FromDevice} with no established session.");
-            return;
+            return false;
         }
 
         var (ok, plaintext) = ReplicationPayloadCodec.TryDecrypt(frame.Payload, identity.PrivateKeyB64, identity.PublicKeyB64);
-        if (!ok || plaintext is null) { Surface("crypto", $"Undecryptable {frame.Kind} body."); return; }
+        if (!ok || plaintext is null) { Surface("crypto", $"Undecryptable {frame.Kind} body."); return false; }
 
         switch (frame.Kind)
         {
@@ -519,65 +637,127 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             case E2EFrameKind.Custody: OnCustody(delivery, plaintext); break;
             default: Surface("route", $"Unhandled frame kind {frame.Kind}."); break;
         }
+        return false;
     }
 
-    private async Task OnSessionInitAsync(OnlineRelayDelivery delivery, E2EFrame frame, ReplicationDevice peer, CancellationToken ct)
+    private async Task<bool> OnSessionInitAsync(
+        OnlineRelayDelivery delivery,
+        E2EFrame frame,
+        ReplicationDevice peer,
+        long sessionInitTicket,
+        CancellationToken ct)
     {
-        var (ok, plaintext) = ReplicationPayloadCodec.TryDecrypt(frame.Payload, identity.PrivateKeyB64, identity.PublicKeyB64);
-        if (!ok || plaintext is null) { Surface("crypto", "Undecryptable session init."); return; }
+        var (ok, plaintext) = ReplicationPayloadCodec.TryDecrypt(
+            frame.Payload, identity.PrivateKeyB64, identity.PublicKeyB64);
+        if (!ok || plaintext is null) { Surface("crypto", "Undecryptable session init."); return false; }
         var init = ReplicationPayloadCodec.DeserializeControl<ReplicationSessionInit>(plaintext);
         if (init is null || !OnlineReplicationProtocol.VerifySessionInit(init, peer.PublicKeyB64))
         {
             Surface("auth", "Session init failed verification.");
-            return;
+            return false;
+        }
+        if (!string.Equals(frame.SessionId, init.SessionId, StringComparison.Ordinal))
+        {
+            Surface("auth", "Session init frame id did not match its signed body.");
+            return false;
         }
         if (init.AuthGeneration < roster.AuthGeneration(delivery.FromHandle) && roster.AuthGeneration(delivery.FromHandle) >= 0
             && init.AuthGeneration < peer.AuthGeneration)
         {
             Surface("auth", "Session init carried a stale auth generation.");
-            return;
+            return false;
+        }
+        var hasExistingSession = sessions.TryGetValue(delivery.FromDevice, out var existing);
+        var stableRetry = hasExistingSession
+            && string.Equals(existing!.SessionId, init.SessionId, StringComparison.Ordinal);
+        if (latestSessionInitTickets.TryGetValue(delivery.FromDevice, out var latestTicket)
+            && sessionInitTicket != latestTicket
+            && !stableRetry)
+        {
+            ObserveActivity(new ReplicationEngineActivity(
+                "session.superseded", delivery.FromHandle, delivery.FromDevice));
+            return false;
         }
 
-        var myNonce = MeshCrypto.NewNonce();
+        var duplicate = stableRetry && existing!.Established;
+        var session = duplicate
+            ? existing!
+            : new PeerSession(
+                delivery.FromHandle, delivery.FromDevice, init.SessionId, MeshCrypto.NewNonce())
+            {
+                Established = true
+            };
         var ack = OnlineReplicationProtocol.CreateSessionAck(
-            init.SessionId, identity.DeviceId, delivery.FromDevice, myNonce, init.Nonce,
+            init.SessionId, identity.DeviceId, delivery.FromDevice, session.LocalNonce, init.Nonce,
             identity.CustodyHead, identity.AuthGeneration, identity.PrivateKeyB64);
-        var session = new PeerSession(delivery.FromHandle, delivery.FromDevice, init.SessionId, myNonce) { Established = true };
-        sessions[delivery.FromDevice] = session;
-        db.UpsertPeerState(delivery.FromHandle, delivery.FromDevice, init.SessionId, null);
-        ObserveActivity(new ReplicationEngineActivity(
-            "session.established", delivery.FromHandle, delivery.FromDevice));
+        if (!duplicate)
+        {
+            sessions[delivery.FromDevice] = session;
+            db.UpsertPeerState(delivery.FromHandle, delivery.FromDevice, init.SessionId, null);
+            ObserveActivity(new ReplicationEngineActivity(
+                "session.established", delivery.FromHandle, delivery.FromDevice));
+        }
 
-        await SendControlAsync(delivery.FromHandle, delivery.FromDevice, E2EFrameKind.SessionAck, init.SessionId,
-            ReplicationPayloadCodec.SerializeControl(ack), OnlinePushClasses.High, ct).ConfigureAwait(false);
-        await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, ct).ConfigureAwait(false);
+        var ackResult = await SendControlAsync(
+            delivery.FromHandle,
+            delivery.FromDevice,
+            E2EFrameKind.SessionAck,
+            init.SessionId,
+            ReplicationPayloadCodec.SerializeControl(ack),
+            OnlinePushClasses.High,
+            ct).ConfigureAwait(false);
+        return ackResult.Accepted && session.TryScheduleInitialOffers();
     }
 
-    private async Task OnSessionAckAsync(OnlineRelayDelivery delivery, E2EFrame frame, ReplicationDevice peer, CancellationToken ct)
+    private async Task<bool> OnSessionAckAsync(
+        OnlineRelayDelivery delivery,
+        E2EFrame frame,
+        ReplicationDevice peer,
+        CancellationToken ct)
     {
         var (ok, plaintext) = ReplicationPayloadCodec.TryDecrypt(frame.Payload, identity.PrivateKeyB64, identity.PublicKeyB64);
-        if (!ok || plaintext is null) { Surface("crypto", "Undecryptable session ack."); return; }
+        if (!ok || plaintext is null) { Surface("crypto", "Undecryptable session ack."); return false; }
         var ack = ReplicationPayloadCodec.DeserializeControl<ReplicationSessionAck>(plaintext);
         if (ack is null || !sessions.TryGetValue(delivery.FromDevice, out var session))
         {
             Surface("route", "Session ack for unknown session.");
-            return;
+            return false;
+        }
+        if (!string.Equals(frame.SessionId, ack.SessionId, StringComparison.Ordinal))
+        {
+            Surface("auth", "Session ack frame id did not match its signed body.");
+            return false;
+        }
+        if (!string.Equals(ack.SessionId, session.SessionId, StringComparison.Ordinal))
+        {
+            Surface("route", "Session ack targeted an obsolete session.");
+            return false;
+        }
+        if (!string.Equals(ack.PeerNonce, session.LocalNonce, StringComparison.Ordinal))
+        {
+            Surface("auth", "Session ack echoed an obsolete nonce.");
+            return false;
         }
         if (!OnlineReplicationProtocol.VerifySessionAck(ack, peer.PublicKeyB64, session.LocalNonce))
         {
-            Surface("auth", "Session ack failed verification.");
-            return;
+            Surface("auth", "Session ack signature failed verification.");
+            return false;
         }
         session.Established = true;
         session.SessionId = ack.SessionId;
         db.UpsertPeerState(delivery.FromHandle, delivery.FromDevice, ack.SessionId, null);
         ObserveActivity(new ReplicationEngineActivity(
             "session.established", delivery.FromHandle, delivery.FromDevice));
-        await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, ct).ConfigureAwait(false);
+        return session.TryScheduleInitialOffers();
     }
+    private bool IsCurrentEstablishedSession(PeerSession session)
+        => sessions.TryGetValue(session.PeerDevice, out var current)
+           && ReferenceEquals(current, session)
+           && current.Established;
 
     private async Task TryOfferLocalOriginsAsync(PeerSession session, string pushClass, CancellationToken ct)
     {
+        if (!IsCurrentEstablishedSession(session)) return;
         var sibling = string.Equals(
             ReplicationHandle.Norm(session.PeerHandle),
             ReplicationHandle.Norm(identity.Handle),
@@ -605,6 +785,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                      .OrderBy(origin => string.Equals(origin.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal) ? 0 : 1)
                      .ThenBy(origin => origin.OriginDeviceId, StringComparer.Ordinal))
         {
+            if (!IsCurrentEstablishedSession(session)) return;
             var availableFrom = available.AvailableFrom;
             var availableThrough = available.AvailableThrough;
             var isLocalOrigin = string.Equals(available.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal);
@@ -612,7 +793,14 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 && !isLocalOrigin
                 && deferSiblingOffersUntilBootstrap
                 && bootstrap?.State != MeshDb.BootstrapStatePersisted)
+            {
+#if ANDROID
+                Android.Util.Log.Info(
+                    "MeshRuntime",
+                    $"[replication-offer] suppressed;peer={session.PeerDevice};origin={available.OriginDeviceId};reason=foreign-before-bootstrap;bootstrap={bootstrap?.State ?? "missing"}");
+#endif
                 continue;
+            }
             ReplicationSnapshotManifest? snapshot = null;
             if (sibling
                 && string.Equals(available.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal)
@@ -620,9 +808,17 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             {
                 if (deferSiblingOffersUntilBootstrap
                     && (bootstrap is null || bootstrap.BootstrapFromSeq == 0))
+                {
+#if ANDROID
+                    Android.Util.Log.Info(
+                        "MeshRuntime",
+                        $"[replication-offer] suppressed;peer={session.PeerDevice};origin={available.OriginDeviceId};reason=local-before-bootstrap;bootstrap={bootstrap?.State ?? "missing"}");
+#endif
                     continue;
+                }
 
                 if (bootstrap is { BootstrapFromSeq: > 0 }
+                    && bootstrap.State != MeshDb.BootstrapStatePersisted
                     && string.Equals(bootstrap.LocalLogEpoch, identity.LogEpoch, StringComparison.Ordinal)
                     && (bootstrap.BootstrapThroughSeq >= bootstrap.BootstrapFromSeq
                         || bootstrap.BootstrapThroughSeq + 1 == bootstrap.BootstrapFromSeq))
@@ -665,7 +861,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             }
 
             if (availableThrough == 0 && snapshot is null) continue;
-            await SendControlAsync(session.PeerHandle, session.PeerDevice, E2EFrameKind.Offer, session.SessionId,
+            var snapshotAcknowledgementPending = snapshot is not null
+                && bootstrap?.State != MeshDb.BootstrapStatePersisted;
+            var receipt = db.GetReceipt(
+                session.PeerDevice,
+                available.OriginDeviceId,
+                available.LogEpoch);
+            if (!snapshotAcknowledgementPending && receipt?.ThroughSeq >= availableThrough) continue;
+            if (!IsCurrentEstablishedSession(session)) return;
+            var offerResult = await SendControlAsync(
+                session.PeerHandle, session.PeerDevice, E2EFrameKind.Offer, session.SessionId,
                 ReplicationPayloadCodec.SerializeControl(new ReplicationOffer(
                     available.OriginDeviceId,
                     available.LogEpoch,
@@ -673,6 +878,12 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                     availableThrough,
                     snapshot)),
                 pushClass, ct).ConfigureAwait(false);
+#if ANDROID
+            Android.Util.Log.Info(
+                "MeshRuntime",
+                $"[replication-offer] sent;peer={session.PeerDevice};origin={available.OriginDeviceId};from={availableFrom};through={availableThrough};accepted={offerResult.Accepted};code={offerResult.Code}");
+#endif
+            if (!offerResult.Accepted) return;
         }
     }
 
@@ -719,6 +930,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
         if (offer.Snapshot is { } snapshot)
         {
+            var snapshotReceiptHandled = false;
             var currentGeneration = roster.AuthGeneration(identity.Handle);
             if (!string.Equals(ReplicationHandle.Norm(session.PeerHandle), ReplicationHandle.Norm(identity.Handle), StringComparison.Ordinal)
                 || !string.Equals(snapshot.ReceiverDeviceId, identity.DeviceId, StringComparison.Ordinal)
@@ -746,16 +958,31 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             }
             if (!TryFinalizePendingSnapshot(session, offer.OriginDeviceId)) return;
             if (snapshot.SnapshotThrough + 1 == snapshot.BaselineFrom)
-                await SendSnapshotReceiptAsync(session, snapshot, ct).ConfigureAwait(false);
+                snapshotReceiptHandled = await SendSnapshotReceiptAsync(session, snapshot, ct).ConfigureAwait(false);
+
+            if (snapshotReceiptHandled && offer.AvailableThrough <= snapshot.SnapshotThrough)
+                return;
         }
 
         var cursor = db.GetCursor(offer.OriginDeviceId) ?? OnlineReplicationProtocol.EmptyCursor();
+#if ANDROID
+        Android.Util.Log.Info(
+            "MeshRuntime",
+            $"[replication-offer] received;peer={session.PeerDevice};origin={offer.OriginDeviceId};from={offer.AvailableFrom};through={offer.AvailableThrough};cursor={cursor.Contiguous}");
+#endif
         if (session.OutstandingRequests.TryGetValue(offer.OriginDeviceId, out var outstanding))
         {
             if (string.Equals(outstanding.LogEpoch, offer.LogEpoch, StringComparison.Ordinal)
                 && cursor.Contiguous <= outstanding.CursorAtRequest
                 && DateTimeOffset.UtcNow - outstanding.RequestedAt < requestRetryInterval)
+            {
+#if ANDROID
+                Android.Util.Log.Info(
+                    "MeshRuntime",
+                    $"[replication-request] suppressed;peer={session.PeerDevice};origin={offer.OriginDeviceId};cursor={cursor.Contiguous};requested_cursor={outstanding.CursorAtRequest}");
+#endif
                 return;
+            }
             session.OutstandingRequests.Remove(offer.OriginDeviceId);
         }
 
@@ -783,6 +1010,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             var storedReceipt = db.GetReceipt(identity.DeviceId, offer.OriginDeviceId, offer.LogEpoch);
             if (storedReceipt is not null && storedReceipt.ThroughSeq >= offer.AvailableThrough)
             {
+                if (!ShouldSendReceipt(session, storedReceipt)) return;
                 var sent = await SendControlAsync(
                     session.PeerHandle,
                     session.PeerDevice,
@@ -792,8 +1020,11 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                     OnlinePushClasses.Normal,
                     ct).ConfigureAwait(false);
                 if (sent.Accepted)
+                {
+                    RecordReceiptSent(session, storedReceipt);
                     ObserveActivity(new ReplicationEngineActivity(
                         "receipt.sent", session.PeerHandle, session.PeerDevice));
+                }
             }
             return;
         }
@@ -814,6 +1045,11 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 offer.LogEpoch,
                 cursor.Contiguous,
                 DateTimeOffset.UtcNow);
+#if ANDROID
+        Android.Util.Log.Info(
+            "MeshRuntime",
+            $"[replication-request] sent;peer={session.PeerDevice};origin={offer.OriginDeviceId};cursor={cursor.Contiguous};ranges={plan.Ranges.Count};accepted={requestSent.Accepted};code={requestSent.Code}");
+#endif
     }
 
     private bool TryFinalizePendingSnapshot(PeerSession session, string originDeviceId)
@@ -877,7 +1113,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         return true;
     }
 
-    private async Task SendSnapshotReceiptAsync(
+    private async Task<bool> SendSnapshotReceiptAsync(
         PeerSession session,
         ReplicationSnapshotManifest snapshot,
         CancellationToken ct)
@@ -888,9 +1124,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             || cursor.Contiguous < snapshot.SnapshotThrough)
         {
             Surface("snapshot", "The empty snapshot baseline was not installed.");
-            return;
+            return true;
         }
-        if (cursor.Contiguous > snapshot.SnapshotThrough) return;
+        if (cursor.Contiguous > snapshot.SnapshotThrough) return false;
 
         var receipt = OnlineReplicationProtocol.CreateReceipt(
             identity.DeviceId,
@@ -910,8 +1146,12 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             OnlinePushClasses.Normal,
             ct).ConfigureAwait(false);
         if (sent.Accepted)
+        {
+            RecordReceiptSent(session, receipt);
             ObserveActivity(new ReplicationEngineActivity(
                 "receipt.sent", session.PeerHandle, session.PeerDevice));
+        }
+        return true;
     }
 
     private async Task OnRequestAsync(PeerSession session, string plaintext, CancellationToken ct)
@@ -1008,6 +1248,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
             await refreshable.RefreshAsync(originAccounts, ct).ConfigureAwait(false);
+
+            var unresolvedAccounts = batch.Events
+                .Where(evt => roster.ResolveDevice(evt.OriginAccount, evt.OriginDeviceId) is null)
+                .Select(evt => evt.OriginAccount)
+                .Where(account => !string.IsNullOrWhiteSpace(account))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (unresolvedAccounts.Length > 0)
+                await refreshable.RefreshAuthoritativeAsync(
+                    unresolvedAccounts, ct).ConfigureAwait(false);
         }
 
         var projectionLease = await EnterProjectionBoundaryAsync(ct).ConfigureAwait(false);
@@ -1136,8 +1386,30 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             OnlinePushClasses.Normal,
             ct).ConfigureAwait(false);
         if (sent.Accepted)
+        {
+            RecordReceiptSent(session, receipt);
             ObserveActivity(new ReplicationEngineActivity(
                 "receipt.sent", session.PeerHandle, session.PeerDevice));
+        }
+    }
+
+    private bool ShouldSendReceipt(PeerSession session, PersistenceReceipt receipt)
+    {
+        if (!session.SentReceipts.TryGetValue(receipt.OriginDeviceId, out var previous))
+            return true;
+        return !string.Equals(previous.LogEpoch, receipt.LogEpoch, StringComparison.Ordinal)
+               || previous.ThroughSeq != receipt.ThroughSeq
+               || !string.Equals(previous.BatchHash, receipt.BatchHash, StringComparison.Ordinal)
+               || DateTimeOffset.UtcNow - previous.SentAt >= receiptRetryInterval;
+    }
+
+    private static void RecordReceiptSent(PeerSession session, PersistenceReceipt receipt)
+    {
+        session.SentReceipts[receipt.OriginDeviceId] = new ReceiptSendState(
+            receipt.LogEpoch,
+            receipt.ThroughSeq,
+            receipt.BatchHash,
+            DateTimeOffset.UtcNow);
     }
 
     private string ComputeEmptySnapshotAckHash(
@@ -1207,7 +1479,11 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                     bootstrapTarget,
                     bootstrapAfter.BootstrapId,
                     bootstrapAfter.TotalItems);
-                await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Normal, ct).ConfigureAwait(false);
+                await OfferPeerAsync(
+                    session.PeerHandle,
+                    session.PeerDevice,
+                    OnlinePushClasses.Normal,
+                    ct).ConfigureAwait(false);
             }
         }
         catch (ArgumentException)
@@ -1526,7 +1802,43 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         StateChanged?.Invoke(new ReplicationStateChange("", reason, error));
     }
 
-    private async Task WithPeerLock(
+    private Task WithPeerLock(
+        string peerDevice,
+        Func<CancellationToken, Task> body,
+        CancellationToken ct,
+        bool prioritize = false)
+        => WithPriorityOperationLock(peerDevice, prioritize, body, ct);
+
+    private async Task WithPriorityOperationLock(
+        string peerDevice,
+        bool prioritize,
+        Func<CancellationToken, Task> body,
+        CancellationToken ct)
+    {
+        PriorityOperationGate gate;
+        lock (disposalGate)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(OnlineReplicationEngine));
+            activePeerOperations++;
+            gate = peerLocks.GetOrAdd(peerDevice, _ => new PriorityOperationGate());
+        }
+
+        IDisposable? lease = null;
+        try
+        {
+            using var operation = CancellationTokenSource.CreateLinkedTokenSource(ct, lifetime.Token);
+            lease = await gate.EnterAsync(prioritize, operation.Token).ConfigureAwait(false);
+            await body(operation.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            lease?.Dispose();
+            ExitPeerOperation();
+        }
+    }
+
+    private async Task WithOperationLock(
+        ConcurrentDictionary<string, SemaphoreSlim> operationLocks,
         string peerDevice,
         Func<CancellationToken, Task> body,
         CancellationToken ct)
@@ -1536,7 +1848,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         {
             if (disposed) throw new ObjectDisposedException(nameof(OnlineReplicationEngine));
             activePeerOperations++;
-            gate = peerLocks.GetOrAdd(peerDevice, _ => new SemaphoreSlim(1, 1));
+            gate = operationLocks.GetOrAdd(peerDevice, _ => new SemaphoreSlim(1, 1));
         }
 
         var entered = false;
@@ -1598,6 +1910,8 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             lock (activityGate) activitySignal.TrySetCanceled();
             await drain.ConfigureAwait(false);
             foreach (var gate in peerLocks.Values) gate.Dispose();
+            foreach (var gate in peerSessionLocks.Values) gate.Dispose();
+            foreach (var gate in peerReceiptLocks.Values) gate.Dispose();
             lifetime.Dispose();
             completion.TrySetResult(true);
         }
@@ -1607,6 +1921,159 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         }
     }
 
+    private sealed class PriorityOperationGate : IDisposable
+    {
+        private const int PriorityBurstLimit = 1;
+        private readonly object sync = new();
+        private readonly Queue<Waiter> priorityWaiters = new();
+        private readonly Queue<Waiter> normalWaiters = new();
+        private bool occupied;
+        private bool disposed;
+        private int priorityBurst;
+
+        public Task<IDisposable> EnterAsync(bool prioritize, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            lock (sync)
+            {
+                if (disposed) throw new ObjectDisposedException(nameof(PriorityOperationGate));
+                if (!occupied)
+                {
+                    occupied = true;
+                    priorityBurst = prioritize ? 1 : 0;
+                    return Task.FromResult<IDisposable>(new PriorityLease(this));
+                }
+
+                var waiter = new Waiter(ct);
+                (prioritize ? priorityWaiters : normalWaiters).Enqueue(waiter);
+                return waiter.Task;
+            }
+        }
+
+        private void Release()
+        {
+            while (true)
+            {
+                Waiter? next;
+                lock (sync)
+                {
+                    if (disposed)
+                    {
+                        occupied = false;
+                        return;
+                    }
+
+                    next = DequeueNext();
+                    if (next is null)
+                    {
+                        occupied = false;
+                        priorityBurst = 0;
+                        return;
+                    }
+                }
+
+                if (next.TryEnter(this)) return;
+            }
+        }
+
+        private Waiter? DequeueNext()
+        {
+            TrimCompleted(priorityWaiters);
+            TrimCompleted(normalWaiters);
+
+            if (priorityWaiters.Count > 0
+                && (normalWaiters.Count == 0 || priorityBurst < PriorityBurstLimit))
+            {
+                priorityBurst++;
+                return priorityWaiters.Dequeue();
+            }
+
+            if (normalWaiters.Count > 0)
+            {
+                priorityBurst = 0;
+                return normalWaiters.Dequeue();
+            }
+
+            if (priorityWaiters.Count > 0)
+            {
+                priorityBurst = 1;
+                return priorityWaiters.Dequeue();
+            }
+
+            return null;
+        }
+
+        private static void TrimCompleted(Queue<Waiter> waiters)
+        {
+            while (waiters.Count > 0 && waiters.Peek().IsCompleted)
+                waiters.Dequeue().Dispose();
+        }
+
+        public void Dispose()
+        {
+            Waiter[] pending;
+            lock (sync)
+            {
+                if (disposed) return;
+                disposed = true;
+                pending = priorityWaiters.Concat(normalWaiters).ToArray();
+                priorityWaiters.Clear();
+                normalWaiters.Clear();
+            }
+
+            foreach (var waiter in pending)
+                waiter.FailDisposed();
+        }
+
+        private sealed class PriorityLease(PriorityOperationGate gate) : IDisposable
+        {
+            private PriorityOperationGate? heldGate = gate;
+
+            public void Dispose()
+            {
+                var current = Interlocked.Exchange(ref heldGate, null);
+                current?.Release();
+            }
+        }
+
+        private sealed class Waiter : IDisposable
+        {
+            private readonly CancellationToken cancellationToken;
+            private readonly TaskCompletionSource<IDisposable> completion = new(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            private CancellationTokenRegistration cancellation;
+
+            public Waiter(CancellationToken ct)
+            {
+                cancellationToken = ct;
+                if (ct.CanBeCanceled)
+                    cancellation = ct.Register(static state => ((Waiter)state!).Cancel(), this);
+            }
+
+            public Task<IDisposable> Task => completion.Task;
+            public bool IsCompleted => completion.Task.IsCompleted;
+
+            public bool TryEnter(PriorityOperationGate gate)
+            {
+                var entered = completion.TrySetResult(new PriorityLease(gate));
+                if (entered || completion.Task.IsCompleted)
+                    cancellation.Dispose();
+                return entered;
+            }
+
+            public void FailDisposed()
+            {
+                completion.TrySetException(new ObjectDisposedException(nameof(PriorityOperationGate)));
+                cancellation.Dispose();
+            }
+
+            private void Cancel()
+                => completion.TrySetCanceled(cancellationToken);
+
+            public void Dispose()
+                => cancellation.Dispose();
+        }
+    }
     private sealed class SemaphoreLease(SemaphoreSlim gate) : IDisposable
     {
         private SemaphoreSlim? heldGate = gate;
@@ -1627,8 +2094,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         ReplicationSnapshotManifest Manifest,
         bool BaselineInstalled);
 
+    private sealed record ReceiptSendState(
+        string LogEpoch,
+        ulong ThroughSeq,
+        string BatchHash,
+        DateTimeOffset SentAt);
+
     private sealed class PeerSession(string peerHandle, string peerDevice, string sessionId, string localNonce)
     {
+        private int initialOffersScheduled;
+
         public string PeerHandle { get; } = peerHandle;
         public string PeerDevice { get; } = peerDevice;
         public string SessionId { get; set; } = sessionId;
@@ -1636,7 +2111,17 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         public bool Established { get; set; }
         public Dictionary<string, OutstandingRequest> OutstandingRequests { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, PendingSnapshot> PendingSnapshots { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, ReceiptSendState> SentReceipts { get; } = new(StringComparer.Ordinal);
         public DateTimeOffset LastInitAttemptAt { get; set; } = DateTimeOffset.UtcNow;
+
+        public bool TryScheduleInitialOffers()
+            => Interlocked.CompareExchange(ref initialOffersScheduled, 1, 0) == 0;
+
+        public void CompleteInitialOffers()
+            => Interlocked.CompareExchange(ref initialOffersScheduled, 2, 1);
+
+        public void ResetInitialOffers()
+            => Interlocked.CompareExchange(ref initialOffersScheduled, 0, 1);
     }
 }
 
@@ -1782,6 +2267,7 @@ public sealed class OnlineReplicationError : Exception
 public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
 {
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan AuthoritativeRefreshCooldown = TimeSpan.FromSeconds(2);
 
     private readonly IReplicationMetadataSource source;
     private readonly string ownHandle;
@@ -1793,6 +2279,9 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
 
     private readonly object gate = new();
     private readonly Dictionary<string, Entry> cache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> refreshAttempts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> authoritativeRefreshAttempts = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> refreshLocks = new(StringComparer.Ordinal);
 
     public RelayReplicationRoster(
         IReplicationMetadataSource source,
@@ -1847,13 +2336,23 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
     public void Invalidate(string accountHandle)
     {
         var h = ReplicationHandle.Norm(accountHandle);
-        lock (gate) cache.Remove(h);
+        lock (gate)
+        {
+            cache.Remove(h);
+            refreshAttempts.Remove(h);
+            authoritativeRefreshAttempts.Remove(h);
+        }
     }
 
     /// <summary>Drops the entire cache (e.g. on account switch).</summary>
     public void Clear()
     {
-        lock (gate) cache.Clear();
+        lock (gate)
+        {
+            cache.Clear();
+            refreshAttempts.Clear();
+            authoritativeRefreshAttempts.Clear();
+        }
     }
 
     /// <summary>
@@ -1862,41 +2361,87 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
     /// head against the local chain and raises the authority-changed callback on an auth-generation or
     /// custody-head shift so the client can re-arm under fresh authority (revocation handling).
     /// </summary>
-    public async Task RefreshAsync(IReadOnlyList<string> handles, CancellationToken ct)
-    {
-        var now = DateTimeOffset.UtcNow;
-        var toFetch = new List<string>();
-        lock (gate)
-        {
-            foreach (var raw in handles)
-            {
-                var h = ReplicationHandle.Norm(raw);
-                if (h.Length == 0) continue;
-                if (cache.TryGetValue(h, out var e) && now - e.FetchedAt < CacheLifetime) continue;
-                if (!toFetch.Contains(h)) toFetch.Add(h);
-            }
-        }
+    public Task RefreshAsync(IReadOnlyList<string> handles, CancellationToken ct)
+        => RefreshCoreAsync(handles, authoritative: false, ct);
 
-        foreach (var h in toFetch)
+    public Task RefreshAuthoritativeAsync(IReadOnlyList<string> handles, CancellationToken ct)
+        => RefreshCoreAsync(handles, authoritative: true, ct);
+
+    private async Task RefreshCoreAsync(
+        IReadOnlyList<string> handles,
+        bool authoritative,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(handles);
+        var requestedAt = DateTimeOffset.UtcNow;
+        foreach (var handle in handles
+                     .Select(ReplicationHandle.Norm)
+                     .Where(candidate => candidate.Length > 0)
+                     .Distinct(StringComparer.Ordinal))
+        {
+            await RefreshHandleAsync(handle, requestedAt, authoritative, ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RefreshHandleAsync(
+        string handle,
+        DateTimeOffset requestedAt,
+        bool authoritative,
+        CancellationToken ct)
+    {
+        var refreshLock = refreshLocks.GetOrAdd(handle, static _ => new SemaphoreSlim(1, 1));
+        await refreshLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
             ct.ThrowIfCancellationRequested();
-            var info = await source.FetchHandleAsync(h, ct).ConfigureAwait(false);
+            var now = DateTimeOffset.UtcNow;
+            lock (gate)
+            {
+                if (!authoritative
+                    && cache.TryGetValue(handle, out var current)
+                    && now - current.FetchedAt < CacheLifetime)
+                    return;
+                if (refreshAttempts.TryGetValue(handle, out var attemptedAt)
+                    && attemptedAt >= requestedAt)
+                    return;
+                if (authoritative
+                    && authoritativeRefreshAttempts.TryGetValue(handle, out var authoritativeAt)
+                    && now - authoritativeAt < AuthoritativeRefreshCooldown)
+                    return;
+            }
+
+            var info = await source.FetchHandleAsync(handle, ct).ConfigureAwait(false);
+            var fetchedAt = DateTimeOffset.UtcNow;
             if (info is null)
             {
-                surface($"directory entry for '{h}' is unavailable");
-                continue;
+                lock (gate)
+                {
+                    refreshAttempts[handle] = fetchedAt;
+                    if (authoritative) authoritativeRefreshAttempts[handle] = fetchedAt;
+                }
+                surface($"directory entry for '{handle}' is unavailable");
+                return;
             }
 
             var devices = (info.DevicePublicKeys ?? Array.Empty<string>())
                 .Where(pk => !string.IsNullOrWhiteSpace(pk))
-                .Select(pk => new ReplicationDevice(h, DeviceProtocol.DeviceId(pk), pk, info.AuthGeneration, Revoked: false))
+                .Select(pk => new ReplicationDevice(
+                    handle, DeviceProtocol.DeviceId(pk), pk, info.AuthGeneration, Revoked: false))
                 .ToList();
 
             lock (gate)
-                cache[h] = new Entry(devices, info.AuthGeneration, info.CustodyHead ?? "", DateTimeOffset.UtcNow);
+            {
+                cache[handle] = new Entry(devices, info.AuthGeneration, info.CustodyHead ?? "", fetchedAt);
+                refreshAttempts[handle] = fetchedAt;
+                if (authoritative) authoritativeRefreshAttempts[handle] = fetchedAt;
+            }
 
-            if (string.Equals(h, ownHandle, StringComparison.Ordinal))
+            if (string.Equals(handle, ownHandle, StringComparison.Ordinal))
                 CrossCheckOwnAuthority(info);
+        }
+        finally
+        {
+            refreshLock.Release();
         }
     }
 
@@ -2107,6 +2652,26 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
 
         await roster.RefreshAsync(candidates, ct).ConfigureAwait(false);
         var presence = await source.ResolvePresenceAsync(candidates, ct).ConfigureAwait(false);
+        var stalePresenceHandles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var handle in presence)
+        {
+            if (!handle.Online) continue;
+            var handleName = ReplicationHandle.Norm(handle.Handle);
+            if (handleName.Length == 0) continue;
+            foreach (var device in handle.Devices ?? Array.Empty<string>())
+            {
+                if (string.IsNullOrWhiteSpace(device)
+                    || string.Equals(device, ownDevice, StringComparison.Ordinal)
+                    || roster.ResolveDevice(handleName, device) is not null)
+                    continue;
+                stalePresenceHandles.Add(handleName);
+                break;
+            }
+        }
+        if (stalePresenceHandles.Count > 0)
+            await roster.RefreshAuthoritativeAsync(
+                stalePresenceHandles.ToArray(), ct).ConfigureAwait(false);
+
         var dueHandles = new HashSet<string>(StringComparer.Ordinal);
         var pendingDevices = new Dictionary<string, bool>(StringComparer.Ordinal);
         foreach (var candidate in candidates)

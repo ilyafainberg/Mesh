@@ -100,6 +100,7 @@ public sealed partial class MeshClient
         switch (activity.Name)
         {
             case "session.started":
+            case "session.retried":
                 SetReplicationStatus(ReplicationPhase.Connecting, activity.PeerDeviceId);
                 break;
             case "bootstrap.started":

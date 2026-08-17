@@ -293,6 +293,9 @@ public sealed class RuntimeDiagnostics
         if (normalized.Length > MaxDiagnosticPayloadChars)
             normalized = normalized[..MaxDiagnosticPayloadChars] + "\n[diagnostic entry truncated]";
         var indented = normalized.Replace("\n", "\n    ", StringComparison.Ordinal);
+#if ANDROID
+        Android.Util.Log.Info("MeshRuntime", $"[{category}] {normalized}");
+#endif
         File.AppendAllText(logPath, $"[{utcNow():O}] [{sessionId}] [{category}] {indented}{Environment.NewLine}", Utf8);
     }
 

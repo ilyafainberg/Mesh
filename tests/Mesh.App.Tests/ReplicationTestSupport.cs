@@ -84,6 +84,12 @@ internal sealed class FabricRoster : IRefreshableReplicationRoster
         RefreshCalls++;
         return Task.CompletedTask;
     }
+
+    public Task RefreshAuthoritativeAsync(IReadOnlyList<string> handles, CancellationToken ct)
+    {
+        RefreshCalls++;
+        return Task.CompletedTask;
+    }
 }
 
 /// <summary>Records every inbound domain projection and can run an in-transaction side effect.</summary>
