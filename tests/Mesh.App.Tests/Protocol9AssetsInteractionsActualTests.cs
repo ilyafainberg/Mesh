@@ -19,9 +19,10 @@ namespace Mesh.App.Tests;
 ///   * LOCAL ATOMICITY: the actual row, the signed event, the outbox references and the sequence
 ///     allocation commit in ONE transaction, so a failure leaves no row, no event and no sequence
 ///     hole;
-///   * FAIL CLOSED: an inbound payload this device cannot faithfully materialise (unknown kind,
-///     absent domain schema, bad hash, oversized or malformed chunk, a local-only asset) rolls the
-///     whole transaction back and leaves the cursor where it was;
+///   * FAIL CLOSED: an invalid inbound payload (unknown kind, absent domain schema, bad hash,
+///     oversized or malformed chunk, a local-only asset) rolls the whole transaction back and
+///     leaves the cursor where it was. Valid desktop-only events in the shared linear log are
+///     stored but deliberately not materialised on mobile so later mobile-compatible events progress;
 ///   * NO LEGACY SURFACE: the old store-only asset outbox is gone from the schema entirely.
 /// </summary>
 [TestClass]
@@ -988,6 +989,43 @@ public sealed class Protocol9AssetsInteractionsActualTests : ReplicationTestBase
     // =======================================================================
     // 5. Inbound fail-closed
     // =======================================================================
+
+    [TestMethod]
+    public async Task Inbound_MobileSkipsDesktopOnlyAssetAndContinuesLinearLog()
+    {
+        var sender = NewNode("alice", "desktop", desktop: true);
+        var mobile = NewNode("alice", "phone", desktop: false);
+        await EstablishAsync(sender, mobile);
+        var originDevice = "desktop-origin";
+        var origin = AddOrigin("alice", originDevice);
+        var asset = MakeEvent(
+            origin,
+            "alice",
+            originDevice,
+            1,
+            AssetUpsert(AssetKind.Skill, "desktop-skill", "desktop bytes"u8.ToArray()),
+            new[] { mobile.Keys.PublicB64 });
+        var message = MakeEvent(
+            origin,
+            "alice",
+            originDevice,
+            2,
+            Msg("mobile-message"),
+            new[] { mobile.Keys.PublicB64 });
+
+        await DeliverBatchAsync(sender, mobile, Batch(originDevice, new[] { asset, message }));
+        await Fabric.DrainAsync();
+
+        Assert.IsNotNull(mobile.Db.GetEvent(asset.EventId));
+        Assert.IsNotNull(mobile.Db.GetEvent(message.EventId));
+        Assert.AreEqual(2UL, mobile.Db.GetCursor(originDevice)?.Contiguous);
+        Assert.IsFalse(mobile.Engine.IsHalted(originDevice));
+        Assert.AreEqual(1, mobile.Applier.Count);
+        Assert.AreEqual(message.EventId, mobile.Applier.Applied.Single().Evt.EventId);
+        Assert.AreEqual(
+            2UL,
+            sender.Db.GetReceipt(mobile.Device, originDevice, "epoch-1")?.ThroughSeq);
+    }
 
     [TestMethod]
     public async Task Inbound_UnknownAssetKindFailsClosedAndHoldsTheCursor()

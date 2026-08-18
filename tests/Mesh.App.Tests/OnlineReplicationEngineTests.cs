@@ -779,7 +779,7 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
     }
 
     [TestMethod]
-    public async Task Asset_MobileRefusesAssetBytesAndDoesNotStore()
+    public async Task Asset_MobileStoresAuthenticatedEventWithoutMaterialisingBytes()
     {
         var a = NewNode("alice", "a1");
         var b = NewNode("bob", "b1", desktop: false);
@@ -791,9 +791,10 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         var e1 = MakeEvent(src, "src", "sd1", 1, env, new[] { b.Keys.PublicB64 });
         await DeliverBatchAsync(a, b, Batch("sd1", new[] { e1 }));
 
-        // Mobile cannot materialise asset bytes, so the projection fails closed rather than
-        // advancing past a change this device could never apply.
-        Assert.IsNull(b.Db.GetEvent(e1.EventId), "nothing is stored when the projection fails closed");
+        Assert.IsNotNull(b.Db.GetEvent(e1.EventId),
+            "the shared origin position must be stored so later mobile-compatible events can progress");
+        Assert.AreEqual(1UL, b.Db.GetCursor("sd1")?.Contiguous);
+        Assert.IsFalse(b.Engine.IsHalted("sd1"));
         Assert.AreEqual(0, b.Applier.Count, "asset bytes are never materialised on mobile");
     }
 

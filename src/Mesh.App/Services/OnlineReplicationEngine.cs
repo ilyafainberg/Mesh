@@ -1359,9 +1359,10 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         var envelope = ReplicationPayloadCodec.DecodeEnvelope(plaintext)
             ?? throw new ReplicationProjectionException(
                 "The authenticated event payload could not be decoded or mapped.");
+        // Desktop-only entries still occupy positions in the shared origin log. Mobile stores the
+        // authenticated event and advances its cursor, but never materialises device-local bytes.
         if (!deviceIsDesktop && ReplicationPayloadCodec.RequiresDesktop(envelope.Kind, envelope.Action))
-            throw new ReplicationProjectionException(
-                "A desktop-only payload was routed to a mobile replica.");
+            return null;
         return applier.Apply(conn, tx, evt, envelope, deviceIsDesktop)
             ? envelope
             : null;

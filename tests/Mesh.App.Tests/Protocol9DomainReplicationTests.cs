@@ -643,7 +643,7 @@ public sealed class Protocol9DomainReplicationTests : ReplicationTestBase
     }
 
     [TestMethod]
-    public async Task Inbound_MobileRefusesAssetBytesAndDoesNotAdvance()
+    public async Task Inbound_MobileStoresAssetLogPositionWithoutMaterialisingBytes()
     {
         var a = NewNode("alice", "a1");
         var b = NewNode("bob", "phone", desktop: false);
@@ -656,12 +656,11 @@ public sealed class Protocol9DomainReplicationTests : ReplicationTestBase
         var evt = MakeEvent(origin, "alice2", "a2", 1, env, new[] { b.Keys.PublicB64 });
         await DeliverBatchAsync(a, b, Batch("a2", new[] { evt }));
 
-        // Mobile cannot hold asset bytes. Rather than silently skipping and losing the change,
-        // the projection fails closed: nothing is stored and the cursor never advances.
-        Assert.IsNull(b.Db.GetEvent(evt.EventId));
+        Assert.IsNotNull(b.Db.GetEvent(evt.EventId));
         Assert.IsNull(b.Db.GetReplicatedEntity(ReplicationOpKinds.Asset, "asset-d"));
-        var cursor = b.Db.GetCursor("a2");
-        Assert.IsTrue(cursor is null || cursor.Contiguous == 0);
+        Assert.AreEqual(1UL, b.Db.GetCursor("a2")?.Contiguous);
+        Assert.IsFalse(b.Engine.IsHalted("a2"));
+        Assert.AreEqual(0, b.Applier.Count);
     }
 
     [TestMethod]
