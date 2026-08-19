@@ -9,27 +9,17 @@ namespace Mesh.App.Tests;
 public sealed class NotificationPolicyTests
 {
     [TestMethod]
-    public void PreviewPolicy_HidesContentUntilAllowed()
+    public void ContentPolicy_AlwaysUsesLocallyDecryptedContent()
     {
         var message = Activity(NotificationKind.Message, "private message");
         var topic = Activity(NotificationKind.TopicCompleted, "private topic title");
 
         Assert.AreEqual(
-            "Open Mesh to read the message.",
-            NotificationPreviewPolicy.Build(
-                message, NotificationPreviewMode.Never, true, true).Body);
-        Assert.AreEqual(
-            "Open Mesh to view the topic.",
-            NotificationPreviewPolicy.Build(
-                topic, NotificationPreviewMode.Never, true, true).Body);
-        Assert.AreEqual(
-            "Open Mesh to read the message.",
-            NotificationPreviewPolicy.Build(
-                message, NotificationPreviewMode.WhenUnlocked, false, true).Body);
-        Assert.AreEqual(
             "private message",
-            NotificationPreviewPolicy.Build(
-                message, NotificationPreviewMode.WhenUnlocked, true, true).Body);
+            NotificationContentPolicy.Build(message, true).Body);
+        Assert.AreEqual(
+            "private topic title",
+            NotificationContentPolicy.Build(topic, true).Body);
     }
 
     [TestMethod]

@@ -640,15 +640,6 @@
                 <label class="switch"><input type="checkbox" checked="@State.Profile.NotificationSound" @onchange="e => Toggle(p => p.NotificationSound = (bool)(e.Value ?? false))" aria-label="Notification sound" /></label>
             </div>
             <div class="field">
-                <label>Notification previews</label>
-                <select class="full" value="@State.Profile.NotificationPreview.ToString()" @onchange="OnNotificationPreviewChanged">
-                    <option value="Never">Never show content</option>
-                    <option value="WhenUnlocked">Show while Mesh is unlocked</option>
-                    <option value="Always">Always show content</option>
-                </select>
-                <div class="field-hint">The default hides message and decision content from lock-screen banners.</div>
-            </div>
-            <div class="field">
                 <label>This device's name</label>
                 <input class="full" value="@State.Profile.DeviceName" @onchange="OnDeviceNameChanged" />
                 <div class="field-hint">Linked devices use this name in the Topic device chooser.</div>
@@ -1859,12 +1850,6 @@
     {
         Toggle(profile => profile.DoNotDisturb = (bool)(e.Value ?? false));
         await Mesh.RegisterPushTokenAsync();
-    }
-
-    void OnNotificationPreviewChanged(ChangeEventArgs e)
-    {
-        if (Enum.TryParse<Mesh.App.Domain.NotificationPreviewMode>(e.Value?.ToString(), out var mode))
-            Toggle(profile => profile.NotificationPreview = mode);
     }
 
     void Toggle(Action<Mesh.App.Domain.MeshProfile> change) => State.Mutate(change);

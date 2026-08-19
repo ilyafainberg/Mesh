@@ -51,6 +51,7 @@ public sealed class AndroidNotifier(ILogger<AndroidNotifier> logger) : INotifier
             builder.SetContentText(notification.Body);
             builder.SetStyle(style);
             builder.SetAutoCancel(true);
+            builder.SetVisibility(NotificationCompat.VisibilityPrivate);
             builder.SetContentIntent(pending);
             builder.SetGroup(Group(notification.Kind));
             builder.SetNumber(Math.Max(0, Volatile.Read(ref badgeCount)));
@@ -111,6 +112,7 @@ public sealed class AndroidNotifier(ILogger<AndroidNotifier> logger) : INotifier
         builder.SetContentTitle("Mesh");
         builder.SetContentText("New activity");
         builder.SetAutoCancel(true);
+        builder.SetVisibility(NotificationCompat.VisibilityPrivate);
         builder.SetContentIntent(pending);
         builder.SetGroup("mesh_wakes");
         builder.SetPriority(NotificationCompat.PriorityHigh);

@@ -91,10 +91,8 @@ public sealed class NotificationCoordinator(
             return;
         }
 
-        var local = NotificationPreviewPolicy.Build(
+        var local = NotificationContentPolicy.Build(
             activity,
-            state.NotificationPreview,
-            views.IsForeground,
             state.NotificationSound);
         var shown = await notifier.ShowAsync(local, ct).ConfigureAwait(false);
         if (shown)

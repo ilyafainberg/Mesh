@@ -65,7 +65,6 @@ public sealed partial class AppState : INotificationState
 
     string INotificationState.LocalHandle => Profile.Handle;
     bool INotificationState.DoNotDisturb => Profile.DoNotDisturb;
-    Domain.NotificationPreviewMode INotificationState.NotificationPreview => Profile.NotificationPreview;
     bool INotificationState.NotificationSound => Profile.NotificationSound;
     bool INotificationState.TryRecordNotificationActivity(CommittedActivity activity)
         => TryRecordNotificationActivity(activity);

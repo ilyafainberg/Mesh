@@ -180,7 +180,6 @@ public sealed class NotificationCoordinatorTests
         public HashSet<string> Read { get; } = new(StringComparer.Ordinal);
         public string LocalHandle { get; set; } = "owner";
         public bool DoNotDisturb { get; set; }
-        public NotificationPreviewMode NotificationPreview { get; set; } = NotificationPreviewMode.Always;
         public bool NotificationSound { get; set; } = true;
         public bool Muted { get; set; }
 

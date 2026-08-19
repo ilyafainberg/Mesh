@@ -171,6 +171,8 @@ client uses this path.
   recipient slots.
 - Visible APNs alerts may be rendered without launching Mesh. Encrypted content appears only after a
   later successful synchronization.
+- After synchronization, Mesh always posts the locally decrypted message or agent response. iOS and
+  Android notification privacy settings decide whether that content is visible on the lock screen.
 - Physical APNs/FCM delivery still depends on valid production credentials, provisioning, OS policy,
   network availability, and a real device.
 

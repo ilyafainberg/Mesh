@@ -3,41 +3,24 @@ using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
-internal static class NotificationPreviewPolicy
+internal static class NotificationContentPolicy
 {
     private const int MaxPreviewChars = 160;
 
     public static LocalNotification Build(
         CommittedActivity activity,
-        NotificationPreviewMode previewMode,
-        bool deviceUnlocked,
         bool playSound)
     {
-        var showContent = previewMode == NotificationPreviewMode.Always
-                          || previewMode == NotificationPreviewMode.WhenUnlocked && deviceUnlocked;
-        var body = showContent ? Preview(activity.Body) : DefaultBody(activity);
         return new LocalNotification(
             activity.StableId,
             activity.Kind,
             activity.Title,
-            body,
+            NormalizeBody(activity.Body),
             activity.Route,
             playSound);
     }
 
-    private static string DefaultBody(CommittedActivity activity) => activity.Kind switch
-    {
-        NotificationKind.TopicCompleted or NotificationKind.TopicFailed or NotificationKind.TopicCancelled
-            => "Open Mesh to view the topic.",
-        NotificationKind.DecisionRequired => "Open Mesh to respond.",
-        NotificationKind.ApprovalRequired => "Open Mesh to review the draft.",
-        NotificationKind.ContactRequest => "Open Mesh to review the request.",
-        NotificationKind.ServiceInvite => "Open Mesh to review the invitation.",
-        NotificationKind.ServiceResponse => "Open Mesh to read the response.",
-        _ => "Open Mesh to read the message."
-    };
-
-    private static string Preview(string value)
+    private static string NormalizeBody(string value)
     {
         var normalized = string.Join(' ', value.Split(
             ['\r', '\n', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));

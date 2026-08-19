@@ -72,7 +72,6 @@ public interface INotificationState
 {
     string LocalHandle { get; }
     bool DoNotDisturb { get; }
-    NotificationPreviewMode NotificationPreview { get; }
     bool NotificationSound { get; }
     bool TryRecordNotificationActivity(CommittedActivity activity);
     void MarkNotificationBannerShown(string stableId);
