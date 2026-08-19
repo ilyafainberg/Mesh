@@ -76,7 +76,7 @@ public sealed class MeshReplicationSyncWorker : Worker
             throw new InvalidOperationException("WorkManager returned an unexpected request type.");
 
         WorkManager.GetInstance(context).EnqueueUniqueWork(
-            AndroidReplicationWakePolicy.UniqueWorkName,
+            AndroidReplicationWakePolicy.WorkName(wakeId),
             ExistingWorkPolicy.Keep!,
             request);
     }

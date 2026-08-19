@@ -139,6 +139,16 @@ public sealed class NotificationPolicyTests
         Assert.IsTrue(payload.ShowAlert);
     }
 
+    [TestMethod]
+    public void AndroidWakeWorkName_IsStablePerWakeAndIsolatesDifferentWakes()
+    {
+        var first = AndroidReplicationWakePolicy.WorkName("wake-1");
+
+        Assert.AreEqual(first, AndroidReplicationWakePolicy.WorkName("wake-1"));
+        Assert.AreNotEqual(first, AndroidReplicationWakePolicy.WorkName("wake-2"));
+        StringAssert.StartsWith(first, AndroidReplicationWakePolicy.UniqueWorkName + ":");
+    }
+
     private static CommittedActivity Activity(NotificationKind kind, string body)
     {
         var now = DateTimeOffset.UtcNow;

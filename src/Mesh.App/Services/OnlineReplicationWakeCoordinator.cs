@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Mesh.Shared;
@@ -133,6 +134,13 @@ internal sealed record AndroidReplicationWakePayload(string? WakeId, bool ShowAl
 internal static class AndroidReplicationWakePolicy
 {
     public const string UniqueWorkName = "mesh-protocol9-sync";
+
+    public static string WorkName(string? wakeId)
+    {
+        var value = string.IsNullOrWhiteSpace(wakeId) ? "unspecified" : wakeId;
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        return $"{UniqueWorkName}:{Convert.ToHexString(hash).ToLowerInvariant()}";
+    }
 
     public static AndroidReplicationWakePayloadKind Classify(
         IEnumerable<KeyValuePair<string, string>>? data)
