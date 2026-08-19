@@ -105,6 +105,7 @@ public class AppDelegate : MauiUIApplicationDelegate
         try
         {
             var result = await OnlineReplicationWakeBridge.SynchronizePendingAsync().ConfigureAwait(false);
+            await NotificationCoordinatorBridge.RecoverPendingAsync().ConfigureAwait(false);
             completionHandler(result.Outcome switch
             {
                 OnlineReplicationWakeOutcome.NewData => UIBackgroundFetchResult.NewData,

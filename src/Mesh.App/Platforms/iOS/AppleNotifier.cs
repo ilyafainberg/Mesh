@@ -18,7 +18,18 @@ public sealed class AppleNotifier(ILogger<AppleNotifier> logger) : INotifier
         var settings = await GetSettingsAsync(ct).ConfigureAwait(false);
         if (settings.AuthorizationStatus is UNAuthorizationStatus.Denied or UNAuthorizationStatus.NotDetermined)
             return false;
-        await RemoveDeliveredGenericWakeNotificationsAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await RemoveDeliveredGenericWakeNotificationsAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "iOS generic wake notification could not be removed.");
+        }
 
         var content = new UNMutableNotificationContent
         {
