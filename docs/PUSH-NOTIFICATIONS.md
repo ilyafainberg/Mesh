@@ -162,7 +162,9 @@ client uses this path.
 - Visible wakes are spaced by at least 5 seconds per device and limited to 60 per rolling hour.
 - Silent wakes are spaced by at least 30 seconds per device and limited to 12 per rolling hour.
 - Visible and silent throttle windows are independent.
-- Wake ids are deduplicated for one hour, and the sender keeps unsatisfied encrypted custody locally.
+- Concurrent wake requests with the same id are deduplicated for the five-second visible-delivery
+  throttle window. Unsatisfied encrypted custody remains local, so later retries can wake the device
+  again when a delivered push did not complete synchronization.
 - A receipt from one device does not mark sibling devices caught up; each authorized device advances
   independently.
 - A device linked after an event is not woken for that event unless its key appears in the encrypted

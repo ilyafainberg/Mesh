@@ -446,26 +446,48 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 return;
             }
 
-            var peer = roster.ResolveDevice(peerHandle, peerDevice);
-            if (peer is null || peer.Revoked)
-            {
-                ObserveActivity(new ReplicationEngineActivity(
-                    "wake.rejected", peerHandle, peerDevice, ErrorCode: OnlineWakeCodes.TargetDeviceUnknown));
-                return;
-            }
-
-            var request = BuildWakeRequest(peer);
-            if (request is null)
-            {
-                ObserveActivity(new ReplicationEngineActivity("wake.skipped", peerHandle, peerDevice));
-                return;
-            }
-
-            var result = await transport.WakeAsync(request, operationCt).ConfigureAwait(false);
-            ObserveActivity(new ReplicationEngineActivity(
-                result.Accepted ? "wake.requested" : "wake.rejected",
-                peerHandle, peerDevice, ErrorCode: result.Accepted ? null : result.Code));
+            await RequestRelayWakeAsync(peerHandle, peerDevice, operationCt).ConfigureAwait(false);
         }, ct, prioritize: true);
+
+    /// <summary>
+    /// Requests a native wake for a peer that the latest relay presence snapshot reported offline.
+    /// A cached established session may outlive the peer's socket and must not suppress APNs/FCM.
+    /// </summary>
+    internal Task RequestOfflineWakeAsync(
+        string peerHandle,
+        string peerDevice,
+        CancellationToken ct = default)
+        => WithPeerLock(
+            peerDevice,
+            operationCt => RequestRelayWakeAsync(peerHandle, peerDevice, operationCt),
+            ct,
+            prioritize: true);
+
+    private async Task RequestRelayWakeAsync(
+        string peerHandle,
+        string peerDevice,
+        CancellationToken ct)
+    {
+        var peer = roster.ResolveDevice(peerHandle, peerDevice);
+        if (peer is null || peer.Revoked)
+        {
+            ObserveActivity(new ReplicationEngineActivity(
+                "wake.rejected", peerHandle, peerDevice, ErrorCode: OnlineWakeCodes.TargetDeviceUnknown));
+            return;
+        }
+
+        var request = BuildWakeRequest(peer);
+        if (request is null)
+        {
+            ObserveActivity(new ReplicationEngineActivity("wake.skipped", peerHandle, peerDevice));
+            return;
+        }
+
+        var result = await transport.WakeAsync(request, ct).ConfigureAwait(false);
+        ObserveActivity(new ReplicationEngineActivity(
+            result.Accepted ? "wake.requested" : "wake.rejected",
+            peerHandle, peerDevice, ErrorCode: result.Accepted ? null : result.Code));
+    }
 
     private bool ShouldStartSession(string peerDevice, DateTimeOffset now)
         => !sessions.TryGetValue(peerDevice, out var existing)
@@ -2736,10 +2758,11 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
                 try
                 {
                     await engine.StartSessionAsync(handleName, device, ct).ConfigureAwait(false);
-                    if (peerPending && engine.IsSessionEstablished(device))
+                    var established = engine.IsSessionEstablished(device);
+                    if (peerPending && established)
                         await engine.OfferPeerAsync(handleName, device, ct).ConfigureAwait(false);
                     if (bootstrapPeer is not null
-                        && engine.IsSessionEstablished(device)
+                        && established
                         && string.Equals(handleName, ownHandle, StringComparison.Ordinal))
                     {
                         await bootstrapPeer(
@@ -2771,7 +2794,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
                     ("peer_device_id", peer.DeviceId));
                 try
                 {
-                    await engine.OnWakeAsync(handleName, peer.DeviceId, ct).ConfigureAwait(false);
+                    await engine.RequestOfflineWakeAsync(handleName, peer.DeviceId, ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)

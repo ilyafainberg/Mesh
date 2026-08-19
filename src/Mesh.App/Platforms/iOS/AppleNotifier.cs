@@ -18,6 +18,7 @@ public sealed class AppleNotifier(ILogger<AppleNotifier> logger) : INotifier
         var settings = await GetSettingsAsync(ct).ConfigureAwait(false);
         if (settings.AuthorizationStatus is UNAuthorizationStatus.Denied or UNAuthorizationStatus.NotDetermined)
             return false;
+        await RemoveDeliveredGenericWakeNotificationsAsync(ct).ConfigureAwait(false);
 
         var content = new UNMutableNotificationContent
         {
@@ -44,6 +45,21 @@ public sealed class AppleNotifier(ILogger<AppleNotifier> logger) : INotifier
             }
         });
         return await completion.Task.ConfigureAwait(false);
+    }
+
+    private static async Task RemoveDeliveredGenericWakeNotificationsAsync(CancellationToken ct)
+    {
+        var delivered = await GetDeliveredNotificationsAsync(ct).ConfigureAwait(false);
+        var genericIds = delivered
+            .Where(item => AppDelegate.TryGetMeshSyncNotification(
+                item.Request.Content.UserInfo,
+                out _,
+                out _))
+            .Select(item => item.Request.Identifier)
+            .Where(static id => !string.IsNullOrWhiteSpace(id))
+            .ToArray();
+        if (genericIds.Length > 0)
+            UNUserNotificationCenter.Current.RemoveDeliveredNotifications(genericIds);
     }
 
     public Task RemoveAsync(string stableId, CancellationToken ct = default)
@@ -81,6 +97,16 @@ public sealed class AppleNotifier(ILogger<AppleNotifier> logger) : INotifier
             TaskCreationOptions.RunContinuationsAsynchronously);
         using var registration = ct.Register(() => completion.TrySetCanceled(ct));
         UNUserNotificationCenter.Current.GetNotificationSettings(settings => completion.TrySetResult(settings));
+        return await completion.Task.ConfigureAwait(false);
+    }
+
+    private static async Task<UNNotification[]> GetDeliveredNotificationsAsync(CancellationToken ct)
+    {
+        var completion = new TaskCompletionSource<UNNotification[]>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = ct.Register(() => completion.TrySetCanceled(ct));
+        UNUserNotificationCenter.Current.GetDeliveredNotifications(
+            notifications => completion.TrySetResult(notifications ?? []));
         return await completion.Task.ConfigureAwait(false);
     }
 

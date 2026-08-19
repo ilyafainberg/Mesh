@@ -51,14 +51,12 @@ internal static class NotificationDecisionPolicy
         CommittedActivity activity,
         bool doNotDisturb,
         bool muted,
-        bool entityVisible,
-        bool visibleRemoteAlertActive)
+        bool entityVisible)
         => activity.NotifyRequested
            && !activity.IsHistorical
            && !doNotDisturb
            && !muted
-           && !entityVisible
-           && !visibleRemoteAlertActive;
+           && !entityVisible;
 }
 
 internal static class RemoteWakeNotificationPolicy

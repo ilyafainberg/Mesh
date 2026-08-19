@@ -1754,7 +1754,12 @@ public sealed partial class AppState : IMemoryState
         {
             var notificationIntent = phase switch
             {
-                AgentRunPhase.Completed => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicCompleted),
+                AgentRunPhase.Completed => NotificationIntents.Topic(
+                    run.RunId,
+                    thread.Id,
+                    thread.Title,
+                    NotificationKind.TopicCompleted,
+                    LatestAssistantResponse(thread)),
                 AgentRunPhase.Failed => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicFailed),
                 AgentRunPhase.Cancelled => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicCancelled),
                 _ => null
@@ -1767,6 +1772,13 @@ public sealed partial class AppState : IMemoryState
         }
         NotifyChanged();
     }
+
+    private static string? LatestAssistantResponse(OwnThread thread)
+        => thread.Lines
+            .LastOrDefault(line =>
+                string.Equals(line.Role, "assistant", StringComparison.Ordinal)
+                && !string.IsNullOrWhiteSpace(line.Text))
+            ?.Text;
 
     /// <summary>True while the given own-thread is specifically building a widget (for the label text).</summary>
     public bool IsThreadBuilding(string threadId) => buildingThreads.Contains(threadId);

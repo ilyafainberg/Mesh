@@ -206,7 +206,21 @@ public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopic
     {
         await state.FlushPersistenceAsync(CancellationToken.None).ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
-        var intent = NotificationIntents.Topic(draft.RunId, draft.ThreadId, state.TopicTitle(draft.ThreadId), kind);
+        var response = kind == NotificationKind.TopicCompleted
+            ? state.Profile.OwnThreads
+                .FirstOrDefault(thread => string.Equals(thread.Id, draft.ThreadId, StringComparison.Ordinal))
+                ?.Lines
+                .LastOrDefault(line =>
+                    string.Equals(line.Role, "assistant", StringComparison.Ordinal)
+                    && !string.IsNullOrWhiteSpace(line.Text))
+                ?.Text
+            : null;
+        var intent = NotificationIntents.Topic(
+            draft.RunId,
+            draft.ThreadId,
+            state.TopicTitle(draft.ThreadId),
+            kind,
+            response);
         var activity = NotificationIntents.ToCommittedActivity(
             intent,
             $"local:{intent.StableId}",

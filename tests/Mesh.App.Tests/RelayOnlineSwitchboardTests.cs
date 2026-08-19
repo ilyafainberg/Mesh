@@ -446,6 +446,9 @@ public sealed class RelayOnlineSwitchboardTests
     {
         Assert.AreEqual(TimeSpan.FromSeconds(5), PushDispatcher.VisibleWakeMinimumInterval);
         Assert.AreEqual(TimeSpan.FromSeconds(30), PushDispatcher.SilentWakeMinimumInterval);
+        Assert.AreEqual(
+            PushDispatcher.VisibleWakeMinimumInterval,
+            PushDispatcher.WakeDeduplicationInterval);
         Assert.AreEqual(60, PushDispatcher.MaxVisibleWakesPerWindow);
         Assert.AreEqual(12, PushDispatcher.MaxSilentWakesPerWindow);
     }
@@ -506,6 +509,25 @@ public sealed class RelayOnlineSwitchboardTests
         Assert.IsTrue(visible.Accepted);
         Assert.AreEqual(1, node.PushSender!.Sent.Count);
         Assert.AreEqual(PushWakeMode.SyncOnly, node.PushSender.Sent[0].Mode);
+    }
+
+    [TestMethod]
+    public async Task PushWake_StableIdCanRetryAfterDeliveryThrottleWindow()
+    {
+        var node = RelayNode.Create(withPush: true);
+        var sender = await node.ConnectAsync("alice");
+        var (handle, deviceId, _) = await node.RegisterAsync("bob");
+        await node.Store.SetDevicePushTokenAsync(
+            handle, deviceId, DevicePlatforms.IOS, "tok-retry", alertsEnabled: true);
+        var request = new OnlineWakeRequest(
+            handle, deviceId, "retry-wake", NotificationWorthy: true);
+
+        Assert.IsTrue((await sender.Hub.Wake(request)).Accepted);
+        await Task.Delay(PushDispatcher.WakeDeduplicationInterval + TimeSpan.FromMilliseconds(500));
+        Assert.IsTrue((await sender.Hub.Wake(request)).Accepted);
+
+        Assert.AreEqual(2, node.PushSender!.Sent.Count);
+        Assert.IsTrue(node.PushSender.Sent.All(item => item.Mode == PushWakeMode.AlertAndSync));
     }
 
     [TestMethod]

@@ -6,7 +6,7 @@ namespace Mesh.App.Services;
 public sealed partial class MeshClient
 {
     private static readonly TimeSpan WakeAuthenticationTimeout = TimeSpan.FromSeconds(8);
-    private static readonly TimeSpan WakeIdlePeriod = TimeSpan.FromSeconds(1.5);
+    private static readonly TimeSpan WakeIdlePeriod = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan WakePollInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan WakeDisconnectTimeout = TimeSpan.FromSeconds(4);
     private readonly SemaphoreSlim wakeConnectGate = new(1, 1);

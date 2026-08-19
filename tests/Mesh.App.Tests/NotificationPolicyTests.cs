@@ -33,23 +33,34 @@ public sealed class NotificationPolicyTests
     }
 
     [TestMethod]
+    public void TopicIntent_UsesDecryptedResponseAsPreviewBody()
+    {
+        var intent = NotificationIntents.Topic(
+            "run-1",
+            "topic-1",
+            "original prompt",
+            NotificationKind.TopicCompleted,
+            "final assistant response");
+
+        Assert.AreEqual("final assistant response", intent.Body);
+    }
+
+    [TestMethod]
     public void DecisionPolicy_RequiresEveryBannerCondition()
     {
         var activity = Activity(NotificationKind.Message, "body");
         Assert.IsTrue(NotificationDecisionPolicy.ShouldShowBanner(
-            activity, false, false, false, false));
+            activity, false, false, false));
         Assert.IsFalse(NotificationDecisionPolicy.ShouldShowBanner(
-            activity, true, false, false, false));
+            activity, true, false, false));
         Assert.IsFalse(NotificationDecisionPolicy.ShouldShowBanner(
-            activity, false, true, false, false));
+            activity, false, true, false));
         Assert.IsFalse(NotificationDecisionPolicy.ShouldShowBanner(
-            activity, false, false, true, false));
+            activity, false, false, true));
         Assert.IsFalse(NotificationDecisionPolicy.ShouldShowBanner(
-            activity, false, false, false, true));
+            activity with { IsHistorical = true }, false, false, false));
         Assert.IsFalse(NotificationDecisionPolicy.ShouldShowBanner(
-            activity with { IsHistorical = true }, false, false, false, false));
-        Assert.IsFalse(NotificationDecisionPolicy.ShouldShowBanner(
-            activity with { NotifyRequested = false }, false, false, false, false));
+            activity with { NotifyRequested = false }, false, false, false));
     }
 
     [TestMethod]

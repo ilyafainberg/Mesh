@@ -48,12 +48,11 @@ public sealed class NotificationCoordinatorTests
     }
 
     [TestMethod]
-    public async Task OwnerCopyAndRemoteAlertSuppressLocalBanner()
+    public async Task OwnerCopyIsSuppressedAndDecryptedPreviewIsShown()
     {
         var state = new RecordingState { LocalHandle = "alice" };
         var notifier = new RecordingNotifier();
-        var sessions = new NotificationWakeSession();
-        var coordinator = Create(state, notifier, wakeSessions: sessions, foreground: false);
+        var coordinator = Create(state, notifier, foreground: false);
         var ownerCopy = Activity("message:owner", NotificationKind.Message, "bob", "bob") with
         {
             OriginAccount = "@ALICE",
@@ -61,13 +60,13 @@ public sealed class NotificationCoordinatorTests
         };
 
         await coordinator.OnCommittedActivityAsync(ownerCopy);
-        using (sessions.Begin("wake-1", visibleRemoteAlert: true))
-            await coordinator.OnCommittedActivityAsync(
-                Activity("message:remote", NotificationKind.Message, "carol", "carol"));
+        await coordinator.OnCommittedActivityAsync(
+            Activity("message:remote", NotificationKind.Message, "carol", "carol"));
 
-        Assert.AreEqual(0, notifier.Shown.Count);
+        Assert.AreEqual(1, notifier.Shown.Count);
+        Assert.AreEqual("Body", notifier.Shown.Single().Body);
         Assert.IsTrue(state.Read.Contains(ownerCopy.StableId));
-        Assert.IsTrue(state.Suppressed.Contains("message:remote"));
+        Assert.IsFalse(state.Suppressed.Contains("message:remote"));
         Assert.AreEqual(1, state.GetUnreadNotificationCount());
     }
 
@@ -107,13 +106,11 @@ public sealed class NotificationCoordinatorTests
         RecordingState state,
         RecordingNotifier notifier,
         NotificationViewState? views = null,
-        NotificationWakeSession? wakeSessions = null,
         bool foreground = true)
         => new(
             state,
             notifier,
             views ?? new NotificationViewState(new TestLifecycle { IsForeground = foreground }),
-            wakeSessions ?? new NotificationWakeSession(),
             NullLogger<NotificationCoordinator>.Instance);
 
     private static CommittedActivity Activity(

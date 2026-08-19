@@ -1095,6 +1095,60 @@ public sealed class OnlineReplicationRuntimeTests
     }
 
     [TestMethod]
+    public async Task Poller_OfflineEstablishedSibling_UsesNativeWakeInsteadOfStaleSession()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
+        source.SetPresence("alice", false);
+
+        var engineRoster = new StubRoster();
+        engineRoster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        engineRoster.Add(new ReplicationDevice("alice", siblingDevice, sibling.PublicB64, 0, false));
+        var transport = new RecordingTransport();
+        var engine = NewEngine("alice", myDevice, engineRoster, transport, mine);
+        await engine.HandleDeliveryAsync(BuildSessionInit(
+            sibling, "alice", siblingDevice, myDevice, mine.PublicB64));
+        Assert.IsTrue(engine.IsSessionEstablished(siblingDevice));
+
+        await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Topic, ReplicationPayloadCodec.DomainAction.Upsert, "topic-complete") with
+            {
+                NotificationIntent = NotificationIntents.Topic(
+                    "run-1",
+                    "topic-complete",
+                    "Notification test",
+                    NotificationKind.TopicCompleted)
+            },
+            new[] { "alice" });
+        var offersBeforePoll = transport.DecodedKinds()
+            .Count(item => item.Kind == E2EFrameKind.Offer);
+        var presenceRoster = NewRoster(source, "alice", new List<string>());
+        var poller = NewPoller(
+            engine,
+            presenceRoster,
+            source,
+            "alice",
+            myDevice,
+            () => new[] { "alice" },
+            hasDueOutbox: true);
+
+        await poller.PollOnceAsync(default);
+
+        Assert.AreEqual(1, transport.Wakes.Count);
+        var wake = transport.Wakes[0];
+        Assert.AreEqual(siblingDevice, wake.ToDevice);
+        Assert.IsTrue(wake.NotificationWorthy);
+        Assert.AreEqual(
+            offersBeforePoll,
+            transport.DecodedKinds().Count(item => item.Kind == E2EFrameKind.Offer),
+            "an offline peer must not be offered over a cached session whose socket is gone");
+    }
+
+    [TestMethod]
     public async Task Poller_AccountReceiptDoesNotSuppressLaggingDeviceWake()
     {
         var source = new FakeMetadataSource();

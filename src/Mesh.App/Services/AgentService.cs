@@ -282,7 +282,8 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
                 runId,
                 thread.Id,
                 thread.Title,
-                NotificationKind.TopicCompleted));
+                NotificationKind.TopicCompleted,
+                finalAnswer));
             if (!ModelReply.IsFailure(finalAnswer)) memoryTurn.Commit();
             return finalAnswer;
         }

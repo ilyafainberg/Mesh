@@ -35,6 +35,7 @@ public sealed class PushDispatcher(
 {
     internal static readonly TimeSpan VisibleWakeMinimumInterval = TimeSpan.FromSeconds(5);
     internal static readonly TimeSpan SilentWakeMinimumInterval = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan WakeDeduplicationInterval = VisibleWakeMinimumInterval;
     private static readonly TimeSpan WakeWindow = TimeSpan.FromHours(1);
     internal const int MaxVisibleWakesPerWindow = 60;
     internal const int MaxSilentWakesPerWindow = 12;
@@ -57,7 +58,7 @@ public sealed class PushDispatcher(
         var dedupKey = $"{handle}:{deviceId ?? "*"}:{wakeId}";
         var now = DateTimeOffset.UtcNow;
         PruneWakeIds(now);
-        if (!recentWakeIds.TryAdd(dedupKey, now)) return PushDispatchOutcome.Coalesced;
+        if (!TryClaimWakeId(dedupKey, now)) return PushDispatchOutcome.Coalesced;
 
         var record = await store.GetHandleAsync(handle, ct).ConfigureAwait(false);
         if (record is null || record.DevicePushTokens.Count == 0)
@@ -165,7 +166,19 @@ public sealed class PushDispatcher(
     private void PruneWakeIds(DateTimeOffset now)
     {
         foreach (var item in recentWakeIds)
-            if (now - item.Value >= WakeWindow) recentWakeIds.TryRemove(item.Key, out _);
+            if (now - item.Value >= WakeDeduplicationInterval)
+                recentWakeIds.TryRemove(item.Key, out _);
+    }
+
+    private bool TryClaimWakeId(string dedupKey, DateTimeOffset now)
+    {
+        while (true)
+        {
+            if (recentWakeIds.TryAdd(dedupKey, now)) return true;
+            if (!recentWakeIds.TryGetValue(dedupKey, out var previous)) continue;
+            if (now - previous < WakeDeduplicationInterval) return false;
+            if (recentWakeIds.TryUpdate(dedupKey, now, previous)) return true;
+        }
     }
 
 

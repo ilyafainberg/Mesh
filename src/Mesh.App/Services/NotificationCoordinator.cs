@@ -6,7 +6,6 @@ public sealed class NotificationCoordinator(
     INotificationState state,
     INotifier notifier,
     NotificationViewState views,
-    NotificationWakeSession wakeSessions,
     ILogger<NotificationCoordinator> logger) : INotificationCoordinator
 {
     // Keep account resets, native delivery, removal, and badge updates in invocation order.
@@ -80,8 +79,7 @@ public sealed class NotificationCoordinator(
                 activity,
                 state.DoNotDisturb,
                 muted,
-                entityVisible: false,
-                wakeSessions.HasVisibleRemoteAlert))
+                entityVisible: false))
         {
             state.MarkNotificationSuppressed(activity.StableId);
             logger.LogDebug(
@@ -98,7 +96,8 @@ public sealed class NotificationCoordinator(
             state.NotificationPreview,
             views.IsForeground,
             state.NotificationSound);
-        if (await notifier.ShowAsync(local, ct).ConfigureAwait(false))
+        var shown = await notifier.ShowAsync(local, ct).ConfigureAwait(false);
+        if (shown)
         {
             state.MarkNotificationBannerShown(activity.StableId);
             logger.LogInformation("notification shown: kind={Kind}", activity.Kind);

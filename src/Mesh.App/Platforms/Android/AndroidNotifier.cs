@@ -18,6 +18,7 @@ public sealed class AndroidNotifier(ILogger<AndroidNotifier> logger) : INotifier
     private const string MessageChannel = "mesh_messages";
     private const string TopicChannel = "mesh_topics";
     private const string DecisionChannel = "mesh_decisions";
+    private static readonly int GenericWakeNotificationId = NativeId("mesh-generic-wake");
     private static int badgeCount;
     private readonly Context context = global::Android.App.Application.Context
         ?? throw new InvalidOperationException("Android application context is unavailable.");
@@ -31,6 +32,7 @@ public sealed class AndroidNotifier(ILogger<AndroidNotifier> logger) : INotifier
             EnsureChannels(context);
             var manager = NotificationManagerCompat.From(context);
             if (manager is null) return Task.FromResult(false);
+            manager.Cancel(GenericWakeNotificationId);
 
             var intent = new Intent(context, typeof(MainActivity));
             intent.SetFlags(ActivityFlags.ClearTop | ActivityFlags.SingleTop);
@@ -114,7 +116,7 @@ public sealed class AndroidNotifier(ILogger<AndroidNotifier> logger) : INotifier
         builder.SetPriority(NotificationCompat.PriorityHigh);
         var notification = builder.Build();
         if (notification is null) return false;
-        manager.Notify(NativeId($"wake:{wakeId}"), notification);
+        manager.Notify(GenericWakeNotificationId, notification);
         return true;
     }
 
