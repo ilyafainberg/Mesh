@@ -133,6 +133,7 @@
     enum Tab { None, Me, Messages, Contacts, Search }
 
     bool moreOpen;
+    bool disposed;
 
     int MessagesBadge => State.UnreadHandles.Count + State.Profile.Approvals.Count;
     int ContactsBadge => State.Profile.Requests.Count;
@@ -182,7 +183,14 @@
 
     private void OnLocationChanged(object? sender, LocationChangedEventArgs e) => Refresh();
 
-    private void Refresh() => InvokeAsync(StateHasChanged);
+    private void Refresh()
+    {
+        if (disposed || Shutdown.IsStopping) return;
+        Shutdown.Track(InvokeAsync(() =>
+        {
+            if (!disposed && !Shutdown.IsStopping) StateHasChanged();
+        }), "mobile shell refresh");
+    }
 
     private void UndoMemoryNotice()
     {
@@ -200,6 +208,7 @@
 
     public void Dispose()
     {
+        disposed = true;
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;

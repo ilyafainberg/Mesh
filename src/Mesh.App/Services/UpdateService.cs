@@ -57,6 +57,7 @@ public sealed class UpdateService
     private readonly IHttpClientFactory httpFactory;
     private readonly IAppControl appControl;
     private readonly ILogger<UpdateService> log;
+    private readonly AppShutdownCoordinator shutdown;
     private readonly SemaphoreSlim checkGate = new(1, 1);
     private readonly object preparationSync = new();
     private readonly Dictionary<string, Task<PreparedUpdate>> preparationTasks = new(StringComparer.Ordinal);
@@ -66,21 +67,14 @@ public sealed class UpdateService
     private string? preparedTag;
     private int launchRequested;
 
-    public UpdateService(IHttpClientFactory httpFactory, IAppControl appControl, ILogger<UpdateService> log)
-        : this(httpFactory, appControl, log, OperatingSystem.IsWindows)
-    {
-    }
-
-    internal UpdateService(
-        IHttpClientFactory httpFactory,
-        IAppControl appControl,
-        ILogger<UpdateService> log,
-        Func<bool> isSupported)
+    public UpdateService(IHttpClientFactory httpFactory, IAppControl appControl,
+        ILogger<UpdateService> log, AppShutdownCoordinator shutdown)
     {
         this.httpFactory = httpFactory;
         this.appControl = appControl;
         this.log = log;
-        this.isSupported = isSupported;
+        this.shutdown = shutdown;
+        shutdown.Register("updates", StopAsync);
         CurrentVersion = DetectCurrentVersion();
         CurrentProgress = new UpdateProgress(UpdatePhase.Idle, 0, 0, null);
     }
@@ -130,15 +124,20 @@ public sealed class UpdateService
     {
         if (!IsSupported || autoTimer is not null) return;
         CleanupTemporaryLaunchers();
-        autoTimer = new Timer(_ => _ = CheckInBackgroundAsync(), null, TimeSpan.Zero, TimeSpan.FromHours(6));
+        autoTimer = new Timer(_ =>
+        {
+            if (shutdown.IsStopping) return;
+            shutdown.Track(CheckInBackgroundAsync(shutdown.Token), "update check");
+        }, null, TimeSpan.Zero, TimeSpan.FromHours(6));
     }
 
-    public async Task CheckInBackgroundAsync()
+    public async Task CheckInBackgroundAsync(CancellationToken cancellationToken = default)
     {
         if (!IsSupported || disposed) return;
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(30));
             var result = await CheckNowAsync(cts.Token);
             if (result.Error is not null)
                 log.LogInformation("Background update check did not complete: {Error}", result.Error);
@@ -176,7 +175,7 @@ public sealed class UpdateService
     {
         if (BannerDismissed) return;
         BannerDismissed = true;
-        Changed?.Invoke();
+        NotifyChanged();
     }
 
     public async Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken = default)
@@ -272,7 +271,7 @@ public sealed class UpdateService
         var updaterStarted = false;
         UpdateInfo? targetInfo = null;
         Error = null;
-        Changed?.Invoke();
+        NotifyChanged();
         try
         {
             targetInfo = Available;
@@ -305,7 +304,7 @@ public sealed class UpdateService
             if (!updaterStarted)
             {
                 Interlocked.Exchange(ref launchRequested, 0);
-                Changed?.Invoke();
+                NotifyChanged();
             }
         }
     }
@@ -324,17 +323,21 @@ public sealed class UpdateService
         }
         else
         {
-            Changed?.Invoke();
+            NotifyChanged();
         }
     }
 
-    private void StartPreDownload(UpdateInfo info) => _ = ObservePreDownloadAsync(info);
+    private void StartPreDownload(UpdateInfo info)
+    {
+        if (shutdown.IsStopping) return;
+        shutdown.Track(ObservePreDownloadAsync(info), $"update pre-download {info.Version}");
+    }
 
     private async Task ObservePreDownloadAsync(UpdateInfo info)
     {
         try
         {
-            await EnsurePreparedAsync(info, CancellationToken.None);
+            await EnsurePreparedAsync(info, shutdown.Token);
         }
         catch (Exception ex) when (IsExpectedUpdateException(ex))
         {
@@ -380,7 +383,7 @@ public sealed class UpdateService
     {
         try
         {
-            var prepared = await PrepareUpdateCoreAsync(info, CancellationToken.None);
+            var prepared = await PrepareUpdateCoreAsync(info, shutdown.Token);
             if (string.Equals(Available?.TagName, info.TagName, StringComparison.Ordinal))
             {
                 preparedUpdate = prepared;
@@ -588,19 +591,16 @@ public sealed class UpdateService
                 await Task.Delay(TimeSpan.FromMilliseconds(200));
             }
 
-            MainThread.BeginInvokeOnMainThread(() =>
+            try
             {
-                try
-                {
-                    appControl.Quit();
-                }
-                catch (Exception ex) when (IsExpectedUpdateException(ex))
-                {
-                    log.LogWarning(ex, "Mesh did not quit cleanly after the updater requested shutdown");
-                }
-            });
+                await appControl.QuitAsync();
+            }
+            catch (Exception ex) when (IsExpectedUpdateException(ex))
+            {
+                log.LogWarning(ex, "Mesh did not quit cleanly after the updater requested shutdown");
+            }
 
-            await Task.Delay(TimeSpan.FromSeconds(3));
+            await Task.Delay(TimeSpan.FromSeconds(10));
             try
             {
                 Process.GetCurrentProcess().Kill(entireProcessTree: true);
@@ -623,6 +623,27 @@ public sealed class UpdateService
             quitEvent.Dispose();
         }
     }
+    private async Task StopAsync(CancellationToken cancellationToken)
+    {
+        Interlocked.Exchange(ref autoTimer, null)?.Dispose();
+        Task<PreparedUpdate>[] pending;
+        lock (preparationSync)
+            pending = preparationTasks.Values.Where(task => !task.IsCompleted).ToArray();
+        if (pending.Length == 0) return;
+
+        var completions = pending.Select(task => task.ContinueWith(
+            static _ => { },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default));
+        await Task.WhenAll(completions).WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private void NotifyChanged()
+    {
+        if (!shutdown.IsStopping)
+            Changed?.Invoke();
+    }
     private void ReportProgress(UpdateInfo info, UpdateProgress progress)
     {
         if (!string.Equals(Available?.TagName, info.TagName, StringComparison.Ordinal)) return;
@@ -637,7 +658,7 @@ public sealed class UpdateService
             UpdatePhase.ReadyToApply => "Ready to update.",
             _ => Status
         };
-        Changed?.Invoke();
+        NotifyChanged();
     }
 
     private void PublishFailure(UpdateInfo? info, string message)
@@ -647,7 +668,7 @@ public sealed class UpdateService
         CurrentProgress = new UpdateProgress(UpdatePhase.Failed, 0, 0, message);
         Status = message;
         Error = message;
-        Changed?.Invoke();
+        NotifyChanged();
     }
 
     private void SetState(UpdatePhase phase, string? status)
@@ -656,7 +677,7 @@ public sealed class UpdateService
         CurrentProgress = new UpdateProgress(phase, 0, 0, status);
         Status = status;
         if (phase != UpdatePhase.Failed) Error = null;
-        Changed?.Invoke();
+        NotifyChanged();
     }
 
     private static void ResetReleaseDirectory(string releaseDirectory)

@@ -117,6 +117,21 @@ public sealed class RuntimeDiagnosticsTests
         Assert.IsFalse(report.Contains("background warning", StringComparison.Ordinal));
     }
 
+    [TestMethod]
+    public void WidgetDiagnosticsPersistNormalizedStageMetadata()
+    {
+        var diagnostics = new RuntimeDiagnostics(directory);
+        diagnostics.StartSession("ios", "1.0.0", detectUnexpectedTermination: true);
+        var bridge = new WidgetDiagnosticsBridge(diagnostics);
+
+        bridge.RecordStage(" First Paint!! ", "mode=host\r\npurpose=self-test");
+        bridge.RecordStage("!!!", "ignored");
+
+        var report = diagnostics.CreateReport();
+        StringAssert.Contains(report, "[widget-render] stage=first-paint; mode=host purpose=self-test");
+        Assert.IsFalse(report.Contains("ignored", StringComparison.Ordinal));
+    }
+
     private static int Count(string value, string target)
     {
         var count = 0;

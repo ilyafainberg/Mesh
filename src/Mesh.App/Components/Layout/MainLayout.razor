@@ -12,6 +12,8 @@
 @inject ConnectorCatalogService Catalog
 @inject IJSRuntime JS
 @inject IUiModeService UiModeSvc
+@inject WidgetDiagnosticsBridge WidgetDiagnostics
+@inject AppShutdownCoordinator Shutdown
 @implements IDisposable
 
 @if (onboardingActive || !State.IsOnboarded)
@@ -109,6 +111,7 @@ else
 @code {
     bool navOpen;
     DotNetObjectReference<MainLayout>? fileLinkRef;
+    DotNetObjectReference<WidgetDiagnosticsBridge>? widgetDiagnosticsRef;
     UiMode _prevEffectiveMode;
 
     string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
@@ -124,6 +127,8 @@ else
     protected override async Task OnInitializedAsync()
     {
         onboardingActive = !State.IsOnboarded;
+        Shutdown.RegisterDrain(
+            "blazor-renderer", cancellationToken => InvokeAsync(() => { }).WaitAsync(cancellationToken));
         _prevEffectiveMode = UiModeSvc.EffectiveMode;
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
@@ -152,12 +157,12 @@ else
             await Mesh.ConnectAsync();
             // Pull the relay's connector catalog (public OAuth metadata) in the background so the
             // Knowledge page can offer one-click connectors. Cached for brief offline periods.
-            _ = Task.Run(() => Catalog.RefreshAsync());
+            Shutdown.Track(Catalog.RefreshAsync(Shutdown.Token), "connector catalog refresh");
         }
         // Preload the on-device model catalog once, in the background, so Settings
         // shows it instantly without reloading (and without resetting the selection).
         if (State.Profile.Model.Provider == ModelProvider.FoundryLocal)
-            _ = Task.Run(() => Foundry.PreloadModelsAsync());
+            Shutdown.Track(Foundry.PreloadModelsAsync(ct: Shutdown.Token), "local model preload");
 
         // Automatic update checks: one now, then periodically. Surfaces the update banner.
         Updater.StartAutoChecks();
@@ -167,6 +172,8 @@ else
     {
         if (!firstRender) return;
         fileLinkRef = DotNetObjectReference.Create(this);
+        widgetDiagnosticsRef = DotNetObjectReference.Create(WidgetDiagnostics);
+        await JS.InvokeVoidAsync("sandboxFrame.initialize", widgetDiagnosticsRef, PlatformCaps.DevicePlatform);
         await JS.InvokeVoidAsync("meshUI.initFileLinks", fileLinkRef);
     }
 
@@ -175,8 +182,12 @@ else
 
     private void Refresh()
     {
+        if (Shutdown.IsStopping) return;
         if (!State.IsOnboarded) onboardingActive = true;
-        _ = InvokeAsync(StateHasChanged);
+        Shutdown.Track(InvokeAsync(() =>
+        {
+            if (!Shutdown.IsStopping) StateHasChanged();
+        }), "main layout refresh");
     }
 
     private void CompleteOnboarding()
@@ -201,7 +212,10 @@ else
 
     // Raised from any thread by UiModeService; marshal to the UI thread.
     private void OnModeChanged(object? sender, EventArgs e)
-        => _ = InvokeAsync(HandleModeChange);
+    {
+        if (Shutdown.IsStopping) return;
+        Shutdown.Track(InvokeAsync(HandleModeChange), "UI mode refresh");
+    }
 
     private void HandleModeChange()
     {
@@ -342,5 +356,6 @@ else
 
         DeepLinkDispatch.SetHandler(null);
         fileLinkRef?.Dispose();
+        widgetDiagnosticsRef?.Dispose();
     }
 }

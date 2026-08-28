@@ -641,6 +641,7 @@
     ElementReference moveMenuButton;
     Microsoft.JSInterop.DotNetObjectReference<Home>? selfRef;
     bool composerWired;
+    bool disposed;
     int lastCount = -1;
     string? lastScrolledThread;
     bool lastBusy;
@@ -839,7 +840,14 @@
         return null;
     }
 
-    void Refresh() => InvokeAsync(StateHasChanged);
+    void Refresh()
+    {
+        if (disposed || Shutdown.IsStopping) return;
+        Shutdown.Track(InvokeAsync(() =>
+        {
+            if (!disposed && !Shutdown.IsStopping) StateHasChanged();
+        }), "home refresh");
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {

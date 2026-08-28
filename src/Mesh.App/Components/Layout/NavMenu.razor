@@ -41,6 +41,8 @@
     [Inject] private IAppControl AppControl { get; set; } = default!;
     [Inject] private AppState State { get; set; } = default!;
     [Inject] private MeshClient Mesh { get; set; } = default!;
+    [Inject] private AppShutdownCoordinator Shutdown { get; set; } = default!;
+    private bool disposed;
 
     // Messages badge: unread person-chats plus drafts awaiting approval.
     int MessagesBadge => State.UnreadHandles.Count + State.Profile.Approvals.Count;
@@ -51,12 +53,20 @@
         Mesh.StateChanged += Refresh;
     }
 
-    void Refresh() => InvokeAsync(StateHasChanged);
+    void Refresh()
+    {
+        if (disposed || Shutdown.IsStopping) return;
+        Shutdown.Track(InvokeAsync(() =>
+        {
+            if (!disposed && !Shutdown.IsStopping) StateHasChanged();
+        }), "navigation refresh");
+    }
 
-    void Quit() => AppControl.Quit();
+    async Task Quit() => await AppControl.QuitAsync();
 
     public void Dispose()
     {
+        disposed = true;
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
     }

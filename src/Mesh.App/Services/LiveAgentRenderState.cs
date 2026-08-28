@@ -11,6 +11,20 @@ internal sealed class LiveAgentRenderState
     private readonly Dictionary<string, List<AgentStep>> steps = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DraftBuffer> drafts = new(StringComparer.Ordinal);
 
+    public LiveAgentStateSnapshot Capture(string key)
+    {
+        lock (gate)
+        {
+            var stepSnapshot = steps.TryGetValue(key, out var current)
+                ? current.ToArray()
+                : NoSteps;
+            AssistantDraftSnapshot? draftSnapshot = drafts.TryGetValue(key, out var draft)
+                ? new AssistantDraftSnapshot(draft.Reasoning.ToString(), draft.Answer.ToString())
+                : null;
+            return new LiveAgentStateSnapshot(stepSnapshot, draftSnapshot);
+        }
+    }
+
     public IReadOnlyList<AgentStep> StepsFor(string key)
     {
         lock (gate)
@@ -100,4 +114,7 @@ internal sealed class LiveAgentRenderState
     }
 }
 
+internal readonly record struct LiveAgentStateSnapshot(
+    IReadOnlyList<AgentStep> Steps,
+    AssistantDraftSnapshot? Draft);
 internal readonly record struct AssistantDraftSnapshot(string Reasoning, string Answer);

@@ -10,6 +10,7 @@
 @inject IAppControl AppControl
 @inject IAccountInstanceCoordinator AccountInstances
 @inject RuntimeDiagnostics Diagnostics
+@inject IJSRuntime JS
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -807,14 +808,34 @@
                     Copy diagnostics and include them with the crash report.
                 </div>
             }
-            <div class="model-row">
+            <div class="model-row" style="flex-wrap:wrap;">
                 <button class="ghost" @onclick="CopyDiagnostics">
                     <i class="bi bi-clipboard"></i> Copy diagnostics
                 </button>
-                <button class="ghost" @onclick="ClearDiagnostics" disabled="@(!Diagnostics.HasEntries)">
+                <button class="ghost" @onclick="RunWidgetSelfTest" disabled="@widgetSelfTestRunning">
+                    <i class="bi bi-window"></i> @(widgetSelfTestRunning ? "Testing widget..." : "Run widget self-test")
+                </button>
+                <button class="ghost" @onclick="CopyWidgetDiagnostics">
+                    <i class="bi bi-clipboard-check"></i> Copy widget diagnostics
+                </button>
+                <button class="ghost" @onclick="ClearDiagnostics">
                     Clear
                 </button>
             </div>
+            @if (widgetSelfTestVisible)
+            {
+                <div class="app-frame" style="height:190px;min-height:190px;resize:none;margin-top:12px;">
+                    <iframe @ref="widgetSelfTestFrame"
+                            sandbox="allow-scripts"
+                            referrerpolicy="no-referrer"
+                            title="Widget renderer self-test"></iframe>
+                    <div class="widget-render-status" hidden aria-live="polite"></div>
+                </div>
+                @if (!string.IsNullOrWhiteSpace(widgetSelfTestStatus))
+                {
+                    <div class="field-hint" role="status">@widgetSelfTestStatus</div>
+                }
+            }
             @if (!string.IsNullOrWhiteSpace(diagnosticsStatus))
             {
                 <div class="field-hint">@diagnosticsStatus</div>
@@ -865,6 +886,24 @@
     bool agentRoutingAttempted;
     string? agentRoutingError;
     string? diagnosticsStatus;
+    ElementReference widgetSelfTestFrame;
+    bool widgetSelfTestVisible;
+    bool widgetSelfTestPending;
+    bool widgetSelfTestRunning;
+    string? widgetSelfTestStatus;
+
+    private const string WidgetSelfTestHtml =
+        "<!doctype html><html><head><meta charset='utf-8'>" +
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+        "<style>html,body{margin:0;min-height:100%;font:16px system-ui,sans-serif}" +
+        "body{display:grid;place-items:center;background:#fff4ce;color:#5c4813;text-align:center}" +
+        "body[data-mesh-self-test='script-ok']{background:#dff6dd;color:#14532d}" +
+        ".card{padding:24px;border:1px solid currentColor;border-radius:12px;max-width:320px}" +
+        "strong{display:block;font-size:18px;margin-bottom:6px}</style></head>" +
+        "<body data-mesh-self-test='pending'><main class='card'><strong id='result'>Renderer loaded</strong>" +
+        "<span>Checking script execution and first paint...</span></main>" +
+        "<script>document.body.dataset.meshSelfTest='script-ok';" +
+        "document.getElementById('result').textContent='Widget rendering works';</script></body></html>";
 
     IReadOnlyList<Mesh.Shared.DeviceInfo> AgentRoutingDevices => agentDevices
         .Where(device => device.IsDesktop && device.AgentHostEnabled)
@@ -956,6 +995,51 @@
         catch { /* clipboard is best-effort */ }
     }
 
+    void RunWidgetSelfTest()
+    {
+        if (widgetSelfTestRunning) return;
+        widgetSelfTestVisible = true;
+        widgetSelfTestPending = true;
+        widgetSelfTestRunning = true;
+        widgetSelfTestStatus = "Starting the secure widget renderer...";
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!widgetSelfTestPending) return;
+        widgetSelfTestPending = false;
+        try
+        {
+            var result = await JS.InvokeAsync<string>(
+                "sandboxFrame.runSelfTest",
+                widgetSelfTestFrame,
+                WidgetSelfTestHtml,
+                PlatformCaps.DevicePlatform) ?? "failed:no-result";
+            if (result.StartsWith("passed:", StringComparison.Ordinal))
+            {
+                var mode = result["passed:".Length..];
+                widgetSelfTestStatus = $"Widget self-test passed using the {mode} renderer.";
+            }
+            else
+            {
+                var reason = result.StartsWith("failed:", StringComparison.Ordinal)
+                    ? result["failed:".Length..].Replace('-', ' ')
+                    : "unknown result";
+                widgetSelfTestStatus = $"Widget self-test failed: {reason}. Copy widget diagnostics and include them with the report.";
+            }
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.RecordException("widget-self-test", ex);
+            widgetSelfTestStatus = "Widget self-test could not run: " + ex.Message;
+        }
+        finally
+        {
+            widgetSelfTestRunning = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
     async Task CopyDiagnostics()
     {
         try
@@ -971,11 +1055,29 @@
         }
     }
 
-    void ClearDiagnostics()
+    async Task CopyWidgetDiagnostics()
+    {
+        try
+        {
+            var rendererReport = await JS.InvokeAsync<string>("sandboxFrame.getDiagnostics")
+                ?? "Mesh widget diagnostics were unavailable.";
+            var report = rendererReport + Environment.NewLine + Environment.NewLine + Diagnostics.CreateReport();
+            await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(report);
+            diagnosticsStatus = "Widget diagnostics copied. Paste them into the widget report.";
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.RecordException("widget-diagnostics-copy", ex);
+            diagnosticsStatus = "Could not copy widget diagnostics: " + ex.Message;
+        }
+    }
+
+    async Task ClearDiagnostics()
     {
         try
         {
             Diagnostics.Clear();
+            await JS.InvokeVoidAsync("sandboxFrame.clearDiagnostics");
             diagnosticsStatus = "Diagnostics cleared.";
         }
         catch (Exception ex)

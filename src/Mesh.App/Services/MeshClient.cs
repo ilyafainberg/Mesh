@@ -67,7 +67,9 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         ITopicTurnRunner topicTurnRunner,
         IHttpClientFactory httpFactory,
         IPushService push,
-        IAppLifecycleState lifecycle)
+        IAppLifecycleState lifecycle,
+        AppShutdownState shutdownState,
+        AppShutdownCoordinator shutdown)
     {
         this.state = state;
         this.agent = agent;
@@ -75,11 +77,16 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
         this.httpFactory = httpFactory;
         this.push = push;
         this.lifecycle = lifecycle;
+        lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdownState.Token);
+        deviceSyncActivityChanged = OnDeviceSyncActivityChanged;
         lifecycle.ForegroundChanged += OnForegroundChanged;
         lifecycle.ForegroundChanged += OnReplicationForegroundChanged;
         state.ActiveAccountChanging += OnActiveAccountChanging;
         replicationActivity.Changed += () => ReplicationStateChanged?.Invoke();
         Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged += OnConnectivityChanged;
+        shutdown.Register(
+            "mesh-client",
+            cancellationToken => ShutdownAsync().WaitAsync(cancellationToken));
     }
 
     private void OnActiveAccountChanging()
@@ -136,6 +143,17 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     public event Action? ReplicationStateChanged;
     public event Action<string>? Log;
 
+    private void NotifyStateChanged()
+    {
+        if (!lifetime.IsCancellationRequested)
+            StateChanged?.Invoke();
+    }
+
+    private void OnDeviceSyncActivityChanged()
+    {
+        if (!lifetime.IsCancellationRequested)
+            DeviceSyncStateChanged?.Invoke();
+    }
     /// <summary>
     /// This device's stable id, derived from its public signing key. Same derivation the relay uses,
     /// so both agree on the id that targets one specific device (MeshEnvelope.ToDevice). Empty when
@@ -730,7 +748,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             {
                 authenticationReady.TrySetException(ex);
                 Log?.Invoke($"hub connect failed: {ex.Message}");
-                StateChanged?.Invoke();
+                NotifyStateChanged();
                 ScheduleRecovery();
                 if (purpose == ConnectionPurpose.BackgroundWake) throw;
             }
@@ -845,7 +863,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
     {
         TrackBackground(Task.Run(async () =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(12));
+            await Task.Delay(TimeSpan.FromSeconds(12), lifetime.Token);
             if (!ReferenceEquals(hub, connection)) return; // superseded by a newer connection
             if (wantConnected && ShouldMaintainContinuousTransport
                 && !authenticated && connection.State == HubConnectionState.Connected)
@@ -874,7 +892,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 var delay = TimeSpan.FromSeconds(2);
                 while (wantConnected && ShouldMaintainContinuousTransport)
                 {
-                    await Task.Delay(delay);
+                    await Task.Delay(delay, lifetime.Token);
                     if (!wantConnected) break;
                     if (Connected)
                     {
@@ -1195,7 +1213,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                     $"request:{from}", NotificationKind.ContactRequest, from, NotificationRoutes.Requests,
                     $"Request from @{from}", text, ct);
             Log?.Invoke($"inbound from @{from} held for approval");
-            StateChanged?.Invoke();
+            NotifyStateChanged();
             return;
         }
 
@@ -1536,7 +1554,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
                     state.DeleteDeferredTopicRunUpdates(update.RunId);
                 RememberReplay(topicEnvelopeReplay, env.Id);
-                StateChanged?.Invoke();
+                NotifyStateChanged();
                 break;
 
             case MeshKinds.TopicRunCancel:
@@ -2015,6 +2033,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
 
     private void TrackBackground(Task task, string operation)
     {
+        ArgumentNullException.ThrowIfNull(task);
         var id = Interlocked.Increment(ref nextBackgroundTaskId);
         backgroundTasks[id] = task;
         task.ContinueWith(completed =>
@@ -2392,7 +2411,7 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
             keyCache[h] = keys;
             keyCacheUpdated[h] = DateTimeOffset.UtcNow;
             state.ReverifyContact(h, keys);
-            StateChanged?.Invoke();
+            NotifyStateChanged();
             return true;
         }
         catch { return false; }
@@ -3336,6 +3355,55 @@ public sealed partial class MeshClient : IDeviceTopicTransport, IOnlineReplicati
                 catch (Exception ex) { TraceTransport("background-dispose-failed", ex.Message); }
             }
         }
-        StateChanged?.Invoke();
+        NotifyStateChanged();
+    }
+
+    private Task ShutdownAsync()
+    {
+        lock (shutdownGate)
+            return shutdownTask ??= ShutdownCoreAsync();
+    }
+
+    private async Task ShutdownCoreAsync()
+    {
+        wantConnected = false;
+        lifecycle.ForegroundChanged -= OnForegroundChanged;
+        state.DeviceSyncOperationCreated -= OnDeviceSyncOperationCreated;
+        deviceSyncActivity.Changed -= deviceSyncActivityChanged;
+        Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged -= OnConnectivityChanged;
+
+        try
+        {
+            lifetime.Cancel();
+        }
+        catch (AggregateException ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("mesh-client-cancel", ex);
+        }
+
+        foreach (var active in activeTopicRuns.Values)
+        {
+            try { active.Cancellation.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
+
+        await DisconnectAsync().ConfigureAwait(false);
+        while (true)
+        {
+            var pending = backgroundTasks.Values.Where(task => !task.IsCompleted).ToArray();
+            if (pending.Length == 0) return;
+            var completions = pending.Select(task => task.ContinueWith(
+                static _ => { },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default));
+            await Task.WhenAll(completions).ConfigureAwait(false);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await ShutdownAsync().ConfigureAwait(false);
+        lifetime.Dispose();
     }
 }

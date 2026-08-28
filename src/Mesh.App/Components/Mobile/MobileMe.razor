@@ -793,11 +793,13 @@ else
 
     void OnMeshStateChanged()
     {
-        _ = InvokeAsync(async () =>
+        if (disposed || Shutdown.IsStopping) return;
+        Shutdown.Track(InvokeAsync(async () =>
         {
+            if (disposed || Shutdown.IsStopping) return;
             await LoadDevicesAsync();
             StateHasChanged();
-        });
+        }), "mobile Me transport refresh");
     }
 
     static string? ParseQueryValue(string queryString, string key)
@@ -812,7 +814,14 @@ else
         return null;
     }
 
-    void Refresh() => InvokeAsync(StateHasChanged);
+    void Refresh()
+    {
+        if (disposed || Shutdown.IsStopping) return;
+        Shutdown.Track(InvokeAsync(() =>
+        {
+            if (!disposed && !Shutdown.IsStopping) StateHasChanged();
+        }), "mobile Me refresh");
+    }
 
     readonly HashSet<string> askResolving = new(StringComparer.Ordinal);
 

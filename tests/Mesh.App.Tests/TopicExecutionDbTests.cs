@@ -716,6 +716,86 @@ public sealed class DeviceTopicDbTests
     }
 
     [TestMethod]
+    public void DeviceEnvelopeOutbox_ReplacementSupersedesOnlyMatchingTargetAndKind()
+    {
+        var created = new DateTimeOffset(2026, 7, 28, 15, 0, 0, TimeSpan.Zero);
+        var oldJob = new MeshDb.DeviceEnvelopeOutboxItem(
+            "old-job", "phone", "internal.snapshot", "old", null, created);
+        var newJob = oldJob with
+        {
+            EnvelopeId = "new-job",
+            Plaintext = "new",
+            CreatedAt = created.AddMinutes(1)
+        };
+        var otherTarget = oldJob with
+        {
+            EnvelopeId = "tablet-job",
+            TargetDeviceId = "tablet"
+        };
+        var control = oldJob with
+        {
+            EnvelopeId = "control",
+            Kind = MeshKinds.TopicRunUpdate,
+            Plaintext = "control"
+        };
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertDeviceEnvelopeOutbox(oldJob);
+            db.UpsertDeviceEnvelopeOutbox(otherTarget);
+            db.UpsertDeviceEnvelopeOutbox(control);
+            db.ReplaceDeviceEnvelopeOutboxForTargetAndKind(newJob);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var queued = reopened.ListDeviceEnvelopeOutbox();
+        Assert.HasCount(3, queued);
+        Assert.IsFalse(queued.Any(item => item.EnvelopeId == oldJob.EnvelopeId));
+        Assert.IsTrue(queued.Any(item => item.EnvelopeId == newJob.EnvelopeId
+                                         && item.Plaintext == "new"));
+        Assert.IsTrue(queued.Any(item => item.EnvelopeId == otherTarget.EnvelopeId));
+        Assert.IsTrue(queued.Any(item => item.EnvelopeId == control.EnvelopeId));
+    }
+
+    [TestMethod]
+    public void DeviceEnvelopeOutbox_ConditionalReplacementPreservesPreferredJob()
+    {
+        var created = new DateTimeOffset(2026, 7, 28, 15, 0, 0, TimeSpan.Zero);
+        var current = new MeshDb.DeviceEnvelopeOutboxItem(
+            "current", "phone", "internal.snapshot", "format-2", null, created);
+        var legacy = current with
+        {
+            EnvelopeId = "legacy",
+            Plaintext = "format-1",
+            CreatedAt = created.AddMinutes(1)
+        };
+        var otherTarget = current with
+        {
+            EnvelopeId = "tablet",
+            TargetDeviceId = "tablet"
+        };
+
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertDeviceEnvelopeOutbox(current);
+            db.UpsertDeviceEnvelopeOutbox(otherTarget);
+            db.ReplaceDeviceEnvelopeOutboxForTargetAndKind(
+                legacy,
+                existing => !string.Equals(
+                    existing.Plaintext, "format-2", StringComparison.Ordinal));
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var queued = reopened.ListDeviceEnvelopeOutbox();
+        Assert.HasCount(2, queued);
+        Assert.IsTrue(queued.Any(item => item.EnvelopeId == current.EnvelopeId));
+        Assert.IsFalse(queued.Any(item => item.EnvelopeId == legacy.EnvelopeId));
+        Assert.IsTrue(queued.Any(item => item.EnvelopeId == otherTarget.EnvelopeId));
+    }
+
+    [TestMethod]
     public void InboundRejection_PersistsMetadataAndDeduplicatesAcrossRestart()
     {
         var rejectedAt = new DateTimeOffset(2026, 8, 2, 7, 0, 0, TimeSpan.Zero);

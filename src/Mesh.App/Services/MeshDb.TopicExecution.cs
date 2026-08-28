@@ -456,6 +456,67 @@ public sealed partial class MeshDb
         cmd.ExecuteNonQuery();
     }
 
+    public void ReplaceDeviceEnvelopeOutboxForTargetAndKind(
+        DeviceEnvelopeOutboxItem item,
+        Func<DeviceEnvelopeOutboxItem, bool>? shouldReplaceExisting = null)
+    {
+        using var transaction = conn.BeginTransaction();
+        if (shouldReplaceExisting is not null)
+        {
+            var preserveExisting = false;
+            using (var select = conn.CreateCommand())
+            {
+                select.Transaction = transaction;
+                select.CommandText = """
+                    SELECT * FROM device_envelope_outbox
+                    WHERE target_device_id = $device AND kind = $kind;
+                    """;
+                select.Parameters.AddWithValue("$device", item.TargetDeviceId);
+                select.Parameters.AddWithValue("$kind", item.Kind);
+                using var reader = select.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (shouldReplaceExisting(ReadDeviceEnvelopeOutbox(reader))) continue;
+                    preserveExisting = true;
+                    break;
+                }
+            }
+            if (preserveExisting)
+            {
+                transaction.Commit();
+                return;
+            }
+        }
+        using (var remove = conn.CreateCommand())
+        {
+            remove.Transaction = transaction;
+            remove.CommandText = """
+                DELETE FROM device_envelope_outbox
+                WHERE target_device_id = $device AND kind = $kind;
+                """;
+            remove.Parameters.AddWithValue("$device", item.TargetDeviceId);
+            remove.Parameters.AddWithValue("$kind", item.Kind);
+            remove.ExecuteNonQuery();
+        }
+        using (var insert = conn.CreateCommand())
+        {
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO device_envelope_outbox(
+                    envelope_id, target_device_id, kind, plaintext, push_hint, created_at)
+                VALUES($id, $device, $kind, $plaintext, $push, $created);
+                """;
+            insert.Parameters.AddWithValue("$id", item.EnvelopeId);
+            insert.Parameters.AddWithValue("$device", item.TargetDeviceId);
+            insert.Parameters.AddWithValue("$kind", item.Kind);
+            insert.Parameters.AddWithValue("$plaintext", item.Plaintext);
+            insert.Parameters.AddWithValue("$push", (object?)item.PushHint ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$created", item.CreatedAt.ToString("O"));
+            insert.ExecuteNonQuery();
+        }
+        transaction.Commit();
+    }
+
     public IReadOnlyList<DeviceEnvelopeOutboxItem> ListDeviceEnvelopeOutbox()
     {
         using var cmd = conn.CreateCommand();
@@ -464,15 +525,7 @@ public sealed partial class MeshDb
         var result = new List<DeviceEnvelopeOutboxItem>();
         while (reader.Read())
         {
-            result.Add(new DeviceEnvelopeOutboxItem(
-                reader.GetString(reader.GetOrdinal("envelope_id")),
-                reader.GetString(reader.GetOrdinal("target_device_id")),
-                reader.GetString(reader.GetOrdinal("kind")),
-                reader.GetString(reader.GetOrdinal("plaintext")),
-                reader.IsDBNull(reader.GetOrdinal("push_hint"))
-                    ? null
-                    : reader.GetString(reader.GetOrdinal("push_hint")),
-                DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at")))));
+            result.Add(ReadDeviceEnvelopeOutbox(reader));
         }
         return result;
     }
@@ -498,6 +551,16 @@ public sealed partial class MeshDb
                 ? null
                 : reader.GetString(reader.GetOrdinal("terminal_update_json")),
             reader.GetInt64(reader.GetOrdinal("queue_sequence")));
+    private static DeviceEnvelopeOutboxItem ReadDeviceEnvelopeOutbox(SqliteDataReader reader)
+        => new(
+            reader.GetString(reader.GetOrdinal("envelope_id")),
+            reader.GetString(reader.GetOrdinal("target_device_id")),
+            reader.GetString(reader.GetOrdinal("kind")),
+            reader.GetString(reader.GetOrdinal("plaintext")),
+            reader.IsDBNull(reader.GetOrdinal("push_hint"))
+                ? null
+                : reader.GetString(reader.GetOrdinal("push_hint")),
+            DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at"))));
     private static TopicOutboxItem ReadTopicOutbox(SqliteDataReader reader)
         => new(
             reader.GetString(reader.GetOrdinal("run_id")),

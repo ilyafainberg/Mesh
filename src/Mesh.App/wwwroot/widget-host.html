@@ -9,27 +9,28 @@
 <script>
 (function () {
     'use strict';
-    var nonce = decodeURIComponent(location.hash.slice(1));
+    var accepted = false;
 
     addEventListener('message', function (event) {
         var data = event.data;
-        if (event.source !== parent || event.origin !== location.origin ||
-            !data || data.type !== 'mesh-widget-render' ||
-            data.nonce !== nonce || typeof data.html !== 'string') return;
+        if (accepted || event.source !== parent || !data || data.type !== 'mesh-widget-render' ||
+            typeof data.nonce !== 'string' || data.nonce.length < 16 ||
+            typeof data.html !== 'string') return;
+        accepted = true;
         try {
             document.open();
             document.write(data.html);
             document.close();
         } catch (error) {
             parent.postMessage({
-                type: 'mesh-widget-error',
-                nonce: nonce,
-                stage: 'document-write'
+                type: 'mesh-widget-host-error',
+                nonce: data.nonce,
+                errorType: error && error.name ? error.name : 'Error'
             }, '*');
         }
     });
 
-    parent.postMessage({ type: 'mesh-widget-host-ready', nonce: nonce }, '*');
+    parent.postMessage({ type: 'mesh-widget-host-ready' }, '*');
 })();
 </script>
 </body>

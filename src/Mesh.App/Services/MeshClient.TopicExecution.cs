@@ -20,6 +20,7 @@ public sealed partial class MeshClient
 
     private void OnForegroundChanged(bool isForeground)
     {
+        if (lifetime.IsCancellationRequested) return;
         if (isForeground)
         {
             DrainDeferredTopicRunUpdates();
@@ -106,7 +107,10 @@ public sealed partial class MeshClient
     }
 
     private void OnConnectivityChanged(object? sender, ConnectivityChangedEventArgs e)
-        => ResumeTransport();
+    {
+        if (!lifetime.IsCancellationRequested)
+            ResumeTransport();
+    }
 
     private void ScheduleOnlineDeliveryRetry()
     {
@@ -181,10 +185,20 @@ public sealed partial class MeshClient
                     await TrySendTopicOutboxItemAsync(identity, item, CancellationToken.None);
             }
 
-            foreach (var item in state.ListDeviceEnvelopeOutbox())
+            var deviceOutbox = state.ListDeviceEnvelopeOutbox();
+            foreach (var item in deviceOutbox.Where(item => !IsDeviceSyncSnapshotResponseJob(item)))
             {
                 if (!IsCurrentReplicationConnectionIdentity(identity)) return;
                 await TrySendDeviceEnvelopeOutboxItemAsync(identity, item, CancellationToken.None);
+            }
+
+            // Snapshot responses can be large. Run their durable jobs only after control and terminal
+            // envelopes so an old synchronization request cannot block topic execution traffic.
+            foreach (var item in deviceOutbox.Where(IsDeviceSyncSnapshotResponseJob))
+            {
+                if (!IsCurrentDeviceSyncIdentity(identity)) return;
+                _ = await TryFlushDeviceSyncSnapshotResponseJobAsync(
+                    identity, item, CancellationToken.None);
             }
         }
         finally

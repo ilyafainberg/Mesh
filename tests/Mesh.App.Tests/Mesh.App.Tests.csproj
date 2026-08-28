@@ -76,6 +76,8 @@
     <Compile Include="..\..\src\Mesh.App\Services\AgentPromptContentSelector.cs" Link="AgentPromptContentSelector.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProviderModelMetadata.cs" Link="ProviderModelMetadata.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\RuntimeDiagnostics.cs" Link="RuntimeDiagnostics.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\AppShutdown.cs" Link="AppShutdown.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\WidgetDiagnosticsBridge.cs" Link="WidgetDiagnosticsBridge.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MessageRenderWindow.cs" Link="MessageRenderWindow.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MobileOverlayState.cs" Link="MobileOverlayState.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ImageSharePolicy.cs" Link="ImageSharePolicy.cs" />

@@ -39,6 +39,7 @@ public sealed partial class AppState : IMemoryState
     }
 
     private readonly ISecretStore secrets;
+    private readonly AppShutdownState shutdown;
     private readonly string dir;
     private readonly string indexPath;
     private readonly object profileSyncGate = new();
@@ -78,8 +79,14 @@ public sealed partial class AppState : IMemoryState
     }
 
     public AppState(ISecretStore secrets)
+        : this(secrets, new AppShutdownState())
+    {
+    }
+
+    public AppState(ISecretStore secrets, AppShutdownState shutdown)
     {
         this.secrets = secrets;
+        this.shutdown = shutdown;
         // Directory is owned by StoragePaths, the single source of truth shared with SecretStore.
         // It resolves to a stable, app-identity-independent root on Windows (%LOCALAPPDATA%\Mesh\Data),
         // still honoring the MESH_PROFILE_DIR override used for isolated test instances.
@@ -581,6 +588,12 @@ public sealed partial class AppState : IMemoryState
             return;
         }
         Changed?.Invoke();
+    }
+
+    public void NotifyChanged()
+    {
+        if (!shutdown.IsStopping)
+            Changed?.Invoke();
     }
 
     // ---- chat history (append-only rows) ----------------------------------
@@ -1311,11 +1324,46 @@ public sealed partial class AppState : IMemoryState
         public bool HasAnswer => Answer.Length > 0;
     }
 
+    /// <summary>One immutable, internally consistent snapshot consumed by a single render pass.</summary>
+    public sealed record AgentRenderSnapshot(
+        bool IsBusy,
+        bool IsBuilding,
+        AgentRunState? Run,
+        RemoteRunProjection? RemoteRun,
+        IReadOnlyList<AgentStep> Steps,
+        AssistantDraft? Draft);
+
     /// <summary>The live streamed draft for the given thread's turn, or null when none is streaming.</summary>
     public AssistantDraft? AssistantDraftFor(string key)
     {
         if (liveAgentRenderState.DraftFor(key) is not { } draft) return null;
         return new AssistantDraft(draft.Reasoning, draft.Answer);
+    }
+
+    public AgentRenderSnapshot CaptureAgentRenderSnapshot(string key)
+    {
+        bool isBusy;
+        bool isBuilding;
+        AgentRunState? run;
+        RemoteRunProjection? remoteRun;
+        lock (profileSyncGate)
+        {
+            isBusy = busyThreads.Contains(key);
+            isBuilding = buildingThreads.Contains(key);
+            run = agentRuns.TryGetValue(key, out var currentRun)
+                ? currentRun with { Subtasks = currentRun.Subtasks.ToArray() }
+                : null;
+            remoteRun = remoteRuns.TryGetValue(key, out var currentRemoteRun)
+                ? CloneRemoteRunProjection(currentRemoteRun)
+                : null;
+        }
+
+        var live = liveAgentRenderState.Capture(key);
+        var draft = live.Draft is { } currentDraft
+            ? new AssistantDraft(currentDraft.Reasoning, currentDraft.Answer)
+            : null;
+        return new AgentRenderSnapshot(
+            isBusy, isBuilding, run, remoteRun, live.Steps, draft);
     }
 
     /// <summary>Starts a fresh streamed draft for a thread at the start of a turn.</summary>
@@ -1365,14 +1413,24 @@ public sealed partial class AppState : IMemoryState
     private readonly HashSet<string> cancelledThreads = new(StringComparer.Ordinal);
 
     /// <summary>True while the given own-thread is running an agent turn.</summary>
-    public bool IsThreadBusy(string threadId) => busyThreads.Contains(threadId);
+    public bool IsThreadBusy(string threadId)
+    {
+        lock (profileSyncGate)
+            return busyThreads.Contains(threadId);
+    }
 
     public AgentRunState? AgentRunFor(string threadId)
-        => agentRuns.TryGetValue(threadId, out var run) ? run : null;
+    {
+        lock (profileSyncGate)
+            return agentRuns.TryGetValue(threadId, out var run)
+                ? run with { Subtasks = run.Subtasks.ToArray() }
+                : null;
+    }
 
     public void SetAgentRun(AgentRunState run)
     {
-        agentRuns[run.ThreadId] = run;
+        lock (profileSyncGate)
+            agentRuns[run.ThreadId] = run with { Subtasks = run.Subtasks.ToArray() };
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == run.ThreadId);
         if (thread is not null)
         {
@@ -1395,7 +1453,10 @@ public sealed partial class AppState : IMemoryState
 
     public void ClearAgentRun(string threadId)
     {
-        if (!agentRuns.Remove(threadId)) return;
+        bool removed;
+        lock (profileSyncGate)
+            removed = agentRuns.Remove(threadId);
+        if (!removed) return;
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
         if (thread is not null)
         {
@@ -1747,8 +1808,14 @@ public sealed partial class AppState : IMemoryState
         IReadOnlyList<AgentSubtaskState>? subtasks = null,
         DateTimeOffset? updatedAt = null)
     {
-        if (!agentRuns.TryGetValue(threadId, out var run)) return;
-        agentRuns[threadId] = run with { Phase = phase, Subtasks = subtasks ?? run.Subtasks };
+        lock (profileSyncGate)
+        {
+            if (!agentRuns.TryGetValue(threadId, out var run)) return;
+            agentRuns[threadId] = run with
+            {
+                Phase = phase, Subtasks = (subtasks ?? run.Subtasks).ToArray()
+            };
+        }
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
         if (thread is not null)
         {
@@ -1781,7 +1848,11 @@ public sealed partial class AppState : IMemoryState
             ?.Text;
 
     /// <summary>True while the given own-thread is specifically building a widget (for the label text).</summary>
-    public bool IsThreadBuilding(string threadId) => buildingThreads.Contains(threadId);
+    public bool IsThreadBuilding(string threadId)
+    {
+        lock (profileSyncGate)
+            return buildingThreads.Contains(threadId);
+    }
 
     /// <summary>True when an own-thread's agent finished while that topic was not being viewed.</summary>
     public bool IsThreadCompleted(string threadId) => completedThreads.Contains(threadId);
@@ -1806,12 +1877,17 @@ public sealed partial class AppState : IMemoryState
     /// </summary>
     public CancellationToken BeginThreadTurn(string threadId, bool building)
     {
-        if (threadCts.Remove(threadId, out var old)) old.Dispose();
-        cancelledThreads.Remove(threadId);
         var cts = new CancellationTokenSource();
-        threadCts[threadId] = cts;
-        busyThreads.Add(threadId);
-        if (building) buildingThreads.Add(threadId);
+        CancellationTokenSource? old;
+        lock (profileSyncGate)
+        {
+            threadCts.Remove(threadId, out old);
+            cancelledThreads.Remove(threadId);
+            threadCts[threadId] = cts;
+            busyThreads.Add(threadId);
+            if (building) buildingThreads.Add(threadId);
+        }
+        old?.Dispose();
         NotifyChanged();
         return cts.Token;
     }
@@ -1819,7 +1895,10 @@ public sealed partial class AppState : IMemoryState
     /// <summary>Clears the widget-building flag (e.g. once the build step is done) while a turn continues.</summary>
     public void ClearThreadBuilding(string threadId)
     {
-        if (buildingThreads.Remove(threadId)) NotifyChanged();
+        bool removed;
+        lock (profileSyncGate)
+            removed = buildingThreads.Remove(threadId);
+        if (removed) NotifyChanged();
     }
 
     /// <summary>
@@ -1828,25 +1907,47 @@ public sealed partial class AppState : IMemoryState
     /// </summary>
     public bool CancelThreadTurn(string threadId)
     {
-        if (!threadCts.TryGetValue(threadId, out var cts)) return false;
-        cancelledThreads.Add(threadId);
-        try { cts.Cancel(); } catch { }
+        CancellationTokenSource? cts;
+        lock (profileSyncGate)
+        {
+            if (!threadCts.TryGetValue(threadId, out cts)) return false;
+            cancelledThreads.Add(threadId);
+        }
+        try
+        {
+            cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
         NotifyChanged();
         return true;
     }
 
     /// <summary>True when the thread's current/just-finished turn was cancelled by the user.</summary>
-    public bool WasThreadCancelled(string threadId) => cancelledThreads.Contains(threadId);
+    public bool WasThreadCancelled(string threadId)
+    {
+        lock (profileSyncGate)
+            return cancelledThreads.Contains(threadId);
+    }
 
     /// <summary>Marks a thread's turn as finished (clears busy + building + its cancellation source).</summary>
     public void EndThreadTurn(string threadId)
     {
-        var a = busyThreads.Remove(threadId);
-        var b = buildingThreads.Remove(threadId);
-        if (threadCts.Remove(threadId, out var cts)) cts.Dispose();
-        if (agentRuns.TryGetValue(threadId, out var run) &&
-            run.Phase is not (AgentRunPhase.Completed or AgentRunPhase.Failed or AgentRunPhase.Cancelled))
-            agentRuns[threadId] = run with { Phase = AgentRunPhase.Completed };
+        bool a;
+        bool b;
+        CancellationTokenSource? cts;
+        lock (profileSyncGate)
+        {
+            a = busyThreads.Remove(threadId);
+            b = buildingThreads.Remove(threadId);
+            threadCts.Remove(threadId, out cts);
+            if (agentRuns.TryGetValue(threadId, out var run) &&
+                run.Phase is not (AgentRunPhase.Completed or AgentRunPhase.Failed or AgentRunPhase.Cancelled))
+                agentRuns[threadId] = run with { Phase = AgentRunPhase.Completed };
+        }
+        cts?.Dispose();
         if (a || b) NotifyChanged();
     }
 

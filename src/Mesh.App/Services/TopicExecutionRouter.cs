@@ -8,11 +8,40 @@ using Mesh.Shared;
 namespace Mesh.App.Services;
 
 /// <summary>Validates and routes one owner topic turn to its bound execution device.</summary>
-public sealed class TopicExecutionRouter(
-    AppState state,
-    ITopicTurnRunner localRunner,
-    IDeviceTopicTransport deviceTransport) : ITopicExecutionRouter
+public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposable
 {
+    private readonly AppState state;
+    private readonly ITopicTurnRunner localRunner;
+    private readonly IDeviceTopicTransport deviceTransport;
+    private readonly CancellationTokenSource lifetime;
+    private readonly ConcurrentDictionary<long, Task> localTasks = new();
+    private readonly object stopGate = new();
+    private long nextLocalTaskId;
+    private Task? stopTask;
+
+    public TopicExecutionRouter(
+        AppState state,
+        ITopicTurnRunner localRunner,
+        IDeviceTopicTransport deviceTransport)
+        : this(state, localRunner, deviceTransport, new AppShutdownState(), null)
+    {
+    }
+
+    public TopicExecutionRouter(
+        AppState state,
+        ITopicTurnRunner localRunner,
+        IDeviceTopicTransport deviceTransport,
+        AppShutdownState shutdownState,
+        AppShutdownCoordinator? shutdown)
+    {
+        this.state = state;
+        this.localRunner = localRunner;
+        this.deviceTransport = deviceTransport;
+        lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdownState.Token);
+        shutdown?.Register(
+            "topic-execution-router",
+            cancellationToken => StopAsync().WaitAsync(cancellationToken));
+    }
     private sealed class RunEntry
     {
         public required TopicTurnDraft Draft { get; set; }
@@ -39,6 +68,9 @@ public sealed class TopicExecutionRouter(
         var validation = Validate(draft);
         if (validation is not null)
             return TopicDispatchResult.Reject(validation, draft.RunId);
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, lifetime.Token);
+        var effectiveCancellation = linkedCancellation.Token;
 
         RunEntry entry;
         var owner = false;
@@ -79,18 +111,18 @@ public sealed class TopicExecutionRouter(
         }
 
         if (!owner)
-            return await entry.Dispatch.Task.WaitAsync(cancellationToken);
+            return await entry.Dispatch.Task.WaitAsync(effectiveCancellation);
 
         try
         {
             var result = await DispatchNewAsync(
-                entry, progress, cancellationToken);
+                entry, progress, effectiveCancellation);
             entry.Dispatch.TrySetResult(result);
             if (!result.Accepted || entry.RemoteDeviceId is not null)
                 RememberCompletion(entry);
             return result;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (effectiveCancellation.IsCancellationRequested)
         {
             var result = TopicDispatchResult.Reject("cancelled", draft.RunId);
             entry.Dispatch.TrySetResult(result);
@@ -316,7 +348,7 @@ public sealed class TopicExecutionRouter(
                 if (!state.TryApplyRemoteRunUpdate(queuedUpdate))
                     throw new InvalidOperationException("The queued run state could not be persisted.");
             }
-            var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token);
             entry.LocalCancellation = linked;
             var projectedProgress = new InlineProgress<TopicRunUpdatePayload>(update =>
             {
@@ -324,11 +356,9 @@ public sealed class TopicExecutionRouter(
                     throw new InvalidOperationException("The local run state could not be persisted.");
                 progress?.Report(update);
             });
-            _ = RunLocalAsync(
-                entry,
-                draft,
-                projectedProgress,
-                linked);
+            TrackLocal(
+                RunLocalAsync(entry, draft, projectedProgress, linked),
+                draft.RunId);
             return TopicDispatchResult.Ok(draft.RunId);
         }
 
@@ -423,6 +453,73 @@ public sealed class TopicExecutionRouter(
         }
     }
 
+    private void TrackLocal(Task task, string runId)
+    {
+        var id = Interlocked.Increment(ref nextLocalTaskId);
+        localTasks[id] = task;
+        _ = ObserveLocalAsync(id, task, runId);
+    }
+
+    private async Task ObserveLocalAsync(long id, Task task, string runId)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException($"topic-local-run-{runId}", ex);
+        }
+        finally
+        {
+            localTasks.TryRemove(id, out _);
+        }
+    }
+
+    private Task StopAsync()
+    {
+        lock (stopGate)
+            return stopTask ??= StopCoreAsync();
+    }
+
+    private async Task StopCoreAsync()
+    {
+        try
+        {
+            lifetime.Cancel();
+        }
+        catch (AggregateException ex)
+        {
+            RuntimeDiagnostics.Current?.RecordException("topic-router-cancel", ex);
+        }
+
+        foreach (var entry in runs.Values)
+        {
+            try { entry.LocalCancellation?.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
+
+        while (true)
+        {
+            var pending = localTasks.Values.Where(task => !task.IsCompleted).ToArray();
+            if (pending.Length == 0) return;
+            var completions = pending.Select(task => task.ContinueWith(
+                static _ => { },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default));
+            await Task.WhenAll(completions).ConfigureAwait(false);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync().ConfigureAwait(false);
+        lifetime.Dispose();
+    }
     private string? Validate(TopicTurnDraft draft)
     {
         if (!TopicRunProtocol.IsValidIdentifier(draft.RunId)) return "invalid_run";

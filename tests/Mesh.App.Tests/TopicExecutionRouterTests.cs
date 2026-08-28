@@ -222,6 +222,29 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task RouterShutdownCancelsAndAwaitsDetachedLocalRun()
+        {
+            var state = StateWithThread();
+            var shutdownState = new AppShutdownState();
+            var shutdown = new AppShutdownCoordinator(shutdownState);
+            var runner = new CancellableRunner();
+            var router = new TopicExecutionRouter(
+                state,
+                runner,
+                new RecordingTransport(),
+                shutdownState,
+                shutdown);
+
+            var result = await router.SubmitAsync(Draft(), null, CancellationToken.None);
+            await runner.Called.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            await shutdown.ShutdownAsync(TimeSpan.FromSeconds(2));
+
+            Assert.IsTrue(result.Accepted);
+            Assert.IsTrue(runner.Cancelled.Task.IsCompletedSuccessfully);
+        }
+
+        [TestMethod]
         public async Task RemoteSubmission_ReusesOptimisticTriggerLine()
         {
             var state = StateWithThread();
@@ -559,6 +582,40 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task RunnerShutdownCancelsActiveTurnAndDrainsItsQueue()
+        {
+            var state = StateWithThread();
+            var draft = Draft();
+            state.Profile.OwnThreads[0].Lines.Add(new ChatLine
+            {
+                Id = "line-1",
+                Role = "user",
+                Text = draft.Prompt
+            });
+            var started = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var agent = new AgentService
+            {
+                Continue = async (_, _, cancellationToken) =>
+                {
+                    started.TrySetResult();
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                    return "";
+                }
+            };
+            var shutdownState = new AppShutdownState();
+            var shutdown = new AppShutdownCoordinator(shutdownState);
+            var runner = new TopicTurnRunner(agent, state, shutdownState, shutdown);
+            var run = runner.ExecuteAsync(draft, new RecordingProgress(), CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            await shutdown.ShutdownAsync(TimeSpan.FromSeconds(2));
+
+            Assert.AreEqual(TopicRunPhase.Cancelled, (await run).Phase);
+            Assert.IsFalse(state.Busy);
+        }
+
+        [TestMethod]
         public async Task Runner_ForwardsCoalescedStreamingDeltas()
         {
             var state = StateWithThread();
@@ -649,6 +706,34 @@ namespace Mesh.App.Tests
                     draft.ThreadId,
                     TopicRunPhase.Completed,
                     DateTimeOffset.UtcNow));
+            }
+        }
+
+        private sealed class CancellableRunner : ITopicTurnRunner
+        {
+            public TaskCompletionSource Called { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public TaskCompletionSource Cancelled { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public async Task<TopicRunCompletion> ExecuteAsync(
+                TopicTurnDraft draft,
+                IProgress<TopicRunUpdatePayload> progress,
+                CancellationToken cancellationToken,
+                Func<CancellationToken, Task>? onStarted = null)
+            {
+                Called.TrySetResult();
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    Cancelled.TrySetResult();
+                    throw;
+                }
+                return new TopicRunCompletion(
+                    draft.RunId, draft.ThreadId, TopicRunPhase.Completed, DateTimeOffset.UtcNow);
             }
         }
 

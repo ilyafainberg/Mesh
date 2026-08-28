@@ -137,6 +137,18 @@ public sealed partial class AppState
         }
     }
 
+    public bool ReplaceDeviceEnvelopeOutboxForTargetAndKind(
+        MeshDb.DeviceEnvelopeOutboxItem item,
+        Func<MeshDb.DeviceEnvelopeOutboxItem, bool>? shouldReplaceExisting = null)
+    {
+        lock (profileSyncGate)
+        {
+            if (activeDb is null) return false;
+            activeDb.ReplaceDeviceEnvelopeOutboxForTargetAndKind(item, shouldReplaceExisting);
+            return true;
+        }
+    }
+
     public IReadOnlyList<MeshDb.DeviceEnvelopeOutboxItem> ListDeviceEnvelopeOutbox()
     {
         lock (profileSyncGate)
