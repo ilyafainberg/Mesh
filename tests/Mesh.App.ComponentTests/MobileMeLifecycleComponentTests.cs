@@ -2020,6 +2020,7 @@ public sealed class MobileMeLifecycleComponentTests
         services.AddSingleton<IAppLifecycleState>(lifecycle);
         services.AddSingleton(new NotificationViewState(lifecycle));
         services.AddSingleton(new MobileOverlayState());
+        services.AddSingleton(new AppShutdownCoordinator(new AppShutdownState()));
         if (observerDispatcherFactory is not null)
             services.AddSingleton(observerDispatcherFactory);
         services.AddLogging();
