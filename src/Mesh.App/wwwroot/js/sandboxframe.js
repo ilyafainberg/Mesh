@@ -6,6 +6,8 @@ window.sandboxFrame = (function () {
   var confirmationTimeoutMs = 1200;
   var generation = 0;
   var frameStates = new WeakMap();
+  var diagnosticBridge = null;
+  var configuredPlatform = 'unknown';
   var csp = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
     "img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; " +
     "frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
@@ -102,6 +104,7 @@ window.sandboxFrame = (function () {
   }
 
   function platformLabel() {
+    if (configuredPlatform !== 'unknown') return configuredPlatform;
     if (isIOSWebView()) return 'iOS WebKit';
     if (/Android/i.test(navigator.userAgent || '')) return 'Android WebView';
     return 'desktop WebView';
@@ -133,6 +136,19 @@ window.sandboxFrame = (function () {
     }
     iframe.dispatchEvent(new CustomEvent('mesh-widget-diagnostic', { detail: eventDetail }));
     console.info('Widget diagnostic', eventDetail);
+    if (diagnosticBridge && typeof diagnosticBridge.invokeMethodAsync === 'function') {
+      diagnosticBridge.invokeMethodAsync('RecordStage', stage, JSON.stringify(eventDetail))
+        .catch(function () { });
+    }
+  }
+
+  function initialize(dotNetRef, platform) {
+    diagnosticBridge = dotNetRef || null;
+    configuredPlatform = String(platform || 'unknown').trim().toLowerCase() || 'unknown';
+    if (diagnosticBridge && typeof diagnosticBridge.invokeMethodAsync === 'function') {
+      diagnosticBridge.invokeMethodAsync('RecordStage', 'initialized',
+        'platform=' + configuredPlatform).catch(function () { });
+    }
   }
 
   function failFrame(iframe, state) {
@@ -310,6 +326,8 @@ window.sandboxFrame = (function () {
   window.addEventListener('message', onMessage);
 
   return {
+    initialize: initialize,
+
     setFrameHtml: function (iframe, html) {
       if (!iframe) return;
       try {

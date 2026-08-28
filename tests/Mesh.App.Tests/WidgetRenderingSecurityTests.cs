@@ -129,6 +129,8 @@ public sealed class WidgetRenderingSecurityTests
         }
 
         StringAssert.Contains(script, "console.info('Widget diagnostic', eventDetail)");
+        StringAssert.Contains(script, "initialize: initialize");
+        StringAssert.Contains(script, "invokeMethodAsync('RecordStage'");
         Assert.IsFalse(script.Contains("eventDetail.html", StringComparison.Ordinal));
         Assert.IsFalse(script.Contains("console.info('Widget diagnostic', state", StringComparison.Ordinal));
 
