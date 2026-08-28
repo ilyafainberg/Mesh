@@ -3,15 +3,14 @@
 @inject NavigationManager Nav
 @inject AppState State
 @inject MeshClient Mesh
-@inject IAppControl AppControl
 @inject ModelSetupService Setup
 @inject UpdateService Updater
 @inject MemoryService Memories
-@inject MobileOverlayState Overlays
+@inject MobileOverlayState MobileOverlays
 @inject AppShutdownCoordinator Shutdown
 @implements IDisposable
 
-<div class="m-shell @ModeClass @(Overlays.IsOpen ? "overlay-open" : "")">
+<div class="m-shell @ModeClass @(MobileOverlays.IsOpen ? "mobile-overlay-open" : "")">
     <div class="m-body">
         @if (Setup.HasBanner)
         {
@@ -124,7 +123,6 @@
                 <button class="m-sheet-link" @onclick='() => Go("/backup")'><i class="bi bi-shield-lock"></i><span>Backup</span></button>
                 <button class="m-sheet-link" @onclick='() => Go("/about")'><i class="bi bi-info-circle"></i><span>About</span></button>
             </div>
-            <button class="m-sheet-quit" @onclick="Quit"><i class="bi bi-power"></i><span>Quit</span></button>
         </div>
     }
 </div>
@@ -173,12 +171,6 @@
 
     void CloseMore() => moreOpen = false;
 
-    async Task Quit()
-    {
-        moreOpen = false;
-        await AppControl.QuitAsync();
-    }
-
     protected override void OnInitialized()
     {
         State.Changed += Refresh;
@@ -186,7 +178,7 @@
         Setup.Changed += Refresh;
         Updater.Changed += Refresh;
         Memories.Changed += Refresh;
-        Overlays.Changed += Refresh;
+        MobileOverlays.Changed += Refresh;
         Nav.LocationChanged += OnLocationChanged;
     }
 
@@ -222,8 +214,8 @@
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
         Updater.Changed -= Refresh;
-        Overlays.Changed -= Refresh;
         Memories.Changed -= Refresh;
+        MobileOverlays.Changed -= Refresh;
         Nav.LocationChanged -= OnLocationChanged;
     }
 }

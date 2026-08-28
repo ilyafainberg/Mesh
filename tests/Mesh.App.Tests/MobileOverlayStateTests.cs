@@ -70,7 +70,7 @@ public sealed class MobileOverlayStateTests
         Assert.IsFalse(mobileShell.Contains("Quit", StringComparison.Ordinal));
         Assert.IsFalse(mobileShell.Contains("IAppControl", StringComparison.Ordinal));
         StringAssert.Contains(desktopNav, "@onclick=\"Quit\"");
-        StringAssert.Contains(desktopNav, "AppControl.Quit();");
+        StringAssert.Contains(desktopNav, "AppControl.QuitAsync();");
     }
 
     static string ReadRepoFile(params string[] parts)
