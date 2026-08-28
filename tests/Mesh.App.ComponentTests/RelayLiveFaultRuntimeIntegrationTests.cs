@@ -87,6 +87,57 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
     }
 
     [TestMethod]
+    public async Task ActualProgram_TransientCapabilityFailureRecoversWithStableIdentity()
+    {
+        var repository = FindRepositoryRoot();
+        var root = Path.Combine(
+            repository, "_artifacts", "capability-reconnect", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        await using var relay = await RelayProcess.StartAsync(
+            TestRelayAssembly(repository), "Test", enabled: true, AdminKey);
+        ClientHarness? client = null;
+        try
+        {
+            var http = new OneShotHealthFailureFactory();
+            client = CreateClient(
+                "capability-reconnect", "Reconnect device", relay.BaseUrl, relay.BaseUrl,
+                root, "client", httpFactory: http);
+            Assert.IsTrue(await client.Client.RegisterAsync());
+            var deviceId = client.Client.MyDeviceId;
+
+            var failure = await Assert.ThrowsExactlyAsync<OnlineReplicationError>(
+                client.Client.ConnectAsync);
+            StringAssert.Contains(failure.Message, "Could not read Protocol 9 capabilities");
+            await EventuallyAsync(
+                () => client.Client.Connected,
+                TimeSpan.FromSeconds(15));
+
+            Assert.AreEqual(deviceId, client.Client.MyDeviceId);
+            Assert.AreEqual(2, http.HealthAttempts);
+            Assert.IsNull(client.Client.LastConnectionError);
+
+            await client.Client.DisconnectAsync();
+            Assert.IsFalse(client.Client.Connected);
+            await client.Client.ConnectAsync();
+            await EventuallyAsync(
+                () => client.Client.Connected,
+                TimeSpan.FromSeconds(15));
+            Assert.AreEqual(deviceId, client.Client.MyDeviceId);
+        }
+        finally
+        {
+            if (client is not null) await client.Client.DisconnectAsync();
+            client?.State.SignOut();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try
+            {
+                if (Directory.Exists(root)) Directory.Delete(root, true);
+            }
+            catch (IOException) { }
+        }
+    }
+
+    [TestMethod]
     public async Task ActualProgram_RealClients_CoalesceRetriesAndWakeDrainExactlyOnce()
     {
         var repository = FindRepositoryRoot();
@@ -1623,7 +1674,8 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         string suffix,
         TimeProvider? timeProvider = null,
         MemorySecretStore? secrets = null,
-        bool initializeIdentity = true)
+        bool initializeIdentity = true,
+        IHttpClientFactory? httpFactory = null)
     {
         timeProvider ??= TimeProvider.System;
         secrets ??= new MemorySecretStore();
@@ -1647,7 +1699,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             state.Profile.Model.ApiKey = "test-boundary";
             state.Save();
         }
-        var http = new RealHttpClientFactory();
+        var http = httpFactory ?? new RealHttpClientFactory();
         var meter = new TokenMeter(state);
         var media = new AgentMedia();
         var memory = new MemoryService(state);
@@ -2379,6 +2431,32 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
     private sealed class RealHttpClientFactory : IHttpClientFactory
     {
         public HttpClient CreateClient(string name) => new();
+    }
+
+    private sealed class OneShotHealthFailureFactory : IHttpClientFactory
+    {
+        private int healthAttempts;
+        public int HealthAttempts => Volatile.Read(ref healthAttempts);
+
+        public HttpClient CreateClient(string name)
+            => new(new OneShotHealthFailureHandler(this));
+
+        private sealed class OneShotHealthFailureHandler(
+            OneShotHealthFailureFactory owner) : DelegatingHandler(new HttpClientHandler())
+        {
+            protected override Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request,
+                CancellationToken cancellationToken)
+            {
+                if (request.RequestUri?.AbsolutePath == "/health"
+                    && Interlocked.Increment(ref owner.healthAttempts) == 1)
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                    {
+                        RequestMessage = request
+                    });
+                return base.SendAsync(request, cancellationToken);
+            }
+        }
     }
 
     private sealed class ForegroundLifecycle : IAppLifecycleState

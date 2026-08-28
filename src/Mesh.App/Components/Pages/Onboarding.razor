@@ -218,7 +218,7 @@
 
     bool ValidHandle => handle.Trim().Length >= 2 && handle.Trim().All(c => char.IsLetterOrDigit(c) || c is '_' or '-');
     bool ValidLink => ValidHandle && ValidRelay(relayUrl) && linkCode.Trim().Length is >= 6 and <= 512;
-    bool ValidRestore => !string.IsNullOrWhiteSpace(relayUrl) && !string.IsNullOrWhiteSpace(passphrase);
+    bool ValidRestore => ValidRelay(relayUrl) && !string.IsNullOrWhiteSpace(passphrase);
 
     string ModelPlaceholder => provider switch
     {
@@ -290,6 +290,11 @@
                 return;
             }
 
+            if (!ValidRelay(relayUrl))
+            {
+                error = "Enter a valid HTTPS relay URL. HTTP is allowed only for local debug builds.";
+                return;
+            }
             bundle.Profile.RelayUrl = relayUrl.Trim();
             State.ImportProfile(bundle);
             handle = State.Profile.Handle;
@@ -421,17 +426,8 @@
     }
 
     static bool ValidRelay(string value)
-    {
-        if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri))
-            return false;
-        if (!string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) ||
-            !string.IsNullOrEmpty(uri.Fragment))
-            return false;
-        if (uri.Scheme == Uri.UriSchemeHttps)
-            return true;
-        return uri.Scheme == Uri.UriSchemeHttp
-            && (uri.IsLoopback || uri.Host.Equals("10.0.2.2", StringComparison.OrdinalIgnoreCase));
-    }
+        => RelayTransportPolicy.TryValidateBaseUrl(
+            value, RelayTransportPolicy.LocalHttpEnabled, out _);
 
     async Task Finish()
     {

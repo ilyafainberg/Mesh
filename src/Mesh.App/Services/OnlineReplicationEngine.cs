@@ -2630,6 +2630,8 @@ public interface IReplicationMetadataSource
 public sealed class OnlineReplicationError : Exception
 {
     public OnlineReplicationError(string message) : base(message) { }
+    public OnlineReplicationError(string message, Exception innerException)
+        : base(message, innerException) { }
 }
 
 /// <summary>

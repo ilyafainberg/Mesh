@@ -60,7 +60,9 @@ public static class MauiProgram
 		// well past the default 100s HttpClient timeout. Give model calls plenty of room.
 		builder.Services.AddHttpClient("model", c => c.Timeout = TimeSpan.FromMinutes(10));
 		builder.Services.AddHttpClient("connector");
-		builder.Services.AddHttpClient("relay");
+		builder.Services.AddTransient<RelayTransportPolicyHandler>();
+		builder.Services.AddHttpClient("relay")
+			.AddHttpMessageHandler<RelayTransportPolicyHandler>();
 		builder.Services.AddSingleton(TimeProvider.System);
 		// The self-updater downloads a large (hundreds of MB) client zip, so give it a generous
 		// timeout and the User-Agent the GitHub API requires.

@@ -79,6 +79,7 @@ public sealed partial class MeshClient :
     private readonly TopicDeliveryRetryLoop onlineDeliveryRetry;
     private int shutdownRequested;
     private string? terminalRosterFailureDeviceId;
+    private string? lastConnectionError;
     internal ITopicEnvelopeTestFaultScheduler? TopicEnvelopeTestFaultScheduler { get; set; }
 
     public MeshClient(
@@ -210,6 +211,7 @@ public sealed partial class MeshClient :
     }
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
+    public string? LastConnectionError => Volatile.Read(ref lastConnectionError);
     public bool IsReplicationActive
         => replicationActivity.IsActive
            || CurrentReplicationStatus.Phase is ReplicationPhase.Connecting
@@ -507,9 +509,32 @@ public sealed partial class MeshClient :
 
     public async Task ConnectAsync()
     {
-        await using var lease = await EnsureConnectedAsync(
-            ConnectionPurpose.Foreground,
-            CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await EnsureConnectedAsync(
+                ConnectionPurpose.Foreground,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (OnlineReplicationError ex)
+        {
+            Volatile.Write(ref lastConnectionError, ex.Message);
+            NotifyStateChanged();
+            ScheduleRecovery();
+            throw;
+        }
+        catch (Exception ex) when (ex is HttpRequestException
+                                   or TimeoutException
+                                   or InvalidOperationException)
+        {
+            var failure = new OnlineReplicationError(
+                $"Could not establish an authenticated Protocol {MeshProtocol.Version} relay connection: {ex.Message}",
+                ex);
+            Volatile.Write(ref lastConnectionError, failure.Message);
+            Log?.Invoke($"relay connection failed: {ex.GetType().Name}: {ex.Message}");
+            NotifyStateChanged();
+            ScheduleRecovery();
+            throw failure;
+        }
     }
 
     internal async Task<ReplicationConnectionLease> EnsureConnectedAsync(
@@ -690,11 +715,17 @@ public sealed partial class MeshClient :
                     lifecycle.IsForeground,
                     PlatformCaps.IsMobile,
                     MeshProcessContext.IsHeadless)) return;
-            if (!await DetectRelayCapabilitiesAsync(p.RelayUrl, ct).ConfigureAwait(false))
+            if (!Uri.TryCreate(p.RelayUrl, UriKind.Absolute, out var relayUri))
+                throw new OnlineReplicationError("The configured relay URL is invalid.");
+            try
             {
-                StateChanged?.Invoke();
-                throw new OnlineReplicationError("The relay is missing required Protocol 9 capabilities.");
+                RelayTransportPolicy.EnsureAllowed(relayUri);
             }
+            catch (RelayTransportPolicyException ex)
+            {
+                throw new OnlineReplicationError(ex.Message, ex);
+            }
+            await EnsureRelayCapabilitiesAsync(p.RelayUrl, ct).ConfigureAwait(false);
 
             var normHandle = AppState.Norm(p.Handle);
             var rosterReconciliation = await DeviceRosterReconciliationPolicy.ReconcileCurrentDeviceAsync(
@@ -803,6 +834,7 @@ public sealed partial class MeshClient :
             connection.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, _ =>
             {
                 authenticated = true;
+                Volatile.Write(ref lastConnectionError, null);
                 var identity = CaptureReplicationConnectionIdentity(connection);
                 authenticatedReplicationConnectionIdentity = identity;
                 Log?.Invoke("hub connected + authenticated");
@@ -946,7 +978,7 @@ public sealed partial class MeshClient :
             OnlineReplicationWakeCapabilityPolicy.IsSupported(capabilities));
     }
 
-    private async Task<bool> DetectRelayCapabilitiesAsync(
+    private async Task EnsureRelayCapabilitiesAsync(
         string relayUrl,
         CancellationToken ct = default)
     {
@@ -958,37 +990,40 @@ public sealed partial class MeshClient :
         supportsAuthoritativeTopicState = false;
         supportsAgentHost = false;
         supportsWakeConnect = false;
+        RelayCapabilities capabilities;
         try
         {
-            var capabilities = await ReadRelayCapabilitiesAsync(relayUrl, ct).ConfigureAwait(false);
-            if (capabilities.ProtocolVersion != MeshProtocol.Version)
-            {
-                Log?.Invoke($"relay protocol mismatch: expected {MeshProtocol.Version}, got {capabilities.ProtocolVersion}");
-                return false;
-            }
-            if (!capabilities.SendResults
-                || !capabilities.Replication
-                || !capabilities.SnapshotTransferV2
-                || !capabilities.OnlineDelivery)
-            {
-                Log?.Invoke("relay is missing required online replication capabilities");
-                return false;
-            }
-            supportsSendResults = capabilities.SendResults;
-            supportsEphemeralDelivery = capabilities.EphemeralDelivery;
-            supportsFanout = capabilities.Fanout;
-            supportsReplication = capabilities.Replication;
-            supportsDeviceRevocation = capabilities.DeviceRevocation;
-            supportsAuthoritativeTopicState = capabilities.AuthoritativeTopicState;
-            supportsAgentHost = capabilities.AgentHost;
-            supportsWakeConnect = capabilities.WakeConnect;
-            return true;
+            capabilities = await ReadRelayCapabilitiesAsync(relayUrl, ct).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            Log?.Invoke($"relay capability detection failed: {ex.Message}");
-            return false;
+            Log?.Invoke($"relay capability detection failed: {ex.GetType().Name}: {ex.Message}");
+            throw new OnlineReplicationError(
+                $"Could not read Protocol {MeshProtocol.Version} capabilities from the relay.",
+                ex);
         }
+        if (capabilities.ProtocolVersion != MeshProtocol.Version)
+            throw new OnlineReplicationError(
+                $"Relay protocol mismatch: expected {MeshProtocol.Version}, got {capabilities.ProtocolVersion}.");
+
+        var missing = new List<string>();
+        if (!capabilities.SendResults) missing.Add("sendResults");
+        if (!capabilities.Replication) missing.Add("replication");
+        if (!capabilities.SnapshotTransferV2) missing.Add("snapshotTransferV2");
+        if (!capabilities.OnlineDelivery) missing.Add("onlineDelivery");
+        if (missing.Count != 0)
+            throw new OnlineReplicationError(
+                $"The relay is missing required Protocol {MeshProtocol.Version} capabilities: {string.Join(", ", missing)}.");
+
+        supportsSendResults = capabilities.SendResults;
+        supportsEphemeralDelivery = capabilities.EphemeralDelivery;
+        supportsFanout = capabilities.Fanout;
+        supportsReplication = capabilities.Replication;
+        supportsDeviceRevocation = capabilities.DeviceRevocation;
+        supportsAuthoritativeTopicState = capabilities.AuthoritativeTopicState;
+        supportsAgentHost = capabilities.AgentHost;
+        supportsWakeConnect = capabilities.WakeConnect;
     }
     /// <summary>
     /// Guards the auth handshake: if the connection is up but the challenge/response never completes

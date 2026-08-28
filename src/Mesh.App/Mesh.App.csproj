@@ -63,6 +63,15 @@
         <CodesignEntitlements>Platforms\iOS\Entitlements.Release.plist</CodesignEntitlements>
     </PropertyGroup>
 
+    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android' And '$(Configuration)' == 'Debug'">
+        <AndroidResource Include="Platforms\Android\mesh_network_security.debug.xml"
+                         Link="Resources\xml\mesh_network_security.xml" />
+    </ItemGroup>
+    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android' And '$(Configuration)' != 'Debug'">
+        <AndroidResource Include="Platforms\Android\mesh_network_security.release.xml"
+                         Link="Resources\xml\mesh_network_security.xml" />
+    </ItemGroup>
+
     <!-- MainPage references the Razor-generated Routes component. On iOS, runtime inflation
          defers that type lookup until Razor components have been generated and loaded. -->
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">

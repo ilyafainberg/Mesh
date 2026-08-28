@@ -16,6 +16,18 @@
 @inject AppShutdownCoordinator Shutdown
 @implements IDisposable
 
+@if (State.IsOnboarded && Mesh.LastConnectionError is { } connectionIssue)
+{
+    <div class="global-banner err" role="alert">
+        <i class="bi bi-cloud-slash"></i>
+        <span class="gb-text">Mesh is offline: @connectionIssue</span>
+        <button type="button" class="gb-link" @onclick="RetryConnectionAsync" disabled="@retryingConnection">
+            @(retryingConnection ? "Retrying…" : "Retry")
+        </button>
+        <a class="gb-link" href="settings">Settings</a>
+    </div>
+}
+
 @if (onboardingActive || !State.IsOnboarded)
 {
     <Onboarding @key="State.PairingLinkGeneration" OnDone="CompleteOnboarding" />
@@ -111,6 +123,7 @@ else
 @code {
     bool navOpen;
     bool disposed;
+    bool retryingConnection;
     int renderQueued;
     DotNetObjectReference<MainLayout>? fileLinkRef;
     DotNetObjectReference<WidgetDiagnosticsBridge>? widgetDiagnosticsRef;
@@ -156,11 +169,12 @@ else
 
             await Msal.InitializeAsync();
             await Mesh.RegisterAsync();
-            await Mesh.ConnectAsync();
+            await ConnectWithoutBreakingStartupAsync();
             // Pull the relay's connector catalog (public OAuth metadata) in the background so the
             // Knowledge page can offer one-click connectors. Cached for brief offline periods.
             Shutdown.Track(Catalog.RefreshAsync(Shutdown.Token), "connector catalog refresh");
         }
+
         // Preload the on-device model catalog once, in the background, so Settings
         // shows it instantly without reloading (and without resetting the selection).
         if (State.Profile.Model.Provider == ModelProvider.FoundryLocal)
@@ -168,6 +182,29 @@ else
 
         // Automatic update checks: one now, then periodically. Surfaces the update banner.
         Updater.StartAutoChecks();
+    }
+
+    private async Task ConnectWithoutBreakingStartupAsync()
+    {
+        await StartupConnectionRecovery.TryConnectAsync(
+            Mesh.ConnectAsync,
+            message => RuntimeDiagnostics.Current?.RecordEvent(
+                "startup-relay-connection-failed", message));
+    }
+
+    private async Task RetryConnectionAsync()
+    {
+        if (retryingConnection) return;
+        retryingConnection = true;
+        try
+        {
+            await Mesh.RegisterAsync();
+            await ConnectWithoutBreakingStartupAsync();
+        }
+        finally
+        {
+            retryingConnection = false;
+        }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)

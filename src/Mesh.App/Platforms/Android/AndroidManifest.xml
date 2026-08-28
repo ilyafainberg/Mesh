@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:allowBackup="true" android:icon="@mipmap/meshicon" android:roundIcon="@mipmap/meshicon_round" android:supportsRtl="true">
+    <application android:allowBackup="true" android:icon="@mipmap/meshicon" android:roundIcon="@mipmap/meshicon_round"
+                 android:supportsRtl="true" android:networkSecurityConfig="@xml/mesh_network_security">
         <meta-data android:name="com.google.firebase.messaging.default_notification_channel_id" android:value="mesh_messages" />
     </application>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

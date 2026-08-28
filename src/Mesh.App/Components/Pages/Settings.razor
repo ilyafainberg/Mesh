@@ -1456,6 +1456,13 @@
 
     async Task ChangeModel()
     {
+        if (!RelayTransportPolicy.TryValidateBaseUrl(
+                relay, RelayTransportPolicy.LocalHttpEnabled, out var policyError))
+        {
+            relayTestOk = false;
+            relayTestMsg = policyError;
+            return;
+        }
         var apiKeyToSet = apiKey;
         var tokenOptimizationToSet = SelectedTokenOptimization;
         apiKey = "";
@@ -1718,6 +1725,14 @@
         relay = e.Value?.ToString() ?? "";
         var url = relay.Trim();
         if (string.IsNullOrWhiteSpace(url)) return;
+        if (!RelayTransportPolicy.TryValidateBaseUrl(
+                url, RelayTransportPolicy.LocalHttpEnabled, out var policyError))
+        {
+            relayTestOk = false;
+            relayTestMsg = policyError;
+            relay = State.Profile.RelayUrl;
+            return;
+        }
         Toggle(p => p.RelayUrl = url);
         // A handle is registered per relay, so switching relays re-registers there and reconnects.
         try { await Mesh.RegisterAsync(); await Mesh.ConnectAsync(); await LoadAgentRoutingAsync(); } catch { }
@@ -1749,6 +1764,13 @@
         testingRelay = true;
         try
         {
+            if (!RelayTransportPolicy.TryValidateBaseUrl(
+                    url, RelayTransportPolicy.LocalHttpEnabled, out var policyError))
+            {
+                relayTestOk = false;
+                relayTestMsg = policyError;
+                return;
+            }
             var http = HttpFactory.CreateClient("relay");
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             var resp = await http.GetAsync($"{url.TrimEnd('/')}/health", cts.Token);
@@ -1847,10 +1869,10 @@
         linkWorking = true;
         try
         {
-            if (!Uri.TryCreate(State.Profile.RelayUrl, UriKind.Absolute, out var relayUri) ||
-                (relayUri.Scheme != Uri.UriSchemeHttps && !(relayUri.Scheme == Uri.UriSchemeHttp && relayUri.IsLoopback)) ||
-                !string.IsNullOrEmpty(relayUri.UserInfo) || !string.IsNullOrEmpty(relayUri.Query) ||
-                !string.IsNullOrEmpty(relayUri.Fragment))
+            if (!RelayTransportPolicy.TryValidateBaseUrl(
+                    State.Profile.RelayUrl,
+                    RelayTransportPolicy.LocalHttpEnabled,
+                    out _))
             {
                 linkError = "A valid HTTPS relay URL is required before generating a device-link.";
                 return;
