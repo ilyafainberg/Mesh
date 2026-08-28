@@ -351,6 +351,12 @@ else
                     <button class="primary send-btn" @onclick="Send" disabled="@(string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null)" title="Send" aria-label="Send"><i class="bi bi-send"></i></button>
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
+                @if (DraftError is not null)
+                {
+                    <p class="err-text" role="alert">
+                        @DraftError <button class="link-btn" @onclick="RetryDraft">Retry save</button>
+                    </p>
+                }
             </div>
         </div>
     </div>
@@ -414,6 +420,11 @@ else
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
+    string? DraftError => active is null ? null : State.GetConversationDraftError(active);
+    void RetryDraft()
+    {
+        if (active is not null) State.RetryConversationDraft(active);
+    }
     const long MaxAttachmentBytes = 20L * 1024 * 1024;
 
     // Tier-1 steerable input: messages the user submits while a send is in flight are queued

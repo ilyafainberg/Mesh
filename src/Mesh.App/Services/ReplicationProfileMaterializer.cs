@@ -147,11 +147,14 @@ public static class ReplicationProfileMaterializer
                 thread.Title = body.Title ?? thread.Title;
                 if (body.CreatedAt != default) thread.CreatedAt = body.CreatedAt;
                 thread.IsPinned = body.IsPinned;
-                thread.ExecutionDeviceId = body.ExecutionDeviceId;
-                thread.ExecutionDeviceName = body.ExecutionDeviceName;
-                thread.ExecutionDevicePlatform = body.ExecutionDevicePlatform;
-                thread.ExecutionAt = body.ExecutionAt;
-                thread.ExecutionRunId = body.ExecutionRunId;
+                if (body.ExecutionRunId is not null || thread.ExecutionRunId is null)
+                {
+                    thread.ExecutionDeviceId = body.ExecutionDeviceId;
+                    thread.ExecutionDeviceName = body.ExecutionDeviceName;
+                    thread.ExecutionDevicePlatform = body.ExecutionDevicePlatform;
+                    thread.ExecutionAt = body.ExecutionAt;
+                    thread.ExecutionRunId = body.ExecutionRunId;
+                }
                 if (body.LastActivityAt.HasValue)
                     thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, body.LastActivityAt.Value);
                 return true;

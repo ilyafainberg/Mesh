@@ -178,7 +178,7 @@ internal sealed class NotificationOperationGate
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await operation(ct).ConfigureAwait(false);
+            await Task.Run(() => operation(ct), ct).ConfigureAwait(false);
         }
         finally
         {
@@ -193,7 +193,7 @@ internal sealed class NotificationOperationGate
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await operation(ct).ConfigureAwait(false);
+            return await Task.Run(() => operation(ct), ct).ConfigureAwait(false);
         }
         finally
         {

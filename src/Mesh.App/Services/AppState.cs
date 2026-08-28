@@ -1,9 +1,23 @@
+using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text;
+using System.Security.Cryptography;
 using Mesh.App.Domain;
 using Mesh.Shared;
 
 namespace Mesh.App.Services;
+
+internal sealed record GeneratedReplicationEvent(
+    string Kind,
+    ReplicationPayloadCodec.DomainAction Action,
+    string EntityId,
+    string BodyJson);
+
+internal interface IReplicationEventTestFaultScheduler
+{
+    bool Schedule(GeneratedReplicationEvent generated, Action persist);
+}
 
 /// <summary>A saved identity on this device (one Mesh handle + its own encrypted database).</summary>
 public sealed class AccountRef
@@ -24,7 +38,10 @@ public sealed class AccountRef
 /// databases are kept so the user can switch back. No data leaves the device except through an
 /// explicit passphrase-encrypted export (see <see cref="MeshExport"/>).
 /// </summary>
-public sealed partial class AppState : IMemoryState
+public sealed partial class AppState :
+    IMemoryState,
+    ITopicDurabilityStore,
+    ITopicRequestOutboxStore
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
@@ -40,13 +57,27 @@ public sealed partial class AppState : IMemoryState
 
     private readonly ISecretStore secrets;
     private readonly AppShutdownState shutdown;
+    private readonly TimeProvider timeProvider;
+    private readonly StoragePathSet storagePaths;
     private readonly string dir;
     private readonly string indexPath;
     private readonly object profileSyncGate = new();
     private string? activeId;
     private List<AccountRef> accounts = new();
     private MeshDb? activeDb;
+    private sealed record ActiveDatabaseIdentity(
+        MeshDb Database,
+        string AccountId,
+        string Identity,
+        long Generation);
+    private ActiveDatabaseIdentity? activeDatabaseIdentity;
+    private long activeDatabaseGeneration;
+    private readonly Dictionary<string, TopicSendRetryAuthorization>
+        issuedTopicSendAuthorizations = new(StringComparer.Ordinal);
+    private ComposerDraftPersistenceCoordinator? draftPersistence;
+    private DesktopSelectionPersistenceCoordinator? desktopSelectionPersistence;
     private bool applyingReplicationProjection;
+    internal IReplicationEventTestFaultScheduler? ReplicationEventTestFaultScheduler { get; set; }
 
     public MeshProfile Profile { get; private set; } = new();
     /// <summary>OwnThreads sorted by pin (pinned first), then activity (newest), then created (newest), then stable id.</summary>
@@ -78,19 +109,29 @@ public sealed partial class AppState : IMemoryState
         return link;
     }
 
-    public AppState(ISecretStore secrets)
-        : this(secrets, new AppShutdownState())
+    public AppState(
+        ISecretStore secrets,
+        TimeProvider? timeProvider = null,
+        StoragePathSet? storagePaths = null)
+        : this(secrets, new AppShutdownState(), timeProvider, storagePaths)
     {
     }
 
-    public AppState(ISecretStore secrets, AppShutdownState shutdown)
+    public AppState(
+        ISecretStore secrets,
+        AppShutdownState shutdown,
+        TimeProvider? timeProvider = null,
+        StoragePathSet? storagePaths = null)
     {
         this.secrets = secrets;
         this.shutdown = shutdown;
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.storagePaths = storagePaths
+                            ?? new StoragePathSet(StoragePaths.Root);
         // Directory is owned by StoragePaths, the single source of truth shared with SecretStore.
         // It resolves to a stable, app-identity-independent root on Windows (%LOCALAPPDATA%\Mesh\Data),
         // still honoring the MESH_PROFILE_DIR override used for isolated test instances.
-        dir = StoragePaths.DataDir;
+        dir = this.storagePaths.DataDir;
         Directory.CreateDirectory(dir);
         indexPath = Path.Combine(dir, "accounts.json");
         StorageProtection.TryEnsureBackgroundReadable(indexPath);
@@ -102,6 +143,8 @@ public sealed partial class AppState : IMemoryState
     /// <summary>All identities saved on this device.</summary>
     public IReadOnlyList<AccountRef> Accounts => accounts;
     public string? ActiveAccountId => activeId;
+    internal string StorageRoot => storagePaths.Root;
+    internal string? ActiveDatabasePath => activeId is null ? null : DbPath(activeId);
     public bool HasSavedAccounts => accounts.Count > 0;
 
     private string DbPath(string id) => Path.Combine(dir, $"identity-{id}.meshdb");
@@ -116,16 +159,60 @@ public sealed partial class AppState : IMemoryState
                 throw new InvalidOperationException("The database key is unavailable for an existing identity.");
             key = secrets.GetOrCreateDbKey(id);
         }
-        return MeshDb.Open(path, key);
+        return MeshDb.Open(path, key, timeProvider);
+    }
+
+    private ActiveDatabaseIdentity NewActiveDatabaseIdentity(MeshDb database, string accountId)
+    {
+        issuedTopicSendAuthorizations.Clear();
+        return new(
+            database,
+            accountId,
+            TopicSendSnapshot.StableId(
+                "account-database",
+                Path.GetFullPath(DbPath(accountId)).ToUpperInvariant()),
+            Interlocked.Increment(ref activeDatabaseGeneration));
+    }
+
+    internal bool TryConsumeTopicSendAuthorization(
+        TopicSendAuthorizationScope expected,
+        Func<bool> consume)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        ArgumentNullException.ThrowIfNull(consume);
+        lock (profileSyncGate)
+        {
+            var current = Volatile.Read(ref activeDatabaseIdentity);
+            return current is not null
+                   && string.Equals(current.AccountId, expected.AccountId, StringComparison.Ordinal)
+                   && string.Equals(current.Identity, expected.DatabaseIdentity, StringComparison.Ordinal)
+                   && current.Generation == expected.DatabaseGeneration
+                   && consume();
+        }
+    }
+
+    internal bool IsCurrentTopicSendAuthorization(TopicSendAuthorizationScope expected)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        lock (profileSyncGate)
+        {
+            var current = Volatile.Read(ref activeDatabaseIdentity);
+            return current is not null
+                   && string.Equals(current.AccountId, expected.AccountId, StringComparison.Ordinal)
+                   && string.Equals(current.Identity, expected.DatabaseIdentity, StringComparison.Ordinal)
+                   && current.Generation == expected.DatabaseGeneration;
+        }
     }
 
     public void Load()
     {
+        var started = Stopwatch.StartNew();
         try
         {
             if (!File.Exists(indexPath))
             {
                 Profile = new MeshProfile();
+                RecordStartupTiming("empty", started.Elapsed);
                 return;
             }
 
@@ -135,22 +222,33 @@ public sealed partial class AppState : IMemoryState
 
             if (activeId is not null)
             {
+                var phase = Stopwatch.StartNew();
                 var db = OpenDb(activeId);
+                RecordStartupTiming("database-open", phase.Elapsed);
+                phase.Restart();
                 var loaded = db.LoadProfile();
+                RecordStartupTiming("profile-load", phase.Elapsed);
                 if (loaded is not null)
                 {
                     activeDb = db;
+                    Volatile.Write(
+                        ref activeDatabaseIdentity,
+                        NewActiveDatabaseIdentity(db, activeId));
                     Profile = loaded;
+                    phase.Restart();
                     ReconcileDeletedCircles();
                     RehydrateUnread();
                     RehydrateTopicExecutionState();
                     MigrateAndHydrateAssets(activeDb);
+                    RecordStartupTiming("rehydrate", phase.Elapsed);
+                    RecordStartupTiming("complete", started.Elapsed);
                     return;
                 }
                 db.Dispose();
                 activeId = null; // active database missing/empty, land on the picker
             }
             Profile = new MeshProfile();
+            RecordStartupTiming("complete", started.Elapsed);
         }
         catch (Exception ex)
         {
@@ -158,8 +256,15 @@ public sealed partial class AppState : IMemoryState
             Profile = new MeshProfile();
             activeId = null;
             activeDb = null;
+            Volatile.Write(ref activeDatabaseIdentity, null);
+            RecordStartupTiming("failed", started.Elapsed);
         }
     }
+
+    private static void RecordStartupTiming(string phase, TimeSpan elapsed)
+        => RuntimeDiagnostics.Current?.RecordEvent(
+            "startup",
+            $"app-state.{phase};duration_ms={elapsed.TotalMilliseconds:0};thread={Environment.CurrentManagedThreadId}");
 
     // Restore the in-memory unread set from the persisted profile (survives restarts).
     private void RehydrateUnread()
@@ -177,7 +282,8 @@ public sealed partial class AppState : IMemoryState
             .ToList();
         if (active.Count == Profile.Circles.Count) return;
         Profile.Circles = active;
-        activeDb?.SaveProfileJson(MeshDb.SerializeProfileForStorage(Profile));
+        activeDb?.ExecuteDurableWrite(
+            () => activeDb.SaveProfileJson(MeshDb.SerializeProfileForStorage(Profile)));
     }
 
     private void WriteIndex()
@@ -207,45 +313,261 @@ public sealed partial class AppState : IMemoryState
 
     /// <summary>Gets the local unsent text for a conversation.</summary>
     public string GetConversationDraft(string handle)
+        => GetConversationDraftState(handle)?.Text ?? "";
+
+    public MeshDb.ComposerDraft? GetConversationDraftState(string handle)
     {
         var normalized = Norm(handle);
-        return normalized.Length == 0 ? "" : activeDb?.GetConversationDraft(normalized) ?? "";
+        var db = activeDb;
+        if (normalized.Length == 0 || db is null) return null;
+        return draftPersistence?.TryGetLatestState(
+            db,
+            ComposerDraftKind.Conversation,
+            normalized,
+            out MeshDb.ComposerDraft? latest) == true
+            ? latest
+            : db.GetConversationDraftState(normalized);
     }
 
     /// <summary>Persists local unsent text for a conversation without syncing it to other devices.</summary>
     public void SetConversationDraft(string handle, string text)
+        => _ = SetConversationDraftRevision(handle, text);
+
+    public long SetConversationDraftRevision(string handle, string text)
     {
         var normalized = Norm(handle);
-        if (normalized.Length == 0) return;
-        activeDb?.SetConversationDraft(normalized, text);
+        var db = activeDb;
+        if (normalized.Length == 0 || db is null) return 0;
+        var revision = ComposerDraftRevision.New();
+        EnsureDraftPersistence().Schedule(
+            db,
+            ComposerDraftKind.Conversation,
+            normalized,
+            text,
+            revision);
+        return revision;
+    }
+
+    public string? GetConversationDraftError(string handle)
+    {
+        var normalized = Norm(handle);
+        var db = activeDb;
+        return normalized.Length == 0 || db is null
+            ? null
+            : draftPersistence?.GetFailure(
+                db,
+                ComposerDraftKind.Conversation,
+                normalized)?.Message;
+    }
+
+    public void RetryConversationDraft(string handle)
+    {
+        var normalized = Norm(handle);
+        var db = activeDb;
+        if (normalized.Length == 0 || db is null) return;
+        draftPersistence?.Retry(db, ComposerDraftKind.Conversation, normalized);
     }
 
     /// <summary>Gets the local unsent text for a topic.</summary>
     public string GetTopicDraft(string threadId)
-        => string.IsNullOrWhiteSpace(threadId) ? "" : activeDb?.GetTopicDraft(threadId) ?? "";
+        => GetTopicDraftState(threadId)?.Text ?? "";
+
+    public MeshDb.ComposerDraft? GetTopicDraftState(string threadId)
+    {
+        var db = activeDb;
+        if (string.IsNullOrWhiteSpace(threadId) || db is null) return null;
+        return draftPersistence?.TryGetLatestState(
+            db,
+            ComposerDraftKind.Topic,
+            threadId,
+            out MeshDb.ComposerDraft? latest) == true
+            ? latest
+            : db.GetTopicDraftState(threadId);
+    }
 
     /// <summary>Persists local unsent text for a topic without syncing it to other devices.</summary>
     public void SetTopicDraft(string threadId, string text)
+        => _ = SetTopicDraftRevision(threadId, text);
+
+    public long SetTopicDraftRevision(string threadId, string text)
+        => SetTopicDraftSnapshotRevision(
+            threadId,
+            MeshDb.TopicComposerSnapshot.TextOnly(text));
+
+    public long SetTopicDraftSnapshotRevision(
+        string threadId,
+        MeshDb.TopicComposerSnapshot snapshot)
     {
-        if (string.IsNullOrWhiteSpace(threadId)) return;
-        activeDb?.SetTopicDraft(threadId, text);
+        var db = activeDb;
+        if (string.IsNullOrWhiteSpace(threadId) || db is null) return 0;
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var revision = ComposerDraftRevision.New();
+        EnsureDraftPersistence().ScheduleTopicSnapshot(
+            db,
+            threadId,
+            snapshot,
+            revision);
+        return revision;
     }
+
+    public async Task<MeshDb.ComposerDraft> PersistTopicDraftSnapshotAsync(
+        string threadId,
+        MeshDb.TopicComposerSnapshot snapshot,
+        long revision,
+        CancellationToken cancellationToken = default)
+    {
+        var db = activeDb ?? throw new InvalidOperationException("No active profile database.");
+        if (string.IsNullOrWhiteSpace(threadId))
+            throw new ArgumentException("A thread id is required.", nameof(threadId));
+        ArgumentNullException.ThrowIfNull(snapshot);
+        snapshot = snapshot with { Attachments = snapshot.Attachments.ToArray() };
+        var current = GetTopicDraftState(threadId);
+        if (revision <= 0
+            || current is not null
+            && current.Revision == revision
+            && (current.TopicSnapshot is null
+                || !MeshDb.TopicComposerSnapshotsEqual(
+                    current.TopicSnapshot,
+                    snapshot)))
+            revision = ComposerDraftRevision.New();
+
+        var persistence = EnsureDraftPersistence();
+        ComposerDraftMutationResult result;
+        try
+        {
+            result = await ComposerDraftPersistenceCoordinator.ScheduleAndAwaitAsync(
+                    ComposerDraftKind.Topic,
+                    threadId,
+                    snapshot.Text,
+                    () => persistence.ScheduleTopicSnapshot(db, threadId, snapshot, revision),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException exception)
+        {
+            throw new InvalidOperationException(
+                $"Draft revision {RevisionHash(revision)} could not be durably committed.",
+                exception);
+        }
+        if (result == ComposerDraftMutationResult.Superseded)
+            throw new InvalidOperationException(
+                $"Draft revision {RevisionHash(revision)} was superseded before it could be committed.");
+        var stored = db.GetTopicDraftState(threadId);
+        if (stored is null
+            || stored.IsMalformed
+            || stored.Revision != revision
+            || stored.TopicSnapshot is null
+            || !MeshDb.TopicComposerSnapshotsEqual(stored.TopicSnapshot, snapshot))
+            throw new InvalidOperationException(
+                $"Draft revision {RevisionHash(revision)} was not durably committed.");
+        return stored;
+    }
+
+    public async Task FlushTopicDraftAsync(
+        string threadId,
+        long expectedRevision,
+        CancellationToken cancellationToken = default)
+    {
+        var draft = GetTopicDraftState(threadId)
+                    ?? throw new InvalidOperationException("The topic draft is missing.");
+        if (draft.IsMalformed
+            || draft.Revision != expectedRevision
+            || draft.TopicSnapshot is null)
+            throw new InvalidOperationException("The draft has no valid complete snapshot.");
+        _ = await PersistTopicDraftSnapshotAsync(
+                threadId,
+                draft.TopicSnapshot,
+                expectedRevision,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<MeshDb.ComposerDraftClearResult> CompareAndClearTopicDraftAsync(
+        string threadId,
+        long expectedRevision,
+        CancellationToken cancellationToken = default)
+    {
+        var db = activeDb ?? throw new InvalidOperationException("No active profile database.");
+        if (string.IsNullOrWhiteSpace(threadId))
+            throw new ArgumentException("A thread id is required.", nameof(threadId));
+        if (expectedRevision <= 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+
+        return draftPersistence is null
+            ? await db.ResolveTopicDraftCleanupAsync(
+                    threadId,
+                    expectedRevision,
+                    null,
+                    cancellationToken)
+                .ConfigureAwait(false)
+            : await draftPersistence.ResolveTopicCleanupAsync(
+                    db,
+                    threadId,
+                    expectedRevision,
+                    cancellationToken)
+                .ConfigureAwait(false);
+    }
+
+    private static string RevisionHash(long revision)
+        => Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(
+                revision.ToString(System.Globalization.CultureInfo.InvariantCulture))))
+            [..12];
+
+    public string? GetTopicDraftError(string threadId)
+    {
+        var db = activeDb;
+        return string.IsNullOrWhiteSpace(threadId) || db is null
+            ? null
+            : draftPersistence?.GetFailure(
+                db,
+                ComposerDraftKind.Topic,
+                threadId)?.Message;
+    }
+
+    public void RetryTopicDraft(string threadId)
+    {
+        var db = activeDb;
+        if (string.IsNullOrWhiteSpace(threadId) || db is null) return;
+        draftPersistence?.Retry(db, ComposerDraftKind.Topic, threadId);
+    }
+
+    private ComposerDraftPersistenceCoordinator EnsureDraftPersistence()
+        => draftPersistence ??= new ComposerDraftPersistenceCoordinator(failure =>
+        {
+            if (failure is not null)
+                RuntimeDiagnostics.Current?.RecordException(
+                    "composer-draft-persistence",
+                    failure.Exception);
+            NotifyChanged();
+        });
 
     /// <summary>Gets the last Me topic opened in the desktop UI on this device.</summary>
     public string? GetLastDesktopTopicId()
         => activeDb?.GetLastDesktopTopicId();
 
-    /// <summary>Stores the last Me topic opened in the desktop UI without syncing it.</summary>
+    /// <summary>Stages the last Me topic immediately and persists it off the UI dispatcher.</summary>
     public void SetLastDesktopTopicId(string? threadId)
-        => activeDb?.SetLastDesktopTopicId(threadId);
+    {
+        var db = activeDb;
+        if (db is null) return;
+        EnsureDesktopSelectionPersistence().SetTopic(db, threadId);
+    }
 
     /// <summary>Gets the last Messages conversation opened in the desktop UI on this device.</summary>
     public string? GetLastDesktopConversationKey()
         => activeDb?.GetLastDesktopConversationKey();
 
-    /// <summary>Stores the last Messages conversation opened in the desktop UI without syncing it.</summary>
+    /// <summary>Stages the last Messages conversation immediately and persists it off the UI dispatcher.</summary>
     public void SetLastDesktopConversationKey(string? conversationKey)
-        => activeDb?.SetLastDesktopConversationKey(conversationKey);
+    {
+        var db = activeDb;
+        if (db is null) return;
+        EnsureDesktopSelectionPersistence().SetConversation(db, conversationKey);
+    }
+
+    private DesktopSelectionPersistenceCoordinator EnsureDesktopSelectionPersistence()
+        => desktopSelectionPersistence ??= new DesktopSelectionPersistenceCoordinator();
 
     public MemorySnapshot SnapshotMemories()
     {
@@ -279,7 +601,7 @@ public sealed partial class AppState : IMemoryState
                 return false;
             if (existing is not null && MemoryPolicy.SharedEquals(existing, normalized)) return false;
 
-            activeDb.UpsertMemory(normalized);
+            activeDb.ExecuteDurableWrite(() => activeDb.UpsertMemory(normalized));
             if (existing is null)
                 Profile.Memories.Add(normalized);
             else
@@ -314,7 +636,7 @@ public sealed partial class AppState : IMemoryState
             previous = existing is null ? null : MemoryPolicy.Clone(existing);
             if (existing is null || !MemoryPolicy.SharedEquals(existing, expected)) return false;
 
-            activeDb.DeleteMemory(id);
+            activeDb.ExecuteDurableWrite(() => activeDb.DeleteMemory(id));
             Profile.Memories.Remove(existing);
             deleted = true;
         }
@@ -342,7 +664,7 @@ public sealed partial class AppState : IMemoryState
             if (activeDb is null
                 || !string.Equals(activeId, accountId, StringComparison.Ordinal))
                 return;
-            activeDb.TouchMemories(distinct, at);
+            activeDb.ExecuteDurableWrite(() => activeDb.TouchMemories(distinct, at));
             foreach (var memory in Profile.Memories.Where(memory => distinct.Contains(memory.Id, StringComparer.Ordinal)))
             {
                 memory.RecallCount = Math.Min(1_000_000, memory.RecallCount + 1);
@@ -359,49 +681,59 @@ public sealed partial class AppState : IMemoryState
             EnsureRecoveryKeys();
             activeId = NewId();
             activeDb = OpenDb(activeId);
+            Volatile.Write(
+                ref activeDatabaseIdentity,
+                NewActiveDatabaseIdentity(activeDb, activeId));
             accounts.Add(new AccountRef { Id = activeId, Handle = Profile.Handle, DisplayName = Profile.DisplayName });
             // Persist any history the fresh profile already carries (normally none at onboarding).
             foreach (var conv in Profile.Conversations)
             {
                 conv.Handle = PrepareConversationForPersistence(conv);
                 DeriveActivityMetadata(conv);
-                activeDb.EnsureConversation(conv.Handle, conv.CreatedAt);
+                activeDb.ExecuteDurableWrite(
+                    () => activeDb.EnsureConversation(conv.Handle, conv.CreatedAt));
                 PersistConversationMetadata(activeDb, conv);
                 if (conv.LastActivityAt.HasValue)
-                    activeDb.SetConversationActivity(conv.Handle, conv.LastActivityAt.Value);
+                    activeDb.ExecuteDurableWrite(
+                        () => activeDb.SetConversationActivity(conv.Handle, conv.LastActivityAt.Value));
                 if (conv.IsPinned)
-                    activeDb.SetConversationPin(conv.Handle, true);
-                foreach (var line in conv.Lines) activeDb.AppendChatLine(Norm(conv.Handle), line);
+                    activeDb.ExecuteDurableWrite(() => activeDb.SetConversationPin(conv.Handle, true));
+                foreach (var line in conv.Lines)
+                    activeDb.ExecuteDurableWrite(
+                        () => activeDb.AppendChatLine(Norm(conv.Handle), line));
             }
             foreach (var thread in Profile.OwnThreads)
             {
                 thread.LastActivityAt ??= thread.Lines.Count == 0
                     ? thread.CreatedAt
                     : thread.Lines.Max(line => line.At);
-                activeDb.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+                activeDb.ExecuteDurableWrite(
+                    () => activeDb.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt));
                 if (thread.LastActivityAt.HasValue)
-                    activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+                    activeDb.ExecuteDurableWrite(
+                        () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
                 if (thread.IsPinned)
-                    activeDb.SetOwnThreadPin(thread.Id, true);
+                    activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadPin(thread.Id, true));
                 if (thread.ExecutionDeviceId is not null
                     || thread.ExecutionDeviceName is not null
                     || thread.ExecutionDevicePlatform is not null
                     || thread.ExecutionAt.HasValue
                     || thread.ExecutionRunId is not null)
-                    activeDb.SetOwnThreadExecution(
+                    activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecution(
                         thread.Id,
                         thread.ExecutionDeviceId,
                         thread.ExecutionAt,
                         thread.ExecutionRunId,
                         thread.ExecutionDeviceName,
-                        thread.ExecutionDevicePlatform);
-                foreach (var line in thread.Lines) activeDb.AppendOwnChat(thread.Id, line);
+                        thread.ExecutionDevicePlatform));
+                foreach (var line in thread.Lines)
+                    activeDb.ExecuteDurableWrite(() => activeDb.AppendOwnChat(thread.Id, line));
             }
             for (var i = 0; i < Profile.Memories.Count; i++)
             {
                 var memory = MemoryPolicy.Normalize(Profile.Memories[i]);
                 Profile.Memories[i] = memory;
-                activeDb.UpsertMemory(memory);
+                activeDb.ExecuteDurableWrite(() => activeDb.UpsertMemory(memory));
             }
             NotificationCoordinatorBridge.ResetForAccount();
         }
@@ -571,7 +903,12 @@ public sealed partial class AppState : IMemoryState
                     secrets.DeleteDbKey(failedId);
                 }
                 activeId = previousActiveId;
+                Volatile.Write(ref activeDatabaseIdentity, null);
                 activeDb = previousActiveDb;
+                if (previousActiveDb is not null && previousActiveId is not null)
+                    Volatile.Write(
+                        ref activeDatabaseIdentity,
+                        NewActiveDatabaseIdentity(previousActiveDb, previousActiveId));
                 accounts = previousAccounts;
             }
             Profile = previousProfile;
@@ -581,6 +918,7 @@ public sealed partial class AppState : IMemoryState
 
     public void NotifyChanged()
     {
+        if (shutdown.IsStopping) return;
         var batch = replicationNotificationBatch.Value;
         if (batch is not null)
         {
@@ -588,12 +926,6 @@ public sealed partial class AppState : IMemoryState
             return;
         }
         Changed?.Invoke();
-    }
-
-    public void NotifyChanged()
-    {
-        if (!shutdown.IsStopping)
-            Changed?.Invoke();
     }
 
     // ---- chat history (append-only rows) ----------------------------------
@@ -617,6 +949,9 @@ public sealed partial class AppState : IMemoryState
     /// <summary>Appends a line to a "Me" topic thread as a single row.</summary>
     public void AddOwnChatLine(string threadId, ChatLine line, NotificationIntent? notificationIntent = null)
     {
+        if (LegacyUncorrelatedTopicAnswerTestMode
+            && string.Equals(line.Role, "assistant", StringComparison.Ordinal))
+            line.ReplyToLineId = null;
         lock (profileSyncGate)
         {
             if (IsTopicLineDeleted(threadId, line.Id)
@@ -628,8 +963,11 @@ public sealed partial class AppState : IMemoryState
             EmitLineUpsert("topic.line", thread.Id, line, notificationIntent);
             EmitTopicUpsert(thread);
         }
+
         NotifyChanged();
     }
+
+    internal bool LegacyUncorrelatedTopicAnswerTestMode { get; set; }
 
     /// <summary>Returns the thread with this id, or the first thread, creating one if none exist.</summary>
     public OwnThread GetOrCreateOwnThread(string? threadId = null)
@@ -676,12 +1014,12 @@ public sealed partial class AppState : IMemoryState
             ExecutionRunId = executionRunId
         };
         Profile.OwnThreads.Add(thread);
-        activeDb?.UpsertOwnThread(
+        activeDb?.ExecuteDurableWrite(() => activeDb.UpsertOwnThread(
             thread.Id, thread.Title, thread.CreatedAt, Profile.OwnThreads.Count - 1,
             thread.LastActivityAt, thread.IsPinned, thread.ExecutionDeviceId,
             thread.ExecutionAt, thread.ExecutionRunId, replaceExecutionMetadata: true,
             executionDeviceName: thread.ExecutionDeviceName,
-            executionDevicePlatform: thread.ExecutionDevicePlatform);
+            executionDevicePlatform: thread.ExecutionDevicePlatform));
         EmitTopicUpsert(thread);
         NotifyChanged();
         return thread;
@@ -702,6 +1040,56 @@ public sealed partial class AppState : IMemoryState
             targetDeviceName: executionDevice?.DeviceName,
             targetDevicePlatform: executionDevice?.Platform);
 
+    public async Task<OwnThread> NewOwnThreadAsync(
+        string title,
+        ExecutionDevice? executionDevice,
+        DateTimeOffset? createdAt = null,
+        DateTimeOffset? lastActivityAt = null,
+        bool isPinned = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (executionDevice is not null) ValidateExecutionDevice(executionDevice);
+        var thread = new OwnThread
+        {
+            Title = title,
+            CreatedAt = createdAt ?? DateTimeOffset.UtcNow,
+            LastActivityAt = lastActivityAt,
+            IsPinned = isPinned,
+            ExecutionDeviceId = executionDevice?.DeviceId,
+            ExecutionDeviceName = executionDevice?.DeviceName,
+            ExecutionDevicePlatform = executionDevice?.Platform
+        };
+
+        MeshDb? db;
+        int sortOrder;
+        lock (profileSyncGate)
+        {
+            db = activeDb;
+            sortOrder = Profile.OwnThreads.Count;
+        }
+        if (db is not null)
+        {
+            await db.ExecuteDurableWriteAsync(
+                () => db.UpsertOwnThread(
+                    thread.Id, thread.Title, thread.CreatedAt, sortOrder,
+                    thread.LastActivityAt, thread.IsPinned, thread.ExecutionDeviceId,
+                    thread.ExecutionAt, thread.ExecutionRunId, replaceExecutionMetadata: true,
+                    executionDeviceName: thread.ExecutionDeviceName,
+                    executionDevicePlatform: thread.ExecutionDevicePlatform),
+                cancellationToken);
+        }
+
+        lock (profileSyncGate)
+        {
+            if (db is not null && !ReferenceEquals(activeDb, db))
+                throw new InvalidOperationException("The active identity changed while the topic was being created.");
+            Profile.OwnThreads.Add(thread);
+        }
+        EmitTopicUpsert(thread);
+        NotifyChanged();
+        return thread;
+    }
+
     /// <summary>Renames a "Me" thread.</summary>
     /// <summary>Moves one private topic to the requested list position and persists the order.</summary>
     public void ReorderOwnThread(string threadId, int newIndex)
@@ -717,7 +1105,8 @@ public sealed partial class AppState : IMemoryState
             var ordered = Profile.OwnThreads.ToList();
             ordered.RemoveAt(oldIndex);
             ordered.Insert(newIndex, thread);
-            activeDb?.ReorderOwnThreads(ordered.Select(t => t.Id).ToList());
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.ReorderOwnThreads(ordered.Select(t => t.Id).ToList()));
             Profile.OwnThreads.RemoveAt(oldIndex);
             Profile.OwnThreads.Insert(newIndex, thread);
         }
@@ -740,7 +1129,8 @@ public sealed partial class AppState : IMemoryState
             if (thread is null || thread.IsPinned == pinned) return;
             var at = DateTimeOffset.UtcNow;
             var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-            activeDb?.SetOwnThreadPinAndActivity(thread.Id, pinned, activityAt);
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.SetOwnThreadPinAndActivity(thread.Id, pinned, activityAt));
             thread.IsPinned = pinned;
             thread.LastActivityAt = activityAt;
         }
@@ -765,8 +1155,8 @@ public sealed partial class AppState : IMemoryState
             if (!string.IsNullOrWhiteSpace(thread.ExecutionDeviceId))
                 throw new InvalidOperationException("The topic is already bound to an execution device.");
             if (activeDb is not null
-                && !activeDb.TryBindOwnThreadDevice(
-                    thread.Id, target.DeviceId, target.DeviceName, target.Platform))
+                && !activeDb.ExecuteDurableWrite(() => activeDb.TryBindOwnThreadDevice(
+                    thread.Id, target.DeviceId, target.DeviceName, target.Platform)))
                 throw new InvalidOperationException("The topic could not be bound atomically.");
             thread.ExecutionDeviceId = target.DeviceId;
             thread.ExecutionDeviceName = target.DeviceName;
@@ -792,8 +1182,8 @@ public sealed partial class AppState : IMemoryState
                      ?? throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
             var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
             if (activeDb is not null
-                && !activeDb.MoveOwnThreadToDevice(
-                    thread.Id, target.DeviceId, target.DeviceName, target.Platform, activityAt))
+                && !activeDb.ExecuteDurableWrite(() => activeDb.MoveOwnThreadToDevice(
+                    thread.Id, target.DeviceId, target.DeviceName, target.Platform, activityAt)))
                 throw new InvalidOperationException("The topic could not be moved atomically.");
             thread.ExecutionDeviceId = target.DeviceId;
             thread.ExecutionDeviceName = target.DeviceName;
@@ -801,7 +1191,7 @@ public sealed partial class AppState : IMemoryState
             thread.ExecutionAt = null;
             thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
-            remoteRuns.Remove(thread.Id);
+            remoteRuns.TryRemove(thread.Id, out _);
         }
         EmitTopicUpsert(thread);
         NotifyChanged();
@@ -835,7 +1225,7 @@ public sealed partial class AppState : IMemoryState
                 throw new InvalidOperationException("The topic is bound to another execution device.");
 
             var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, createdAt);
-            activeDb?.UpsertOwnThread(
+            activeDb?.ExecuteDurableWrite(() => activeDb.UpsertOwnThread(
                 thread.Id,
                 thread.Title,
                 thread.CreatedAt,
@@ -847,7 +1237,7 @@ public sealed partial class AppState : IMemoryState
                 thread.ExecutionRunId,
                 replaceExecutionMetadata: true,
                 executionDeviceName: target.DeviceName,
-                executionDevicePlatform: target.Platform);
+                executionDevicePlatform: target.Platform));
             thread.ExecutionDeviceId = target.DeviceId;
             thread.ExecutionDeviceName = target.DeviceName;
             thread.ExecutionDevicePlatform = target.Platform;
@@ -878,8 +1268,11 @@ public sealed partial class AppState : IMemoryState
         thread.Title = string.IsNullOrWhiteSpace(title) ? thread.Title : title.Trim();
         var at = DateTimeOffset.UtcNow;
         thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-        activeDb?.RenameOwnThread(thread.Id, thread.Title);
-        activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+        activeDb?.ExecuteDurableWrite(() =>
+        {
+            activeDb.RenameOwnThread(thread.Id, thread.Title);
+            activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+        });
         EmitTopicUpsert(thread);
         NotifyChanged();
     }
@@ -899,6 +1292,8 @@ public sealed partial class AppState : IMemoryState
     {
         var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
         if (thread is null) return;
+        if (activeDb is { } db)
+            draftPersistence?.Forget(db, ComposerDraftKind.Topic, threadId);
         Profile.OwnThreads.Remove(thread);
         completedThreads.Remove(threadId);
         EmitTombstone("topic.delete", threadId);
@@ -1069,19 +1464,23 @@ public sealed partial class AppState : IMemoryState
         if (applyingReplicationProjection) return;
         var db = activeDb;
         if (db is null) return;
-        Enqueue(new ProfileWork(
-            Db: null,
-            BlobJson: null,
-            WriteAccountIndex: false,
-            IndexActiveId: null,
-            IndexAccounts: null,
-            Assets: Array.Empty<AssetWork>(),
-            Replications: new[]
-            {
-                new ReplicationWork(db, kind, action, entityId, conversationId,
-                    NewReplicationVersion(), bodyJson ?? string.Empty, targets.ToArray(),
-                    notificationIntent)
-            }));
+        void Persist() => Enqueue(new ProfileWork(
+                Db: null,
+                BlobJson: null,
+                WriteAccountIndex: false,
+                IndexActiveId: null,
+                IndexAccounts: null,
+                Assets: Array.Empty<AssetWork>(),
+                Replications: new[]
+                {
+                    new ReplicationWork(db, kind, action, entityId, conversationId,
+                        NewReplicationVersion(), bodyJson ?? string.Empty, targets.ToArray(),
+                        notificationIntent)
+                }));
+        if (ReplicationEventTestFaultScheduler?.Schedule(
+                new GeneratedReplicationEvent(kind, action, entityId, bodyJson ?? string.Empty),
+                Persist) != true)
+            Persist();
     }
 
     private string NewReplicationVersion()
@@ -1400,7 +1799,8 @@ public sealed partial class AppState : IMemoryState
     private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
     private readonly HashSet<string> completedThreads = new(StringComparer.Ordinal);
     private readonly QueuedTopicRunState queuedTopicRuns = new();
-    private readonly Dictionary<string, RemoteRunProjection> remoteRuns = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, RemoteRunProjection> remoteRuns =
+        new(StringComparer.Ordinal);
     private readonly HashSet<string> terminalRemoteRuns = new(StringComparer.Ordinal);
     // Last applied streamed-delta sequence per remote run (key: threadId \0 runId), so a viewing device
     // applies each forwarded reply fragment once and in order and ignores duplicates or reordered ones.
@@ -1438,14 +1838,14 @@ public sealed partial class AppState : IMemoryState
             thread.ExecutionAt = run.StartedAt;
             thread.LastActivityAt = ActivityTimestamp.Advance(
                 thread.LastActivityAt, run.StartedAt);
-            activeDb?.SetOwnThreadExecutionAndActivity(
+            activeDb?.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
                 thread.Id,
                 thread.ExecutionDeviceId,
                 thread.ExecutionDeviceName,
                 thread.ExecutionDevicePlatform,
                 thread.ExecutionAt,
                 thread.ExecutionRunId,
-                thread.LastActivityAt!.Value);
+                thread.LastActivityAt!.Value));
             EmitTopicUpsert(thread);
         }
         NotifyChanged();
@@ -1462,7 +1862,8 @@ public sealed partial class AppState : IMemoryState
         {
             var at = DateTimeOffset.UtcNow;
             thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-            activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
             EmitTopicUpsert(thread);
         }
         NotifyChanged();
@@ -1470,12 +1871,9 @@ public sealed partial class AppState : IMemoryState
 
     /// <summary>Gets the current remote run projection for a thread, or null.</summary>
     public RemoteRunProjection? GetRemoteRunProjection(string threadId)
-    {
-        lock (profileSyncGate)
-            return remoteRuns.TryGetValue(threadId, out var projection)
-                ? CloneRemoteRunProjection(projection)
-                : null;
-    }
+        => remoteRuns.TryGetValue(threadId, out var projection)
+            ? CloneRemoteRunProjection(projection)
+            : null;
 
     public void RegisterExpectedRemoteRun(
         string threadId,
@@ -1503,14 +1901,14 @@ public sealed partial class AppState : IMemoryState
                 throw new InvalidOperationException("The run target does not match the bound execution device.");
             var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, startedAt);
             if (activeDb is not null
-                && !activeDb.SetOwnThreadExecutionAndActivity(
+                && !activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
                     thread.Id,
                     target.DeviceId,
                     target.DeviceName,
                     target.Platform,
                     startedAt,
                     runId,
-                    activityAt))
+                    activityAt)))
                 throw new InvalidOperationException("The expected remote run could not be persisted.");
             terminalRemoteRuns.Remove(threadId + "\0" + runId);
             thread.ExecutionDeviceId = target.DeviceId;
@@ -1524,51 +1922,116 @@ public sealed partial class AppState : IMemoryState
         NotifyChanged();
     }
 
-    private enum RemoteRunApplyResult
-    {
-        Applied,
-        Ignored,
-        PersistenceFailed
-    }
-
     public void ApplyRemoteRunUpdate(TopicRunUpdatePayload update)
         => _ = TryApplyRemoteRunUpdate(update);
 
     public bool TryApplyRemoteRunUpdate(TopicRunUpdatePayload update)
     {
-        var correlationKey = update.ThreadId + "\0" + update.RunId;
-        lock (profileSyncGate)
-            if (terminalRemoteRuns.Contains(correlationKey)) return true;
+        var result = ApplyRemoteRunUpdateCore(update, null, null);
+        return result is RemoteTopicUpdatePersistenceResult.Applied
+            or RemoteTopicUpdatePersistenceResult.Ignored
+            or RemoteTopicUpdatePersistenceResult.Duplicate;
+    }
 
-        var terminal = update.Phase is TopicRunPhase.Completed
-            or TopicRunPhase.Failed
-            or TopicRunPhase.Cancelled;
-        if (!terminal && update.Delta is { Length: > 0 })
+    public RemoteTopicUpdatePersistenceResult TryApplyReceivedTopicControl(
+        TopicRunUpdatePayload update,
+        string sourceDeviceId,
+        MeshDb.ReceivedTopicControlItem control)
+        => ApplyRemoteRunUpdateCore(update, sourceDeviceId, control);
+
+    public RemoteTopicUpdatePersistenceResult ApplyRemoteTopicUpdate(
+        TopicRunUpdatePayload update,
+        string sourceDeviceId)
+        => ApplyRemoteRunUpdateCore(update, sourceDeviceId, null);
+
+    private RemoteTopicUpdatePersistenceResult ApplyRemoteRunUpdateCore(
+        TopicRunUpdatePayload update,
+        string? sourceDeviceId,
+        MeshDb.ReceivedTopicControlItem? control)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        var correlationKey = update.ThreadId + "\0" + update.RunId;
+        OwnThread? thread;
+        var terminal = TopicControlProtocol.IsTerminal(update);
+        lock (profileSyncGate)
         {
-            if (!ApplyQueuedTopicRunUpdate(update)) return false;
-            ApplyRemoteAssistantDelta(update);
-            return true;
+            var alreadyTerminal = terminalRemoteRuns.Contains(correlationKey);
+            if (alreadyTerminal && control is null)
+                return RemoteTopicUpdatePersistenceResult.Duplicate;
+            thread = Profile.OwnThreads.FirstOrDefault(candidate =>
+                string.Equals(candidate.Id, update.ThreadId, StringComparison.Ordinal));
+            if (activeDb is null)
+                return RemoteTopicUpdatePersistenceResult.PersistenceFailed;
+            var expected = sourceDeviceId is null
+                ? RemoteRunCorrelation.IsExpected(thread, update.ThreadId, update.RunId)
+                : IsExpectedTopicRunCorrelation(
+                    update, sourceDeviceId, allowRetained: control is not null);
+            if (!expected)
+                return activeDb is null
+                    ? RemoteTopicUpdatePersistenceResult.PersistenceFailed
+                    : RemoteTopicUpdatePersistenceResult.NotCorrelated;
+            sourceDeviceId ??= thread?.ExecutionDeviceId;
+            if (!TopicRunProtocol.IsValidIdentifier(sourceDeviceId))
+                return RemoteTopicUpdatePersistenceResult.NotCorrelated;
+
+            var persistence = activeDb.ExecuteDurableWrite(() =>
+                activeDb.ApplyRemoteTopicUpdate(update, sourceDeviceId!, control));
+            if (persistence != RemoteTopicUpdatePersistenceResult.Applied)
+                return persistence;
+
+            var activityAt = ActivityTimestamp.Advance(
+                thread!.LastActivityAt, update.Timestamp);
+            thread.LastActivityAt = activityAt;
+            thread.ExecutionAt ??= update.Timestamp;
+            thread.ExecutionRunId = terminal ? null : update.RunId;
+            if (terminal)
+            {
+                if (update.Result is { } terminalResult
+                    && !thread.Lines.Any(line => string.Equals(
+                        line.Id, terminalResult.LineId, StringComparison.Ordinal)))
+                {
+                    thread.Lines.Add(new ChatLine
+                    {
+                        Id = terminalResult.LineId,
+                        Role = "assistant",
+                        Text = terminalResult.Text,
+                        ReplyToLineId = update.TriggerLineId,
+                        At = terminalResult.At,
+                        ModelId = terminalResult.ModelId,
+                        Reasoning = terminalResult.Reasoning
+                    });
+                }
+                remoteRuns.TryRemove(update.ThreadId, out _);
+                terminalRemoteRuns.Add(correlationKey);
+                remoteDeltaSeq.Remove(correlationKey);
+                liveAgentRenderState.EndDraft(update.ThreadId);
+                assistantDraftRefreshGate.Reset(update.ThreadId);
+            }
+            else if (update.Delta is not { Length: > 0 })
+            {
+                remoteRuns[update.ThreadId] = new RemoteRunProjection
+                {
+                    RunId = update.RunId,
+                    ThreadId = update.ThreadId,
+                    Phase = update.Phase,
+                    Status = update.Status,
+                    Plan = update.Plan,
+                    Subtasks = update.Subtasks,
+                    Steps = update.Steps,
+                    Queued = update.Queued,
+                    Error = update.Error,
+                    FailureCode = update.FailureCode,
+                    Timestamp = update.Timestamp
+                };
+            }
         }
 
-        var result = ApplyRemoteRunProjectionCore(update.ThreadId, new RemoteRunProjection
-        {
-            RunId = update.RunId,
-            ThreadId = update.ThreadId,
-            Phase = update.Phase,
-            Status = update.Status,
-            Plan = update.Plan,
-            Subtasks = update.Subtasks,
-            Steps = update.Steps,
-            Queued = update.Queued,
-            Error = update.Error,
-            FailureCode = update.FailureCode,
-            Timestamp = update.Timestamp
-        });
-        if (result == RemoteRunApplyResult.PersistenceFailed) return false;
-        if (result == RemoteRunApplyResult.Applied
-            && !ApplyQueuedTopicRunUpdate(update))
-            return false;
-        return true;
+        ApplyQueuedTopicRunUpdate(update);
+        if (!terminal && update.Delta is { Length: > 0 })
+            ApplyRemoteAssistantDelta(update);
+        EmitTopicUpsert(thread!);
+        NotifyChanged();
+        return RemoteTopicUpdatePersistenceResult.Applied;
     }
 
     // Applies one reply fragment forwarded by the executing device into this device's live draft so the
@@ -1612,77 +2075,21 @@ public sealed partial class AppState : IMemoryState
 
     /// <summary>Applies a remote run update projection for a thread and refreshes the UI.</summary>
     public void ApplyRemoteRunProjection(string threadId, RemoteRunProjection projection)
-        => _ = ApplyRemoteRunProjectionCore(threadId, projection);
-
-    private RemoteRunApplyResult ApplyRemoteRunProjectionCore(
-        string threadId,
-        RemoteRunProjection projection)
     {
-        var correlationKey = threadId + "\0" + projection.RunId;
-        if (!string.Equals(threadId, projection.ThreadId, StringComparison.Ordinal)
-            || string.IsNullOrWhiteSpace(projection.RunId)
-            || projection.Timestamp == default)
-            return RemoteRunApplyResult.Ignored;
-
-        OwnThread? thread;
-        lock (profileSyncGate)
-        {
-            if (terminalRemoteRuns.Contains(correlationKey))
-                return RemoteRunApplyResult.Ignored;
-            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
-            if (!RemoteRunCorrelation.IsExpected(thread, threadId, projection.RunId)
-                || remoteRuns.TryGetValue(threadId, out var current)
-                   && projection.Timestamp < current.Timestamp)
-                return RemoteRunApplyResult.Ignored;
-
-            var activityAt = ActivityTimestamp.Advance(
-                thread!.LastActivityAt, projection.Timestamp);
-            var terminal = projection.Phase is TopicRunPhase.Completed
-                or TopicRunPhase.Failed
-                or TopicRunPhase.Cancelled;
-            var nextRunId = terminal ? null : projection.RunId;
-            var executionAt = thread.ExecutionAt ?? projection.Timestamp;
-            if (activeDb is null)
-                return RemoteRunApplyResult.PersistenceFailed;
-            var persisted = terminal
-                ? activeDb.CompleteOwnThreadRunAndDeleteTopicOutbox(
-                    thread.Id,
-                    projection.RunId,
-                    thread.ExecutionDeviceId,
-                    thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform,
-                    executionAt,
-                    activityAt)
-                : activeDb.SetOwnThreadExecutionAndActivity(
-                    thread.Id,
-                    thread.ExecutionDeviceId,
-                    thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform,
-                    executionAt,
-                    nextRunId,
-                    activityAt);
-            if (!persisted)
-                return RemoteRunApplyResult.PersistenceFailed;
-
-            thread.LastActivityAt = activityAt;
-            thread.ExecutionAt = executionAt;
-            thread.ExecutionRunId = nextRunId;
-            if (terminal)
-            {
-                remoteRuns.Remove(threadId);
-                terminalRemoteRuns.Add(correlationKey);
-                remoteDeltaSeq.Remove(correlationKey);
-                liveAgentRenderState.EndDraft(threadId);
-                assistantDraftRefreshGate.Reset(threadId);
-            }
-            else
-            {
-                remoteRuns[threadId] = CloneRemoteRunProjection(projection);
-            }
-        }
-        EmitTopicUpsert(thread!);
-        NotifyChanged();
-        return RemoteRunApplyResult.Applied;
+        if (!string.Equals(threadId, projection.ThreadId, StringComparison.Ordinal))
+            return;
+        _ = TryApplyRemoteRunUpdate(new TopicRunUpdatePayload(
+            projection.RunId,
+            projection.ThreadId,
+            projection.Phase,
+            projection.Status,
+            projection.Plan,
+            projection.Subtasks,
+            projection.Steps,
+            projection.Queued,
+            projection.Error,
+            projection.FailureCode,
+            projection.Timestamp));
     }
 
     /// <summary>Clears the remote run projection for a thread (run completed or cancelled).</summary>
@@ -1706,16 +2113,16 @@ public sealed partial class AppState : IMemoryState
             var at = clearedAt ?? DateTimeOffset.UtcNow;
             var activityAt = ActivityTimestamp.Advance(thread!.LastActivityAt, at);
             if (activeDb is not null
-                && !activeDb.SetOwnThreadExecutionAndActivity(
+                && !activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
                     thread.Id,
                     thread.ExecutionDeviceId,
                     thread.ExecutionDeviceName,
                     thread.ExecutionDevicePlatform,
                     thread.ExecutionAt,
                     null,
-                    activityAt))
+                    activityAt)))
                 return;
-            remoteRuns.Remove(threadId);
+            remoteRuns.TryRemove(threadId, out _);
             terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
             thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
@@ -1741,11 +2148,33 @@ public sealed partial class AppState : IMemoryState
         lock (profileSyncGate)
         {
             remoteRuns.TryGetValue(thread.Id, out var projection);
-            var queuedRun = TopicRunProtocol.IsValidIdentifier(replyToLineId)
+            var hasReplyIdentity = TopicRunProtocol.IsValidIdentifier(replyToLineId);
+            var queuedRun = hasReplyIdentity
                 ? queuedTopicRuns.FindByLine(thread.Id, replyToLineId!)
                 : null;
-            var runId = RemoteRunReconciliation.RunIdForAnswer(
-                thread.Id, replyToLineId, queuedRun, projection, answerAt);
+            MeshDb.TopicRunCorrelationItem? durableCorrelation = null;
+            if (hasReplyIdentity && activeDb is not null)
+            {
+                durableCorrelation = activeDb.ExecuteDurableWrite(
+                    () => activeDb.FindTopicRunCorrelation(thread.Id, replyToLineId!));
+            }
+            var runId = durableCorrelation?.RunId
+                        ?? RemoteRunReconciliation.RunIdForAnswer(
+                            thread.Id, replyToLineId, queuedRun, projection, answerAt);
+            if (!hasReplyIdentity && activeDb is not null)
+            {
+                if (activeDb.ExecuteDurableWrite(
+                        () => activeDb.HasTopicRunCorrelationForThread(thread.Id)))
+                    return false;
+                // Pre-correlation profiles persisted only the run and start time on the topic.
+                // This is the sole upgrade fallback: an uncorrelated answer may finish that legacy
+                // run only when no durable run identity exists for the topic.
+                if (runId is null
+                    && TopicRunProtocol.IsValidIdentifier(thread.ExecutionRunId)
+                    && thread.ExecutionAt is { } executionAt
+                    && answerAt >= executionAt)
+                    runId = thread.ExecutionRunId;
+            }
             if (runId is null)
                 return false;
 
@@ -1753,35 +2182,45 @@ public sealed partial class AppState : IMemoryState
             var projectionMatches = projection is not null
                                     && string.Equals(
                                         projection.RunId, runId, StringComparison.Ordinal);
-            var outboxDeletedAtomically = false;
-            if (string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
-            {
-                var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, answerAt);
-                if (activeDb is not null
-                    && !activeDb.CompleteOwnThreadRunAndDeleteTopicOutbox(
-                        thread.Id,
-                        runId,
-                        thread.ExecutionDeviceId,
-                        thread.ExecutionDeviceName,
-                        thread.ExecutionDevicePlatform,
-                        thread.ExecutionAt ?? answerAt,
-                        activityAt))
-                    return false;
-                outboxDeletedAtomically = activeDb is not null;
-                thread.LastActivityAt = activityAt;
-                thread.ExecutionRunId = null;
-            }
+            if (thread.ExecutionRunId is null
+                && queuedRun is null
+                && !projectionMatches
+                && terminalRemoteRuns.Contains(correlationKey))
+                return false;
+            if (thread.ExecutionRunId is not null
+                && !string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
+                return false;
 
+            var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, answerAt);
+            if (activeDb is not null
+                && !activeDb.ExecuteDurableWrite(() => activeDb.CompleteOwnThreadRunAndDeleteTopicOutbox(
+                    thread.Id,
+                    runId,
+                    replyToLineId,
+                    thread.ExecutionDeviceId,
+                    thread.ExecutionDeviceName,
+                    thread.ExecutionDevicePlatform,
+                    thread.ExecutionAt ?? answerAt,
+                    activityAt)))
+                return false;
+
+            thread.LastActivityAt = activityAt;
+            thread.ExecutionRunId = null;
             queuedTopicRuns.Complete(thread.Id, runId);
-            if (!outboxDeletedAtomically) activeDb?.DeleteTopicOutbox(runId);
             terminalRemoteRuns.Add(correlationKey);
             remoteDeltaSeq.Remove(correlationKey);
             if (projectionMatches)
             {
-                remoteRuns.Remove(thread.Id);
+                remoteRuns.TryRemove(thread.Id, out _);
                 liveAgentRenderState.EndDraft(thread.Id);
                 assistantDraftRefreshGate.Reset(thread.Id);
             }
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "topic-terminal-cleanup",
+                $"thread={StableDiagnosticId(thread.Id)}"
+                + $";run={StableDiagnosticId(runId)}"
+                + $";projection_cleared={projectionMatches.ToString().ToLowerInvariant()}"
+                + ";result=converged");
             return true;
         }
     }
@@ -1808,9 +2247,10 @@ public sealed partial class AppState : IMemoryState
         IReadOnlyList<AgentSubtaskState>? subtasks = null,
         DateTimeOffset? updatedAt = null)
     {
+        AgentRunState run;
         lock (profileSyncGate)
         {
-            if (!agentRuns.TryGetValue(threadId, out var run)) return;
+            if (!agentRuns.TryGetValue(threadId, out run!)) return;
             agentRuns[threadId] = run with
             {
                 Phase = phase, Subtasks = (subtasks ?? run.Subtasks).ToArray()
@@ -1834,7 +2274,8 @@ public sealed partial class AppState : IMemoryState
 
             var at = updatedAt ?? DateTimeOffset.UtcNow;
             thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-            activeDb?.SetOwnThreadActivity(thread.Id, thread.LastActivityAt!.Value);
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt!.Value));
             EmitTopicUpsert(thread, notificationIntent);
         }
         NotifyChanged();
@@ -2010,7 +2451,8 @@ public sealed partial class AppState : IMemoryState
         {
             if (terminalRemoteRuns.Contains(update.ThreadId + "\0" + update.RunId))
                 return false;
-            if (queuedTopicRuns.IsKnownRun(update.ThreadId, update.RunId)) return true;
+            if (queuedTopicRuns.Matches(
+                    update.ThreadId, update.RunId, update.TriggerLineId)) return true;
             if (update.Phase != TopicRunPhase.Queued
                 || !TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
                 return false;
@@ -2025,53 +2467,86 @@ public sealed partial class AppState : IMemoryState
         }
     }
 
-    private bool ApplyQueuedTopicRunUpdate(TopicRunUpdatePayload update)
+    public bool IsExpectedTopicRunCorrelation(
+        TopicRunUpdatePayload update,
+        string sourceDeviceId,
+        bool allowRetained)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceDeviceId);
+        lock (profileSyncGate)
+        {
+            var thread = Profile.OwnThreads.FirstOrDefault(item =>
+                string.Equals(item.Id, update.ThreadId, StringComparison.Ordinal));
+            var current = RemoteRunCorrelation.IsExpected(
+                thread, update.ThreadId, update.RunId);
+            var queued = IsExpectedQueuedRunUpdate(update);
+            var correlation = activeDb?.GetTopicRunCorrelation(update.RunId);
+            if (correlation is not null
+                && correlation.TriggerLineId is null
+                && (current || queued)
+                && TopicRunProtocol.IsValidIdentifier(update.TriggerLineId)
+                && activeDb!.ExecuteDurableWrite(() =>
+                    activeDb.TryBindLegacyTopicRunCorrelation(
+                        update.RunId,
+                        update.ThreadId,
+                        sourceDeviceId,
+                        update.TriggerLineId!)))
+            {
+                correlation = activeDb.GetTopicRunCorrelation(update.RunId);
+            }
+            var durableIdentity = correlation is not null
+                                  && string.Equals(
+                                      correlation.ThreadId, update.ThreadId, StringComparison.Ordinal)
+                                  && string.Equals(
+                                      correlation.TargetDeviceId, sourceDeviceId, StringComparison.Ordinal)
+                                  && string.Equals(
+                                      correlation.TriggerLineId,
+                                      update.TriggerLineId,
+                                      StringComparison.Ordinal);
+            if (correlation is null || !durableIdentity)
+                return false;
+            return (current || queued)
+                   || allowRetained && durableIdentity && correlation!.TerminalAt is not null;
+        }
+    }
+
+    private void ApplyQueuedTopicRunUpdate(TopicRunUpdatePayload update)
     {
         if (update.Phase == TopicRunPhase.Queued)
         {
-            if (!SetTopicOutboxState(update.RunId, TopicOutboxStates.DeviceQueued))
-                return false;
             if (TopicRunProtocol.IsValidIdentifier(update.TriggerLineId))
                 TrackQueuedTopicRun(
                     update.ThreadId, update.RunId, update.TriggerLineId!, TopicQueueStage.Device);
-            return true;
+            return;
         }
         if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
         {
-            if (!DeleteTopicOutbox(update.RunId)) return false;
             CompleteQueuedTopicRun(update.ThreadId, update.RunId);
-            return true;
+            return;
         }
-        if (!SetTopicOutboxState(update.RunId, TopicOutboxStates.Running))
-            return false;
         StartQueuedTopicRun(update.ThreadId, update.RunId);
-        return true;
     }
 
     /// <summary>True when a specific line is still waiting in some thread's queue (drives the "queued" tag).</summary>
     public bool IsLineQueued(ChatLine line)
     {
         ArgumentNullException.ThrowIfNull(line);
-        lock (profileSyncGate)
-            return queuedTopicRuns.IsLineWaiting(line.Id);
+        return queuedTopicRuns.IsLineWaiting(line.Id);
     }
 
     public QueuedTopicRunInfo? QueuedTopicRunForLine(ChatLine line)
     {
         ArgumentNullException.ThrowIfNull(line);
-        lock (profileSyncGate)
-            return queuedTopicRuns.FindByLine(line.Id);
+        return queuedTopicRuns.FindByLine(line.Id);
     }
 
     public bool IsQueuedTopicRunLine(string threadId, string runId, string lineId)
     {
-        lock (profileSyncGate)
-        {
-            var queued = queuedTopicRuns.FindByLine(threadId, lineId);
-            return queued is { Waiting: true }
-                   && string.Equals(queued.ThreadId, threadId, StringComparison.Ordinal)
-                   && string.Equals(queued.RunId, runId, StringComparison.Ordinal);
-        }
+        var queued = queuedTopicRuns.FindByLine(threadId, lineId);
+        return queued is { Waiting: true }
+               && string.Equals(queued.ThreadId, threadId, StringComparison.Ordinal)
+               && string.Equals(queued.RunId, runId, StringComparison.Ordinal);
     }
 
     public bool RemoveCancelledQueuedTopicLine(string threadId, string runId, string lineId)
@@ -2113,7 +2588,8 @@ public sealed partial class AppState : IMemoryState
                 thread.Lines.RemoveAll(line =>
                     string.Equals(line.Id, lineId, StringComparison.Ordinal)
                     || string.Equals(line.ReplyToLineId, lineId, StringComparison.Ordinal));
-                activeDb?.DeleteOwnChatLine(threadId, lineId);
+                activeDb?.ExecuteDurableWrite(
+                    () => activeDb.DeleteOwnChatLine(threadId, lineId));
                 queuedTopicRuns.Complete(threadId, runId);
                 EmitTombstone("topic.line.delete", DomainProjectionEntityIds.TopicLine(threadId, lineId));
                 visibleChanged = true;
@@ -2125,17 +2601,11 @@ public sealed partial class AppState : IMemoryState
     }
 
     public bool IsKnownQueuedTopicRun(string threadId, string runId)
-    {
-        lock (profileSyncGate)
-            return queuedTopicRuns.IsKnownRun(threadId, runId);
-    }
+        => queuedTopicRuns.IsKnownRun(threadId, runId);
 
     /// <summary>Number of lines currently queued for a thread.</summary>
     public int QueuedCountForThread(string threadId)
-    {
-        lock (profileSyncGate)
-            return queuedTopicRuns.WaitingCount(threadId);
-    }
+        => queuedTopicRuns.WaitingCount(threadId);
 
     /// <summary>Clears transient queue presentation state for a topic.</summary>
     public void ClearThreadQueue(string threadId)
@@ -2276,7 +2746,11 @@ public sealed partial class AppState : IMemoryState
         imported.PrivateKey = priv;
         imported.PublicKey = pub;
 
-        if (activeId is not null && activeDb is not null) FlushBlocking();
+        if (activeId is not null && activeDb is not null)
+        {
+            FlushBlocking();
+            RaiseActiveAccountChanging();
+        }
 
         var id = NewId();
         var db = OpenDb(id);
@@ -2284,13 +2758,15 @@ public sealed partial class AppState : IMemoryState
         {
             conv.Handle = PrepareConversationForPersistence(conv);
             DeriveActivityMetadata(conv);
-            db.EnsureConversation(conv.Handle, conv.CreatedAt);
+            db.ExecuteDurableWrite(() => db.EnsureConversation(conv.Handle, conv.CreatedAt));
             PersistConversationMetadata(db, conv);
             if (conv.LastActivityAt.HasValue)
-                db.SetConversationActivity(conv.Handle, conv.LastActivityAt.Value);
+                db.ExecuteDurableWrite(
+                    () => db.SetConversationActivity(conv.Handle, conv.LastActivityAt.Value));
             if (conv.IsPinned)
-                db.SetConversationPin(conv.Handle, true);
-            foreach (var line in conv.Lines) db.AppendChatLine(Norm(conv.Handle), line);
+                db.ExecuteDurableWrite(() => db.SetConversationPin(conv.Handle, true));
+            foreach (var line in conv.Lines)
+                db.ExecuteDurableWrite(() => db.AppendChatLine(Norm(conv.Handle), line));
         }
         // Migrate a legacy single OwnChat (older exports) into a thread so nothing is lost.
         if (imported.OwnChat.Count > 0)
@@ -2311,40 +2787,49 @@ public sealed partial class AppState : IMemoryState
             thread.LastActivityAt ??= thread.Lines.Count == 0
                 ? thread.CreatedAt
                 : thread.Lines.Max(line => line.At);
-            db.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt);
+            db.ExecuteDurableWrite(
+                () => db.EnsureOwnThread(thread.Id, thread.Title, thread.CreatedAt));
             if (thread.LastActivityAt.HasValue)
-                db.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value);
+                db.ExecuteDurableWrite(
+                    () => db.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
             if (thread.IsPinned)
-                db.SetOwnThreadPin(thread.Id, true);
+                db.ExecuteDurableWrite(() => db.SetOwnThreadPin(thread.Id, true));
             if (thread.ExecutionDeviceId is not null || thread.ExecutionAt.HasValue || thread.ExecutionRunId is not null)
-                db.SetOwnThreadExecution(
+                db.ExecuteDurableWrite(() => db.SetOwnThreadExecution(
                     thread.Id,
                     thread.ExecutionDeviceId,
                     thread.ExecutionAt,
                     thread.ExecutionRunId,
                     thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform);
-            foreach (var line in thread.Lines) db.AppendOwnChat(thread.Id, line);
+                    thread.ExecutionDevicePlatform));
+            foreach (var line in thread.Lines)
+                db.ExecuteDurableWrite(() => db.AppendOwnChat(thread.Id, line));
         }
         for (var i = 0; i < imported.Memories.Count; i++)
         {
             var memory = MemoryPolicy.Normalize(imported.Memories[i]);
             imported.Memories[i] = memory;
-            db.UpsertMemory(memory);
+            db.ExecuteDurableWrite(() => db.UpsertMemory(memory));
         }
-        db.SaveProfile(imported);
+        db.ExecuteDurableWrite(() => db.SaveProfile(imported));
 
-        if (activeId is not null) RaiseActiveAccountChanging();
-        activeDb?.Dispose();
-        activeDb = db;
-        activeId = id;
-        Profile = imported;
-        MigrateAndHydrateAssets(db);
-        RehydrateUnread();
-        RehydrateTopicExecutionState();
-        NotificationCoordinatorBridge.ResetForAccount();
-        accounts.Add(new AccountRef { Id = id, Handle = imported.Handle, DisplayName = imported.DisplayName });
-        WriteIndex();
+        lock (profileSyncGate)
+        {
+            Volatile.Write(ref activeDatabaseIdentity, null);
+            activeDb?.Dispose();
+            activeDb = db;
+            activeId = id;
+            Volatile.Write(
+                ref activeDatabaseIdentity,
+                NewActiveDatabaseIdentity(db, id));
+            Profile = imported;
+            MigrateAndHydrateAssets(db);
+            RehydrateUnread();
+            RehydrateTopicExecutionState();
+            NotificationCoordinatorBridge.ResetForAccount();
+            accounts.Add(new AccountRef { Id = id, Handle = imported.Handle, DisplayName = imported.DisplayName });
+            WriteIndex();
+        }
         NotifyChanged();
         return id;
     }
@@ -2362,39 +2847,58 @@ public sealed partial class AppState : IMemoryState
             FlushBlocking();
             RaiseActiveAccountChanging();
         }
-        activeDb?.Dispose();
-        activeDb = null;
-        activeId = null;
-        Profile = new MeshProfile();
-        ResetAssetState();
-        queuedTopicRuns.Clear();
-        NotificationCoordinatorBridge.ResetForAccount();
-        WriteIndex();
+        lock (profileSyncGate)
+        {
+            Volatile.Write(ref activeDatabaseIdentity, null);
+            activeDb?.Dispose();
+            activeDb = null;
+            activeId = null;
+            Profile = new MeshProfile();
+            ResetAssetState();
+            queuedTopicRuns.Clear();
+            NotificationCoordinatorBridge.ResetForAccount();
+            WriteIndex();
+        }
         NotifyChanged();
     }
 
     /// <summary>Switch the active identity to a previously saved account.</summary>
     public bool SwitchAccount(string id)
     {
-        if (id == activeId) return true;
+        lock (profileSyncGate)
+        {
+            if (id == activeId) return true;
+        }
         MeshDb? db = null;
         try
         {
             db = OpenDb(id);
             var loaded = db.LoadProfile();
             if (loaded is null) { db.Dispose(); return false; }
-
-            if (activeId is not null) FlushBlocking(); // persist the one we're leaving
+            if (activeId is not null) FlushBlocking();
             RaiseActiveAccountChanging();
-            activeDb?.Dispose();
-            activeDb = db;
-            activeId = id;
-            Profile = loaded;
-            MigrateAndHydrateAssets(db);
-            RehydrateUnread();
-            RehydrateTopicExecutionState();
-            NotificationCoordinatorBridge.ResetForAccount();
-            WriteIndex();
+
+            lock (profileSyncGate)
+            {
+                if (id == activeId)
+                {
+                    db.Dispose();
+                    return true;
+                }
+                Volatile.Write(ref activeDatabaseIdentity, null);
+                activeDb?.Dispose();
+                activeDb = db;
+                activeId = id;
+                Volatile.Write(
+                    ref activeDatabaseIdentity,
+                    NewActiveDatabaseIdentity(db, id));
+                Profile = loaded;
+                MigrateAndHydrateAssets(db);
+                RehydrateUnread();
+                RehydrateTopicExecutionState();
+                NotificationCoordinatorBridge.ResetForAccount();
+                WriteIndex();
+            }
             NotifyChanged();
             return true;
         }
@@ -2409,21 +2913,29 @@ public sealed partial class AppState : IMemoryState
     /// <summary>Permanently remove a saved identity: its database file and its master key.</summary>
     public void DeleteAccount(string id)
     {
-        accounts.RemoveAll(a => a.Id == id);
-        if (id == activeId)
+        if (string.Equals(id, activeId, StringComparison.Ordinal))
         {
             FlushBlocking();
             RaiseActiveAccountChanging();
-            activeDb?.Dispose();
-            activeDb = null;
-            activeId = null;
-            Profile = new MeshProfile();
-            ResetAssetState();
-            NotificationCoordinatorBridge.ResetForAccount();
+        }
+        lock (profileSyncGate)
+        {
+            accounts.RemoveAll(a => a.Id == id);
+            if (id == activeId)
+            {
+                Volatile.Write(ref activeDatabaseIdentity, null);
+                activeDb?.Dispose();
+                activeDb = null;
+                activeId = null;
+                Profile = new MeshProfile();
+                ResetAssetState();
+                queuedTopicRuns.Clear();
+                NotificationCoordinatorBridge.ResetForAccount();
+            }
+            WriteIndex();
         }
         try { var p = DbPath(id); if (File.Exists(p)) File.Delete(p); } catch { }
         secrets.DeleteDbKey(id);
-        WriteIndex();
         NotifyChanged();
     }
 
@@ -2533,8 +3045,8 @@ public sealed partial class AppState : IMemoryState
         conv.GroupOwnerHandle = normalized.OwnerHandle;
         conv.GroupMembers = normalized.MemberHandles.ToList();
         conv.GroupVersion = normalized.Version;
-        activeDb?.SetConversationGroup(
-            key, conv.GroupId, conv.GroupName, conv.GroupOwnerHandle, conv.GroupMembers, conv.GroupVersion);
+        activeDb?.ExecuteDurableWrite(() => activeDb.SetConversationGroup(
+            key, conv.GroupId, conv.GroupName, conv.GroupOwnerHandle, conv.GroupMembers, conv.GroupVersion));
         EmitConversationUpsert(conv);
         NotifyChanged();
         return conv;
@@ -2556,7 +3068,8 @@ public sealed partial class AppState : IMemoryState
         {
             conv = new Conversation { Handle = key, ServiceId = serviceId, ServiceName = name, ProviderHandle = provider };
             Profile.Conversations.Add(conv);
-            activeDb?.SetConversationService(key, serviceId, name, provider);
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.SetConversationService(key, serviceId, name, provider));
             changed = true;
         }
         else if (conv.ServiceId != serviceId
@@ -2566,7 +3079,8 @@ public sealed partial class AppState : IMemoryState
             conv.ServiceId = serviceId;
             conv.ServiceName = name;
             conv.ProviderHandle = provider;
-            activeDb?.SetConversationService(key, serviceId, name, provider);
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.SetConversationService(key, serviceId, name, provider));
             changed = true;
         }
         if (changed) EmitConversationUpsert(conv);
@@ -2582,7 +3096,7 @@ public sealed partial class AppState : IMemoryState
         {
             conv = new Conversation { Handle = handle, CreatedAt = DateTimeOffset.UtcNow };
             Profile.Conversations.Add(conv);
-            activeDb?.EnsureConversation(handle);
+            activeDb?.ExecuteDurableWrite(() => activeDb.EnsureConversation(handle));
             EmitConversationUpsert(conv);
         }
         return conv;
@@ -2604,7 +3118,8 @@ public sealed partial class AppState : IMemoryState
             var ordered = Profile.Conversations.ToList();
             ordered.RemoveAt(oldIndex);
             ordered.Insert(newIndex, conversation);
-            activeDb?.ReorderConversations(ordered.Select(c => c.Handle).ToList());
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.ReorderConversations(ordered.Select(c => c.Handle).ToList()));
             Profile.Conversations.RemoveAt(oldIndex);
             Profile.Conversations.Insert(newIndex, conversation);
         }
@@ -2629,7 +3144,8 @@ public sealed partial class AppState : IMemoryState
             if (conv is null || conv.IsPinned == pinned) return;
             var at = DateTimeOffset.UtcNow;
             var activityAt = ActivityTimestamp.Advance(conv.LastActivityAt, at);
-            activeDb?.SetConversationPinAndActivity(h, pinned, activityAt);
+            activeDb?.ExecuteDurableWrite(
+                () => activeDb.SetConversationPinAndActivity(h, pinned, activityAt));
             conv.IsPinned = pinned;
             conv.LastActivityAt = activityAt;
         }
@@ -2659,6 +3175,8 @@ public sealed partial class AppState : IMemoryState
         var conversation = Profile.Conversations.FirstOrDefault(
             c => c.Handle.Equals(h, StringComparison.OrdinalIgnoreCase));
         if (conversation is null) return;
+        if (activeDb is { } db)
+            draftPersistence?.Forget(db, ComposerDraftKind.Conversation, h);
         Profile.Conversations.Remove(conversation);
         unread.Remove(h);
         if (Profile.UnreadFrom.Remove(h)) ScheduleProfileSave();
@@ -2763,7 +3281,7 @@ public sealed partial class AppState : IMemoryState
     private static void PersistConversationMetadata(MeshDb db, Conversation conversation)
     {
         if (conversation.IsGroup)
-            db.SetConversationGroup(
+            db.ExecuteDurableWrite(() => db.SetConversationGroup(
                 conversation.Handle,
                 conversation.GroupId!,
                 conversation.GroupName
@@ -2771,7 +3289,7 @@ public sealed partial class AppState : IMemoryState
                 conversation.GroupOwnerHandle
                     ?? throw new InvalidOperationException($"Group conversation '{conversation.Handle}' has no owner."),
                 conversation.GroupMembers,
-                conversation.GroupVersion);
+                conversation.GroupVersion));
     }
 
     private static void DeriveActivityMetadata(Conversation conversation)

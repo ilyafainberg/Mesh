@@ -1,5 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Mesh.Shared;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Mesh.App.Services;
 
@@ -36,18 +38,27 @@ public sealed partial class MeshDb
     /// references, applies the domain change and advances <c>next_seq</c> in one transaction.
     /// Any failure rolls the sequence allocation back, so an origin log can never acquire a hole.
     /// </summary>
-    public ReplicationEvent AllocateAndAppendLocalEvent(
+    internal ReplicationEvent AllocateAndAppendLocalEvent(
         string originDeviceId,
         Func<string, ulong, ReplicationEvent> eventFactory,
         IReadOnlyCollection<string> targetAccounts,
         Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainApply,
-        Func<string, ReplicationOutboxNotification>? notificationForTarget = null)
+        Func<string, ReplicationOutboxNotification>? notificationForTarget = null,
+        string? intentId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(originDeviceId);
         ArgumentNullException.ThrowIfNull(eventFactory);
         ArgumentNullException.ThrowIfNull(targetAccounts);
 
         using var journalLock = EnterLocalOriginJournalLock();
+        if (!string.IsNullOrWhiteSpace(intentId))
+        {
+            var completedEventId = GetCompletedReplicationIntentEvent(intentId);
+            if (completedEventId is not null)
+                return GetEvent(completedEventId)
+                    ?? throw new InvalidOperationException(
+                        "A completed replication intent referenced a missing event.");
+        }
         using var tx = conn.BeginTransaction(deferred: false);
         string epoch;
         long next;
@@ -89,6 +100,20 @@ public sealed partial class MeshDb
 
         domainApply?.Invoke(conn, tx, evt);
 
+        if (!string.IsNullOrWhiteSpace(intentId))
+        {
+            using var complete = conn.CreateCommand();
+            complete.Transaction = tx;
+            complete.CommandText = """
+                INSERT INTO replication_local_intent_events(intent_id, event_id, completed_at)
+                VALUES($intent, $event, $at);
+                """;
+            complete.Parameters.AddWithValue("$intent", intentId);
+            complete.Parameters.AddWithValue("$event", evt.EventId);
+            complete.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"));
+            complete.ExecuteNonQuery();
+        }
+
         using (var bump = conn.CreateCommand())
         {
             bump.Transaction = tx;
@@ -108,6 +133,223 @@ public sealed partial class MeshDb
         return evt;
     }
 
+    public sealed record PendingReplicationIntent(
+        string IntentId,
+        string Kind,
+        string EntityId,
+        string CausalVersion,
+        string TargetAccountsJson,
+        string ContentHash,
+        string EncryptedEnvelope,
+        string RosterState);
+
+    internal void StorePendingReplicationIntent(
+        PendingReplicationIntent intent,
+        Action<SqliteConnection, SqliteTransaction>? domainApply)
+    {
+        ArgumentNullException.ThrowIfNull(intent);
+        using var journalLock = EnterLocalOriginJournalLock();
+        if (GetCompletedReplicationIntentEvent(intent.IntentId) is not null) return;
+
+        using var tx = conn.BeginTransaction(deferred: false);
+        using var insert = conn.CreateCommand();
+        insert.Transaction = tx;
+        insert.CommandText = """
+            INSERT INTO replication_pending_intents(
+                intent_id, kind, entity_id, causal_version, target_accounts_json,
+                content_hash, encrypted_envelope, roster_state, durable_sequence, attempts,
+                last_error, created_at, updated_at)
+            VALUES(
+                $intent, $kind, $entity, $causal, $targets,
+                $hash, $envelope, $state,
+                (SELECT COALESCE(MAX(durable_sequence), 0) + 1 FROM replication_pending_intents), 0,
+                NULL, $now, $now)
+            ON CONFLICT(intent_id) DO NOTHING;
+            """;
+        insert.Parameters.AddWithValue("$intent", intent.IntentId);
+        insert.Parameters.AddWithValue("$kind", intent.Kind);
+        insert.Parameters.AddWithValue("$entity", intent.EntityId);
+        insert.Parameters.AddWithValue("$causal", intent.CausalVersion);
+        insert.Parameters.AddWithValue("$targets", intent.TargetAccountsJson);
+        insert.Parameters.AddWithValue("$hash", intent.ContentHash);
+        insert.Parameters.AddWithValue("$envelope", intent.EncryptedEnvelope);
+        insert.Parameters.AddWithValue("$state", intent.RosterState);
+        insert.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        if (insert.ExecuteNonQuery() == 1)
+            domainApply?.Invoke(conn, tx);
+        tx.Commit();
+    }
+
+    public IReadOnlyList<PendingReplicationIntent> GetPendingReplicationIntents()
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT intent_id, kind, entity_id, causal_version, target_accounts_json,
+                   content_hash, encrypted_envelope, roster_state
+            FROM replication_pending_intents
+            ORDER BY durable_sequence, intent_id;
+            """;
+        using var reader = cmd.ExecuteReader();
+        var result = new List<PendingReplicationIntent>();
+        while (reader.Read())
+        {
+            result.Add(new PendingReplicationIntent(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5),
+                reader.GetString(6),
+                reader.GetString(7)));
+        }
+        return result;
+    }
+
+    public bool HasPendingReplicationIntents()
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS(SELECT 1 FROM replication_pending_intents LIMIT 1);";
+        return Convert.ToInt32(cmd.ExecuteScalar()) != 0;
+    }
+
+    public string ProtectReplicationIntent(string plaintext, string associatedData)
+    {
+        ArgumentNullException.ThrowIfNull(plaintext);
+        ArgumentNullException.ThrowIfNull(associatedData);
+        var encryptionKey = DeriveReplicationIntentKey();
+        try
+        {
+            var nonce = RandomNumberGenerator.GetBytes(AesGcm.NonceByteSizes.MaxSize);
+            var bytes = Encoding.UTF8.GetBytes(plaintext);
+            var cipher = new byte[bytes.Length];
+            var tag = new byte[AesGcm.TagByteSizes.MaxSize];
+            using var aes = new AesGcm(encryptionKey, tag.Length);
+            aes.Encrypt(
+                nonce,
+                bytes,
+                cipher,
+                tag,
+                Encoding.UTF8.GetBytes(associatedData));
+            return "local-v1:" + Convert.ToBase64String(
+                nonce.Concat(tag).Concat(cipher).ToArray());
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encryptionKey);
+        }
+    }
+
+    public string? UnprotectReplicationIntent(string protectedValue, string associatedData)
+    {
+        if (!protectedValue.StartsWith("local-v1:", StringComparison.Ordinal))
+            return null;
+        var encryptionKey = DeriveReplicationIntentKey();
+        try
+        {
+            var payload = Convert.FromBase64String(protectedValue["local-v1:".Length..]);
+            var nonceLength = AesGcm.NonceByteSizes.MaxSize;
+            var tagLength = AesGcm.TagByteSizes.MaxSize;
+            if (payload.Length < nonceLength + tagLength)
+                return null;
+            var plaintext = new byte[payload.Length - nonceLength - tagLength];
+            using var aes = new AesGcm(encryptionKey, tagLength);
+            aes.Decrypt(
+                payload.AsSpan(0, nonceLength),
+                payload.AsSpan(nonceLength + tagLength),
+                payload.AsSpan(nonceLength, tagLength),
+                plaintext,
+                Encoding.UTF8.GetBytes(associatedData));
+            return Encoding.UTF8.GetString(plaintext);
+        }
+        catch (Exception ex) when (ex is FormatException
+                                   or ArgumentException
+                                   or CryptographicException)
+        {
+            return null;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encryptionKey);
+        }
+    }
+
+    internal void RewrapPendingReplicationIntent(string intentId, string protectedEnvelope)
+        => ExecuteDurableWrite(
+            () => RewrapPendingReplicationIntentCore(intentId, protectedEnvelope));
+
+    private void RewrapPendingReplicationIntentCore(string intentId, string protectedEnvelope)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE replication_pending_intents
+            SET encrypted_envelope = $envelope, updated_at = $now
+            WHERE intent_id = $intent;
+            """;
+        cmd.Parameters.AddWithValue("$envelope", protectedEnvelope);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$intent", intentId);
+        cmd.ExecuteNonQuery();
+    }
+
+    private byte[] DeriveReplicationIntentKey()
+    {
+        using var hmac = new HMACSHA256(key);
+        return hmac.ComputeHash(
+            Encoding.UTF8.GetBytes("mesh.replication.pending-intent.local-at-rest.v1"));
+    }
+
+    public string? GetCompletedReplicationIntentEvent(string intentId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT event_id
+            FROM replication_local_intent_events
+            WHERE intent_id = $intent;
+            """;
+        cmd.Parameters.AddWithValue("$intent", intentId);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    internal void DeletePendingReplicationIntentInTransaction(string intentId, SqliteTransaction tx)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "DELETE FROM replication_pending_intents WHERE intent_id = $intent;";
+        cmd.Parameters.AddWithValue("$intent", intentId);
+        cmd.ExecuteNonQuery();
+    }
+
+    internal void RecordPendingReplicationIntentFailure(
+        string intentId,
+        string error,
+        ReplicationEmissionRosterState? rosterState = null)
+        => ExecuteDurableWrite(
+            () => RecordPendingReplicationIntentFailureCore(intentId, error, rosterState));
+
+    private void RecordPendingReplicationIntentFailureCore(
+        string intentId,
+        string error,
+        ReplicationEmissionRosterState? rosterState)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE replication_pending_intents
+            SET attempts = attempts + 1,
+                last_error = $error,
+                roster_state = COALESCE($state, roster_state),
+                updated_at = $now
+            WHERE intent_id = $intent;
+            """;
+        cmd.Parameters.AddWithValue("$error", error);
+        cmd.Parameters.AddWithValue(
+            "$state",
+            rosterState is null ? DBNull.Value : rosterState.Value.ToString());
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$intent", intentId);
+        cmd.ExecuteNonQuery();
+    }
+
     /// <summary>
     /// Allocates a contiguous run of local sequences and commits every event, its outbox
     /// references and the whole domain change in ONE transaction. Used when a single logical
@@ -119,12 +361,13 @@ public sealed partial class MeshDb
     /// <param name="domainApply">
     /// Domain write invoked once per created event, in order, inside the same transaction.
     /// </param>
-    public IReadOnlyList<ReplicationEvent> AllocateAndAppendLocalEvents(
+    internal IReadOnlyList<ReplicationEvent> AllocateAndAppendLocalEvents(
         string originDeviceId,
         IReadOnlyList<Func<string, ulong, ReplicationEvent>> eventFactories,
         IReadOnlyCollection<string> targetAccounts,
         Action<SqliteConnection, SqliteTransaction, ReplicationEvent, int>? domainApply,
-        Func<int, string, ReplicationOutboxNotification>? notificationForTarget = null)
+        Func<int, string, ReplicationOutboxNotification>? notificationForTarget = null,
+        string? intentId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(originDeviceId);
         ArgumentNullException.ThrowIfNull(eventFactories);
@@ -133,6 +376,17 @@ public sealed partial class MeshDb
             throw new ArgumentException("At least one event factory is required.", nameof(eventFactories));
 
         using var journalLock = EnterLocalOriginJournalLock();
+        if (!string.IsNullOrWhiteSpace(intentId))
+        {
+            var completedEventId = GetCompletedReplicationIntentEvent(intentId);
+            if (completedEventId is not null)
+                return new[]
+                {
+                    GetEvent(completedEventId)
+                    ?? throw new InvalidOperationException(
+                        "A completed replication batch intent referenced a missing event.")
+                };
+        }
         using var tx = conn.BeginTransaction(deferred: false);
         string epoch;
         long next;
@@ -177,6 +431,21 @@ public sealed partial class MeshDb
             }
             domainApply?.Invoke(conn, tx, evt, i);
             created.Add(evt);
+        }
+
+        if (!string.IsNullOrWhiteSpace(intentId))
+        {
+            using var complete = conn.CreateCommand();
+            complete.Transaction = tx;
+            complete.CommandText = """
+                INSERT INTO replication_local_intent_events(intent_id, event_id, completed_at)
+                VALUES($intent, $event, $at);
+                """;
+            complete.Parameters.AddWithValue("$intent", intentId);
+            complete.Parameters.AddWithValue("$event", created[0].EventId);
+            complete.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"));
+            complete.ExecuteNonQuery();
+            DeletePendingReplicationIntentInTransaction(intentId, tx);
         }
 
         using (var bump = conn.CreateCommand())
@@ -292,4 +561,3 @@ public sealed partial class MeshDb
     /// </summary>
     internal SqliteConnection RawConnectionForTest => conn;
 }
-

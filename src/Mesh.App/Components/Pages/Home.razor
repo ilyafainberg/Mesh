@@ -1,5 +1,6 @@
 @page "/"
 @inject AppState State
+@inject AppShutdownCoordinator Shutdown
 @inject AgentService Agent
 @inject ITopicExecutionRouter TopicRouter
 @inject MeshClient Mesh
@@ -567,6 +568,12 @@
                 </div>
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
                 @if (dispatchError is not null) { <p class="err-text" role="alert">@dispatchError</p> }
+                @if (DraftError is not null)
+                {
+                    <p class="err-text" role="alert">
+                        @DraftError <button class="link-btn" @onclick="RetryDraft">Retry save</button>
+                    </p>
+                }
                 @if (Active is not null && !ActiveDeviceOnline)
                 {
                     <div class="warn-banner"><i class="bi bi-cloud-arrow-up"></i> @ThreadDeviceName(Active) is offline. New turns will wait securely until it reconnects.</div>
@@ -650,6 +657,11 @@
     bool loadingDevices;
     string? deviceError;
     string? dispatchError;
+    string? DraftError => activeThread is null ? null : State.GetTopicDraftError(activeThread);
+    void RetryDraft()
+    {
+        if (activeThread is not null) State.RetryTopicDraft(activeThread);
+    }
     PendingTopicMove? pendingMove;
     readonly List<global::Mesh.Shared.DeviceInfo> eligibleDevices = new();
     sealed record PendingTopicMove(string ThreadId, string TopicTitle, string RunId, ExecutionDevice Target);
@@ -714,15 +726,10 @@
     string QueueLabel(ChatLine line)
     {
         var device = Active is null ? "linked device" : ThreadDeviceName(Active);
-        return QueueInfo(line)?.Stage switch
-        {
-            TopicQueueStage.Relay => $"waiting for {device}",
-            TopicQueueStage.Device => $"queued on {device}",
-            TopicQueueStage.Cancelling => "cancelling",
-            TopicQueueStage.Expired => "expired",
-            TopicQueueStage.Failed => "failed",
-            _ => ActiveUsesCurrentDevice ? "queued on this device" : "sending"
-        };
+        return TopicQueuePresentation.Label(
+            QueueInfo(line)?.Stage ?? TopicQueueStage.Sending,
+            ActiveUsesCurrentDevice,
+            device);
     }
     string QueueIcon(ChatLine line) => QueueInfo(line)?.Stage switch
     {
@@ -958,12 +965,12 @@
             l => l.Role == "assistant" ? "agent" : "me", State.CurrentModelKey());
     }
 
-    void NewLocalThread() => CreateThreadOn(CurrentDevice);
+    async Task NewLocalThread() => await CreateThreadOn(CurrentDevice);
 
-    void CreateThreadOn(ExecutionDevice device)
+    async Task CreateThreadOn(ExecutionDevice device)
     {
         if (device.DeviceId != Mesh.MyDeviceId && !IsDeviceOnline(device.DeviceId)) return;
-        var t = State.NewOwnThread("New chat", device);
+        var t = await State.NewOwnThreadAsync("New chat", device);
         activeThread = t.Id;
         confirmDelete = false;
         renaming = false;
@@ -1270,7 +1277,7 @@
         if (SendDisabled) return;
         dispatchError = null;
         var text = input;
-        var thread = Active ?? State.NewOwnThread("New chat", CurrentDevice);
+        var thread = Active ?? await State.NewOwnThreadAsync("New chat", CurrentDevice);
         activeThread = thread.Id;
         input = text;
         if (thread.ExecutionDeviceId is null)

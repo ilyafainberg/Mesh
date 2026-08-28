@@ -408,6 +408,71 @@ public sealed class ReplicationBootstrapPersistenceTests
     }
 
     [TestMethod]
+    public void CursorBoundedBootstrap_RequestsPostCaptureTailBeforeSnapshotEvents()
+    {
+        using var db = OpenDb();
+        var journal = OpenJournal(db);
+        var beforeCapture = journal.EmitLocal(
+            CreateEnvelopes(1)[0] with { EntityId = "before-capture" },
+            new[] { "alice" });
+        var captureCursor = db.GetEvent(beforeCapture)!.Seq;
+        const string bootstrapId = "cursor-bounded";
+        db.CreateOrResumePeerBootstrap(
+            target,
+            bootstrapId,
+            Hash("snapshot"),
+            "snapshot",
+            totalItems: 1,
+            captureCursor: captureCursor);
+
+        var raced = journal.EmitLocal(
+            CreateEnvelopes(1)[0] with { EntityId = "after-capture" },
+            new[] { "alice" });
+        var snapshot = journal.EmitLocalBatch(
+            CreateEnvelopes(1),
+            new[] { "alice" },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, _) =>
+                db.UpdatePeerBootstrapProgress(
+                    target, bootstrapId, 1, 1, evt.Seq, evt.Seq, tx));
+
+        var marker = db.GetPeerBootstrap(target)!;
+        Assert.AreEqual(1UL, marker.CaptureCursor);
+        Assert.AreEqual(2UL, db.GetEvent(raced)!.Seq);
+        Assert.AreEqual(3UL, db.GetEvent(snapshot[0])!.Seq);
+        Assert.AreEqual(3UL, marker.BootstrapFromSeq);
+
+        var manifest = OnlineReplicationProtocol.CreateSnapshotManifest(
+            bootstrapId,
+            target.PeerDeviceId,
+            identity.DeviceId,
+            identity.LogEpoch,
+            marker.CaptureCursor + 1,
+            marker.BootstrapThroughSeq,
+            OnlineReplicationProtocol.ComputeSnapshotStateHash(
+                db.QueryEvents(identity.DeviceId, identity.LogEpoch, 2, 3, 10)),
+            identity.AuthGeneration,
+            localKeys.PrivateB64);
+        using var receiver = MeshDb.Open(
+            Path.Combine(directory, "cursor-receiver.meshdb"),
+            RandomNumberGenerator.GetBytes(32));
+        Assert.IsTrue(receiver.TryInstallSnapshotBaseline(manifest));
+        var plan = OnlineReplicationProtocol.PlanReplication(
+            receiver.GetCursor(identity.DeviceId)!,
+            new ReplicationOffer(
+                identity.DeviceId,
+                identity.LogEpoch,
+                marker.CaptureCursor + 1,
+                marker.BootstrapThroughSeq,
+                manifest));
+
+        CollectionAssert.AreEqual(
+            new[] { new ReplicationRange(2, 3) },
+            plan.Ranges.ToArray(),
+            "the event emitted after capture must remain in the requested catch-up range");
+    }
+
+    [TestMethod]
     public void SnapshotBaseline_OnlyAdvancesAnEmptyOrigin()
     {
         using var db = OpenDb();
@@ -525,6 +590,72 @@ public sealed class ReplicationBootstrapPersistenceTests
             target.PeerDeviceId,
             db.GetLastSuccessfulReplication("alice")!.PeerDeviceId);
         Assert.IsNull(db.GetLastSuccessfulReplication("carol"));
+    }
+
+    [TestMethod]
+    public void OutboxTargets_AreCanonicalBeforePersistenceAndLegacyVariantsMergeOnReopen()
+    {
+        string eventId;
+        using (var db = OpenDb())
+        {
+            var journal = OpenJournal(db);
+            eventId = journal.EmitLocal(
+                CreateEnvelopes(1)[0],
+                new[] { " @Alice ", "ALICE", "alice" });
+            Assert.AreEqual(MeshDb.OutboxStatePending, db.GetOutboxState(eventId, "alice"));
+
+            using var tx = db.RawConnectionForTest.BeginTransaction();
+            using (var rename = db.RawConnectionForTest.CreateCommand())
+            {
+                rename.Transaction = tx;
+                rename.CommandText = """
+                    UPDATE replication_outbox
+                    SET target_account = ' @Alice ', state = 'offered', attempts = 2,
+                        offered_at = '2026-08-25T00:00:00.0000000Z',
+                        last_attempt_at = '2026-08-25T00:00:00.0000000Z',
+                        last_error = 'older'
+                    WHERE event_id = $event;
+                    """;
+                rename.Parameters.AddWithValue("$event", eventId);
+                Assert.AreEqual(1, rename.ExecuteNonQuery());
+            }
+            using (var duplicate = db.RawConnectionForTest.CreateCommand())
+            {
+                duplicate.Transaction = tx;
+                duplicate.CommandText = """
+                    INSERT INTO replication_outbox(
+                        event_id, target_account, state, offered_at, last_attempt_at, attempts,
+                        last_error, notification_worthy, notification_id)
+                    VALUES(
+                        $event, 'ALICE', 'persisted', '2026-08-26T00:00:00.0000000Z',
+                        '2026-08-26T00:00:00.0000000Z', 5, 'newer', 1, 'notification-1');
+                    """;
+                duplicate.Parameters.AddWithValue("$event", eventId);
+                duplicate.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+
+        SqliteConnection.ClearAllPools();
+        using var reopened = OpenDb();
+        using var read = reopened.RawConnectionForTest.CreateCommand();
+        read.CommandText = """
+            SELECT target_account, state, attempts, last_error, notification_worthy, notification_id,
+                   COUNT(*) OVER ()
+            FROM replication_outbox
+            WHERE event_id = $event;
+            """;
+        read.Parameters.AddWithValue("$event", eventId);
+        using var reader = read.ExecuteReader();
+        Assert.IsTrue(reader.Read());
+        Assert.AreEqual("alice", reader.GetString(0));
+        Assert.AreEqual(MeshDb.OutboxStatePersisted, reader.GetString(1));
+        Assert.AreEqual(5, reader.GetInt32(2));
+        Assert.AreEqual("newer", reader.GetString(3));
+        Assert.AreEqual(1, reader.GetInt32(4));
+        Assert.AreEqual("notification-1", reader.GetString(5));
+        Assert.AreEqual(1, reader.GetInt32(6));
+        Assert.IsFalse(reader.Read());
     }
 
     private SqliteConnection OpenRawConnection()

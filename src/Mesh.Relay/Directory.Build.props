@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <MeshRelayTestFaults Condition="'$(MeshRelayTestFaults)' == ''">false</MeshRelayTestFaults>
+    <MeshRelayFlavor Condition="'$(MeshRelayTestFaults)' != 'true'">production</MeshRelayFlavor>
+    <MeshRelayFlavor Condition="'$(MeshRelayTestFaults)' == 'true'">test-hooks</MeshRelayFlavor>
+    <BaseOutputPath Condition="'$(MeshRelayOutputRoot)' != ''">$(MeshRelayOutputRoot)</BaseOutputPath>
+    <BaseIntermediateOutputPath Condition="'$(MeshRelayIntermediateRoot)' != ''">$(MeshRelayIntermediateRoot)$(MeshRelayFlavor)\</BaseIntermediateOutputPath>
+    <BaseIntermediateOutputPath Condition="'$(MeshRelayIntermediateRoot)' == ''">obj\$(MeshRelayFlavor)\</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath Condition="'$(MSBuildProjectExtensionsPath)' == ''">$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)\obj\**;$(MSBuildProjectDirectory)\bin\**</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

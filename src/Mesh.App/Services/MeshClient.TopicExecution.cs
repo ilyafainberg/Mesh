@@ -1,6 +1,4 @@
-using System.Security.Cryptography;
 using System.Text.Json;
-using System.Text;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Maui.Networking;
 using Mesh.App.Domain;
@@ -11,6 +9,7 @@ namespace Mesh.App.Services;
 public sealed partial class MeshClient
 {
     private static readonly TimeSpan DurableMaintenanceInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan MobileBackgroundTopicHandoffTimeout = TimeSpan.FromSeconds(8);
 
     private bool ShouldMaintainContinuousTransport
         => ContinuousTransportPolicy.ShouldRun(
@@ -20,11 +19,16 @@ public sealed partial class MeshClient
 
     private void OnForegroundChanged(bool isForeground)
     {
-        if (lifetime.IsCancellationRequested) return;
         if (isForeground)
         {
-            DrainDeferredTopicRunUpdates();
-            ResumeTransport();
+            TrackBackground(
+                Task.Run(() =>
+                {
+                    using var operation = ManagedOperationDiagnostics.Begin("lifecycle.foreground-recovery");
+                    DrainDeferredTopicRunUpdates();
+                    ResumeTransport();
+                }),
+                "foreground topic recovery");
             return;
         }
 
@@ -60,6 +64,8 @@ public sealed partial class MeshClient
 
     private async Task SuspendForegroundTransportAsync()
     {
+        if (ShouldMaintainContinuousTransport || Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
+        await CompleteMobileBackgroundTopicHandoffAsync().ConfigureAwait(false);
         if (ShouldMaintainContinuousTransport || Volatile.Read(ref backgroundWakeLeaseCount) > 0) return;
         await connectionGate.WaitAsync().ConfigureAwait(false);
         try
@@ -100,53 +106,217 @@ public sealed partial class MeshClient
         if (identity is not null && Connected && IsCurrentReplicationConnectionIdentity(identity))
         {
             TryRegisterPushToken();
-            TrackBackground(RecoverOnlineDeliveryAsync(identity), "durable delivery resume");
+            WakeOnlineDelivery(identity, "transport-resumed");
             return;
         }
         ScheduleRecovery();
     }
 
-    private void OnConnectivityChanged(object? sender, ConnectivityChangedEventArgs e)
+    private void WakeOnlineDelivery(
+        ReplicationConnectionIdentity identity,
+        string reason)
+        => WakeOnlineDelivery(identity, targetDeviceIds: null, reason);
+
+    private void WakeOnlineDelivery(
+        ReplicationConnectionIdentity identity,
+        IReadOnlyCollection<string>? targetDeviceIds,
+        string reason)
     {
-        if (!lifetime.IsCancellationRequested)
-            ResumeTransport();
+        if (!Connected
+            || !IsCurrentReplicationConnectionIdentity(identity)
+            || (targetDeviceIds is null
+                ? !HasLocalDurableWork()
+                : !HasLocalDurableWorkFor(targetDeviceIds)))
+            return;
+        TraceTransport(
+            "topic-delivery-wake",
+            targetDeviceIds is null
+                ? reason
+                : $"{reason};targets={string.Join(",", targetDeviceIds.Order(StringComparer.Ordinal))}");
+        lock (onlineRecoverySync)
+        {
+            pendingOnlineRecoveryIdentity = identity;
+            if (targetDeviceIds is null)
+            {
+                pendingFullOnlineRecovery = true;
+                pendingOnlineRecoveryTargets.Clear();
+            }
+            else if (!pendingFullOnlineRecovery)
+            {
+                foreach (var target in targetDeviceIds)
+                {
+                    if (!string.IsNullOrWhiteSpace(target))
+                        pendingOnlineRecoveryTargets.Add(target);
+                }
+            }
+        }
+        if (targetDeviceIds is null)
+        {
+            onlineDeliveryRetry.Wake();
+            return;
+        }
+        onlineDeliveryRetry.Wake();
     }
+
+    private void OnConnectivityChanged(object? sender, ConnectivityChangedEventArgs e)
+        => ResumeTransport();
 
     private void ScheduleOnlineDeliveryRetry()
     {
-        if (!wantConnected || !ShouldMaintainContinuousTransport
-            || Interlocked.Exchange(ref onlineRetryScheduled, 1) == 1) return;
-        TrackBackground(Task.Run(async () =>
+        if (!wantConnected || !ShouldMaintainContinuousTransport) return;
+        onlineDeliveryRetry.Schedule();
+    }
+
+    private async Task AttemptOnlineDeliveryRetryAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var identity = authenticatedReplicationConnectionIdentity;
+        if (identity is not null && Connected && IsCurrentReplicationConnectionIdentity(identity))
         {
-            try
+            IReadOnlyCollection<string>? targets;
+            lock (onlineRecoverySync)
             {
-                await Task.Delay(TimeSpan.FromSeconds(15));
-                var identity = authenticatedReplicationConnectionIdentity;
-                if (identity is not null && Connected && IsCurrentReplicationConnectionIdentity(identity))
-                    await RecoverOnlineDeliveryAsync(identity);
-                else
-                    ScheduleRecovery();
+                targets = pendingFullOnlineRecovery || pendingOnlineRecoveryTargets.Count == 0
+                    ? null
+                    : pendingOnlineRecoveryTargets.ToArray();
+                pendingFullOnlineRecovery = false;
+                pendingOnlineRecoveryTargets.Clear();
             }
-            finally
-            {
-                Interlocked.Exchange(ref onlineRetryScheduled, 0);
-                if (wantConnected && ShouldMaintainContinuousTransport && Connected && HasLocalDurableWork())
-                    ScheduleOnlineDeliveryRetry();
-            }
-        }), "durable delivery retry");
+            await RecoverOnlineDeliveryAsync(identity, targets).ConfigureAwait(false);
+        }
+        else
+            ScheduleRecovery();
     }
 
     private bool HasLocalDurableWork()
-        => state.ListTopicOutbox().Any(item => item.State is TopicOutboxStates.Pending
-            or TopicOutboxStates.CancelPending)
-           || state.ListDeviceEnvelopeOutbox().Count > 0;
+        => state.ListTopicOutbox().Any(item =>
+               TopicOutboxStates.NeedsRemoteAcceptance(item.State)
+               || item.State == TopicOutboxStates.CancelPending)
+           || state.ListDeviceEnvelopeOutbox().Any(item =>
+               item.State is not TopicOutboxStates.DeadLetter
+                   and not TopicOutboxStates.Expired
+               && !TopicTransportPolicy.IsControlDeliveryExpired(
+                   item, timeProvider.GetUtcNow()));
+
+    private bool HasLocalDurableWorkFor(IReadOnlyCollection<string> deviceIds)
+    {
+        if (deviceIds.Count == 0) return false;
+        var online = new HashSet<string>(deviceIds, StringComparer.Ordinal);
+        return state.ListTopicOutbox().Any(item =>
+                  online.Contains(item.TargetDeviceId)
+                  && (TopicOutboxStates.NeedsRemoteAcceptance(item.State)
+                      || item.State == TopicOutboxStates.CancelPending))
+               || state.ListDeviceEnvelopeOutbox().Any(item =>
+                  online.Contains(item.TargetDeviceId)
+                  && item.State is not TopicOutboxStates.DeadLetter
+                      and not TopicOutboxStates.Expired
+                  && !TopicTransportPolicy.IsControlDeliveryExpired(
+                      item, timeProvider.GetUtcNow()));
+    }
+
+    private bool HasTopicRequestsAwaitingRemoteAcceptance()
+        => state.ListTopicOutbox().Any(item =>
+            TopicOutboxStates.NeedsRemoteAcceptance(item.State));
+
+    public IReadOnlyList<TopicControlRecoveryStatus> GetTopicControlRecoveryStatus()
+        => state.ListDeviceEnvelopeOutbox()
+            .Where(item => TopicTransportPolicy.IsReceiptGatedControl(item)
+                           && (item.State == TopicOutboxStates.DeadLetter
+                               || item.RecoveryCount > 0))
+            .Select(item =>
+            {
+                _ = TopicRunProtocol.TryParseUpdate(item.Plaintext, out var update);
+                var now = timeProvider.GetUtcNow();
+                return new TopicControlRecoveryStatus(
+                    item.EnvelopeId,
+                    update?.RunId ?? "",
+                    update is null ? "unknown" : TopicControlProtocol.ControlPurpose(update),
+                    item.State,
+                    item.RecoveryCount,
+                    item.State == TopicOutboxStates.DeadLetter
+                    && item.RecoveryCount < TopicTransportPolicy.MaximumControlRecoveryCount
+                    && now < item.CreatedAt + TopicTransportPolicy.DeadLetterRecoveryWindow,
+                    item.LastError);
+            })
+            .ToArray();
+
+    public async Task<TopicControlRecoveryBatchResult> RecoverDeadLetteredTopicControlsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var recovery = new TopicControlOutboxRecovery(state, timeProvider);
+        var results = new List<TopicControlRecoveryResult>();
+        foreach (var item in state.ListDeviceEnvelopeOutbox()
+                     .Where(candidate => candidate.State == TopicOutboxStates.DeadLetter))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = recovery.Recover(item);
+            results.Add(result);
+            TraceTransport(
+                result.Recovered
+                    ? "topic-control-recovery-queued"
+                    : "topic-control-recovery-deferred",
+                $"{result.EnvelopeId}:{result.Kind}:{result.RecoveryCount}");
+        }
+        if (results.Count == 0)
+            return new(0, 0, results);
+
+        StateChanged?.Invoke();
+        var recovered = results.Count(result => result.Recovered);
+        if (recovered > 0)
+        {
+            var identity = authenticatedReplicationConnectionIdentity;
+            if (identity is not null
+                && Connected
+                && IsCurrentReplicationConnectionIdentity(identity))
+                await RecoverOnlineDeliveryAsync(identity).WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            else
+                ResumeTransport();
+        }
+        return new(
+            recovered,
+            results.Count - recovered,
+            results);
+    }
+
+    private async Task CompleteMobileBackgroundTopicHandoffAsync()
+    {
+        var identity = authenticatedReplicationConnectionIdentity;
+        if (identity is null
+            || !Connected
+            || !IsCurrentReplicationConnectionIdentity(identity)
+            || !HasTopicRequestsAwaitingRemoteAcceptance())
+            return;
+
+        var deadline = timeProvider.GetUtcNow() + MobileBackgroundTopicHandoffTimeout;
+        while (!ShouldMaintainContinuousTransport
+               && IsCurrentReplicationConnectionIdentity(identity)
+               && HasTopicRequestsAwaitingRemoteAcceptance()
+               && timeProvider.GetUtcNow() < deadline)
+        {
+            try
+            {
+                await RecoverOnlineDeliveryAsync(identity).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                TraceTransport("topic-background-handoff-failed", ex.GetType().Name);
+            }
+
+            if (!HasTopicRequestsAwaitingRemoteAcceptance()) return;
+            await Task.Delay(
+                    TimeSpan.FromMilliseconds(250), timeProvider, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+    }
 
 
     private async Task MaintainOnlineDeliveryAsync(ReplicationConnectionIdentity identity)
     {
         while (ShouldMaintainContinuousTransport && IsCurrentReplicationConnectionIdentity(identity))
         {
-            await Task.Delay(DurableMaintenanceInterval);
+            await Task.Delay(
+                DurableMaintenanceInterval, timeProvider, CancellationToken.None);
             if (!IsCurrentReplicationConnectionIdentity(identity)) return;
             try
             {
@@ -159,21 +329,91 @@ public sealed partial class MeshClient
         }
     }
 
-    private async Task RecoverOnlineDeliveryAsync(ReplicationConnectionIdentity identity)
+    private Task RecoverOnlineDeliveryAsync(
+        ReplicationConnectionIdentity identity,
+        IReadOnlyCollection<string>? targetDeviceIds = null)
+    {
+        lock (onlineRecoverySync)
+        {
+            pendingOnlineRecoveryIdentity = identity;
+            if (targetDeviceIds is null)
+            {
+                pendingFullOnlineRecovery = true;
+                pendingOnlineRecoveryTargets.Clear();
+            }
+            else if (!pendingFullOnlineRecovery)
+            {
+                foreach (var target in targetDeviceIds)
+                {
+                    if (!string.IsNullOrWhiteSpace(target))
+                        pendingOnlineRecoveryTargets.Add(target);
+                }
+            }
+            if (onlineRecoveryRunning) return onlineRecoveryTask;
+            onlineRecoveryRunning = true;
+            onlineRecoveryTask = Task.Run(DrainOnlineRecoveryAsync);
+            return onlineRecoveryTask;
+        }
+    }
+
+    private async Task DrainOnlineRecoveryAsync()
+    {
+        try
+        {
+            while (true)
+            {
+                ReplicationConnectionIdentity identity;
+                IReadOnlyCollection<string>? targetDeviceIds;
+                lock (onlineRecoverySync)
+                {
+                    identity = pendingOnlineRecoveryIdentity!;
+                    pendingOnlineRecoveryIdentity = null;
+                    targetDeviceIds = pendingFullOnlineRecovery
+                        ? null
+                        : pendingOnlineRecoveryTargets.ToArray();
+                    pendingFullOnlineRecovery = false;
+                    pendingOnlineRecoveryTargets.Clear();
+                }
+                await RecoverOnlineDeliveryCoreAsync(identity, targetDeviceIds).ConfigureAwait(false);
+                lock (onlineRecoverySync)
+                {
+                    if (pendingOnlineRecoveryIdentity is not null) continue;
+                    onlineRecoveryRunning = false;
+                    return;
+                }
+            }
+        }
+        catch
+        {
+            lock (onlineRecoverySync)
+            {
+                pendingOnlineRecoveryIdentity = null;
+                pendingFullOnlineRecovery = false;
+                pendingOnlineRecoveryTargets.Clear();
+                onlineRecoveryRunning = false;
+            }
+            throw;
+        }
+    }
+
+    private async Task RecoverOnlineDeliveryCoreAsync(
+        ReplicationConnectionIdentity identity,
+        IReadOnlyCollection<string>? targetDeviceIds)
     {
         // Protocol 9: the relay keeps no durable staging to drain, so recovery is local only.
         // Inbound events replay through the online replication engine's persisted cursors/outbox;
         // here we only recover local topic-execution outbox state.
         if (!IsCurrentReplicationConnectionIdentity(identity)) return;
-        RecoverInboundTopicRuns();
-
-        await onlineFlushGate.WaitAsync();
+        await onlineFlushGate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (!IsCurrentReplicationConnectionIdentity(identity)) return;
+            var scope = new OnlineDeliveryTargetScope(targetDeviceIds);
+            if (targetDeviceIds is null) RecoverInboundTopicRuns();
             foreach (var item in state.ListTopicOutbox())
             {
                 if (!IsCurrentReplicationConnectionIdentity(identity)) return;
+                if (!scope.Includes(item.TargetDeviceId)) continue;
                 if (IsExpired(item))
                 {
                     ExpireTopicRequest(item);
@@ -185,50 +425,65 @@ public sealed partial class MeshClient
                     await TrySendTopicOutboxItemAsync(identity, item, CancellationToken.None);
             }
 
-            var deviceOutbox = state.ListDeviceEnvelopeOutbox();
-            foreach (var item in deviceOutbox.Where(item => !IsDeviceSyncSnapshotResponseJob(item)))
+            foreach (var item in state.ListDeviceEnvelopeOutbox())
             {
                 if (!IsCurrentReplicationConnectionIdentity(identity)) return;
-                await TrySendDeviceEnvelopeOutboxItemAsync(identity, item, CancellationToken.None);
-            }
-
-            // Snapshot responses can be large. Run their durable jobs only after control and terminal
-            // envelopes so an old synchronization request cannot block topic execution traffic.
-            foreach (var item in deviceOutbox.Where(IsDeviceSyncSnapshotResponseJob))
-            {
-                if (!IsCurrentDeviceSyncIdentity(identity)) return;
-                _ = await TryFlushDeviceSyncSnapshotResponseJobAsync(
-                    identity, item, CancellationToken.None);
+                if (!scope.Includes(item.TargetDeviceId)) continue;
+                if (!TopicTransportPolicy.ShouldRetryDeviceEnvelope(
+                        item, timeProvider.GetUtcNow()))
+                    continue;
+                var candidate = item;
+                if (item.State == TopicOutboxStates.DeadLetter)
+                {
+                    var recovery = new TopicControlOutboxRecovery(state, timeProvider)
+                        .Recover(item);
+                    TraceTransport(
+                        recovery.Recovered
+                            ? "topic-control-recovery-queued"
+                            : "topic-control-recovery-deferred",
+                        $"{recovery.EnvelopeId}:{recovery.Kind}:{recovery.RecoveryCount}");
+                    if (!recovery.Recovered) continue;
+                    candidate = state.GetDeviceEnvelopeOutbox(item.EnvelopeId);
+                    if (candidate is null) continue;
+                    StateChanged?.Invoke();
+                }
+                await TrySendDeviceEnvelopeOutboxItemAsync(
+                    identity, candidate, CancellationToken.None);
             }
         }
         finally
         {
             onlineFlushGate.Release();
         }
-        if (HasLocalDurableWork()) ScheduleOnlineDeliveryRetry();
+        if (targetDeviceIds is null
+                ? HasLocalDurableWork()
+                : HasLocalDurableWorkFor(targetDeviceIds))
+            ScheduleOnlineDeliveryRetry();
     }
 
     private void RecoverInboundTopicRuns()
     {
-        var blockedThreads = new HashSet<string>(StringComparer.Ordinal);
+        var resumedThreads = new HashSet<string>(StringComparer.Ordinal);
         foreach (var item in state.ListInboundTopicRuns(
                      InboundTopicRunStates.Accepted,
                      InboundTopicRunStates.Running))
         {
             var threadId = item.Request.ThreadId;
-            if (blockedThreads.Contains(threadId) || activeTopicRuns.ContainsKey(item.RunId))
+            if (activeTopicRuns.ContainsKey(item.RunId))
                 continue;
-            if (string.Equals(item.State, InboundTopicRunStates.Accepted, StringComparison.Ordinal))
+            if (string.Equals(item.State, InboundTopicRunStates.Running, StringComparison.Ordinal))
             {
-                if (!TryStartInboundTopicRun(item.Request, item.SourceDeviceId))
-                {
-                    QueueInterruptedInboundRun(item, "remote_execution_recovery_failed");
-                    blockedThreads.Add(threadId);
-                }
+                QueueInterruptedInboundRun(item, "remote_execution_interrupted");
                 continue;
             }
-            QueueInterruptedInboundRun(item, "remote_execution_interrupted");
-            blockedThreads.Add(threadId);
+            if (!resumedThreads.Add(threadId)) continue;
+            if (!TryStartInboundTopicRun(item.Request, item.SourceDeviceId))
+            {
+                resumedThreads.Remove(threadId);
+                TraceTransport(
+                    "topic-accepted-recovery-deferred",
+                    item.RunId);
+            }
         }
     }
 
@@ -240,7 +495,8 @@ public sealed partial class MeshClient
             TopicRunPhase.Failed,
             Error: "The remote device restarted before this run completed.",
             FailureCode: failureCode,
-            Timestamp: DateTimeOffset.UtcNow);
+            Timestamp: timeProvider.GetUtcNow(),
+            TriggerLineId: item.Request.TriggerLineId);
         _ = PersistInboundTopicTerminal(
             item.RunId,
             InboundTopicRunStates.Interrupted,
@@ -279,19 +535,23 @@ public sealed partial class MeshClient
 
     private void StartNextInboundTopicRun(string threadId)
     {
-        var next = state.ListInboundTopicRuns(
-                InboundTopicRunStates.Accepted,
-                InboundTopicRunStates.Running)
-            .FirstOrDefault(item => string.Equals(
-                item.Request.ThreadId, threadId, StringComparison.Ordinal));
-        if (next is null || activeTopicRuns.ContainsKey(next.RunId)) return;
-        if (string.Equals(next.State, InboundTopicRunStates.Running, StringComparison.Ordinal))
+        while (true)
         {
-            QueueInterruptedInboundRun(next, "remote_execution_interrupted");
+            var next = state.ListInboundTopicRuns(
+                    InboundTopicRunStates.Accepted,
+                    InboundTopicRunStates.Running)
+                .FirstOrDefault(item => string.Equals(
+                    item.Request.ThreadId, threadId, StringComparison.Ordinal));
+            if (next is null || activeTopicRuns.ContainsKey(next.RunId)) return;
+            if (string.Equals(next.State, InboundTopicRunStates.Running, StringComparison.Ordinal))
+            {
+                QueueInterruptedInboundRun(next, "remote_execution_interrupted");
+                continue;
+            }
+            if (!TryStartInboundTopicRun(next.Request, next.SourceDeviceId))
+                TraceTransport("topic-accepted-recovery-deferred", next.RunId);
             return;
         }
-        if (!TryStartInboundTopicRun(next.Request, next.SourceDeviceId))
-            QueueInterruptedInboundRun(next, "remote_execution_recovery_failed");
     }
     private bool EnsureInboundTopicContext(TopicRunRequestPayload request)
     {
@@ -341,33 +601,21 @@ public sealed partial class MeshClient
         IReadOnlyList<ChatAttachment> attachments,
         CancellationToken ct)
     {
-        var existing = state.GetTopicOutbox(request.RunId);
         MeshDb.TopicOutboxItem item;
-        if (existing is not null)
+        try
         {
-            if (!string.Equals(existing.ThreadId, request.ThreadId, StringComparison.Ordinal)
-                || !string.Equals(existing.TriggerLineId, request.TriggerLineId, StringComparison.Ordinal)
-                || !string.Equals(existing.TargetDeviceId, targetDeviceId, StringComparison.Ordinal))
-                return TopicDispatchResult.Reject("run_id_conflict", request.RunId);
-            item = existing;
+            item = topicRequestOutboxHandler.Queue(
+                targetDeviceId, request, attachments);
         }
-        else
+        catch (InvalidOperationException ex) when (
+            ex.Message is "run_id_conflict" or "local_persistence_failed")
         {
-            var now = DateTimeOffset.UtcNow;
-            item = new MeshDb.TopicOutboxItem(
+            return TopicDispatchResult.Reject(
+                ex.Message,
                 request.RunId,
-                request.ThreadId,
-                request.TriggerLineId,
-                targetDeviceId,
-                request,
-                attachments.Select(CloneAttachment).ToList(),
-                TopicOutboxStates.Pending,
-                now,
-                now);
-            if (!state.SaveTopicOutbox(item))
-                return TopicDispatchResult.Reject(
-                    "local_persistence_failed", request.RunId,
-                    "The request could not be saved on this device.");
+                ex.Message == "local_persistence_failed"
+                    ? "The request could not be saved on this device."
+                    : null);
         }
 
         if (IsExpired(item))
@@ -395,9 +643,52 @@ public sealed partial class MeshClient
                 return TopicDispatchResult.Ok(request.RunId, "local_pending");
             }
             if (result.Accepted)
-                return TopicDispatchResult.Ok(request.RunId, result.Code);
+                return TopicDispatchResult.Ok(
+                    request.RunId,
+                    TopicExecutionStatus.RelayAccepted);
             state.DeleteTopicOutbox(request.RunId);
             return TopicDispatchResult.Reject(result.Code, request.RunId, DescribeResult(result));
+        }
+        finally
+        {
+            onlineFlushGate.Release();
+        }
+    }
+
+    private async Task<TopicDispatchResult> DispatchPersistedTopicRequestAsync(
+        MeshDb.TopicOutboxItem item,
+        CancellationToken ct)
+    {
+        if (IsExpired(item))
+        {
+            ExpireTopicRequest(item);
+            return TopicDispatchResult.Reject(
+                "request_expired", item.RunId, durable: true);
+        }
+        if (string.Equals(item.State, TopicOutboxStates.CancelPending, StringComparison.Ordinal))
+            return TopicDispatchResult.Ok(item.RunId, "local_pending", durable: true);
+
+        var identity = authenticatedReplicationConnectionIdentity;
+        if (identity is null || !Connected || !IsCurrentReplicationConnectionIdentity(identity))
+        {
+            ScheduleRecovery();
+            return TopicDispatchResult.Ok(item.RunId, "local_pending", durable: true);
+        }
+
+        await onlineFlushGate.WaitAsync(ct);
+        try
+        {
+            var result = await TrySendTopicOutboxItemAsync(identity, item, ct);
+            if (result is null)
+            {
+                ScheduleOnlineDeliveryRetry();
+                return TopicDispatchResult.Ok(item.RunId, "local_pending", durable: true);
+            }
+            return result.Accepted
+                ? TopicDispatchResult.Ok(
+                    item.RunId, TopicExecutionStatus.RelayAccepted, durable: true)
+                : TopicDispatchResult.Reject(
+                    result.Code, item.RunId, DescribeResult(result), durable: true);
         }
         finally
         {
@@ -411,40 +702,66 @@ public sealed partial class MeshClient
         CancellationToken ct)
     {
         if (!IsCurrentReplicationConnectionIdentity(identity)
-            || !string.Equals(item.State, TopicOutboxStates.Pending, StringComparison.Ordinal))
+            || !TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                item.State,
+                item.UpdatedAt,
+                timeProvider.GetUtcNow()))
             return null;
 
         var prepared = await PrepareTopicOutboxItemAsync(item, ct);
         if (prepared is null) return null;
         item = prepared;
-        var result = await TrySendTargetedTopicEnvelopeCoreAsync(
-            identity,
-            item.TargetDeviceId,
-            MeshKinds.TopicRunRequest,
-            TopicRunProtocol.RequestBody(item.Request),
-            item.RunId,
-            null,
-            ct);
+        var delivery = await topicRequestOutboxDelivery.TrySendAsync(item, ct);
+        var result = delivery.TransportResult;
         if (result is null) return null;
         if (result.Accepted)
         {
-            if (!state.SetTopicOutboxState(item.RunId, TopicOutboxStates.RelayQueued))
-                throw new InvalidOperationException("The topic request delivery state could not be persisted.");
-            state.SetQueuedTopicRunStage(item.ThreadId, item.RunId, TopicQueueStage.Relay);
+            var persistence = delivery.PersistenceResult
+                              ?? TopicSendOutcomePersistenceResult.Ignored;
+            if (persistence == TopicSendOutcomePersistenceResult.Applied)
+                state.SetQueuedTopicRunStage(item.ThreadId, item.RunId, TopicQueueStage.Relay);
+            else
+                TraceStaleTopicSendCompletion(item, persistence, result.Code);
             TraceTransport("topic-request-relay-accepted", result.Code);
             return result;
         }
 
         if (IsPermanentTransportRejection(result.Code))
         {
-            state.SetTopicOutboxState(item.RunId, TopicOutboxStates.Failed, result.Code);
+            var persistence = delivery.PersistenceResult
+                              ?? TopicSendOutcomePersistenceResult.Ignored;
+            if (persistence != TopicSendOutcomePersistenceResult.Applied)
+            {
+                TraceStaleTopicSendCompletion(item, persistence, result.Code);
+                return MeshSendResult.Ok();
+            }
             state.SetQueuedTopicRunStage(item.ThreadId, item.RunId, TopicQueueStage.Failed);
             return result;
         }
-        state.SetTopicOutboxState(item.RunId, TopicOutboxStates.Pending, result.Code);
+        var deferred = delivery.PersistenceResult
+                       ?? TopicSendOutcomePersistenceResult.Ignored;
+        if (deferred != TopicSendOutcomePersistenceResult.Applied)
+        {
+            TraceStaleTopicSendCompletion(item, deferred, result.Code);
+            return MeshSendResult.Ok();
+        }
         TraceTransport("topic-request-deferred", result.Code);
         ScheduleOnlineDeliveryRetry();
         return null;
+    }
+
+    private void TraceStaleTopicSendCompletion(
+        MeshDb.TopicOutboxItem attempted,
+        TopicSendOutcomePersistenceResult persistence,
+        string resultCode)
+    {
+        var current = state.GetTopicOutbox(attempted.RunId);
+        TraceTransport(
+            "topic-request-stale-send-completion",
+            $"{attempted.RunId}:{resultCode}:{persistence}:"
+            + (current is null
+                ? "terminal-or-removed"
+                : $"{current.State}:{current.RemoteStageOrdinal}"));
     }
 
     private async Task<MeshDb.TopicOutboxItem?> PrepareTopicOutboxItemAsync(
@@ -481,7 +798,7 @@ public sealed partial class MeshClient
             });
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = timeProvider.GetUtcNow();
         var prepared = item with
         {
             Request = item.Request with
@@ -591,7 +908,7 @@ public sealed partial class MeshClient
             request.ThreadId,
             TopicRunPhase.Cancelled,
             Status: "Cancelled",
-            Timestamp: DateTimeOffset.UtcNow,
+            Timestamp: timeProvider.GetUtcNow(),
             TriggerLineId: request.TriggerLineId);
         if (!state.TryApplyRemoteRunUpdate(cancelled))
             throw new InvalidOperationException("The local cancellation state could not be persisted.");
@@ -620,7 +937,9 @@ public sealed partial class MeshClient
         CancellationToken ct,
         string? pushHint)
     {
-        var item = PersistDeviceEnvelopeOutbox(targetDeviceId, kind, plaintext, pushHint);
+        var item = await Task.Run(
+            () => PersistDeviceEnvelopeOutbox(targetDeviceId, kind, plaintext, pushHint),
+            ct).ConfigureAwait(false);
         var identity = authenticatedReplicationConnectionIdentity;
         if (identity is null || !Connected || !IsCurrentReplicationConnectionIdentity(identity))
         {
@@ -652,10 +971,26 @@ public sealed partial class MeshClient
             kind,
             plaintext,
             pushHint,
-            DateTimeOffset.UtcNow);
+            timeProvider.GetUtcNow());
+        if (string.Equals(kind, MeshKinds.TopicRunUpdate, StringComparison.Ordinal)
+            && TopicRunProtocol.TryParseUpdate(plaintext, out var update)
+            && TopicControlProtocol.IsReceipt(update))
+        {
+            var persistence = state.GetOrCreateTopicReceiptOutbox(item);
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "topic-receipt-outbox",
+                $"envelope={AppState.StableDiagnosticId(item.EnvelopeId)}"
+                + $";run={AppState.StableDiagnosticId(update.RunId)}"
+                + $";result={persistence.Kind.ToString().ToLowerInvariant()}");
+            if (persistence.Kind == TopicReceiptOutboxPersistenceKind.IdentityConflict)
+                throw new InvalidOperationException("topic_receipt_outbox_identity_conflict");
+            return persistence.Item;
+        }
         if (!state.SaveDeviceEnvelopeOutbox(item))
             throw new InvalidOperationException("The durable device envelope could not be persisted.");
-        return item;
+        return state.GetDeviceEnvelopeOutbox(item.EnvelopeId)
+               ?? throw new InvalidOperationException(
+                   "The durable device envelope could not be read.");
     }
 
     private async Task<MeshSendResult?> TrySendDeviceEnvelopeOutboxItemAsync(
@@ -663,29 +998,40 @@ public sealed partial class MeshClient
         MeshDb.DeviceEnvelopeOutboxItem item,
         CancellationToken ct)
     {
-        var result = await TrySendTargetedTopicEnvelopeCoreAsync(
-            identity,
-            item.TargetDeviceId,
-            item.Kind,
-            item.Plaintext,
-            item.EnvelopeId,
-            item.PushHint,
-            ct);
+        if (!IsCurrentReplicationConnectionIdentity(identity))
+            return null;
+        var result = await topicControlOutboxDelivery.TrySendAsync(item, ct);
+        var persisted = state.GetDeviceEnvelopeOutbox(item.EnvelopeId);
         if (result?.Accepted == true)
         {
-            state.DeleteDeviceEnvelopeOutbox(item.EnvelopeId);
-            TraceTransport("device-envelope-relay-accepted", result.Code);
+            if (RequiresDevicePersistenceReceipt(item))
+            {
+                TraceTransport(
+                    "device-control-relay-accepted-awaiting-receipt",
+                    item.EnvelopeId);
+                ScheduleOnlineDeliveryRetry();
+            }
+            else
+            {
+                TraceTransport("device-envelope-relay-accepted", result.Code);
+            }
+        }
+        else if (persisted?.State == TopicOutboxStates.DeadLetter)
+        {
+            TraceTransport(
+                "device-control-dead-lettered",
+                $"{item.EnvelopeId}:{persisted.LastError}");
+            StateChanged?.Invoke();
         }
         else if (result is not null && IsPermanentTransportRejection(result.Code))
         {
-            state.DeleteDeviceEnvelopeOutbox(item.EnvelopeId);
             TraceTransport("device-envelope-permanent-reject", result.Code);
         }
         else
         {
             if (result is not null)
                 TraceTransport("device-envelope-deferred", result.Code);
-            ScheduleOnlineDeliveryRetry();
+            if (persisted is not null) ScheduleOnlineDeliveryRetry();
         }
         return result;
     }
@@ -737,6 +1083,21 @@ public sealed partial class MeshClient
             var method = ephemeral
                 ? MeshHubProtocol.SendEphemeralEnvelope
                 : MeshHubProtocol.SendEnvelope;
+            if (string.Equals(kind, MeshKinds.TopicRunRequest, StringComparison.Ordinal))
+            {
+                var request = JsonSerializer.Deserialize<TopicRunRequestPayload>(
+                    plaintext, Json);
+                var attempt = request is null
+                    ? null
+                    : state.BeginTopicTransportAttempt(request.RunId);
+                if (attempt is null) return null;
+                RuntimeDiagnostics.Current?.RecordEvent(
+                    "topic-transport-attempt",
+                    $"operation={AppState.StableDiagnosticId(attempt.TriggerId)}"
+                    + $";run={AppState.StableDiagnosticId(attempt.RunId)}"
+                    + $";envelope={AppState.StableDiagnosticId(envelopeId)}"
+                    + $";attempt={attempt.Ordinal};transport_entered=true");
+            }
             if (supportsSendResults)
                 return await identity.Connection.InvokeAsync<MeshSendResult>(method, envelope, ct);
             await identity.Connection.InvokeAsync(method, envelope, ct);
@@ -761,30 +1122,28 @@ public sealed partial class MeshClient
         if (string.Equals(kind, MeshKinds.TopicRunUpdate, StringComparison.Ordinal)
             && TopicRunProtocol.TryParseUpdate(plaintext, out var update))
         {
-            if (update.Phase == TopicRunPhase.Queued)
-                return StableEnvelopeId("topic.queued", update.RunId);
-            if (update.Phase is TopicRunPhase.Completed
-                or TopicRunPhase.Failed
-                or TopicRunPhase.Cancelled)
-                return StableEnvelopeId("topic.terminal", update.RunId);
+            if (TopicControlProtocol.IsAcceptance(update)
+                || TopicControlProtocol.IsExecutionQueued(update)
+                || TopicControlProtocol.IsTerminal(update)
+                || TopicControlProtocol.IsReceipt(update))
+                return StableEnvelopeId(
+                    TopicControlProtocol.ControlPurpose(update), update.RunId);
         }
         return Guid.NewGuid().ToString("n");
     }
 
+    private static bool RequiresDevicePersistenceReceipt(
+        MeshDb.DeviceEnvelopeOutboxItem item)
+        => TopicTransportPolicy.IsReceiptGatedControl(item);
+
     private static string StableEnvelopeId(string purpose, string runId)
-        => Convert.ToHexString(SHA256.HashData(
-            Encoding.UTF8.GetBytes($"{purpose}\0{runId}"))).ToLowerInvariant();
+        => TopicControlProtocol.EnvelopeId(purpose, runId);
 
     private static bool IsPermanentTransportRejection(string code)
-        => code is "invalid_signature"
-            or "message_too_large"
-            or "invalid_push_hint"
-            or "target_device_unknown"
-            or "sync_target_unknown"
-            or "device_revoked";
+        => TopicTransportPolicy.IsPermanentRejection(code);
 
-    private static bool IsExpired(MeshDb.TopicOutboxItem item)
-        => DateTimeOffset.UtcNow - item.CreatedAt >= TopicTransportPolicy.RequestLifetime;
+    private bool IsExpired(MeshDb.TopicOutboxItem item)
+        => timeProvider.GetUtcNow() >= item.CreatedAt + TopicTransportPolicy.RequestLifetime;
 
     private void ExpireTopicRequest(MeshDb.TopicOutboxItem item)
     {
@@ -793,9 +1152,6 @@ public sealed partial class MeshClient
         state.ClearRemoteRunProjection(item.ThreadId, item.RunId);
         TraceTransport("topic-request-expired", "ttl");
     }
-
-    private static ChatAttachment CloneAttachment(ChatAttachment attachment)
-        => new(attachment.Name, attachment.MimeType, attachment.Data.ToArray());
 
     private void TraceTransport(string eventName, string? detail = null)
     {

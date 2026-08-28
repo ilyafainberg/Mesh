@@ -23,6 +23,71 @@ namespace Mesh.App.Services
 
         public Task FlushPersistenceAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+        public TopicRunBeginResult BeginTopicRun(TopicRunBeginCommand command)
+        {
+            if (!RemoteRunUpdatePersistenceSucceeds)
+                return new TopicRunBeginResult(false, false, "persistence_failed");
+            var thread = Profile.OwnThreads.Single(item => item.Id == command.Draft.ThreadId);
+            thread.ExecutionDeviceId = command.Target.DeviceId;
+            thread.ExecutionDeviceName = command.Target.DeviceName;
+            thread.ExecutionDevicePlatform = command.Target.Platform;
+            var existing = thread.Lines.FirstOrDefault(line =>
+                line.Id == command.Draft.TriggerLineId);
+            if (existing is null)
+                AddOwnChatLine(command.Draft.ThreadId, new ChatLine
+                {
+                    Id = command.Draft.TriggerLineId,
+                    Role = "user",
+                    Text = command.Draft.Prompt,
+                    SenderHandle = command.Draft.TriggerHandle,
+                    At = command.Draft.TriggerAt,
+                    Attachments = command.Draft.Attachments?.ToList() ?? []
+                });
+            RegisterExpectedRemoteRun(
+                command.Draft.ThreadId,
+                command.Draft.RunId,
+                command.Target,
+                command.Draft.TriggerAt);
+            TrackQueuedTopicRun(
+                command.Draft.ThreadId,
+                command.Draft.RunId,
+                command.Draft.TriggerLineId);
+            MeshDb.TopicOutboxItem? outbox = null;
+            if (command.Mode == TopicRunBeginMode.Remote)
+            {
+                var now = command.InitialProjection.Timestamp;
+                outbox = new MeshDb.TopicOutboxItem(
+                    command.Draft.RunId,
+                    command.Draft.ThreadId,
+                    command.Draft.TriggerLineId,
+                    command.Target.DeviceId,
+                    command.Request!,
+                    command.Attachments ?? [],
+                    TopicOutboxStates.Pending,
+                    now,
+                    now,
+                    RemoteStage: "sender_queued");
+            }
+            return new TopicRunBeginResult(
+                true,
+                true,
+                "created",
+                outbox,
+                AuthoritativeRunId: command.Draft.RunId,
+                TriggerId: TopicRunTriggerIdentity.For(
+                    command.Draft.ThreadId, command.Draft.TriggerLineId),
+                AuthoritativeDraft: command.Draft,
+                ProjectionApplied: true);
+        }
+
+        public void CompleteLocalTopicRun(string runId, DateTimeOffset terminalAt) { }
+
+        internal static string BeginDiagnostic(
+            TopicRunBeginCommand command,
+            string result,
+            bool transportEntered)
+            => $"result={result};transport_entered={transportEntered}";
+
 
         public void AddOwnChatLine(string threadId, ChatLine line)
             => Profile.OwnThreads.Single(thread => thread.Id == threadId).Lines.Add(line);
@@ -275,6 +340,29 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task RepeatedRemoteSubmission_DispatchesOneDurableRequest()
+        {
+            var state = StateWithThread();
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                ]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+
+            var first = await router.SubmitAsync(draft, null, CancellationToken.None);
+            var retry = await router.SubmitAsync(draft, null, CancellationToken.None);
+
+            Assert.IsTrue(first.Accepted);
+            Assert.IsTrue(retry.Accepted);
+            Assert.AreEqual(1, transport.Dispatches);
+            Assert.AreEqual(1, state.Profile.OwnThreads[0].Lines.Count);
+        }
+
+        [TestMethod]
         public async Task RemoteSubmission_DoesNotDispatchWhenQueuedStateCannotPersist()
         {
             var state = StateWithThread();
@@ -292,7 +380,7 @@ namespace Mesh.App.Tests
             var result = await router.SubmitAsync(draft, null, CancellationToken.None);
 
             Assert.IsFalse(result.Accepted);
-            Assert.AreEqual("dispatch_failed", result.Code);
+            Assert.AreEqual("local_persistence_failed", result.Code);
             Assert.AreEqual(0, transport.Dispatches);
         }
 
@@ -336,6 +424,84 @@ namespace Mesh.App.Tests
             Assert.AreEqual("offline", listed[1].DeviceId);
             Assert.AreEqual("target", listed[2].DeviceId);
             Assert.AreEqual(0, state.Profile.OwnThreads[0].Lines[0].Attachments.Count);
+            Assert.AreEqual(
+                TopicQueueStage.Relay,
+                state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage,
+                "relay acceptance must no longer look like a local-only send");
+        }
+
+        [TestMethod]
+        public void TransportStatus_DistinguishesLocalRelayAndDeviceAcceptance()
+        {
+            Assert.IsTrue(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.Pending));
+            Assert.IsTrue(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.RelayQueued));
+            Assert.IsFalse(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.DeviceAccepted));
+            Assert.IsFalse(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.DeviceQueued));
+            Assert.IsTrue(TopicExecutionStatus.IsRelayAccepted("accepted"));
+            Assert.IsFalse(TopicExecutionStatus.IsRelayAccepted(TopicExecutionStatus.LocalQueued));
+
+            var now = DateTimeOffset.UtcNow;
+            Assert.IsTrue(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.Pending, now, now));
+            Assert.IsFalse(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.RelayQueued, now, now));
+            Assert.IsTrue(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.RelayQueued,
+                now,
+                now + TopicTransportPolicy.RemoteAcceptanceRetryInterval));
+            Assert.IsFalse(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.DeviceQueued, now, now.AddMinutes(1)));
+
+            var request = new TopicRunRequestPayload(
+                "run-acceptance",
+                "thread-acceptance",
+                "line-acceptance",
+                "owner",
+                "prompt",
+                now,
+                "target",
+                TopicTurnMode.Single);
+            var accepted = TopicAcceptancePolicy.Create(request, now);
+            Assert.AreEqual(TopicRunPhase.Queued, accepted.Phase);
+            Assert.AreEqual("Accepted", accepted.Status);
+            Assert.AreEqual(request.TriggerLineId, accepted.TriggerLineId);
+            Assert.AreEqual(now, accepted.Timestamp);
+
+            var executionQueued = accepted with
+            {
+                Status = TopicControlProtocol.ExecutionQueuedStatus
+            };
+            Assert.IsTrue(TopicControlProtocol.IsAcceptance(accepted));
+            Assert.IsFalse(TopicControlProtocol.IsExecutionQueued(accepted));
+            Assert.IsTrue(TopicControlProtocol.IsExecutionQueued(executionQueued));
+            Assert.IsTrue(TopicControlProtocol.RequiresPersistenceReceipt(accepted));
+            Assert.IsFalse(
+                TopicControlProtocol.RequiresPersistenceReceipt(executionQueued));
+            Assert.AreEqual(
+                "topic.accepted", TopicControlProtocol.ControlPurpose(accepted));
+            Assert.AreEqual(
+                "topic.execution-queued",
+                TopicControlProtocol.ControlPurpose(executionQueued));
+
+            var acceptanceReceipt = TopicControlProtocol.CreateReceipt(accepted, now);
+            Assert.IsTrue(TopicControlProtocol.IsReceipt(acceptanceReceipt));
+            Assert.AreEqual(
+                TopicControlProtocol.AcceptanceReceiptStatus,
+                acceptanceReceipt.Status);
+            Assert.AreEqual(
+                "topic.accepted",
+                TopicControlProtocol.AcknowledgedPurpose(acceptanceReceipt));
+
+            var terminal = accepted with
+            {
+                Phase = TopicRunPhase.Failed,
+                Status = "Failed"
+            };
+            var terminalReceipt = TopicControlProtocol.CreateReceipt(terminal, now);
+            Assert.IsTrue(TopicControlProtocol.IsReceipt(terminalReceipt));
+            Assert.AreEqual(
+                "topic.terminal",
+                TopicControlProtocol.AcknowledgedPurpose(terminalReceipt));
         }
 
         [TestMethod]
@@ -418,6 +584,38 @@ namespace Mesh.App.Tests
                 TopicQueueStage.Sending,
                 state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
         }
+
+        [TestMethod]
+        public async Task RunningCancellation_PublicBoundaryNeverBlocksCallingThread()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.ExecutionDeviceId = "offline";
+            thread.ExecutionDeviceName = "Laptop";
+            thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
+            using var release = new ManualResetEventSlim();
+            var transport = new RecordingTransport
+            {
+                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                ResultCode = TopicExecutionStatus.LocalQueued,
+                CancellationRelease = release
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "offline" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var cancellation = router.StopAsync(
+                draft.ThreadId, draft.RunId, CancellationToken.None);
+            stopwatch.Stop();
+
+            Assert.IsTrue(stopwatch.ElapsedMilliseconds < 250);
+            await transport.CancellationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.IsFalse(cancellation.IsCompleted);
+            release.Set();
+            Assert.IsTrue(await cancellation.WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+
         [TestMethod]
         public async Task EligibleDeviceRefreshes_AreSerializedSoThePickerGetsTheNewestResult()
         {
@@ -665,6 +863,75 @@ namespace Mesh.App.Tests
             Assert.AreEqual(new string('y', 120), answer);
         }
 
+        [TestMethod]
+        public async Task Runner_PostCompletionFault_DoesNotStrandDrainAndPreservesFifo()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.Lines.AddRange(
+            [
+                new ChatLine { Id = "line-q1", Role = "user", Text = "q1" },
+                new ChatLine { Id = "line-q2", Role = "user", Text = "q2" },
+                new ChatLine { Id = "line-q3", Role = "user", Text = "q3" }
+            ]);
+            var order = new List<string>();
+            var agent = new AgentService
+            {
+                Continue = (_, runId, _) =>
+                {
+                    lock (order) order.Add(runId);
+                    return Task.FromResult("");
+                }
+            };
+            var runner = new TopicTurnRunner(agent, state);
+            var at = new DateTimeOffset(2026, 8, 22, 11, 0, 0, TimeSpan.Zero);
+            var q1 = new TopicTurnDraft(
+                "run-q1", thread.Id, "line-q1", "owner", "q1", at,
+                TopicTurnMode.Single);
+            var q2 = new TopicTurnDraft(
+                "run-q2", thread.Id, "line-q2", "owner", "q2", at.AddSeconds(1),
+                TopicTurnMode.Single);
+            var q3 = new TopicTurnDraft(
+                "run-q3", thread.Id, "line-q3", "owner", "q3", at.AddSeconds(2),
+                TopicTurnMode.Single);
+
+            var first = runner.ExecuteAsync(
+                q1, new ThrowOnTerminalProgress(), CancellationToken.None);
+            var second = runner.ExecuteAsync(
+                q2, new RecordingProgress(), CancellationToken.None);
+            var third = runner.ExecuteAsync(
+                q3, new RecordingProgress(), CancellationToken.None);
+
+            var completions = await Task.WhenAll(first, second, third)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            CollectionAssert.AreEqual(
+                new[] { "run-q1", "run-q2", "run-q3" }, order);
+            Assert.AreEqual(TopicRunPhase.Failed, completions[0].Phase);
+            Assert.AreEqual(TopicRunPhase.Completed, completions[1].Phase);
+            Assert.AreEqual(TopicRunPhase.Completed, completions[2].Phase);
+            Assert.IsFalse(state.IsLineQueued(q2.TriggerLineId));
+            Assert.IsFalse(state.IsLineQueued(q3.TriggerLineId));
+
+            var q4 = q3 with
+            {
+                RunId = "run-q4",
+                TriggerLineId = "line-q4",
+                Prompt = "q4",
+                TriggerAt = at.AddSeconds(3)
+            };
+            thread.Lines.Add(new ChatLine
+            {
+                Id = q4.TriggerLineId,
+                Role = "user",
+                Text = q4.Prompt
+            });
+            var fourth = await runner.ExecuteAsync(
+                q4, new RecordingProgress(), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.AreEqual(TopicRunPhase.Completed, fourth.Phase);
+        }
+
         private static Mesh.App.Services.AppState StateWithThread()
         {
             var state = new Mesh.App.Services.AppState();
@@ -742,6 +1009,9 @@ namespace Mesh.App.Tests
             public IReadOnlyList<DeviceInfo> Devices { get; set; } = [];
             public int Dispatches { get; private set; }
             public int Cancellations { get; private set; }
+            public TaskCompletionSource CancellationStarted { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public ManualResetEventSlim? CancellationRelease { get; set; }
             public TopicRunRequestPayload? Request { get; private set; }
             public string ResultCode { get; set; } = "accepted";
             public bool CancellationAccepted { get; set; } = true;
@@ -763,6 +1033,8 @@ namespace Mesh.App.Tests
                 CancellationToken cancellationToken)
             {
                 Cancellations++;
+                CancellationStarted.TrySetResult();
+                CancellationRelease?.Wait(cancellationToken);
                 return Task.FromResult(CancellationAccepted);
             }
 
@@ -816,6 +1088,17 @@ namespace Mesh.App.Tests
             {
                 lock (Updates) Updates.Add(value);
                 if (value.Phase == TopicRunPhase.Queued) Queued.TrySetResult();
+            }
+        }
+
+        private sealed class ThrowOnTerminalProgress : IProgress<TopicRunUpdatePayload>
+        {
+            public void Report(TopicRunUpdatePayload value)
+            {
+                if (value.Phase is TopicRunPhase.Completed
+                    or TopicRunPhase.Failed
+                    or TopicRunPhase.Cancelled)
+                    throw new InvalidOperationException("post-completion projection failed");
             }
         }
     }

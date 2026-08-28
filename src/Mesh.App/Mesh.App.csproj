@@ -19,6 +19,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <EnableDefaultCssItems>false</EnableDefaultCssItems>
+        <DefaultItemExcludes>$(DefaultItemExcludes);_artifacts\**</DefaultItemExcludes>
         <Nullable>enable</Nullable>
 
         <!-- Enable XAML source generation for faster build times and improved performance.
@@ -134,6 +135,11 @@
       <ProjectReference Include="..\Mesh.Shared\Mesh.Shared.csproj" />
       <ProjectReference Include="..\Mesh.BuiltIns.Compiler\Mesh.BuiltIns.Compiler.csproj"
                         ReferenceOutputAssembly="false" Private="false" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <InternalsVisibleTo Include="Mesh.App.Tests" />
+      <InternalsVisibleTo Include="Mesh.App.ComponentTests" />
     </ItemGroup>
 
     <PropertyGroup>

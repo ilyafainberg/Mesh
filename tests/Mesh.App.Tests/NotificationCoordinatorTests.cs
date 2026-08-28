@@ -102,6 +102,31 @@ public sealed class NotificationCoordinatorTests
         Assert.AreEqual(1, state.GetUnreadNotificationCount());
     }
 
+    [TestMethod]
+    public async Task ConcurrentRecovery_CoalescesToOneFlight()
+    {
+        var state = new RecordingState();
+        var notifier = new RecordingNotifier
+        {
+            ShowEntered = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            ReleaseShow = new(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        var activity = Activity("message:single-flight", NotificationKind.Message, "alice", "alice");
+        Assert.IsTrue(state.TryRecordNotificationActivity(activity));
+        var coordinator = Create(state, notifier, foreground: false);
+
+        var recoveries = Enumerable.Range(0, 32)
+            .Select(_ => coordinator.RecoverPendingAsync())
+            .ToArray();
+        await notifier.ShowEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.AreEqual(1, state.ListPendingCalls);
+
+        notifier.ReleaseShow.TrySetResult(true);
+        await Task.WhenAll(recoveries).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.AreEqual(1, notifier.Shown.Count);
+        Assert.AreEqual(1, state.ListPendingCalls);
+    }
+
     private static NotificationCoordinator Create(
         RecordingState state,
         RecordingNotifier notifier,
@@ -149,11 +174,16 @@ public sealed class NotificationCoordinatorTests
         public List<LocalNotification> Shown { get; } = new();
         public List<string> Removed { get; } = new();
         public List<int> Badges { get; } = new();
+        public TaskCompletionSource<bool>? ShowEntered { get; init; }
+        public TaskCompletionSource<bool>? ReleaseShow { get; init; }
 
-        public Task<bool> ShowAsync(LocalNotification notification, CancellationToken ct = default)
+        public async Task<bool> ShowAsync(LocalNotification notification, CancellationToken ct = default)
         {
             Shown.Add(notification);
-            return Task.FromResult(true);
+            ShowEntered?.TrySetResult(true);
+            if (ReleaseShow is not null)
+                await ReleaseShow.Task.WaitAsync(ct);
+            return true;
         }
 
         public Task RemoveAsync(string stableId, CancellationToken ct = default)
@@ -178,6 +208,7 @@ public sealed class NotificationCoordinatorTests
         private readonly HashSet<string> pending = new(StringComparer.Ordinal);
         public HashSet<string> Suppressed { get; } = new(StringComparer.Ordinal);
         public HashSet<string> Read { get; } = new(StringComparer.Ordinal);
+        public int ListPendingCalls { get; private set; }
         public string LocalHandle { get; set; } = "owner";
         public bool DoNotDisturb { get; set; }
         public bool NotificationSound { get; set; } = true;
@@ -235,10 +266,13 @@ public sealed class NotificationCoordinatorTests
                 : null;
 
         public IReadOnlyList<CommittedActivity> ListPendingNotificationActivities(int limit)
-            => activities.Values
+        {
+            ListPendingCalls++;
+            return activities.Values
                 .Where(activity => pending.Contains(activity.StableId))
                 .Take(limit)
                 .ToArray();
+        }
 
         public int GetUnreadNotificationCount() => attention.Count;
         public string? GetHighestPriorityNotificationRoute()

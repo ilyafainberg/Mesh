@@ -383,6 +383,9 @@ the code carries a default base URL.
 | `MESH_MAX_FANOUT_RECIPIENTS` | `Mesh:MaxFanoutRecipients` | Default fan-out recipient limit; values are clamped to the hard cap of 128. | `128` |
 | `MESH_RATE_POLICY_CACHE_SECONDS` | `Mesh:RatePolicyCacheSeconds` | Per-replica effective-policy cache duration. | `60` |
 | `MESH_ADMIN_KEY` | `Mesh:AdminKey` | Secret required in `X-Mesh-Admin-Key` for rate-policy admin endpoints. | none |
+| `MESH_LIVE_FAULTS_ENABLED` | `Mesh:LiveFaultsEnabled` | Runtime gate for an admin-only hook that exists only in the explicit test-relay build flavor. Production-default artifacts ignore it. | `false` |
+| `MESH_LIVE_FAULT_MAX_TTL_SECONDS` | `Mesh:LiveFaultMaxTtlSeconds` | Upper bound for a fault rule TTL (hard maximum 3600). | `3600` |
+| `MESH_LIVE_FAULT_MAX_USES` | `Mesh:LiveFaultMaxUses` | Upper bound for bounded-use fault rules (hard maximum 1000). | `1000` |
 
 Rate limits count **logical sends**, not physical recipient envelopes. An ordinary send
 consumes one Direct token. One fan-out consumes one Group token whether it addresses 1
@@ -413,6 +416,82 @@ unauthorized. Do not expose them without TLS. Keep the key in a
 secret manager, use a high-entropy value, restrict network access, and rotate it. There
 is currently no user endpoint for changing policy; user-controlled lower limits may be
 added later.
+
+### Live-fault test hook
+
+Production relay artifacts do **not** contain live-fault activation routes or interception code.
+The default `MeshRelayTestFaults=false` build removes the source at compile time. A Release build
+with `MeshRelayTestFaults=true` is rejected by MSBuild, so a stray runtime flag cannot activate a
+production Release artifact. The flavors also use physically separate output and intermediate
+directories and different assembly identities:
+
+| Flavor | Assembly |
+| --- | --- |
+| Production default | `src\Mesh.Relay\bin\<Configuration>\net10.0\production\Mesh.Relay.dll` |
+| Debug test hooks | `src\Mesh.Relay\bin\Debug\net10.0\test-hooks\Mesh.Relay.TestHooks.dll` |
+
+A test build therefore cannot overwrite or be loaded as the ordinary production assembly.
+
+Build the clearly separate test relay in Debug:
+
+```powershell
+dotnet build .\src\Mesh.Relay\Mesh.Relay.csproj -c Debug -p:MeshRelayTestFaults=true
+$env:ASPNETCORE_ENVIRONMENT = 'Test' # Development is also accepted
+$env:MESH_LIVE_FAULTS_ENABLED = 'true'
+$env:MESH_ADMIN_KEY = '<secret-from-vault>'
+dotnet .\src\Mesh.Relay\bin\Debug\net10.0\test-hooks\Mesh.Relay.TestHooks.dll
+```
+
+All four gates are required: test-relay compile flavor, Development/Test environment, explicit
+runtime enable flag, and a configured admin key. Every request also requires the exact
+`X-Mesh-Admin-Key`. A test-flavor binary refuses startup when the enable flag is set in another
+environment. A production-default relay returns 404 because the routes are absent. Missing
+configuration or authentication fails closed.
+
+Rules are replica-local, in-memory, TTL-bound, bounded-use, and require a source account plus an
+explicit target device. Optional source device, target account, kind, SHA-256 stable-envelope ID
+hash, and ordinal narrow the match further. `online-frame` is the only kind exposed for encrypted
+replication frames because the relay never reads ciphertext. Control envelopes can use their public
+control kind. Audit entries contain rule metadata, IDs/hashes, timestamps, and counts only—never
+plaintext or ciphertext.
+
+| Method | Path | Effect |
+| --- | --- | --- |
+| `POST` | `/admin/live-faults` | Idempotently activate a named rule. |
+| `GET` | `/admin/live-faults` | List status, expiry, ordinal, and use counts. |
+| `GET` | `/admin/live-faults/{ruleId}` | Read one rule. |
+| `DELETE` | `/admin/live-faults/{ruleId}` | Idempotently deactivate one rule. |
+| `POST` | `/admin/live-faults/cleanup` | Mark expired rules inactive immediately. |
+| `GET` | `/admin/live-faults/audit` | Read metadata-only activation/consumption/expiry audit. |
+| `GET` | `/admin/live-faults/runtime` | Read ordered hashed control-send attempts and handshake evidence. |
+
+Runtime evidence never returns raw envelope IDs. It includes only SHA-256 stable-ID hashes,
+per-ID attempt numbers, and the existing authenticated handshake test fields, and is protected by
+the same compile-time, environment, runtime-enable, and admin-key gates as every other hook route.
+
+Mode semantics are exact: `RejectBeforeForwarding` does not forward and returns
+`test_fault_rejected`; `DropBeforeForwarding` does not forward and returns `not_online`;
+`SuccessDropBeforeDestination` does not forward or persist at the destination but returns the
+normal relay success (`delivered` for an online frame, `accepted` for a control). A success-drop is
+not entered in relay frame de-duplication, so a stable-ID application retry can proceed after the
+one-shot rule is consumed. Inbound rules return a delivered backplane receipt only for
+`SuccessDropBeforeDestination`; the two failure modes return not-delivered.
+
+For a live gate, use `_deploy/test-relay/Invoke-MeshLiveFault.ps1`.
+Its `Run` action activates a scoped rule, runs the supplied gate script, and deactivates the rule
+returned by the relay in `finally`. The CLI reports an explicit refusal if pointed at a
+production-default relay.
+
+```powershell
+$env:MESH_ADMIN_KEY = '<secret-from-vault>'
+.\_deploy\test-relay\Invoke-MeshLiveFault.ps1 `
+  -Action Run -BaseUri https://test-relay.example `
+  -SourceAccount alice -SourceDevice 0123456789ab `
+  -TargetAccount alice -TargetDevice abcdef012345 `
+  -Mode SuccessDropBeforeDestination -Kind topic.run.update `
+  -StableId '<stable-envelope-id>' -TtlSeconds 180 -MaxUses 1 `
+  -GateScript .\_deploy\validation\run-m08-gate.ps1
+```
 
 ### Connector OAuth (optional)
 

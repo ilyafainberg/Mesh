@@ -16,6 +16,7 @@ public sealed class WindowsAppControl : IAppControl
     private static AppWindow? appWindow;
     private static TaskbarIcon? tray;
     private static bool forceQuit;
+    private static bool headless;
     private static readonly object quitGate = new();
     private static AppShutdownCoordinator? shutdownCoordinator;
     private static Task? quitTask;
@@ -94,11 +95,9 @@ public sealed class WindowsAppControl : IAppControl
         };
 
         var menu = new MenuFlyout();
-        var open = new MenuFlyoutItem { Text = "Open Mesh", Command = new RelayCommand(Show) };
-        var quit = new MenuFlyoutItem { Text = "Quit Mesh", Command = new AsyncRelayCommand(QuitAppAsync) };
-        menu.Items.Add(open);
+        menu.Items.Add(new MenuFlyoutItem { Text = "Open Mesh", Command = new RelayCommand(Show) });
         menu.Items.Add(new MenuFlyoutSeparator());
-        menu.Items.Add(new MenuFlyoutItem { Text = "Quit Mesh", Command = new RelayCommand(QuitApp) });
+        menu.Items.Add(new MenuFlyoutItem { Text = "Quit Mesh", Command = new AsyncRelayCommand(QuitAppAsync) });
         tray = new TaskbarIcon
         {
             ToolTipText = "Mesh",
@@ -173,17 +172,41 @@ public sealed class WindowsAppControl : IAppControl
 
     private static async Task QuitAppCoreAsync()
     {
+        if (MeshDesktopInstanceRuntime.RequestLocalShutdown()) return;
         if (shutdownCoordinator is not null)
             await shutdownCoordinator.ShutdownAsync().ConfigureAwait(false);
+        ExitNow();
+    }
 
-        await MainThread.InvokeOnMainThreadAsync(() =>
+    internal static void ExitNow()
+        => RunOnUiThread(() =>
         {
             forceQuit = true;
-            try { tray?.Dispose(); }
-            catch (Exception ex) { RuntimeDiagnostics.Current?.RecordException("tray-dispose", ex); }
+            try { tray?.Dispose(); } catch { }
             tray = null;
             Microsoft.UI.Xaml.Application.Current.Exit();
         });
+
+    private static void RunOnUiThread(Action action)
+    {
+        var dispatcher = window?.DispatcherQueue;
+        if (dispatcher is not null && !dispatcher.HasThreadAccess)
+        {
+            dispatcher.TryEnqueue(() => action());
+            return;
+        }
+        action();
+    }
+
+    private sealed class AsyncRelayCommand(Func<Task> execute) : ICommand
+    {
+        public event EventHandler? CanExecuteChanged { add { } remove { } }
+        public bool CanExecute(object? parameter) => true;
+        public async void Execute(object? parameter)
+        {
+            try { await execute().ConfigureAwait(false); }
+            catch (Exception ex) { RuntimeDiagnostics.Current?.RecordException("tray-command", ex); }
+        }
     }
 
     private sealed class RelayCommand(Action execute) : ICommand
@@ -191,23 +214,5 @@ public sealed class WindowsAppControl : IAppControl
         public event EventHandler? CanExecuteChanged { add { } remove { } }
         public bool CanExecute(object? parameter) => true;
         public void Execute(object? parameter) => execute();
-    }
-
-    private sealed class AsyncRelayCommand(Func<Task> execute) : ICommand
-    {
-        public event EventHandler? CanExecuteChanged { add { } remove { } }
-        public bool CanExecute(object? parameter) => true;
-
-        public async void Execute(object? parameter)
-        {
-            try
-            {
-                await execute();
-            }
-            catch (Exception ex)
-            {
-                RuntimeDiagnostics.Current?.RecordException("tray-command", ex);
-            }
-        }
     }
 }

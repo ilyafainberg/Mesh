@@ -28,7 +28,15 @@ public enum UpdatePhase
 
 public readonly record struct UpdateProgress(UpdatePhase Phase, long BytesReceived, long TotalBytes, string? Message)
 {
-    public int Percent => TotalBytes > 0 ? (int)Math.Clamp(BytesReceived * 100 / TotalBytes, 0, 100) : -1;
+    public int Percent
+    {
+        get
+        {
+            if (TotalBytes <= 0) return -1;
+            var received = Math.Clamp(BytesReceived, 0, TotalBytes);
+            return (int)Math.Clamp((decimal)received * 100m / TotalBytes, 0m, 100m);
+        }
+    }
 }
 
 public sealed record UpdateInfo(
@@ -47,18 +55,38 @@ public sealed record UpdateCheckResult(bool Available, Version Current, Version?
 /// Detects, pre-downloads, and starts signed Windows updates. The installer is cached until the
 /// user chooses Update, then a bundled helper closes Mesh, installs silently, and relaunches it.
 /// </summary>
-public sealed class UpdateService
+public sealed class UpdateService : IDisposable
 {
     private const string Owner = "MeshRelayAI";
     private const string Repo = "Mesh";
     private const string InstallerPrefix = "Mesh-Setup";
     private const string UpdaterFileName = "Mesh.Updater.exe";
+    internal const long MaxMetadataBytes = 1 * 1024 * 1024;
+    internal const long MaxArchiveBytes = 512 * 1024 * 1024;
+    internal const long MaxInstallerBytes = 256 * 1024 * 1024;
+    private static readonly IReadOnlyDictionary<string, string> TrustedPublisherAttributes =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CN"] = "Feincraft",
+            ["O"] = "Feincraft",
+            ["L"] = "Woluwe-Saint-Lambert",
+            ["S"] = "Bruxelles/Brusell",
+            ["C"] = "BE"
+        };
+    private static readonly Regex ReleaseTagPattern =
+        new(@"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$", RegexOptions.CultureInvariant);
+    private static readonly Regex Sha256Pattern =
+        new(@"^sha256:([0-9a-fA-F]{64})$", RegexOptions.CultureInvariant);
 
     private readonly IHttpClientFactory httpFactory;
     private readonly IAppControl appControl;
     private readonly ILogger<UpdateService> log;
     private readonly AppShutdownCoordinator shutdown;
     private readonly SemaphoreSlim checkGate = new(1, 1);
+    private readonly SemaphoreSlim operationGate = new(1, 1);
+    private readonly CancellationTokenSource lifetimeCts;
+    private readonly Func<bool> isSupported;
+    private readonly object timerLock = new();
     private readonly object preparationSync = new();
     private readonly Dictionary<string, Task<PreparedUpdate>> preparationTasks = new(StringComparer.Ordinal);
 
@@ -66,21 +94,56 @@ public sealed class UpdateService
     private PreparedUpdate? preparedUpdate;
     private string? preparedTag;
     private int launchRequested;
+    private bool disposed;
 
-    public UpdateService(IHttpClientFactory httpFactory, IAppControl appControl,
-        ILogger<UpdateService> log, AppShutdownCoordinator shutdown)
+    public UpdateService(
+        IHttpClientFactory httpFactory,
+        IAppControl appControl,
+        ILogger<UpdateService> log)
+        : this(httpFactory, appControl, log, OperatingSystem.IsWindows,
+            new AppShutdownCoordinator(new AppShutdownState()))
+    {
+    }
+
+    public UpdateService(
+        IHttpClientFactory httpFactory,
+        IAppControl appControl,
+        ILogger<UpdateService> log,
+        AppShutdownCoordinator shutdown)
+        : this(httpFactory, appControl, log, OperatingSystem.IsWindows, shutdown)
+    {
+    }
+
+    internal UpdateService(
+        IHttpClientFactory httpFactory,
+        IAppControl appControl,
+        ILogger<UpdateService> log,
+        Func<bool> isSupported)
+        : this(httpFactory, appControl, log, isSupported,
+            new AppShutdownCoordinator(new AppShutdownState()))
+    {
+    }
+
+    private UpdateService(
+        IHttpClientFactory httpFactory,
+        IAppControl appControl,
+        ILogger<UpdateService> log,
+        Func<bool> isSupported,
+        AppShutdownCoordinator shutdown)
     {
         this.httpFactory = httpFactory;
         this.appControl = appControl;
         this.log = log;
+        this.isSupported = isSupported;
         this.shutdown = shutdown;
+        lifetimeCts = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token);
         shutdown.Register("updates", StopAsync);
         CurrentVersion = DetectCurrentVersion();
         CurrentProgress = new UpdateProgress(UpdatePhase.Idle, 0, 0, null);
     }
 
     public Version CurrentVersion { get; }
-    public bool IsSupported => OperatingSystem.IsWindows();
+    public bool IsSupported => isSupported();
     public UpdateInfo? Available { get; private set; }
     public bool BannerDismissed { get; private set; }
     public UpdatePhase Phase { get; private set; }
@@ -184,75 +247,35 @@ public sealed class UpdateService
         if (!IsSupported)
             return new UpdateCheckResult(false, CurrentVersion, null, null, "Updates are only supported on Windows.");
 
-        await operationGate.WaitAsync(ct).ConfigureAwait(false);
+        await operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var http = httpFactory.CreateClient("updater");
-            using var request = new HttpRequestMessage(HttpMethod.Get,
-                $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest");
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get, $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest");
             request.Headers.TryAddWithoutValidation("Accept", "application/vnd.github+json");
             request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
 
-            using var response = await http.SendAsync(request, cancellationToken);
+            using var response = await http.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
-            {
                 return new UpdateCheckResult(false, CurrentVersion, null, null,
                     $"GitHub returned {(int)response.StatusCode} when checking for updates.");
-            }
+            if (response.Content.Headers.ContentLength is > MaxMetadataBytes)
+                return new UpdateCheckResult(false, CurrentVersion, null, null, "GitHub release metadata is too large.");
 
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-            var root = document.RootElement;
-
-            var tag = root.TryGetProperty("tag_name", out var tagElement) ? tagElement.GetString() : null;
-            if (string.IsNullOrWhiteSpace(tag) || !TryParseVersion(tag, out var latest))
-                return new UpdateCheckResult(false, CurrentVersion, null, null, "Could not read the latest version.");
-
-            string? assetName = null;
-            string? assetUrl = null;
-            long assetSize = 0;
-            if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var wantZip in new[] { true, false })
-                {
-                    foreach (var asset in assets.EnumerateArray())
-                    {
-                        var name = asset.TryGetProperty("name", out var nameElement) ? nameElement.GetString() : null;
-                        if (name is null || !name.StartsWith(InstallerPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-                        var matchesType = wantZip
-                            ? name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
-                            : name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
-                        if (!matchesType) continue;
-
-                        assetName = name;
-                        assetUrl = asset.TryGetProperty("browser_download_url", out var urlElement)
-                            ? urlElement.GetString()
-                            : null;
-                        assetSize = asset.TryGetProperty("size", out var sizeElement)
-                            && sizeElement.TryGetInt64(out var value) ? value : 0;
-                        break;
-                    }
-                    if (assetUrl is not null) break;
-                }
-            }
-
-            var releaseNotes = root.TryGetProperty("body", out var bodyElement) ? bodyElement.GetString() : null;
-            var htmlUrl = root.TryGetProperty("html_url", out var htmlElement) ? htmlElement.GetString() : null;
-            var newer = latest > CurrentVersion;
-            if (!newer || assetUrl is null || assetName is null)
-            {
-                return new UpdateCheckResult(false, CurrentVersion, latest, null,
-                    assetUrl is null && newer ? "The latest release has no Windows installer asset." : null);
-            }
-
-            var info = new UpdateInfo(latest, tag, assetName, assetUrl, assetSize, releaseNotes, htmlUrl);
-            return new UpdateCheckResult(true, CurrentVersion, latest, info, null);
+            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using var bounded = new MemoryStream();
+            await CopyBoundedAsync(source, bounded, MaxMetadataBytes, cancellationToken).ConfigureAwait(false);
+            bounded.Position = 0;
+            using var document = await JsonDocument.ParseAsync(bounded, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return ParseLatestRelease(document.RootElement, CurrentVersion);
         }
         catch (OperationCanceledException)
         {
             throw;
         }
-        catch (Exception ex) when (IsExpectedUpdateException(ex))
+        catch (Exception ex)
         {
             log.LogWarning(ex, "Update check failed");
             return new UpdateCheckResult(false, CurrentVersion, null, null, $"Update check failed: {ex.Message}");
@@ -400,8 +423,7 @@ public sealed class UpdateService
 
     private async Task<PreparedUpdate> PrepareUpdateCoreAsync(UpdateInfo info, CancellationToken cancellationToken)
     {
-        if (!string.Equals(Path.GetFileName(info.AssetName), info.AssetName, StringComparison.Ordinal))
-            throw new InvalidDataException("The update asset name is invalid.");
+        ValidateInfo(info);
 
         var descriptor = new UpdatePackageDescriptor(info.TagName, info.AssetName, info.DownloadUrl, info.Size);
         var releaseDirectory = UpdatePackageCache.GetReleaseDirectory(
@@ -412,6 +434,7 @@ public sealed class UpdateService
             var cached = await UpdatePackageCache.TryLoadAsync(releaseDirectory, descriptor, cancellationToken);
             if (cached is not null)
             {
+                VerifySignedInstaller(cached.InstallerPath);
                 ReportProgress(info, new UpdateProgress(UpdatePhase.ReadyToApply, 0, 0, "Ready to update"));
                 return cached;
             }
@@ -436,6 +459,7 @@ public sealed class UpdateService
             await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
             await using var destination = new FileStream(downloadPath, FileMode.Create, FileAccess.Write, FileShare.None,
                 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
             var buffer = new byte[1024 * 1024];
             long received = 0;
@@ -445,6 +469,7 @@ public sealed class UpdateService
             while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
             {
                 await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                hasher.AppendData(buffer, 0, read);
                 received += read;
                 if (received - lastReport >= 512 * 1024 || received == total)
                 {
@@ -457,6 +482,10 @@ public sealed class UpdateService
                 throw new InvalidDataException($"The update download was incomplete ({received} of {total} bytes).");
             if (info.Size > 0 && received != info.Size)
                 throw new InvalidDataException($"The update size did not match its release metadata ({received} of {info.Size} bytes).");
+            var actualDigest = hasher.GetHashAndReset();
+            if (!CryptographicOperations.FixedTimeEquals(
+                    actualDigest, Convert.FromHexString(info.Sha256)))
+                throw new CryptographicException("The installer archive SHA-256 digest is invalid.");
         }
 
         string sourceInstaller;
@@ -465,8 +494,12 @@ public sealed class UpdateService
             ReportProgress(info, new UpdateProgress(UpdatePhase.Extracting, 0, 0, "Extracting update"));
             var extractDirectory = Path.Combine(stagingDirectory, "extracted");
             Directory.CreateDirectory(extractDirectory);
-            await Task.Run(() => ZipFile.ExtractToDirectory(downloadPath, extractDirectory, overwriteFiles: true), cancellationToken);
-            sourceInstaller = FindInstaller(extractDirectory);
+            sourceInstaller = await ExtractInstallerAsync(
+                downloadPath,
+                extractDirectory,
+                info,
+                new InlineProgress<UpdateProgress>(progress => ReportProgress(info, progress)),
+                cancellationToken);
         }
         else
         {
@@ -481,6 +514,7 @@ public sealed class UpdateService
         var finalInstallerPath = Path.Combine(releaseDirectory, installerName);
         File.Copy(sourceInstaller, finalInstallerPath, overwrite: true);
         ReportProgress(info, new UpdateProgress(UpdatePhase.Preparing, 0, 0, "Verifying downloaded update"));
+        VerifySignedInstaller(finalInstallerPath);
         var result = await UpdatePackageCache.SaveAsync(
             releaseDirectory, descriptor, finalInstallerPath, cancellationToken);
 
@@ -779,33 +813,359 @@ public sealed class UpdateService
             or UriFormatException
             or NotSupportedException;
 
-    private static Version DetectCurrentVersion()
+    private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
     {
-        var assembly = Assembly.GetExecutingAssembly();
-        var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
-        if (TryParseVersion(informational, out var version)) return version;
-        var named = assembly.GetName().Version;
-        return named is not null
-            ? new Version(named.Major, named.Minor, Math.Max(named.Build, 0))
-            : new Version(0, 0, 0);
+        public void Report(T value) => report(value);
+    }
+
+    internal static UpdateCheckResult ParseLatestRelease(JsonElement root, Version currentVersion)
+    {
+        if (root.ValueKind != JsonValueKind.Object)
+            return InvalidRelease(currentVersion, "The latest release metadata is malformed.");
+        if (ReadBoolean(root, "draft") is not false || ReadBoolean(root, "prerelease") is not false)
+            return InvalidRelease(currentVersion, "The latest release is not a stable published release.");
+
+        var tag = ReadString(root, "tag_name");
+        if (!TryParseVersion(tag, out var latest))
+            return InvalidRelease(currentVersion, "The latest release tag is invalid.");
+        if (latest <= currentVersion)
+            return new UpdateCheckResult(false, currentVersion, latest, null, null);
+
+        var expectedAsset = $"{InstallerPrefix}-{tag}.zip";
+        if (!root.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+            return InvalidRelease(currentVersion, "The latest release has no valid Windows installer asset.", latest);
+
+        JsonElement? match = null;
+        foreach (var asset in assets.EnumerateArray())
+        {
+            if (asset.ValueKind == JsonValueKind.Object &&
+                string.Equals(ReadString(asset, "name"), expectedAsset, StringComparison.Ordinal))
+            {
+                if (match is not null)
+                    return InvalidRelease(currentVersion, "The latest release contains duplicate installer assets.", latest);
+                match = asset;
+            }
+        }
+
+        if (match is null)
+            return InvalidRelease(currentVersion, "The latest release has no valid Windows installer asset.", latest);
+
+        var selected = match.Value;
+        var url = ReadString(selected, "browser_download_url");
+        var digest = ReadString(selected, "digest");
+        var size = ReadInt64(selected, "size");
+        if (!IsExpectedDownloadUrl(url, tag!, expectedAsset))
+            return InvalidRelease(currentVersion, "The installer download URL is invalid.", latest);
+        if (!TryNormalizeDigest(digest, out var sha256))
+            return InvalidRelease(currentVersion, "The installer asset has no valid GitHub SHA-256 digest.", latest);
+        if (size is null or <= 0 or > MaxArchiveBytes)
+            return InvalidRelease(currentVersion, "The installer archive size is invalid.", latest);
+
+        var info = new UpdateInfo(
+            latest, tag!, expectedAsset, url!, size.Value, sha256,
+            ReadString(root, "body"), ReadString(root, "html_url"));
+        return new UpdateCheckResult(true, currentVersion, latest, info, null);
+    }
+
+    internal static async Task<string> ExtractInstallerAsync(
+        string archivePath,
+        string destinationDirectory,
+        UpdateInfo info,
+        IProgress<UpdateProgress> progress,
+        CancellationToken ct)
+    {
+        var expectedName = $"{InstallerPrefix}-{info.TagName}.exe";
+        using var archive = ZipFile.OpenRead(archivePath);
+        if (archive.Entries.Count != 1)
+            throw new InvalidDataException("The installer archive must contain exactly one file.");
+        var entry = archive.Entries[0];
+        if (!string.Equals(entry.FullName, expectedName, StringComparison.Ordinal) ||
+            !string.Equals(entry.Name, expectedName, StringComparison.Ordinal) ||
+            entry.Length <= 0 || entry.Length > MaxInstallerBytes)
+            throw new InvalidDataException("The installer archive has an invalid layout.");
+
+        var destinationRoot = Path.GetFullPath(destinationDirectory) + Path.DirectorySeparatorChar;
+        var outputPath = Path.GetFullPath(Path.Combine(destinationDirectory, entry.FullName));
+        if (!outputPath.StartsWith(destinationRoot, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("The installer archive contains an unsafe path.");
+
+        await using var input = entry.Open();
+        await using var output = new FileStream(
+            outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, true);
+        var buffer = new byte[1024 * 1024];
+        long extracted = 0;
+        while (true)
+        {
+            var read = await input.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false);
+            if (read == 0) break;
+            if (extracted > MaxInstallerBytes - read)
+                throw new InvalidDataException("The extracted installer is too large.");
+            extracted += read;
+            await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+            progress.Report(new UpdateProgress(UpdatePhase.Extracting, extracted, entry.Length, null));
+        }
+        if (extracted != entry.Length)
+            throw new InvalidDataException("The extracted installer size is invalid.");
+        return outputPath;
     }
 
     internal static bool TryParseVersion(string? value, out Version version)
     {
         version = new Version(0, 0, 0);
-        if (string.IsNullOrWhiteSpace(value)) return false;
-        value = value.Trim();
-        if (value.Length > 0 && (value[0] == 'v' || value[0] == 'V')) value = value[1..];
-        var cut = value.IndexOfAny(new[] { '+', '-', ' ' });
-        if (cut >= 0) value = value[..cut];
-        if (value.Length == 0) return false;
+        if (value is null) return false;
+        var match = ReleaseTagPattern.Match(value);
+        if (!match.Success ||
+            !int.TryParse(match.Groups[1].Value, out var major) ||
+            !int.TryParse(match.Groups[2].Value, out var minor) ||
+            !int.TryParse(match.Groups[3].Value, out var patch))
+            return false;
+        try
+        {
+            version = new Version(major, minor, patch);
+            return true;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return false;
+        }
+    }
 
-        var parts = value.Split('.');
-        int major = 0, minor = 0, patch = 0;
-        if (parts.Length > 0) int.TryParse(parts[0], out major);
-        if (parts.Length > 1) int.TryParse(parts[1], out minor);
-        if (parts.Length > 2) int.TryParse(parts[2], out patch);
-        version = new Version(major, minor, patch);
+    internal static bool IsMeshPublisher(string? subject)
+    {
+        if (string.IsNullOrWhiteSpace(subject)) return false;
+        try
+        {
+            return IsMeshPublisher(new X500DistinguishedName(subject));
+        }
+        catch (CryptographicException)
+        {
+        }
+        return false;
+    }
+
+    private static bool IsMeshPublisher(X500DistinguishedName subject)
+    {
+        var decoded = subject.Decode(
+            X500DistinguishedNameFlags.UseNewLines | X500DistinguishedNameFlags.DoNotUseQuotes);
+        var matchedAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var line in decoded.Split(
+            new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separator = line.IndexOf('=');
+            if (separator <= 0) return false;
+            var key = line[..separator].Trim();
+            var value = line[(separator + 1)..].Trim();
+            if (!TrustedPublisherAttributes.TryGetValue(key, out var trustedValue) ||
+                !string.Equals(value, trustedValue, StringComparison.Ordinal) ||
+                !matchedAttributes.Add(key))
+                return false;
+        }
+        return matchedAttributes.Count == TrustedPublisherAttributes.Count;
+    }
+
+    private static void VerifySignedInstaller(string path)
+    {
+        if (!OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("Authenticode validation requires Windows.");
+        if (WinVerifyTrustFile(path) != 0)
+            throw new CryptographicException("The installer Authenticode signature is not trusted.");
+#pragma warning disable SYSLIB0057
+        using var certificate = new X509Certificate2(X509Certificate.CreateFromSignedFile(path));
+#pragma warning restore SYSLIB0057
+        if (!IsMeshPublisher(certificate.SubjectName))
+            throw new CryptographicException(
+                "The installer publisher is not an approved Mesh publisher (expected Feincraft).");
+    }
+
+    private static int WinVerifyTrustFile(string path)
+    {
+        var fileInfo = new WinTrustFileInfo(path);
+        var filePointer = Marshal.AllocHGlobal(Marshal.SizeOf<WinTrustFileInfo>());
+        var dataPointer = IntPtr.Zero;
+        try
+        {
+            Marshal.StructureToPtr(fileInfo, filePointer, false);
+            var data = new WinTrustData(filePointer);
+            dataPointer = Marshal.AllocHGlobal(Marshal.SizeOf<WinTrustData>());
+            Marshal.StructureToPtr(data, dataPointer, false);
+            var action = WinTrustActionGenericVerifyV2;
+            return WinVerifyTrust(IntPtr.Zero, ref action, dataPointer);
+        }
+        finally
+        {
+            if (dataPointer != IntPtr.Zero) Marshal.FreeHGlobal(dataPointer);
+            Marshal.FreeHGlobal(filePointer);
+        }
+    }
+
+    private static void ValidateInfo(UpdateInfo info)
+    {
+        if (!TryParseVersion(info.TagName, out var parsed) || parsed != info.Version)
+            throw new InvalidDataException("The update version is invalid.");
+        var expectedAsset = $"{InstallerPrefix}-{info.TagName}.zip";
+        if (!string.Equals(info.AssetName, expectedAsset, StringComparison.Ordinal))
+            throw new InvalidDataException("The update asset name is invalid.");
+        if (!IsExpectedDownloadUrl(info.DownloadUrl, info.TagName, expectedAsset))
+            throw new InvalidDataException("The update download URL is invalid.");
+        if (info.Size <= 0 || info.Size > MaxArchiveBytes)
+            throw new InvalidDataException("The update archive size is invalid.");
+        if (info.Sha256.Length != 64 || !info.Sha256.All(Uri.IsHexDigit))
+            throw new InvalidDataException("The update digest is invalid.");
+    }
+
+    private static bool IsExpectedDownloadUrl(string? value, string tag, string asset)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.Ordinal) ||
+            !string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase) ||
+            uri.Port != 443 || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment) ||
+            !string.IsNullOrEmpty(uri.UserInfo))
+            return false;
+        var expected = $"/{Owner}/{Repo}/releases/download/{Uri.EscapeDataString(tag)}/{Uri.EscapeDataString(asset)}";
+        return string.Equals(uri.AbsolutePath, expected, StringComparison.Ordinal);
+    }
+
+    private static bool TryNormalizeDigest(string? value, out string digest)
+    {
+        digest = string.Empty;
+        if (value is null) return false;
+        var match = Sha256Pattern.Match(value);
+        if (!match.Success) return false;
+        digest = match.Groups[1].Value.ToLowerInvariant();
         return true;
+    }
+
+    private static async Task CopyBoundedAsync(Stream source, Stream destination, long maximum, CancellationToken ct)
+    {
+        var buffer = new byte[64 * 1024];
+        long total = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false);
+            if (read == 0) return;
+            if (total > maximum - read) throw new InvalidDataException("Content exceeds the allowed size.");
+            total += read;
+            await destination.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+        }
+    }
+
+    private static UpdateCheckResult InvalidRelease(Version current, string error, Version? latest = null) =>
+        new(false, current, latest, null, error);
+
+    private static string? ReadString(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static bool? ReadBoolean(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) &&
+        (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False)
+            ? value.GetBoolean()
+            : null;
+
+    private static long? ReadInt64(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.TryGetInt64(out var result) ? result : null;
+
+    private static Version DetectCurrentVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (informational is not null)
+        {
+            var core = informational.Split('+', 2)[0].Split('-', 2)[0];
+            if (Version.TryParse(core, out var parsed))
+                return new Version(parsed.Major, Math.Max(parsed.Minor, 0), Math.Max(parsed.Build, 0));
+        }
+        var named = assembly.GetName().Version;
+        return named is null
+            ? new Version(0, 0, 0)
+            : new Version(named.Major, Math.Max(named.Minor, 0), Math.Max(named.Build, 0));
+    }
+
+    private static string GetUpdateRoot() => Path.Combine(Path.GetTempPath(), "MeshUpdate");
+
+    private static void CleanupStaleTempDirectories()
+    {
+        var root = GetUpdateRoot();
+        if (!Directory.Exists(root)) return;
+        try
+        {
+            foreach (var directory in Directory.EnumerateDirectories(root))
+            {
+                try
+                {
+                    if (Directory.GetLastWriteTimeUtc(directory) < DateTime.UtcNow.AddDays(-1))
+                        Directory.Delete(directory, true);
+                }
+                catch
+                {
+                }
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static void DeleteDirectoryBestEffort(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, true);
+        }
+        catch
+        {
+        }
+    }
+
+    private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(disposed, this);
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        lifetimeCts.Cancel();
+        lock (timerLock)
+        {
+            autoTimer?.Dispose();
+            autoTimer = null;
+        }
+        lifetimeCts.Dispose();
+    }
+
+    private static readonly Guid WinTrustActionGenericVerifyV2 =
+        new("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+
+    [DllImport("wintrust.dll", ExactSpelling = true, SetLastError = true)]
+    private static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, IntPtr trustData);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private sealed class WinTrustFileInfo
+    {
+        public int StructSize = Marshal.SizeOf<WinTrustFileInfo>();
+        public string FilePath;
+        public IntPtr FileHandle = IntPtr.Zero;
+        public IntPtr KnownSubject = IntPtr.Zero;
+
+        public WinTrustFileInfo(string filePath) => FilePath = filePath;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private sealed class WinTrustData
+    {
+        public int StructSize = Marshal.SizeOf<WinTrustData>();
+        public IntPtr PolicyCallbackData = IntPtr.Zero;
+        public IntPtr SipClientData = IntPtr.Zero;
+        public uint UIChoice = 2;
+        public uint RevocationChecks = 1;
+        public uint UnionChoice = 1;
+        public IntPtr FileInfo;
+        public uint StateAction = 0;
+        public IntPtr StateData = IntPtr.Zero;
+        public string? UrlReference = null;
+        public uint ProviderFlags = 0x00000040;
+        public uint UIContext = 0;
+
+        public WinTrustData(IntPtr fileInfo) => FileInfo = fileInfo;
     }
 }

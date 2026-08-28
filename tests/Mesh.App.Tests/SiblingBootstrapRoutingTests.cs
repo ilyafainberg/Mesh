@@ -29,6 +29,19 @@ public sealed class SiblingBootstrapRoutingTests
         Assert.IsFalse(
             method.Contains("EmitLineUpsert(\"message.bootstrap\"", StringComparison.Ordinal),
             "the generic message helper includes the peer handle and is unsafe for sibling bootstrap");
+        var boundary = method.IndexOf("WithProjectionBoundaryAsync", StringComparison.Ordinal);
+        var markerWrite = method.IndexOf("ExecuteJournalWrite(() =>", StringComparison.Ordinal);
+        var chunkEmission = method.IndexOf("EmitBootstrapChunkAsync", StringComparison.Ordinal);
+        Assert.IsTrue(boundary >= 0 && markerWrite > boundary && chunkEmission > markerWrite,
+            "capture must persist its cursor-bounded plan before chunk emission");
+        var boundaryCallEnd = method.IndexOf(
+            "ct).ConfigureAwait(false);",
+            boundary,
+            StringComparison.Ordinal);
+        Assert.IsTrue(boundaryCallEnd > markerWrite && boundaryCallEnd < chunkEmission,
+            "the durable plan must be committed before releasing the projection boundary");
+        StringAssert.Contains(method, "EnterLocalOriginJournalLock");
+        StringAssert.Contains(method, "captureCursor");
     }
 
     private static string ReadSource(params string[] segments)

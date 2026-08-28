@@ -1,6 +1,9 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.SignalR;
 using Mesh.Relay.Backplane;
+#if MESH_TEST_RELAY_FAULTS
+using Mesh.Relay.LiveFaults;
+#endif
 using Mesh.Relay.Observability;
 using Mesh.Shared;
 
@@ -19,7 +22,13 @@ public sealed class MeshRouter(
     IHubContext<MeshHub> hub,
     ConnectionRegistry registry,
     IBackplane backplane,
-    RelayMetrics metrics)
+    RelayMetrics metrics
+#if MESH_TEST_RELAY_FAULTS
+    ,
+    LiveFaultStore liveFaults)
+#else
+    )
+#endif
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private sealed record ControlBackplanePayload(MeshEnvelope ControlEnvelope);
@@ -41,6 +50,19 @@ public sealed class MeshRouter(
         string? excludeConnectionId = null)
     {
         var normalized = Normalize(handle);
+#if MESH_TEST_RELAY_FAULTS
+        var fault = liveFaults.TryApply(
+            LiveFaultDirection.Inbound,
+            delivery.FromHandle,
+            delivery.FromDevice,
+            normalized,
+            delivery.ToDevice ?? "",
+            LiveFaultStore.OnlineFrameKind,
+            delivery.FrameId);
+        if (fault is not null)
+            return fault.Mode == LiveFaultMode.SuccessDropBeforeDestination ? 1 : 0;
+#endif
+
         var conns = toDevice is not null
             ? registry.ConnectionsForDevice(normalized, toDevice)
             : registry.ConnectionsFor(normalized);
@@ -75,6 +97,19 @@ public sealed class MeshRouter(
         string? excludeConnectionId = null)
     {
         var normalized = Normalize(handle);
+#if MESH_TEST_RELAY_FAULTS
+        var fault = liveFaults.TryApply(
+            LiveFaultDirection.Inbound,
+            envelope.From,
+            envelope.FromDevice ?? "",
+            normalized,
+            envelope.ToDevice ?? "",
+            envelope.Kind,
+            envelope.Id);
+        if (fault is not null)
+            return fault.Mode == LiveFaultMode.SuccessDropBeforeDestination ? 1 : 0;
+#endif
+
         var conns = toDevice is not null
             ? registry.ConnectionsForDevice(normalized, toDevice)
             : registry.ConnectionsFor(normalized);

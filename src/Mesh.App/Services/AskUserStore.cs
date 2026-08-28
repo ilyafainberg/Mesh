@@ -104,7 +104,7 @@ public sealed class AskUserStore(MeshDb db, IStoreScheduler? scheduler = null) :
         {
             ArgumentNullException.ThrowIfNull(prompt);
             prompt.EnsureValidForCreate();
-            db.InsertAskUserPrompt(prompt);
+            db.ExecuteDurableWrite(() => db.InsertAskUserPrompt(prompt), ct);
             return prompt;
         }, ct);
 
@@ -145,14 +145,19 @@ public sealed class AskUserStore(MeshDb db, IStoreScheduler? scheduler = null) :
                 throw new ArgumentException(
                     $"Selection '{selection}' does not match any option id.", nameof(selection));
 
-            return db.ResolveAskUserPrompt(promptId, selection, resolutionDeviceId, idempotencyToken);
+            return db.ExecuteDurableWrite(
+                () => db.ResolveAskUserPrompt(
+                    promptId, selection, resolutionDeviceId, idempotencyToken),
+                ct);
         }, ct);
 
     public Task<AskUserPrompt> ExpireAsync(string promptId, CancellationToken ct = default)
-        => _scheduler.RunAsync(() => db.ExpireAskUserPrompt(promptId), ct);
+        => _scheduler.RunAsync(
+            () => db.ExecuteDurableWrite(() => db.ExpireAskUserPrompt(promptId), ct), ct);
 
     public Task<AskUserPrompt> CancelAsync(string promptId, CancellationToken ct = default)
-        => _scheduler.RunAsync(() => db.CancelAskUserPrompt(promptId), ct);
+        => _scheduler.RunAsync(
+            () => db.ExecuteDurableWrite(() => db.CancelAskUserPrompt(promptId), ct), ct);
 
     public Task SaveSuspendedContextAsync(
         SuspendedAgentContext context, CancellationToken ct = default)
@@ -160,7 +165,7 @@ public sealed class AskUserStore(MeshDb db, IStoreScheduler? scheduler = null) :
         {
             ArgumentNullException.ThrowIfNull(context);
             context.EnsureValid();
-            db.SaveSuspendedContext(context);
+            db.ExecuteDurableWrite(() => db.SaveSuspendedContext(context), ct);
         }, ct);
 
     public Task<SuspendedAgentContext?> GetSuspendedContextAsync(
@@ -169,7 +174,8 @@ public sealed class AskUserStore(MeshDb db, IStoreScheduler? scheduler = null) :
 
     public Task<bool> MarkContextResumedAsync(
         string contextId, DateTimeOffset resumedAt, CancellationToken ct = default)
-        => _scheduler.RunAsync(() => db.MarkContextResumed(contextId, resumedAt), ct);
+        => _scheduler.RunAsync(
+            () => db.ExecuteDurableWrite(() => db.MarkContextResumed(contextId, resumedAt), ct), ct);
 
     private static void RequireNonBlank(string? value, string name)
     {

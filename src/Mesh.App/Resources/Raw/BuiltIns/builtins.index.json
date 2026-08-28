@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "contentVersion": "sha256:142388cd7ea5673d",
-  "catalogHash": "142388cd7ea5673d8b04b6c02fbb92158c93ddf02378b4f811c415a629394e9b",
+  "contentVersion": "sha256:3bfc0b7f0b5f9962",
+  "catalogHash": "3bfc0b7f0b5f99623134add5222633751a598778407d312e2c65ca68d540b784",
   "items": [
     {
       "id": "builtin:knowledge:about-mesh",
@@ -223,6 +223,42 @@
       "keywords": [],
       "triggers": [],
       "priority": 90
+    },
+    {
+      "id": "builtin:skill:adaptive-execution",
+      "type": "skill",
+      "path": "Skills/adaptive-execution/SKILL.md",
+      "sha256": "6eed8737f3263d55b6502bfd2db6fbead4dc8956520c6f0488ed682852194fd1",
+      "sizeBytes": 1947,
+      "roles": [
+        "owner"
+      ],
+      "title": null,
+      "name": "Decide how to process user requests",
+      "description": "Determines how to handle a request based on its complexity, then plans, executes, tests, and iterates until the requested outcome is verified.",
+      "keywords": [],
+      "triggers": [
+        "agent responds"
+      ],
+      "priority": null
+    },
+    {
+      "id": "builtin:skill:adhd",
+      "type": "skill",
+      "path": "Skills/adhd/SKILL.md",
+      "sha256": "49cc3e1ecad510d20a776767bcdf33140b53564d63fc76fc38e91f7ad1e37f00",
+      "sizeBytes": 3612,
+      "roles": [
+        "owner"
+      ],
+      "title": null,
+      "name": "Convert big reports into bite-sized decision making process",
+      "description": "Turns complex, long agent reports into short, bite-sized decision points, guides the user through each choice, records every answer, and requests approval before executing the resulting plan.",
+      "keywords": [],
+      "triggers": [
+        "agent responds"
+      ],
+      "priority": null
     },
     {
       "id": "builtin:skill:configure-capabilities",

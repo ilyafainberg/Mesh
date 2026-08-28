@@ -557,28 +557,37 @@ public sealed class Protocol9FoundationTests
     [TestMethod]
     public async Task ProfileCoordinator_WritesOffCallerThread()
     {
-        var callerThreadId = Thread.CurrentThread.ManagedThreadId;
-        int writerThreadId = -1;
+        var callerContext = new SynchronizationContext();
+        SynchronizationContext? writerContext = null;
         var tcs = new TaskCompletionSource<bool>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         await using var coordinator = new ProfilePersistenceCoordinator<string>(
             async (snapshot, ct) =>
             {
-                writerThreadId = Thread.CurrentThread.ManagedThreadId;
+                writerContext = SynchronizationContext.Current;
                 tcs.TrySetResult(true);
                 await Task.CompletedTask.ConfigureAwait(false);
             },
             debounce: TimeSpan.Zero);
 
-        coordinator.Schedule("payload");
+        var previousContext = SynchronizationContext.Current;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(callerContext);
+            coordinator.Schedule("payload");
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousContext);
+        }
         await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await coordinator.FlushAsync();
 
-        Assert.AreNotEqual(-1, writerThreadId, "Save delegate was never invoked.");
-        Assert.AreNotEqual(
-            callerThreadId, writerThreadId,
-            "Save delegate must run on a background thread, not the caller thread.");
+        Assert.AreNotSame(
+            callerContext,
+            writerContext,
+            "Save delegate must not inherit the caller synchronization context.");
     }
 
     [TestMethod]

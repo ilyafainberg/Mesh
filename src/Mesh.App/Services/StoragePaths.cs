@@ -1,5 +1,31 @@
 namespace Mesh.App.Services;
 
+public sealed class StoragePathSet
+{
+    public string Root { get; }
+    public string DataDir { get; }
+    public string KeysDir { get; }
+
+    internal StoragePathSet(string root)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(root);
+        Root = Path.GetFullPath(root);
+        DataDir = Path.Combine(Root, "Data");
+        KeysDir = Path.Combine(Root, "Keys");
+        TryCreate(Root);
+        TryCreate(DataDir);
+        TryCreate(KeysDir);
+        StorageProtection.TryEnsureBackgroundReadable(Root);
+        StorageProtection.TryEnsureBackgroundReadable(DataDir);
+        StorageProtection.TryEnsureBackgroundReadable(KeysDir);
+    }
+
+    private static void TryCreate(string path)
+    {
+        try { Directory.CreateDirectory(path); } catch { }
+    }
+}
+
 /// <summary>
 /// Single source of truth for where Mesh stores its per-identity data and keys.
 ///
@@ -16,30 +42,18 @@ namespace Mesh.App.Services;
 /// </summary>
 public static class StoragePaths
 {
+    private static readonly StoragePathSet Default = new(ResolveRoot());
+
     /// <summary>The resolved storage root. See class remarks for resolution order.</summary>
-    public static string Root { get; }
+    public static string Root => Default.Root;
 
     /// <summary>Directory holding accounts.json and the per-identity .meshdb databases.</summary>
-    public static string DataDir { get; }
+    public static string DataDir => Default.DataDir;
 
     /// <summary>Directory holding the per-identity DPAPI-protected key files.</summary>
-    public static string KeysDir { get; }
+    public static string KeysDir => Default.KeysDir;
 
-    static StoragePaths()
-    {
-        Root = ResolveRoot();
-        DataDir = Path.Combine(Root, "Data");
-        KeysDir = Path.Combine(Root, "Keys");
-
-        // Create eagerly and defensively: never throw from the static initializer, otherwise a
-        // headless test host that touches any member would fail with a TypeInitializationException.
-        TryCreate(Root);
-        TryCreate(DataDir);
-        TryCreate(KeysDir);
-        StorageProtection.TryEnsureBackgroundReadable(Root);
-        StorageProtection.TryEnsureBackgroundReadable(DataDir);
-        StorageProtection.TryEnsureBackgroundReadable(KeysDir);
-    }
+    public static StoragePathSet ForRoot(string root) => new(root);
 
     private static string ResolveRoot()
     {
@@ -68,10 +82,5 @@ public static class StoragePaths
         }
 
         return Path.Combine(Path.GetTempPath(), "Mesh");
-    }
-
-    private static void TryCreate(string path)
-    {
-        try { Directory.CreateDirectory(path); } catch { /* best effort */ }
     }
 }

@@ -24,6 +24,7 @@ public static class NotificationCoordinatorBridge
         {
             RuntimeDiagnostics.Current?.RecordException("notification-publish", ex);
             System.Diagnostics.Debug.WriteLine(ex);
+            throw;
         }
     }
 
@@ -59,7 +60,13 @@ public static class NotificationCoordinatorBridge
 
     private static void Observe(Task task)
         => _ = task.ContinueWith(
-            static completed => System.Diagnostics.Debug.WriteLine(completed.Exception),
+            static completed =>
+            {
+                var failure = completed.Exception?.GetBaseException();
+                if (failure is null) return;
+                RuntimeDiagnostics.Current?.RecordException("notification-background", failure);
+                System.Diagnostics.Debug.WriteLine(failure);
+            },
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted,
             TaskScheduler.Default);

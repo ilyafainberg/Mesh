@@ -134,10 +134,12 @@ public static class ReplicationPayloadCodec
     }
 
     /// <summary>
-    /// Attempts to decrypt an end-to-end payload with this device's key pair. Returns
-    /// (true, plaintext) when the payload is addressed to this device and authenticates.
+    /// Attempts to decrypt an end-to-end payload with this device's key pair.
     /// </summary>
-    public static (bool ok, string? plaintext) TryDecrypt(string ciphertext, string myPrivateKeyB64, string myPublicKeyB64)
+    public static MessageDecryptResult TryDecrypt(
+        string ciphertext,
+        string myPrivateKeyB64,
+        string myPublicKeyB64)
         => MessageCrypto.TryDecrypt(ciphertext, myPrivateKeyB64, myPublicKeyB64);
 
     /// <summary>The device ids an encrypted body was wrapped for (key-slot metadata only).</summary>

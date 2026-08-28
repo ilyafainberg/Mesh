@@ -139,9 +139,10 @@ public sealed partial class AppState
             localOnly: false,
             version: 1);
 
-        await Task.Run(() =>
-        {
-            EnsureLocalJournal().EmitLocalBatch(envelopes, targets, (conn, tx, index) =>
+        await ReplicateLocalBatchAsync(
+            envelopes,
+            targets,
+            (conn, tx, index) =>
             {
                 if (index == 0)
                 {
@@ -160,8 +161,8 @@ public sealed partial class AppState
                         skillRecord.UpdatedAt,
                         localOnly: false);
                 }
-            });
-        }, cancellationToken).ConfigureAwait(false);
+            },
+            cancellationToken).ConfigureAwait(false);
 
         lock (profileSyncGate)
         {
@@ -187,7 +188,8 @@ public sealed partial class AppState
         {
             var db = ActiveDb();
             if (db is not null)
-                await Task.Run(() => db.DeleteAllSkillPackages(skillId), cancellationToken).ConfigureAwait(false);
+                await db.ExecuteDurableWriteAsync(
+                    () => db.DeleteAllSkillPackages(skillId), cancellationToken).ConfigureAwait(false);
             skillPackageCache.RemoveAll(skillId);
         }
 

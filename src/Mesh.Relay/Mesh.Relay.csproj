@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <ItemGroup>
-    <ProjectReference Include="..\Mesh.Shared\Mesh.Shared.csproj" />
+    <ProjectReference Include="..\Mesh.Shared\Mesh.Shared.csproj"
+                      GlobalPropertiesToRemove="MeshRelayTestFaults;MeshRelayFlavor;MeshRelayOutputRoot;MeshRelayIntermediateRoot" />
   </ItemGroup>
 
   <ItemGroup>
@@ -15,6 +16,26 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AzureCosmosDisableNewtonsoftJsonCheck>true</AzureCosmosDisableNewtonsoftJsonCheck>
+    <BaseOutputPath Condition="'$(BaseOutputPath)' == ''">bin\</BaseOutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <OutputPath>$(BaseOutputPath)$(Configuration)\$(TargetFramework)\$(MeshRelayFlavor)\</OutputPath>
+    <IntermediateOutputPath>$(BaseIntermediateOutputPath)$(Configuration)\$(TargetFramework)\</IntermediateOutputPath>
   </PropertyGroup>
+
+  <PropertyGroup Condition="'$(MeshRelayTestFaults)' == 'true'">
+    <DefineConstants>$(DefineConstants);MESH_TEST_RELAY_FAULTS</DefineConstants>
+    <AssemblyName>Mesh.Relay.TestHooks</AssemblyName>
+    <RootNamespace>Mesh.Relay</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(MeshRelayTestFaults)' != 'true'">
+    <Compile Remove="LiveFaults\**\*.cs" />
+  </ItemGroup>
+
+  <Target Name="RejectTestFaultsInRelease" BeforeTargets="CoreCompile"
+          Condition="'$(MeshRelayTestFaults)' == 'true' and '$(Configuration)' == 'Release'">
+    <Error Text="The test-relay live-fault flavor cannot be compiled as Release. Production Release artifacts exclude activation endpoints and interception code." />
+  </Target>
 
 </Project>

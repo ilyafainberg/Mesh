@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using Mesh.App.Services;
+using Mesh.Relay.LiveFaults;
 using Mesh.Shared;
 using Microsoft.Data.Sqlite;
 
@@ -90,14 +91,58 @@ internal sealed class FabricRoster : IRefreshableReplicationRoster
         RefreshCalls++;
         return Task.CompletedTask;
     }
+
+    public Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+        IReadOnlyCollection<string> accountHandles,
+        ReplicationIdentity localIdentity,
+        CancellationToken ct)
+    {
+        lock (gate)
+        {
+            var handles = accountHandles
+                .Append(localIdentity.Handle)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var devices = handles
+                .Where(byAccount.ContainsKey)
+                .SelectMany(handle => byAccount[handle])
+                .Where(device => !device.Revoked)
+                .ToList();
+            var generations = handles.ToDictionary(
+                handle => handle,
+                handle => generation.TryGetValue(handle, out var value) ? value : 0,
+                StringComparer.Ordinal);
+            var ownOnly = handles.All(handle =>
+                string.Equals(handle, localIdentity.Handle, StringComparison.Ordinal));
+            var hasSibling = devices.Any(device =>
+                string.Equals(device.Handle, localIdentity.Handle, StringComparison.Ordinal)
+                && !string.Equals(device.DeviceId, localIdentity.DeviceId, StringComparison.Ordinal));
+            return Task.FromResult(new ReplicationEmissionRosterSnapshot(
+                ownOnly && !hasSibling
+                    ? ReplicationEmissionRosterState.NoSiblings
+                    : ReplicationEmissionRosterState.FreshComplete,
+                devices,
+                generations));
+        }
+    }
 }
 
 /// <summary>Records every inbound domain projection and can run an in-transaction side effect.</summary>
 internal sealed class RecordingApplier : IReplicationDomainApplier
 {
     public readonly List<(ReplicationEvent Evt, ReplicationPayloadCodec.DomainEnvelope Env, bool Desktop)> Applied = new();
+    public Func<ReplicationEvent, ReplicationPayloadCodec.DomainEnvelope, bool,
+        ReplicationPayloadCodec.DomainEnvelope?>? OnPrepare;
     public Action<SqliteConnection, SqliteTransaction, ReplicationEvent, ReplicationPayloadCodec.DomainEnvelope>? OnApply;
     public bool ApplyResult = true;
+
+    public ReplicationPayloadCodec.DomainEnvelope? Prepare(
+        ReplicationEvent evt,
+        ReplicationPayloadCodec.DomainEnvelope envelope,
+        bool deviceIsDesktop)
+        => OnPrepare is null
+            ? envelope
+            : OnPrepare(evt, envelope, deviceIsDesktop);
 
     public bool Apply(
         SqliteConnection conn,
@@ -115,6 +160,7 @@ internal sealed class RecordingApplier : IReplicationDomainApplier
 
     /// <summary>Post-commit hook: fired only after the inbound transaction has committed.</summary>
     public Action<ReplicationEvent, ReplicationPayloadCodec.DomainEnvelope>? OnAfterCommit;
+    public Func<ReplicationEvent, ReplicationPayloadCodec.DomainEnvelope, Task>? OnAfterCommitAsync;
     public int AfterCommitBatchCalls;
 
     public Task AfterCommitAsync(
@@ -123,7 +169,7 @@ internal sealed class RecordingApplier : IReplicationDomainApplier
         bool deviceIsDesktop)
     {
         OnAfterCommit?.Invoke(evt, envelope);
-        return Task.CompletedTask;
+        return OnAfterCommitAsync?.Invoke(evt, envelope) ?? Task.CompletedTask;
     }
 
     public async Task AfterCommitBatchAsync(
@@ -149,6 +195,7 @@ internal sealed class ReplicationFabric
     public int Unknown { get; private set; }
     public Func<string, OnlineRelayFrame, bool>? DropFrame { get; set; }
     public Func<string, OnlineRelayFrame, bool>? DropAcceptedFrame { get; set; }
+    public LiveFaultStore? LiveFaults { get; set; }
 
     private sealed class Node(string handle, string device, OnlineReplicationEngine engine)
     {
@@ -190,6 +237,30 @@ internal sealed class ReplicationFabric
             {
                 DroppedOffline++;
                 return new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline);
+            }
+            var fault = LiveFaults?.TryApply(
+                LiveFaultDirection.Outbound,
+                fromHandle,
+                fromDevice,
+                frame.ToHandle,
+                frame.ToDevice,
+                LiveFaultStore.OnlineFrameKind,
+                frame.FrameId);
+            if (fault is not null)
+            {
+                if (fault.Mode == LiveFaultMode.SuccessDropBeforeDestination)
+                {
+                    DroppedAccepted++;
+                    Delivered++;
+                    return new OnlineRelaySendResult(true, OnlineRelaySendCodes.Delivered);
+                }
+
+                DroppedOffline++;
+                return new OnlineRelaySendResult(
+                    false,
+                    fault.Mode == LiveFaultMode.RejectBeforeForwarding
+                        ? LiveFaultStore.RejectedCode
+                        : OnlineRelaySendCodes.NotOnline);
             }
             if (DropAcceptedFrame?.Invoke(fromDevice, frame) == true)
             {

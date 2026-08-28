@@ -843,3 +843,11 @@
     .bar-btn { min-width: 42px; padding-inline: 6px; }
     .thread-bar { padding-inline: 6px; }
 }
+
+@media (orientation: landscape) and (max-height: 600px) {
+    .me-list {
+        box-sizing: border-box;
+        padding-bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+        scroll-padding-bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+    }
+}

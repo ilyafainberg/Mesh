@@ -100,9 +100,20 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
                 startDrain = true;
             }
         }
-        if (item.WasQueued)
-            state.TrackQueuedTopicRun(draft.ThreadId, draft.RunId, draft.TriggerLineId);
-        Report(progress, draft, TopicRunPhase.Queued, "Queued", queued: queued);
+        try
+        {
+            if (item.WasQueued)
+                state.TrackQueuedTopicRun(draft.ThreadId, draft.RunId, draft.TriggerLineId);
+            Report(progress, draft, TopicRunPhase.Queued, "Queued", queued: queued);
+        }
+        catch (Exception ex)
+        {
+            item.Completion.TrySetException(ex);
+        }
+        finally
+        {
+            if (startDrain) TrackDrain(DrainAsync(queue));
+        }
         using var registration = effectiveCancellation.Register(() =>
         {
             var clearQueued = false;
@@ -117,54 +128,69 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
             if (clearQueued)
                 state.CompleteQueuedTopicRun(draft.ThreadId, draft.RunId);
         });
-        if (startDrain) TrackDrain(DrainAsync(queue));
         return await item.Completion.Task;
     }
 
     private async Task DrainAsync(TopicQueue queue)
     {
-        while (true)
+        var restart = false;
+        try
         {
-            WorkItem item;
+            while (TryDequeue(queue, out var item))
+            {
+                TopicRunCompletion completion;
+                try
+                {
+                    if (item.OnStarted is not null)
+                        await item.OnStarted(item.CancellationToken);
+                    if (item.WasQueued)
+                        state.StartQueuedTopicRun(item.Draft.ThreadId, item.Draft.RunId);
+                    Report(item.Progress, item.Draft, TopicRunPhase.Executing, "Running");
+                    completion = await ExecuteCoreAsync(
+                        item.Draft, item.Progress, item.CancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    ClearTriggerAttachments(item.Draft);
+                    completion = new TopicRunCompletion(
+                        item.Draft.RunId,
+                        item.Draft.ThreadId,
+                        TopicRunPhase.Failed,
+                        DateTimeOffset.UtcNow,
+                        ex.Message,
+                        "execution_failed");
+                }
+
+                Exception? postCompletionError = null;
+                try
+                {
+                    if (item.WasQueued)
+                        state.CompleteQueuedTopicRun(
+                            item.Draft.ThreadId, item.Draft.RunId);
+                }
+                catch (Exception ex)
+                {
+                    postCompletionError = ex;
+                }
+
+                if (postCompletionError is null)
+                    item.Completion.TrySetResult(completion);
+                else
+                    item.Completion.TrySetException(postCompletionError);
+            }
+        }
+        finally
+        {
             lock (queue.Sync)
             {
-                do
+                queue.Draining = false;
+                if (queue.Items.Count > 0)
                 {
-                    if (queue.Items.Count == 0)
-                    {
-                        queue.Draining = false;
-                        return;
-                    }
-                    item = queue.Items.Dequeue();
+                    queue.Draining = true;
+                    restart = true;
                 }
-                while (item.Completion.Task.IsCompleted);
-                item.Started = true;
             }
-            TopicRunCompletion completion;
-            try
-            {
-                if (item.OnStarted is not null)
-                    await item.OnStarted(item.CancellationToken);
-                if (item.WasQueued)
-                    state.StartQueuedTopicRun(item.Draft.ThreadId, item.Draft.RunId);
-                Report(item.Progress, item.Draft, TopicRunPhase.Executing, "Running");
-                completion = await ExecuteCoreAsync(
-                    item.Draft, item.Progress, item.CancellationToken);
-            }
-            catch (Exception ex)
-            {
-                ClearTriggerAttachments(item.Draft);
-                completion = new TopicRunCompletion(
-                    item.Draft.RunId,
-                    item.Draft.ThreadId,
-                    TopicRunPhase.Failed,
-                    DateTimeOffset.UtcNow,
-                    ex.Message,
-                    "execution_failed");
-            }
-            if (item.WasQueued)
-                state.CompleteQueuedTopicRun(item.Draft.ThreadId, item.Draft.RunId);
-            item.Completion.TrySetResult(completion);
+            if (restart) _ = DrainAsync(queue);
         }
     }
 
@@ -229,6 +255,22 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         await StopAsync().ConfigureAwait(false);
         lifetime.Dispose();
     }
+    private static bool TryDequeue(TopicQueue queue, out WorkItem item)
+    {
+        lock (queue.Sync)
+        {
+            while (queue.Items.Count > 0)
+            {
+                item = queue.Items.Dequeue();
+                if (item.Completion.Task.IsCompleted) continue;
+                item.Started = true;
+                return true;
+            }
+        }
+        item = null!;
+        return false;
+    }
+
     private async Task<TopicRunCompletion> ExecuteCoreAsync(
         TopicTurnDraft draft,
         IProgress<TopicRunUpdatePayload> progress,

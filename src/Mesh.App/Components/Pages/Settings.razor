@@ -1302,16 +1302,6 @@
         InvokeAsync(StateHasChanged);
     }
 
-    void RefreshUpdater()
-    {
-        InvokeAsync(() =>
-        {
-            updateInfo = Updater.Available;
-            updateAvailable = updateInfo is not null;
-            StateHasChanged();
-        });
-    }
-
     void OnProviderChange(ChangeEventArgs e)
     {
         provider = e.Value?.ToString() ?? "Anthropic";
@@ -1790,12 +1780,9 @@
 
     async Task CheckUpdate()
     {
-        if (updateOperationActive) return;
-        updateOperationActive = true;
+        checkingUpdate = true;
         updateFailed = false;
-        updatePhase = UpdatePhase.Checking;
-        updateStatus = "Checking";
-        updateOperationCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        updateStatus = null;
         try
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
@@ -1807,15 +1794,11 @@
             else if (result.Error is not null)
             {
                 updateFailed = true;
-                updatePhase = UpdatePhase.Failed;
-                updateStatus = $"Failed: {result.Error}";
+                updateStatus = result.Error;
             }
             else
             {
-                updateAvailable = false;
-                updateInfo = null;
-                updatePhase = UpdatePhase.UpToDate;
-                updateStatus = $"UpToDate: {Updater.CurrentVersion.ToString(3)}";
+                updateStatus = $"You're on the latest version ({Updater.CurrentVersion.ToString(3)}).";
             }
         }
         catch (OperationCanceledException)
@@ -1850,6 +1833,12 @@
             updateStatus = $"Could not open the release page: {ex.Message}";
         }
     }
+    async Task OnDoNotDisturbChanged(ChangeEventArgs e)
+    {
+        Toggle(profile => profile.DoNotDisturb = (bool)(e.Value ?? false));
+        await Mesh.RegisterPushTokenAsync();
+    }
+
     void Toggle(Action<Mesh.App.Domain.MeshProfile> change) => State.Mutate(change);
 
     async Task CreateInvite()
@@ -1903,13 +1892,11 @@
 
     public void Dispose()
     {
-        updateOperationCts?.Cancel();
-        updateOperationCts?.Dispose();
         linkTimer?.Dispose();
         State.Changed -= Refresh;
         Setup.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Foundry.ModelsChanged -= Refresh;
-        Updater.Changed -= RefreshUpdater;
+        Updater.Changed -= Refresh;
     }
 }

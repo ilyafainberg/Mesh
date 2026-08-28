@@ -7,6 +7,7 @@
     <Project Path="src/Mesh.Updater/Mesh.Updater.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Mesh.App.ComponentTests/Mesh.App.ComponentTests.csproj" />
     <Project Path="tests/Mesh.App.Tests/Mesh.App.Tests.csproj" />
   </Folder>
 </Solution>

@@ -18,6 +18,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
     private readonly object stopGate = new();
     private long nextLocalTaskId;
     private Task? stopTask;
+    internal static Action<string>? BeforeTransportCheckpointHook { get; set; }
 
     public TopicExecutionRouter(
         AppState state,
@@ -42,6 +43,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             "topic-execution-router",
             cancellationToken => StopAsync().WaitAsync(cancellationToken));
     }
+
     private sealed class RunEntry
     {
         public required TopicTurnDraft Draft { get; set; }
@@ -49,6 +51,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         public required TaskCompletionSource<TopicDispatchResult> Dispatch { get; init; }
         public CancellationTokenSource? LocalCancellation { get; set; }
         public string? RemoteDeviceId { get; set; }
+        public bool DurableBeginCommitted { get; set; }
     }
 
     private readonly ConcurrentDictionary<string, RunEntry> runs =
@@ -59,10 +62,20 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
     private readonly SemaphoreSlim deviceListGate = new(1, 1);
     private const int MaxRememberedRuns = 1024;
 
-    public async Task<TopicDispatchResult> SubmitAsync(
+    public Task<TopicDispatchResult> SubmitAsync(
         TopicTurnDraft draft,
         IProgress<TopicRunUpdatePayload>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TopicSendHandoffContext? handoffContext = null)
+        => RunOffDispatcherAsync(
+            "topic.submit",
+            () => SubmitCoreAsync(draft, progress, cancellationToken, handoffContext));
+
+    private async Task<TopicDispatchResult> SubmitCoreAsync(
+        TopicTurnDraft draft,
+        IProgress<TopicRunUpdatePayload>? progress,
+        CancellationToken cancellationToken,
+        TopicSendHandoffContext? handoffContext)
     {
         ArgumentNullException.ThrowIfNull(draft);
         var validation = Validate(draft);
@@ -76,7 +89,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         var owner = false;
         lock (submitGate)
         {
-            var triggerKey = draft.ThreadId + "\0" + draft.TriggerLineId;
+            var triggerKey = TriggerKey(draft);
             if (triggerRuns.TryGetValue(triggerKey, out var triggerRunId)
                 && !string.Equals(triggerRunId, draft.RunId, StringComparison.Ordinal))
             {
@@ -116,7 +129,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         try
         {
             var result = await DispatchNewAsync(
-                entry, progress, effectiveCancellation);
+                entry, progress, effectiveCancellation, handoffContext);
             entry.Dispatch.TrySetResult(result);
             if (!result.Accepted || entry.RemoteDeviceId is not null)
                 RememberCompletion(entry);
@@ -129,17 +142,42 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             RememberCompletion(entry);
             return result;
         }
+        catch (TopicSendAuthorizationException ex)
+        {
+            entry.Dispatch.TrySetException(ex);
+            lock (submitGate)
+            {
+                runs.TryRemove(draft.RunId, out _);
+                var triggerKey = TriggerKey(draft);
+                if (triggerRuns.TryGetValue(triggerKey, out var runId)
+                    && string.Equals(runId, draft.RunId, StringComparison.Ordinal))
+                    triggerRuns.Remove(triggerKey);
+            }
+            throw;
+        }
         catch (Exception ex)
         {
             var result = TopicDispatchResult.Reject(
-                "dispatch_failed", draft.RunId, ex.Message);
+                "dispatch_failed",
+                draft.RunId,
+                ex.Message,
+                entry.DurableBeginCommitted);
             entry.Dispatch.TrySetResult(result);
             RememberCompletion(entry);
             return result;
         }
     }
 
-    public async Task<bool> CancelQueuedAsync(
+    public Task<bool> CancelQueuedAsync(
+        string threadId,
+        string runId,
+        string lineId,
+        CancellationToken cancellationToken)
+        => RunOffDispatcherAsync(
+            "topic.cancel-queued",
+            () => CancelQueuedCoreAsync(threadId, runId, lineId, cancellationToken));
+
+    private async Task<bool> CancelQueuedCoreAsync(
         string threadId,
         string runId,
         string lineId,
@@ -148,13 +186,21 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         if (!state.IsQueuedTopicRunLine(threadId, runId, lineId))
             return false;
 
-        if (!await StopAsync(threadId, runId, cancellationToken))
+        if (!await StopCoreAsync(threadId, runId, cancellationToken).ConfigureAwait(false))
             return false;
         state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
         return true;
     }
 
-    public async Task<bool> StopAsync(
+    public Task<bool> StopAsync(
+        string threadId,
+        string runId,
+        CancellationToken cancellationToken)
+        => RunOffDispatcherAsync(
+            "topic.stop",
+            () => StopCoreAsync(threadId, runId, cancellationToken));
+
+    private async Task<bool> StopCoreAsync(
         string threadId,
         string runId,
         CancellationToken cancellationToken)
@@ -171,11 +217,12 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             if (thread?.ExecutionDeviceId is null
                 || !state.IsKnownQueuedTopicRun(threadId, runId))
                 return false;
-            state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
             var queuedCancelled = await deviceTransport.CancelAsync(
                 thread.ExecutionDeviceId,
                 new TopicRunCancelPayload(runId, threadId),
                 cancellationToken);
+            if (queuedCancelled)
+                state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
             return queuedCancelled;
         }
 
@@ -208,7 +255,13 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             cancellationToken);
         return cancelled;
     }
-    public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
+    public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
+        CancellationToken cancellationToken)
+        => RunOffDispatcherAsync(
+            "topic.list-devices",
+            () => ListEligibleDevicesCoreAsync(cancellationToken));
+
+    private async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesCoreAsync(
         CancellationToken cancellationToken)
     {
         await deviceListGate.WaitAsync(cancellationToken);
@@ -237,7 +290,8 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
     private async Task<TopicDispatchResult> DispatchNewAsync(
         RunEntry entry,
         IProgress<TopicRunUpdatePayload>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TopicSendHandoffContext? handoffContext)
     {
         var draft = entry.Draft;
         var thread = state.Profile.OwnThreads.First(thread =>
@@ -264,7 +318,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         {
             try
             {
-                var devices = await ListEligibleDevicesAsync(cancellationToken);
+                var devices = await ListEligibleDevicesCoreAsync(cancellationToken);
                 target = devices.FirstOrDefault(device =>
                     string.Equals(device.DeviceId, targetId, StringComparison.Ordinal));
             }
@@ -286,20 +340,8 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 return TopicDispatchResult.Reject(
                     "device_not_eligible", draft.RunId,
                     "The selected device is not agent-ready.");
-            if (thread.ExecutionDeviceId is null)
-            {
-                try
-                {
-                    state.BindOwnThreadForSend(
-                        thread.Id,
-                        new ExecutionDevice(target.DeviceId, target.Name, target.Platform));
-                }
-                catch (InvalidOperationException)
-                {
-                    return TopicDispatchResult.Reject("topic_bind_conflict", draft.RunId);
-                }
-            }
-            else if (!string.Equals(
+            if (thread.ExecutionDeviceId is not null
+                && !string.Equals(
                          thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
             {
                 return TopicDispatchResult.Reject(
@@ -307,76 +349,80 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                     "Move the topic before sending it to a different device.");
             }
         }
-        if (trigger is null)
-        {
-            trigger = new ChatLine
-            {
-                Id = draft.TriggerLineId,
-                Role = "user",
-                Text = draft.Prompt,
-                SenderHandle = draft.TriggerHandle,
-                At = draft.TriggerAt,
-                Attachments = draft.Attachments?.ToList() ?? []
-            };
-            state.AddOwnChatLine(thread.Id, trigger);
-        }
-        var queuedBehindActiveRun = thread.ExecutionRunId is not null
-                                    || state.IsThreadBusy(thread.Id);
-        if (queuedBehindActiveRun)
-            state.TrackQueuedTopicRun(thread.Id, draft.RunId, draft.TriggerLineId);
-
         var queuedUpdate = new TopicRunUpdatePayload(
             draft.RunId,
             draft.ThreadId,
             TopicRunPhase.Queued,
             "Queued",
-            Queued: state.QueuedCountForThread(thread.Id),
+            Queued: state.QueuedCountForThread(thread.Id)
+                    + (thread.ExecutionRunId is null ? 0 : 1),
             Timestamp: DateTimeOffset.UtcNow,
             TriggerLineId: draft.TriggerLineId);
-        progress?.Report(queuedUpdate);
+        var executionTarget = new ExecutionDevice(
+            target!.DeviceId, target.Name, target.Platform);
 
         if (current is not null
-            && string.Equals(target!.DeviceId, current.DeviceId, StringComparison.Ordinal))
+            && string.Equals(target.DeviceId, current.DeviceId, StringComparison.Ordinal))
         {
-            if (thread.ExecutionRunId is null)
+            var beginCommand = new TopicRunBeginCommand(
+                    draft,
+                    executionTarget,
+                    TopicRunBeginMode.Local,
+                    queuedUpdate);
+            var begin = handoffContext?.BeginTopicRun(
+                            beginCommand,
+                            () => state.BeginTopicRun(beginCommand))
+                        ?? state.BeginTopicRun(beginCommand);
+            if (!begin.Committed)
             {
-                state.RegisterExpectedRemoteRun(
-                    thread.Id,
+                return TopicDispatchResult.Reject(
+                    "local_persistence_failed",
                     draft.RunId,
-                    new ExecutionDevice(target.DeviceId, target.Name, target.Platform),
-                    draft.TriggerAt);
-                if (!state.TryApplyRemoteRunUpdate(queuedUpdate))
-                    throw new InvalidOperationException("The queued run state could not be persisted.");
+                    $"The run could not be durably started ({begin.Code}).");
             }
-            var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token);
+            entry.DurableBeginCommitted = true;
+            AdoptAuthoritativeBegin(entry, begin);
+            var authoritativeDraft = entry.Draft;
+            var authoritativeQueued = queuedUpdate with
+            {
+                RunId = authoritativeDraft.RunId,
+                ThreadId = authoritativeDraft.ThreadId,
+                TriggerLineId = authoritativeDraft.TriggerLineId
+            };
+            progress?.Report(authoritativeQueued);
+            if (begin.ProjectionDeferred)
+                return TopicDispatchResult.Ok(
+                    authoritativeDraft.RunId, "projection_deferred", durable: true);
+            if (!begin.Created)
+                return TopicDispatchResult.Ok(
+                    authoritativeDraft.RunId, begin.Code, durable: true);
+
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, lifetime.Token);
             entry.LocalCancellation = linked;
             var projectedProgress = new InlineProgress<TopicRunUpdatePayload>(update =>
             {
-                if (!state.TryApplyRemoteRunUpdate(update))
-                    throw new InvalidOperationException("The local run state could not be persisted.");
+                if (update.Phase == TopicRunPhase.Queued)
+                    state.TrackQueuedTopicRun(
+                        update.ThreadId,
+                        update.RunId,
+                        update.TriggerLineId ?? authoritativeDraft.TriggerLineId);
+                else if (update.Phase is TopicRunPhase.Completed
+                         or TopicRunPhase.Failed
+                         or TopicRunPhase.Cancelled)
+                    state.CompleteQueuedTopicRun(update.ThreadId, update.RunId);
+                else
+                    state.StartQueuedTopicRun(update.ThreadId, update.RunId);
                 progress?.Report(update);
             });
             TrackLocal(
-                RunLocalAsync(entry, draft, projectedProgress, linked),
-                draft.RunId);
-            return TopicDispatchResult.Ok(draft.RunId);
+                RunLocalAsync(entry, authoritativeDraft, projectedProgress, linked),
+                authoritativeDraft.RunId);
+            return TopicDispatchResult.Ok(authoritativeDraft.RunId, durable: true);
         }
 
         var remoteTarget = target!;
         entry.RemoteDeviceId = remoteTarget.DeviceId;
-        state.TrackQueuedTopicRun(
-            thread.Id, draft.RunId, draft.TriggerLineId, TopicQueueStage.Sending);
-        if (thread.ExecutionRunId is null)
-        {
-            state.RegisterExpectedRemoteRun(
-                thread.Id,
-                draft.RunId,
-                new ExecutionDevice(
-                    remoteTarget.DeviceId, remoteTarget.Name, remoteTarget.Platform),
-                draft.TriggerAt);
-            if (!state.TryApplyRemoteRunUpdate(queuedUpdate))
-                throw new InvalidOperationException("The queued run state could not be persisted.");
-        }
 
         var attachments = draft.Attachments?.ToList() ?? [];
         var manifests = attachments.Select((attachment, index) =>
@@ -398,37 +444,91 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             draft.WidgetContext,
             manifests,
             manifests.Select(manifest => manifest.Id).ToList());
+        var command = new TopicRunBeginCommand(
+            draft,
+            executionTarget,
+            TopicRunBeginMode.Remote,
+            queuedUpdate,
+            request,
+            attachments);
+        var remoteBegin = handoffContext?.BeginTopicRun(
+                              command,
+                              () => state.BeginTopicRun(command))
+                          ?? state.BeginTopicRun(command);
+        if (!remoteBegin.Committed)
+        {
+            return TopicDispatchResult.Reject(
+                "local_persistence_failed",
+                draft.RunId,
+                $"The run could not be durably started ({remoteBegin.Code}).");
+        }
+        entry.DurableBeginCommitted = true;
+        AdoptAuthoritativeBegin(entry, remoteBegin);
+        var authoritativeRemoteDraft = entry.Draft;
+        progress?.Report(queuedUpdate with
+        {
+            RunId = authoritativeRemoteDraft.RunId,
+            ThreadId = authoritativeRemoteDraft.ThreadId,
+            TriggerLineId = authoritativeRemoteDraft.TriggerLineId
+        });
+        if (remoteBegin.ProjectionDeferred)
+            return TopicDispatchResult.Ok(
+                authoritativeRemoteDraft.RunId, "projection_deferred", durable: true);
+        if (remoteBegin.Outbox is null)
+            return TopicDispatchResult.Ok(
+                authoritativeRemoteDraft.RunId, remoteBegin.Code, durable: true);
 
         try
         {
-            var result = await deviceTransport.DispatchAsync(
-                remoteTarget.DeviceId, request, attachments, cancellationToken);
+            BeforeTransportCheckpointHook?.Invoke(authoritativeRemoteDraft.RunId);
+            var result = await deviceTransport.DispatchPersistedAsync(
+                remoteBegin.Outbox, cancellationToken);
             if (!result.Accepted)
             {
-                state.CompleteQueuedTopicRun(thread.Id, draft.RunId);
-                state.ClearRemoteRunProjection(thread.Id, draft.RunId);
+                state.SetQueuedTopicRunStage(
+                    thread.Id, authoritativeRemoteDraft.RunId, TopicQueueStage.Failed);
             }
             else
             {
                 state.SetQueuedTopicRunStage(
                     thread.Id,
-                    draft.RunId,
-                    result.Code is TopicExecutionStatus.RelayAccepted
-                        or TopicExecutionStatus.Delivered
+                    authoritativeRemoteDraft.RunId,
+                    TopicExecutionStatus.IsRelayAccepted(result.Code)
                         ? TopicQueueStage.Relay
                         : TopicQueueStage.Sending);
             }
-            return result;
+            return result with
+            {
+                RunId = authoritativeRemoteDraft.RunId,
+                Durable = true
+            };
         }
+
         catch
         {
-            state.CompleteQueuedTopicRun(thread.Id, draft.RunId);
-            state.ClearRemoteRunProjection(thread.Id, draft.RunId);
             throw;
         }
         finally
         {
-            trigger.Attachments.Clear();
+            var persistedTrigger = thread.Lines.FirstOrDefault(line =>
+                string.Equals(line.Id, draft.TriggerLineId, StringComparison.Ordinal));
+            persistedTrigger?.Attachments.Clear();
+        }
+    }
+
+    private void AdoptAuthoritativeBegin(
+        RunEntry entry,
+        TopicRunBeginResult begin)
+    {
+        if (begin.AuthoritativeDraft is null) return;
+        lock (submitGate)
+        {
+            var proposedRunId = entry.Draft.RunId;
+            entry.Draft = Snapshot(begin.AuthoritativeDraft);
+            runs[entry.Draft.RunId] = entry;
+            triggerRuns[TriggerKey(entry.Draft)] = entry.Draft.RunId;
+            if (!string.Equals(proposedRunId, entry.Draft.RunId, StringComparison.Ordinal))
+                runs.TryRemove(proposedRunId, out _);
         }
     }
 
@@ -447,6 +547,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         }
         finally
         {
+            state.CompleteLocalTopicRun(draft.RunId, DateTimeOffset.UtcNow);
             entry.LocalCancellation = null;
             cancellation.Dispose();
             RememberCompletion(entry);
@@ -528,6 +629,9 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 string.Equals(thread.Id, draft.ThreadId, StringComparison.Ordinal)))
             return "invalid_thread";
         if (!TopicRunProtocol.IsValidIdentifier(draft.TriggerLineId)) return "invalid_trigger_line";
+        if (draft.TriggerOperationId is not null
+            && !TopicRunProtocol.IsValidIdentifier(draft.TriggerOperationId))
+            return "invalid_trigger_operation";
         if (!TopicRunProtocol.IsValidIdentifier(draft.TriggerHandle)
             || !string.Equals(
                 AppState.Norm(draft.TriggerHandle),
@@ -650,7 +754,14 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
            && left.TurnMode == right.TurnMode
            && string.Equals(left.TargetDeviceId, right.TargetDeviceId, StringComparison.Ordinal)
            && string.Equals(left.WidgetId, right.WidgetId, StringComparison.Ordinal)
-           && string.Equals(left.WidgetContext, right.WidgetContext, StringComparison.Ordinal);
+           && string.Equals(left.WidgetContext, right.WidgetContext, StringComparison.Ordinal)
+           && string.Equals(
+               left.TriggerOperationId, right.TriggerOperationId, StringComparison.Ordinal);
+
+    private static string TriggerKey(TopicTurnDraft draft)
+        => string.IsNullOrWhiteSpace(draft.TriggerOperationId)
+            ? draft.ThreadId + "\0" + draft.TriggerLineId
+            : "operation\0" + draft.TriggerOperationId;
 
     private static string AttachmentFingerprint(IReadOnlyList<ChatAttachment>? attachments)
     {
@@ -709,7 +820,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 var expired = completedRuns.Dequeue();
                 if (runs.TryRemove(expired, out var removed))
                     triggerRuns.Remove(
-                        removed.Draft.ThreadId + "\0" + removed.Draft.TriggerLineId);
+                        TriggerKey(removed.Draft));
             }
         }
     }
@@ -717,6 +828,15 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
     private static string AttachmentId(string runId, int index)
         => Convert.ToHexString(SHA256.HashData(
             Encoding.UTF8.GetBytes($"{runId}\0{index}"))).ToLowerInvariant();
+
+    private static Task<T> RunOffDispatcherAsync<T>(
+        string operation,
+        Func<Task<T>> action)
+        => Task.Run(async () =>
+        {
+            using var trace = ManagedOperationDiagnostics.Begin(operation);
+            return await action().ConfigureAwait(false);
+        });
 
     private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
     {

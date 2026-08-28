@@ -10,6 +10,8 @@ public sealed class NotificationCoordinator(
 {
     // Keep account resets, native delivery, removal, and badge updates in invocation order.
     private readonly NotificationOperationGate operationGate = new();
+    private readonly object recoveryGate = new();
+    private Task recoveryTask = Task.CompletedTask;
 
     public Task OnCommittedActivityAsync(
         CommittedActivity activity,
@@ -108,7 +110,17 @@ public sealed class NotificationCoordinator(
     }
 
     public Task RecoverPendingAsync(CancellationToken ct = default)
-        => operationGate.RunAsync(RecoverPendingCoreAsync, ct);
+    {
+        Task current;
+        lock (recoveryGate)
+        {
+            if (recoveryTask.IsCompleted)
+                recoveryTask = operationGate.RunAsync(
+                    RecoverPendingCoreAsync, CancellationToken.None);
+            current = recoveryTask;
+        }
+        return ct.CanBeCanceled ? current.WaitAsync(ct) : current;
+    }
 
     private async Task RecoverPendingCoreAsync(CancellationToken ct)
     {

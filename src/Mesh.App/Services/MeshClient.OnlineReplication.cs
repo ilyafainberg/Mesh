@@ -205,7 +205,8 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                 localCustodyHead: state.LocalCustodyHead,
                 surface: reason => Log?.Invoke($"replication roster: {reason}"),
                 onOwnAuthorityChanged: () => TrackBackground(
-                    ReArmReplicationAsync("authority-changed"), "replication re-arm"));
+                    ReArmReplicationAsync("authority-changed"), "replication re-arm"),
+                timeProvider: timeProvider);
 
             lock (replicationLifecycleGate)
             {
@@ -236,7 +237,8 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                     ownDevice: identity.DeviceId,
                     surface: reason => TraceTransport("replication-poll", reason),
                     bootstrapPeer: state.EmitOwnerBootstrapSnapshotAsync,
-                    pollCompleted: OnReplicationPresencePollCompleted);
+                    pollCompleted: OnReplicationPresencePollCompleted,
+                    rosterOnline: OnReplicationRosterOnline);
                 replicationPoller = poller;
                 if (ShouldMaintainContinuousTransport) poller.Start();
             }
@@ -330,6 +332,20 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
         else if (!hasPendingWork)
             RefreshReplicationStatus(replicationPoller?.LastOnlinePeerDevice);
     }
+
+    private void OnReplicationRosterOnline(IReadOnlyCollection<string> onlineDevices)
+    {
+        var identity = authenticatedReplicationConnectionIdentity;
+        if (identity is null
+            || !Connected
+            || !IsCurrentReplicationConnectionIdentity(identity)
+            || !HasLocalDurableWorkFor(onlineDevices))
+            return;
+        WakeOnlineDelivery(identity, onlineDevices, "roster-online-transition");
+    }
+
+    internal bool IsReplicationRosterDeviceAvailable(string accountHandle, string deviceId)
+        => replicationRoster?.ResolveDevice(accountHandle, deviceId) is { Revoked: false };
 
     /// <summary>
     /// Mobile backgrounding pauses continuous polling. Desktop, tray, and headless instances retain

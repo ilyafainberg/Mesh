@@ -4,34 +4,43 @@ public sealed partial class AppState : INotificationState
 {
     internal bool TryRecordNotificationActivity(CommittedActivity activity)
     {
-        lock (profileSyncGate) return activeDb?.RecordNotificationActivity(activity) == true;
+        lock (profileSyncGate)
+            return activeDb?.ExecuteDurableWrite(
+                () => activeDb.RecordNotificationActivity(activity)) == true;
     }
 
     internal void MarkNotificationBannerShown(string stableId)
     {
-        lock (profileSyncGate) activeDb?.MarkNotificationBannerShown(stableId);
+        lock (profileSyncGate)
+            activeDb?.ExecuteDurableWrite(() => activeDb.MarkNotificationBannerShown(stableId));
     }
 
     internal void MarkNotificationSuppressed(string stableId)
     {
-        lock (profileSyncGate) activeDb?.MarkNotificationSuppressed(stableId);
+        lock (profileSyncGate)
+            activeDb?.ExecuteDurableWrite(() => activeDb.MarkNotificationSuppressed(stableId));
     }
 
     internal void MarkNotificationRead(string stableId)
     {
-        lock (profileSyncGate) activeDb?.MarkNotificationRead(stableId);
+        lock (profileSyncGate)
+            activeDb?.ExecuteDurableWrite(() => activeDb.MarkNotificationRead(stableId));
     }
 
     internal IReadOnlyList<string> MarkNotificationEntityRead(string entityId)
     {
         lock (profileSyncGate)
-            return activeDb?.MarkNotificationEntityRead(entityId) ?? Array.Empty<string>();
+            return activeDb?.ExecuteDurableWrite(
+                       () => activeDb.MarkNotificationEntityRead(entityId))
+                   ?? Array.Empty<string>();
     }
 
     internal IReadOnlyList<string> MarkNotificationKindRead(NotificationKind kind)
     {
         lock (profileSyncGate)
-            return activeDb?.MarkNotificationKindRead(kind) ?? Array.Empty<string>();
+            return activeDb?.ExecuteDurableWrite(
+                       () => activeDb.MarkNotificationKindRead(kind))
+                   ?? Array.Empty<string>();
     }
 
     internal CommittedActivity? GetPendingNotificationActivity(string stableId)
