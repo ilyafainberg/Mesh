@@ -119,11 +119,20 @@ steps:
             print(r.get("name",r.get("version","unknown"))); break
     ')"
 
-    iphone_type="com.apple.CoreSimulator.SimDeviceType.iPhone-11-Pro-Max"
-    ipad_type="com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M4"
     available_types="$(xcrun simctl list devicetypes -j)"
-    [[ "$available_types" == *"$iphone_type"* ]]
-    [[ "$available_types" == *"$ipad_type"* ]]
+    iphone_type="$(python3 -c '
+    import json,sys
+    matches=[d for d in json.load(sys.stdin)["devicetypes"] if d.get("name")=="iPhone 11 Pro Max"]
+    if not matches: raise SystemExit("iPhone 11 Pro Max simulator type is unavailable")
+    print(matches[0]["identifier"])
+    ' <<< "$available_types")"
+    ipad_type="$(python3 -c '
+    import json,sys
+    matches=[d for d in json.load(sys.stdin)["devicetypes"] if d.get("name","").startswith("iPad Pro 13-inch (M4)")]
+    if not matches: raise SystemExit("iPad Pro 13-inch (M4) simulator type is unavailable")
+    print(matches[0]["identifier"])
+    ' <<< "$available_types")"
+    echo "Selected device types: $iphone_type ; $ipad_type"
 
     iphone_udid="$(xcrun simctl create Sora-iPhone-65 "$iphone_type" "$runtime_id")"
     ipad_udid="$(xcrun simctl create Sora-iPad-13 "$ipad_type" "$runtime_id")"
