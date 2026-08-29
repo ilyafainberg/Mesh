@@ -234,23 +234,24 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
                 new AgentSubtaskState("strategy", "Design independent implementation workstreams", AgentStepState.Done, findings[1]),
                 new AgentSubtaskState("integrate", "Execute, integrate, and verify", AgentStepState.Started)
             };
-            state.UpdateAgentRun(thread.Id, AgentRunPhase.Integrating, subtasks);
+            state.UpdateAgentRun(
+                thread.Id, AgentRunPhase.Integrating, subtasks, runId: runId);
             runProgress?.Report(new AgentRunState(
                 runId, thread.Id, AgentRunPhase.Integrating,
                 state.AgentRunFor(thread.Id)?.Plan ?? "", subtasks, startedAt));
         }
 
-        state.BeginAgentSteps(thread.Id);
-        state.BeginAssistantDraft(thread.Id);
+        state.BeginAgentSteps(thread.Id, runId);
+        state.BeginAssistantDraft(thread.Id, runId);
         var progress = new InlineProgress<AgentStep>(step =>
         {
-            state.ReportAgentStep(thread.Id, step);
-            stepProgress?.Report(step);
+            if (state.ReportAgentStep(thread.Id, runId, step))
+                stepProgress?.Report(step);
         });
         var delta = new InlineProgress<AgentDelta>(fragment =>
         {
-            state.AppendAssistantDelta(thread.Id, fragment);
-            deltaProgress?.Report(fragment);
+            if (state.AppendAssistantDelta(thread.Id, runId, fragment))
+                deltaProgress?.Report(fragment);
         });
         using (media.BeginScope(out var images))
         {
@@ -264,27 +265,32 @@ public sealed class AgentService(AppState state, ModelFactory factory, FoundryLo
             }
             finally
             {
-                state.EndAgentSteps(thread.Id);
-                state.EndAssistantDraft(thread.Id);
+                state.EndAgentSteps(thread.Id, runId);
+                state.EndAssistantDraft(thread.Id, runId);
             }
 
             var (reasoning, finalAnswer) = ReasoningExtract.FromText(answer);
             finalAnswer = await ExpandWidgetsAsync(finalAnswer, p.Widgets, ct);
             finalAnswer = AppendImages(finalAnswer, images);
-            state.AddOwnChatLine(thread.Id, new ChatLine
+            var line = new ChatLine
             {
                 Role = "assistant",
                 Text = finalAnswer,
                 ModelId = model.ResponseModelId,
                 Reasoning = reasoning,
                 ReplyToLineId = triggerLineId
-            }, NotificationIntents.Topic(
+            };
+            if (!state.IsCurrentAgentRuntimeContext)
+                throw new OperationCanceledException(
+                    "The active account changed during the agent run.", ct);
+            if (!ModelReply.IsFailure(finalAnswer)) memoryTurn.Commit();
+            state.AddOwnChatLine(thread.Id, line, NotificationIntents.Topic(
                 runId,
                 thread.Id,
                 thread.Title,
                 NotificationKind.TopicCompleted,
-                finalAnswer));
-            if (!ModelReply.IsFailure(finalAnswer)) memoryTurn.Commit();
+                finalAnswer),
+                terminalRunId: runId);
             return finalAnswer;
         }
     }

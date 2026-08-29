@@ -1,4 +1,5 @@
 using Mesh.App.Services;
+using Mesh.App.Domain;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
 namespace Mesh.App.Tests;
@@ -22,6 +23,33 @@ public sealed class ModelCallContextTests
         Assert.AreEqual(42, await reported.Task.WaitAsync(TimeSpan.FromSeconds(1)));
     }
 
+    [TestMethod]
+    public async Task PostedStreamCallbackCannotRecreateDraftAfterTerminalCompletion()
+    {
+        var context = new QueuedSynchronizationContext();
+        var render = new LiveAgentRenderState();
+        render.BeginDraft("thread", "run");
+        var accepted = 0;
+        var progress = ModelCallDispatcher.MarshalProgress(
+            new InlineProgress<AgentDelta>(delta =>
+            {
+                if (render.AppendDraft("thread", "run", delta))
+                    accepted++;
+            }),
+            context)!;
+
+        await Task.Run(() =>
+            progress.Report(new AgentDelta(AgentDeltaKind.Reasoning, "late thinking")));
+        Assert.AreEqual(1, context.PostCount);
+
+        render.EndDraft("thread", "run");
+        render.CompleteRun("thread", "run");
+        context.Drain();
+
+        Assert.AreEqual(0, accepted);
+        Assert.IsNull(render.Capture("thread").Draft);
+    }
+
     private sealed class RecordingSynchronizationContext : SynchronizationContext
     {
         public int PostCount { get; private set; }
@@ -30,6 +58,32 @@ public sealed class ModelCallContextTests
         {
             PostCount++;
             callback(state);
+        }
+    }
+
+    private sealed class QueuedSynchronizationContext : SynchronizationContext
+    {
+        private readonly Queue<(SendOrPostCallback Callback, object? State)> callbacks = new();
+        public int PostCount => callbacks.Count;
+
+        public override void Post(SendOrPostCallback callback, object? state)
+        {
+            lock (callbacks)
+                callbacks.Enqueue((callback, state));
+        }
+
+        public void Drain()
+        {
+            while (true)
+            {
+                (SendOrPostCallback Callback, object? State) item;
+                lock (callbacks)
+                {
+                    if (callbacks.Count == 0) return;
+                    item = callbacks.Dequeue();
+                }
+                item.Callback(item.State);
+            }
         }
     }
 

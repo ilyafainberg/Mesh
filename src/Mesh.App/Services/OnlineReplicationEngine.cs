@@ -640,6 +640,19 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     public async Task OnPresenceOnlineAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
     {
         await RetryPendingIntentsAsync(ct).ConfigureAwait(false);
+        if (sessions.TryGetValue(peerDevice, out var session) && session.Established)
+        {
+            // Relay presence is authoritative for the current socket, while an established
+            // protocol session can survive a transient disconnect in this process. Re-offer on
+            // the online transition so work rejected while the socket was down is not stranded
+            // behind that stale session.
+            await OfferPeerAsync(
+                session.PeerHandle,
+                session.PeerDevice,
+                OnlinePushClasses.Normal,
+                ct).ConfigureAwait(false);
+            return;
+        }
         await StartSessionAsync(peerHandle, peerDevice, ct).ConfigureAwait(false);
     }
 

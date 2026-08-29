@@ -1805,6 +1805,30 @@ public sealed class DeviceTopicDbTests
         Assert.AreEqual(request.TriggerLineId, resultLine.ReplyToLineId);
         Assert.AreEqual(terminal.Result.ModelId, resultLine.ModelId);
         Assert.AreEqual(terminal.Result.Reasoning, resultLine.Reasoning);
+        var lateProgress = running with
+        {
+            Status = "Late thinking",
+            Timestamp = terminal.Timestamp.AddSeconds(1),
+            DeltaSeq = 1,
+            DeltaKind = TopicRunDeltaKind.Reasoning,
+            Delta = "must not reappear"
+        };
+        var lateProgressControl = new MeshDb.ReceivedTopicControlItem(
+            "stable-late-progress-envelope",
+            request.TargetDeviceId,
+            request.RunId,
+            request.ThreadId,
+            TopicControlProtocol.ControlPurpose(lateProgress),
+            TopicRunProtocol.UpdateBody(lateProgress),
+            lateProgress.Timestamp);
+        Assert.AreEqual(
+            RemoteTopicUpdatePersistenceResult.NotCorrelated,
+            final.ExecuteDurableWrite(() => final.ApplyRemoteTopicUpdate(
+                lateProgress, request.TargetDeviceId, lateProgressControl)));
+        Assert.AreEqual(
+            RemoteTopicUpdatePersistenceResult.NotCorrelated,
+            final.ExecuteDurableWrite(() => final.ApplyRemoteTopicUpdate(
+                lateProgress, request.TargetDeviceId, lateProgressControl)));
         Assert.AreEqual(
             RemoteTopicUpdatePersistenceResult.Duplicate,
             final.ExecuteDurableWrite(() => final.ApplyRemoteTopicUpdate(
@@ -1814,6 +1838,12 @@ public sealed class DeviceTopicDbTests
             final.ExecuteDurableWrite(() => final.ApplyRemoteTopicUpdate(
                 running, request.TargetDeviceId)));
         Assert.HasCount(2, final.ListReceivedTopicControls());
+        Assert.IsNull(final.GetTopicOutbox(request.RunId));
+        var replayedProfile = final.LoadProfile()!;
+        Assert.IsNull(replayedProfile.OwnThreads.Single(
+            thread => thread.Id == request.ThreadId).ExecutionRunId);
+        Assert.HasCount(1, replayedProfile.OwnThreads.Single(
+            thread => thread.Id == request.ThreadId).Lines);
     }
 
     [TestMethod]

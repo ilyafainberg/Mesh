@@ -72,6 +72,7 @@ public sealed partial class AppState :
         long Generation);
     private ActiveDatabaseIdentity? activeDatabaseIdentity;
     private long activeDatabaseGeneration;
+    private readonly AgentRuntimeScopeTracker agentRuntimeScopes = new();
     private readonly Dictionary<string, TopicSendRetryAuthorization>
         issuedTopicSendAuthorizations = new(StringComparer.Ordinal);
     private ComposerDraftPersistenceCoordinator? draftPersistence;
@@ -165,13 +166,58 @@ public sealed partial class AppState :
     private ActiveDatabaseIdentity NewActiveDatabaseIdentity(MeshDb database, string accountId)
     {
         issuedTopicSendAuthorizations.Clear();
+        var identity = TopicSendSnapshot.StableId(
+            "account-database",
+            Path.GetFullPath(DbPath(accountId)).ToUpperInvariant());
+        agentRuntimeScopes.Activate(identity);
         return new(
             database,
             accountId,
-            TopicSendSnapshot.StableId(
-                "account-database",
-                Path.GetFullPath(DbPath(accountId)).ToUpperInvariant()),
+            identity,
             Interlocked.Increment(ref activeDatabaseGeneration));
+    }
+
+    internal AgentRuntimeScopeToken CaptureAgentRuntimeScope()
+        => agentRuntimeScopes.CaptureCurrent();
+
+    internal IDisposable EnterAgentRuntimeScope(AgentRuntimeScopeToken scope)
+        => agentRuntimeScopes.Enter(scope);
+
+    internal bool IsCurrentAgentRuntimeScope(AgentRuntimeScopeToken scope)
+        => agentRuntimeScopes.IsCurrent(scope);
+
+    internal bool IsCurrentAgentRuntimeContext
+        => agentRuntimeScopes.IsCurrentContext;
+
+    private void ResetAgentRuntimeStateForAccountChange()
+    {
+        CancellationTokenSource[] cancellationSources;
+        lock (profileSyncGate)
+        {
+            agentRuntimeScopes.Deactivate();
+            cancellationSources = threadCts.Values.Distinct().ToArray();
+            threadCts.Clear();
+            awaiting.Clear();
+            busyThreads.Clear();
+            activeThreadRuns.Clear();
+            agentRuns.Clear();
+            buildingThreads.Clear();
+            completedThreads.Clear();
+            queuedTopicRuns.Clear();
+            remoteRuns.Clear();
+            terminalRemoteRuns.Clear();
+            remoteDeltaSeq.Clear();
+            cancelledThreads.Clear();
+            liveAgentRenderState.ResetForAccount();
+            assistantDraftRefreshGate.ResetForAccount();
+        }
+
+        foreach (var source in cancellationSources)
+        {
+            try { source.Cancel(); }
+            catch (ObjectDisposedException) { }
+            finally { source.Dispose(); }
+        }
     }
 
     internal bool TryConsumeTopicSendAuthorization(
@@ -765,7 +811,10 @@ public sealed partial class AppState :
     {
         ArgumentNullException.ThrowIfNull(change);
         lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
             MutateCore(change, renamedCircleFrom: null, AssetPlanKind.Hints, hints);
+        }
         NotifyChanged();
     }
 
@@ -946,24 +995,37 @@ public sealed partial class AppState :
         NotifyChanged();
     }
 
-    /// <summary>Appends a line to a "Me" topic thread as a single row.</summary>
-    public void AddOwnChatLine(string threadId, ChatLine line, NotificationIntent? notificationIntent = null)
+    /// <summary>
+    /// Appends a line to a "Me" topic thread as a single row. A terminal run is retired before the
+    /// single UI notification, so the committed answer can never render above a stale thinking bubble.
+    /// </summary>
+    public void AddOwnChatLine(
+        string threadId,
+        ChatLine line,
+        NotificationIntent? notificationIntent = null,
+        string? terminalRunId = null)
     {
         if (LegacyUncorrelatedTopicAnswerTestMode
             && string.Equals(line.Role, "assistant", StringComparison.Ordinal))
             line.ReplyToLineId = null;
+        CancellationTokenSource? completedCts = null;
         lock (profileSyncGate)
         {
+            if (!IsCurrentAgentRuntimeContext) return;
             if (IsTopicLineDeleted(threadId, line.Id)
                 || IsTopicLineDeleted(threadId, line.ReplyToLineId))
                 return;
             var thread = GetOrCreateOwnThread(threadId);
             thread.Lines.Add(line);
             thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
+            if (terminalRunId is not null)
+                completedCts = CompleteAgentRunLocked(
+                    threadId, terminalRunId, AgentRunPhase.Completed);
             EmitLineUpsert("topic.line", thread.Id, line, notificationIntent);
             EmitTopicUpsert(thread);
         }
 
+        completedCts?.Dispose();
         NotifyChanged();
     }
 
@@ -1688,28 +1750,49 @@ public sealed partial class AppState :
 
     /// <summary>The steps taken so far in the given thread's current turn (most recent last).</summary>
     public IReadOnlyList<AgentStep> AgentStepsFor(string key)
-        => liveAgentRenderState.StepsFor(key);
+    {
+        lock (profileSyncGate)
+            return liveAgentRenderState.StepsFor(key);
+    }
 
     /// <summary>Clears one thread's step trace at the start of a new turn.</summary>
-    public void BeginAgentSteps(string key)
+    public void BeginAgentSteps(string key, string runId)
     {
-        if (liveAgentRenderState.BeginSteps(key)) NotifyChanged();
+        bool changed;
+        lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
+            changed = liveAgentRenderState.BeginSteps(key, runId);
+        }
+        if (changed) NotifyChanged();
     }
 
     /// <summary>
     /// Records a step for a thread. A Started step is appended; a Done/Failed step updates the matching
     /// pending step in place (so a tool shows as running then completed rather than twice).
     /// </summary>
-    public void ReportAgentStep(string key, AgentStep step)
+    public bool ReportAgentStep(string key, string runId, AgentStep step)
     {
-        liveAgentRenderState.ReportStep(key, step);
+        lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext
+                || !liveAgentRenderState.ReportStep(key, runId, step))
+                return false;
+        }
         NotifyChanged();
+        return true;
     }
 
     /// <summary>Clears one thread's step trace when its turn ends.</summary>
-    public void EndAgentSteps(string key)
+    public void EndAgentSteps(string key, string runId)
     {
-        if (liveAgentRenderState.EndSteps(key)) NotifyChanged();
+        bool changed;
+        lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
+            changed = liveAgentRenderState.EndSteps(key, runId);
+        }
+        if (changed) NotifyChanged();
     }
 
     // Transient streamed assistant draft (reasoning + answer) for a thread's in-flight turn. Mirrors
@@ -1735,8 +1818,11 @@ public sealed partial class AppState :
     /// <summary>The live streamed draft for the given thread's turn, or null when none is streaming.</summary>
     public AssistantDraft? AssistantDraftFor(string key)
     {
-        if (liveAgentRenderState.DraftFor(key) is not { } draft) return null;
-        return new AssistantDraft(draft.Reasoning, draft.Answer);
+        AssistantDraftSnapshot? draft;
+        lock (profileSyncGate)
+            draft = liveAgentRenderState.DraftFor(key);
+        if (draft is not { } current) return null;
+        return new AssistantDraft(current.Reasoning, current.Answer);
     }
 
     public AgentRenderSnapshot CaptureAgentRenderSnapshot(string key)
@@ -1745,6 +1831,7 @@ public sealed partial class AppState :
         bool isBuilding;
         AgentRunState? run;
         RemoteRunProjection? remoteRun;
+        LiveAgentStateSnapshot live;
         lock (profileSyncGate)
         {
             isBusy = busyThreads.Contains(key);
@@ -1755,9 +1842,9 @@ public sealed partial class AppState :
             remoteRun = remoteRuns.TryGetValue(key, out var currentRemoteRun)
                 ? CloneRemoteRunProjection(currentRemoteRun)
                 : null;
+            live = liveAgentRenderState.Capture(key);
         }
 
-        var live = liveAgentRenderState.Capture(key);
         var draft = live.Draft is { } currentDraft
             ? new AssistantDraft(currentDraft.Reasoning, currentDraft.Answer)
             : null;
@@ -1766,26 +1853,45 @@ public sealed partial class AppState :
     }
 
     /// <summary>Starts a fresh streamed draft for a thread at the start of a turn.</summary>
-    public void BeginAssistantDraft(string key)
+    public void BeginAssistantDraft(string key, string runId)
     {
-        assistantDraftRefreshGate.Reset(key);
-        liveAgentRenderState.BeginDraft(key);
-        NotifyChanged();
+        bool changed;
+        lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
+            assistantDraftRefreshGate.Reset(key);
+            changed = liveAgentRenderState.BeginDraft(key, runId);
+        }
+        if (changed) NotifyChanged();
     }
 
     /// <summary>Appends one streamed reasoning/answer fragment to a thread's live draft.</summary>
-    public void AppendAssistantDelta(string key, AgentDelta delta)
+    public bool AppendAssistantDelta(string key, string runId, AgentDelta delta)
     {
-        if (liveAgentRenderState.AppendDraft(key, delta)
-            && assistantDraftRefreshGate.ShouldPublish(key, delta.Kind, Environment.TickCount64))
+        bool publish;
+        lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext
+                || !liveAgentRenderState.AppendDraft(key, runId, delta))
+                return false;
+            publish = assistantDraftRefreshGate.ShouldPublish(
+                key, delta.Kind, Environment.TickCount64);
+        }
+        if (publish)
             NotifyChanged();
+        return true;
     }
 
     /// <summary>Clears a thread's streamed draft once its turn ends and the final line is committed.</summary>
-    public void EndAssistantDraft(string key)
+    public void EndAssistantDraft(string key, string runId)
     {
-        var removed = liveAgentRenderState.EndDraft(key);
-        assistantDraftRefreshGate.Reset(key);
+        bool removed;
+        lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
+            removed = liveAgentRenderState.EndDraft(key, runId);
+            assistantDraftRefreshGate.Reset(key);
+        }
         if (removed) NotifyChanged();
     }
 
@@ -1795,6 +1901,7 @@ public sealed partial class AppState :
     // queue must all still be correct when they return (and a fresh page instance must not start a
     // second concurrent turn for a thread that is already running). Keyed by own-thread id.
     private readonly HashSet<string> busyThreads = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> activeThreadRuns = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AgentRunState> agentRuns = new(StringComparer.Ordinal);
     private readonly HashSet<string> buildingThreads = new(StringComparer.Ordinal);
     private readonly HashSet<string> completedThreads = new(StringComparer.Ordinal);
@@ -1816,13 +1923,14 @@ public sealed partial class AppState :
     public bool IsThreadBusy(string threadId)
     {
         lock (profileSyncGate)
-            return busyThreads.Contains(threadId);
+            return IsCurrentAgentRuntimeContext && busyThreads.Contains(threadId);
     }
 
     public AgentRunState? AgentRunFor(string threadId)
     {
         lock (profileSyncGate)
-            return agentRuns.TryGetValue(threadId, out var run)
+            return IsCurrentAgentRuntimeContext
+                   && agentRuns.TryGetValue(threadId, out var run)
                 ? run with { Subtasks = run.Subtasks.ToArray() }
                 : null;
     }
@@ -1830,41 +1938,61 @@ public sealed partial class AppState :
     public void SetAgentRun(AgentRunState run)
     {
         lock (profileSyncGate)
-            agentRuns[run.ThreadId] = run with { Subtasks = run.Subtasks.ToArray() };
-        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == run.ThreadId);
-        if (thread is not null)
         {
-            thread.ExecutionRunId = run.RunId;
-            thread.ExecutionAt = run.StartedAt;
-            thread.LastActivityAt = ActivityTimestamp.Advance(
-                thread.LastActivityAt, run.StartedAt);
-            activeDb?.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
-                thread.Id,
-                thread.ExecutionDeviceId,
-                thread.ExecutionDeviceName,
-                thread.ExecutionDevicePlatform,
-                thread.ExecutionAt,
-                thread.ExecutionRunId,
-                thread.LastActivityAt!.Value));
-            EmitTopicUpsert(thread);
+            if (!IsCurrentAgentRuntimeContext) return;
+            if (agentRuns.TryGetValue(run.ThreadId, out var current))
+            {
+                if (string.Equals(current.RunId, run.RunId, StringComparison.Ordinal))
+                {
+                    if (!AgentRunLifecycle.CanTransition(current.Phase, run.Phase))
+                        return;
+                }
+                else
+                {
+                    var activeMatches = activeThreadRuns.TryGetValue(
+                        run.ThreadId, out var activeRunId)
+                        && string.Equals(activeRunId, run.RunId, StringComparison.Ordinal);
+                    if (!activeMatches && run.StartedAt <= current.StartedAt)
+                        return;
+                }
+            }
+            agentRuns[run.ThreadId] = run with { Subtasks = run.Subtasks.ToArray() };
+            var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == run.ThreadId);
+            if (thread is not null)
+            {
+                thread.ExecutionRunId = run.RunId;
+                thread.ExecutionAt = run.StartedAt;
+                thread.LastActivityAt = ActivityTimestamp.Advance(
+                    thread.LastActivityAt, run.StartedAt);
+                activeDb?.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
+                    thread.Id,
+                    thread.ExecutionDeviceId,
+                    thread.ExecutionDeviceName,
+                    thread.ExecutionDevicePlatform,
+                    thread.ExecutionAt,
+                    thread.ExecutionRunId,
+                    thread.LastActivityAt!.Value));
+                EmitTopicUpsert(thread);
+            }
         }
         NotifyChanged();
     }
 
     public void ClearAgentRun(string threadId)
     {
-        bool removed;
+        OwnThread? thread;
         lock (profileSyncGate)
-            removed = agentRuns.Remove(threadId);
-        if (!removed) return;
-        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
-        if (thread is not null)
         {
-            var at = DateTimeOffset.UtcNow;
-            thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-            activeDb?.ExecuteDurableWrite(
-                () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
-            EmitTopicUpsert(thread);
+            if (!IsCurrentAgentRuntimeContext || !agentRuns.Remove(threadId)) return;
+            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            if (thread is not null)
+            {
+                var at = DateTimeOffset.UtcNow;
+                thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
+                activeDb?.ExecuteDurableWrite(
+                    () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
+                EmitTopicUpsert(thread);
+            }
         }
         NotifyChanged();
     }
@@ -2004,7 +2132,7 @@ public sealed partial class AppState :
                 remoteRuns.TryRemove(update.ThreadId, out _);
                 terminalRemoteRuns.Add(correlationKey);
                 remoteDeltaSeq.Remove(correlationKey);
-                liveAgentRenderState.EndDraft(update.ThreadId);
+                liveAgentRenderState.CompleteRun(update.ThreadId, update.RunId);
                 assistantDraftRefreshGate.Reset(update.ThreadId);
             }
             else if (update.Delta is not { Length: > 0 })
@@ -2064,7 +2192,10 @@ public sealed partial class AppState :
                 ? AgentDeltaKind.Reasoning
                 : AgentDeltaKind.Answer;
             appended = liveAgentRenderState.AppendDraft(
-                threadId, new AgentDelta(kind, update.Delta));
+                threadId,
+                update.RunId,
+                new AgentDelta(kind, update.Delta),
+                beginIfNeeded: true);
         }
         if (appended
             && assistantDraftRefreshGate.ShouldPublish(
@@ -2101,6 +2232,7 @@ public sealed partial class AppState :
         OwnThread? thread;
         lock (profileSyncGate)
         {
+            if (!IsCurrentAgentRuntimeContext) return;
             thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
             remoteRuns.TryGetValue(threadId, out var projection);
             var correlatedRunId = runId ?? projection?.RunId;
@@ -2126,7 +2258,7 @@ public sealed partial class AppState :
             terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
             thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
-            liveAgentRenderState.EndDraft(threadId);
+            liveAgentRenderState.CompleteRun(threadId, correlatedRunId!);
             assistantDraftRefreshGate.Reset(threadId);
         }
         EmitTopicUpsert(thread!);
@@ -2209,11 +2341,11 @@ public sealed partial class AppState :
             queuedTopicRuns.Complete(thread.Id, runId);
             terminalRemoteRuns.Add(correlationKey);
             remoteDeltaSeq.Remove(correlationKey);
+            liveAgentRenderState.CompleteRun(thread.Id, runId);
+            assistantDraftRefreshGate.Reset(thread.Id);
             if (projectionMatches)
             {
                 remoteRuns.TryRemove(thread.Id, out _);
-                liveAgentRenderState.EndDraft(thread.Id);
-                assistantDraftRefreshGate.Reset(thread.Id);
             }
             RuntimeDiagnostics.Current?.RecordEvent(
                 "topic-terminal-cleanup",
@@ -2245,39 +2377,50 @@ public sealed partial class AppState :
         string threadId,
         AgentRunPhase phase,
         IReadOnlyList<AgentSubtaskState>? subtasks = null,
-        DateTimeOffset? updatedAt = null)
+        DateTimeOffset? updatedAt = null,
+        string? runId = null)
     {
         AgentRunState run;
+        CancellationTokenSource? completedCts = null;
         lock (profileSyncGate)
         {
+            if (!IsCurrentAgentRuntimeContext) return;
             if (!agentRuns.TryGetValue(threadId, out run!)) return;
-            agentRuns[threadId] = run with
+            if (runId is not null
+                && !string.Equals(run.RunId, runId, StringComparison.Ordinal))
+                return;
+            if (!AgentRunLifecycle.CanTransition(run.Phase, phase)) return;
+            run = run with
             {
                 Phase = phase, Subtasks = (subtasks ?? run.Subtasks).ToArray()
             };
-        }
-        var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
-        if (thread is not null)
-        {
-            var notificationIntent = phase switch
+            agentRuns[threadId] = run;
+            if (AgentRunLifecycle.IsTerminal(phase))
+                completedCts = CompleteAgentRunLocked(threadId, run.RunId, phase);
+            var thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
+            if (thread is not null)
             {
-                AgentRunPhase.Completed => NotificationIntents.Topic(
-                    run.RunId,
-                    thread.Id,
-                    thread.Title,
-                    NotificationKind.TopicCompleted,
-                    LatestAssistantResponse(thread)),
-                AgentRunPhase.Failed => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicFailed),
-                AgentRunPhase.Cancelled => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicCancelled),
-                _ => null
-            };
+                var notificationIntent = phase switch
+                {
+                    AgentRunPhase.Completed => NotificationIntents.Topic(
+                        run.RunId,
+                        thread.Id,
+                        thread.Title,
+                        NotificationKind.TopicCompleted,
+                        LatestAssistantResponse(thread)),
+                    AgentRunPhase.Failed => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicFailed),
+                    AgentRunPhase.Cancelled => NotificationIntents.Topic(run.RunId, thread.Id, thread.Title, NotificationKind.TopicCancelled),
+                    _ => null
+                };
 
-            var at = updatedAt ?? DateTimeOffset.UtcNow;
-            thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-            activeDb?.ExecuteDurableWrite(
-                () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt!.Value));
-            EmitTopicUpsert(thread, notificationIntent);
+                var at = updatedAt ?? DateTimeOffset.UtcNow;
+                thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
+                activeDb?.ExecuteDurableWrite(
+                    () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt!.Value));
+                EmitTopicUpsert(thread, notificationIntent);
+            }
         }
+        completedCts?.Dispose();
         NotifyChanged();
     }
 
@@ -2292,16 +2435,26 @@ public sealed partial class AppState :
     public bool IsThreadBuilding(string threadId)
     {
         lock (profileSyncGate)
-            return buildingThreads.Contains(threadId);
+            return IsCurrentAgentRuntimeContext && buildingThreads.Contains(threadId);
     }
 
     /// <summary>True when an own-thread's agent finished while that topic was not being viewed.</summary>
-    public bool IsThreadCompleted(string threadId) => completedThreads.Contains(threadId);
+    public bool IsThreadCompleted(string threadId)
+    {
+        lock (profileSyncGate)
+            return completedThreads.Contains(threadId);
+    }
 
     /// <summary>Marks an own-thread as needing attention because its agent run finished.</summary>
     public void MarkThreadCompleted(string threadId)
     {
-        if (completedThreads.Add(threadId)) NotifyChanged();
+        bool changed;
+        lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
+            changed = completedThreads.Add(threadId);
+        }
+        if (changed) NotifyChanged();
     }
 
     /// <summary>Clears a topic's completion indicator when the owner opens it.</summary>
@@ -2316,15 +2469,22 @@ public sealed partial class AppState :
     /// caller must pass into the agent call, so the user can stop the turn. Replaces any prior source
     /// for the thread.
     /// </summary>
-    public CancellationToken BeginThreadTurn(string threadId, bool building)
+    public CancellationToken BeginThreadTurn(string threadId, string runId, bool building)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(runId);
         var cts = new CancellationTokenSource();
         CancellationTokenSource? old;
         lock (profileSyncGate)
         {
+            if (!IsCurrentAgentRuntimeContext)
+            {
+                cts.Dispose();
+                return new CancellationToken(canceled: true);
+            }
             threadCts.Remove(threadId, out old);
             cancelledThreads.Remove(threadId);
             threadCts[threadId] = cts;
+            activeThreadRuns[threadId] = runId;
             busyThreads.Add(threadId);
             if (building) buildingThreads.Add(threadId);
         }
@@ -2338,7 +2498,10 @@ public sealed partial class AppState :
     {
         bool removed;
         lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
             removed = buildingThreads.Remove(threadId);
+        }
         if (removed) NotifyChanged();
     }
 
@@ -2351,6 +2514,7 @@ public sealed partial class AppState :
         CancellationTokenSource? cts;
         lock (profileSyncGate)
         {
+            if (!IsCurrentAgentRuntimeContext) return false;
             if (!threadCts.TryGetValue(threadId, out cts)) return false;
             cancelledThreads.Add(threadId);
         }
@@ -2370,17 +2534,23 @@ public sealed partial class AppState :
     public bool WasThreadCancelled(string threadId)
     {
         lock (profileSyncGate)
-            return cancelledThreads.Contains(threadId);
+            return IsCurrentAgentRuntimeContext && cancelledThreads.Contains(threadId);
     }
 
     /// <summary>Marks a thread's turn as finished (clears busy + building + its cancellation source).</summary>
-    public void EndThreadTurn(string threadId)
+    public void EndThreadTurn(string threadId, string runId)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(runId);
         bool a;
         bool b;
         CancellationTokenSource? cts;
         lock (profileSyncGate)
         {
+            if (!IsCurrentAgentRuntimeContext) return;
+            if (!activeThreadRuns.TryGetValue(threadId, out var activeRunId)
+                || !string.Equals(activeRunId, runId, StringComparison.Ordinal))
+                return;
+            activeThreadRuns.Remove(threadId);
             a = busyThreads.Remove(threadId);
             b = buildingThreads.Remove(threadId);
             threadCts.Remove(threadId, out cts);
@@ -2391,6 +2561,29 @@ public sealed partial class AppState :
         cts?.Dispose();
         if (a || b) NotifyChanged();
     }
+
+    private CancellationTokenSource? CompleteAgentRunLocked(
+        string threadId,
+        string runId,
+        AgentRunPhase phase)
+    {
+        if (agentRuns.TryGetValue(threadId, out var run)
+            && string.Equals(run.RunId, runId, StringComparison.Ordinal)
+            && AgentRunLifecycle.CanTransition(run.Phase, phase))
+            agentRuns[threadId] = run with { Phase = phase };
+
+        liveAgentRenderState.CompleteRun(threadId, runId);
+        assistantDraftRefreshGate.Reset(threadId);
+        if (!activeThreadRuns.TryGetValue(threadId, out var activeRunId)
+            || !string.Equals(activeRunId, runId, StringComparison.Ordinal))
+            return null;
+        activeThreadRuns.Remove(threadId);
+        busyThreads.Remove(threadId);
+        buildingThreads.Remove(threadId);
+        threadCts.Remove(threadId, out var cts);
+        return cts;
+    }
+
 
     /// <summary>Marks a submitted topic run as waiting behind the active turn.</summary>
     public void TrackQueuedTopicRun(
@@ -2407,6 +2600,7 @@ public sealed partial class AppState :
         bool changed;
         lock (profileSyncGate)
         {
+            if (!IsCurrentAgentRuntimeContext) return;
             if (!Profile.OwnThreads.Any(thread =>
                     string.Equals(thread.Id, threadId, StringComparison.Ordinal)))
                 return;
@@ -2419,7 +2613,10 @@ public sealed partial class AppState :
     {
         bool changed;
         lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
             changed = queuedTopicRuns.SetStage(threadId, runId, stage);
+        }
         if (changed) NotifyChanged();
     }
 
@@ -2428,7 +2625,10 @@ public sealed partial class AppState :
     {
         bool changed;
         lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
             changed = queuedTopicRuns.MarkStarted(threadId, runId);
+        }
         if (changed) NotifyChanged();
     }
 
@@ -2437,7 +2637,10 @@ public sealed partial class AppState :
     {
         bool changed;
         lock (profileSyncGate)
+        {
+            if (!IsCurrentAgentRuntimeContext) return;
             changed = queuedTopicRuns.Complete(threadId, runId);
+        }
         if (changed) NotifyChanged();
     }
 
