@@ -146,72 +146,54 @@ steps:
     }
     trap cleanup EXIT
 
-    cat > "$flow_root/launch.yaml" <<'EOF'
-    appId: net.meshrelay.mesh
-    ---
-    - launchApp:
-        clearState: true
-    - extendedWaitUntil:
-        visible: "Create a new identity"
-        timeout: 30000
-    EOF
-
-    cat > "$flow_root/link.yaml" <<'EOF'
-    appId: net.meshrelay.mesh
-    ---
-    - tapOn: "Link an existing device"
-    - extendedWaitUntil:
-        visible: "Link code"
-        timeout: 15000
-    EOF
-
-    cat > "$flow_root/restore.yaml" <<'EOF'
-    appId: net.meshrelay.mesh
-    ---
-    - tapOn: "Back"
-    - tapOn: "Restore from a backup"
-    - extendedWaitUntil:
-        visible: "Backup passphrase"
-        timeout: 15000
-    EOF
-
-    cat > "$flow_root/create.yaml" <<'EOF'
-    appId: net.meshrelay.mesh
-    ---
-    - tapOn: "Back"
-    - tapOn: "Create a new identity"
-    - extendedWaitUntil:
-        visible: "Pick your handle"
-        timeout: 15000
-    EOF
-
     capture_set() {
       local udid="$1"
       local folder="$2"
       local expected_width="$3"
       local expected_height="$4"
+      local create_y="$5"
+      local link_y="$6"
+      local restore_y="$7"
 
       xcrun simctl boot "$udid"
       xcrun simctl bootstatus "$udid" -b
       xcrun simctl status_bar "$udid" override \
         --time "9:41" --batteryState charged --batteryLevel 100 \
         --wifiBars 3 --cellularBars 4
-      xcrun simctl install "$udid" "$app_path"
 
-      maestro --device "$udid" test "$flow_root/launch.yaml"
-      sleep 2
+      reset_launch() {
+        xcrun simctl terminate "$udid" net.meshrelay.mesh >/dev/null 2>&1 || true
+        xcrun simctl uninstall "$udid" net.meshrelay.mesh >/dev/null 2>&1 || true
+        xcrun simctl install "$udid" "$app_path"
+        xcrun simctl launch "$udid" net.meshrelay.mesh
+        sleep 25
+      }
+
+      tap_point() {
+        local y="$1"
+        cat > "$flow_root/tap.yaml" <<EOF
+    appId: net.meshrelay.mesh
+    ---
+    - tapOn:
+        point: "50%,$y%"
+    EOF
+        maestro --device "$udid" test "$flow_root/tap.yaml"
+        sleep 3
+      }
+
+      reset_launch
       xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/01-welcome.png"
 
-      maestro --device "$udid" test "$flow_root/link.yaml"
-      sleep 1
+      reset_launch
+      tap_point "$link_y"
       xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/02-device-linking.png"
 
-      maestro --device "$udid" test "$flow_root/restore.yaml"
-      sleep 1
+      reset_launch
+      tap_point "$restore_y"
       xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/03-backup-restore.png"
 
-      maestro --device "$udid" test "$flow_root/create.yaml"
-      sleep 1
+      reset_launch
+      tap_point "$create_y"
       xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/04-new-identity.png"
 
       for image in "$screenshot_root/$folder"/*.png; do
@@ -227,8 +209,8 @@ steps:
       xcrun simctl shutdown "$udid"
     }
 
-    capture_set "$iphone_udid" "iphone-6.5" 1242 2688
-    capture_set "$ipad_udid" "ipad-13" 2064 2752
+    capture_set "$iphone_udid" "iphone-6.5" 1242 2688 42 55 68
+    capture_set "$ipad_udid" "ipad-13" 2064 2752 44 52 60
 
     export ARTIFACT_ROOT="$artifact_root"
     export RUNTIME_NAME="$runtime_name"
@@ -337,6 +319,7 @@ steps:
 
 - task: PublishPipelineArtifact@1
   displayName: Publish screenshots and redacted evidence
+  condition: succeededOrFailed()
   inputs:
     targetPath: $(Build.ArtifactStagingDirectory)/sora-apple-screenshots
     artifactName: Sora-Apple-Screenshots-$(Build.BuildId)
