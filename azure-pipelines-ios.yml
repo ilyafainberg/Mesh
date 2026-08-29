@@ -1,49 +1,15 @@
-# Mesh iOS signed IPA / optional TestFlight pipeline.
-#
-# Azure Pipelines setup (one time):
-# 1. Create a pipeline for the private GitHub repository ilyafainberg/Mesh and select this YAML file.
-# 2. Library -> Secure files:
-#      Mesh-Apple-Distribution.p12
-#      Mesh-AppStore.mobileprovision
-#      Mesh-AppStore-Connect.p8       (needed only for TestFlight uploads)
-#    Authorize this pipeline to use each secure file.
-#    On every Secure File, configure Approvals and Checks:
-#      - Branch control: refs/heads/main only
-#      - Approval: required before use
-# 3. Add pipeline variables:
-#      APPLE_CERT_PASSWORD  secret, required
-#      ASC_APP_ID           numeric App Store Connect app Apple ID, required for TestFlight
-#      ASC_KEY_ID           App Store Connect API key ID, required for TestFlight
-#      ASC_ISSUER_ID        App Store Connect issuer ID, required for TestFlight
-#
-# The workflow is manual-only. Pull requests and pushes cannot access the signing files.
-
+# Ephemeral, non-signing simulator screenshot pipeline. This branch is never merged.
 trigger: none
 pr: none
 
-name: ios-${{ parameters.version }}-$(Date:yyyyMMdd).$(Rev:r)
-
-parameters:
-- name: version
-  displayName: App version
-  type: string
-  default: '1.19.0'
-
-- name: buildNumber
-  displayName: Apple build number (0 uses the unique Azure Pipeline build ID)
-  type: number
-  default: 76
-
-- name: pushTestFlight
-  displayName: Validate and upload to TestFlight
-  type: boolean
-  default: false
+name: ios-screenshots-$(Date:yyyyMMdd).$(Rev:r)
 
 variables:
-  # Keep the .NET iOS workload and Xcode versions aligned. Do not let workload
-  # install update to a newer manifest that requires an Xcode absent from the image.
   DOTNET_VERSION: '10.0.302'
   XCODE_PATH: '/Applications/Xcode_26.0.1.app/Contents/Developer'
+  LOCKED_COMMIT: '7de3de3c2ddda0b30abb0c42d5b1fd2c2b859710'
+  APP_VERSION: '1.19.0'
+  APP_BUILD: '76'
 
 pool:
   vmImage: macos-15
@@ -57,103 +23,308 @@ steps:
   fetchDepth: 0
   persistCredentials: false
 
-- pwsh: |
-    if ('$(Build.SourceBranch)' -ne 'refs/heads/main') {
-      throw 'iOS signing is restricted to refs/heads/main.'
-    }
-  displayName: Enforce protected release branch
+- bash: |
+    set -euo pipefail
+    git cat-file -e "$(LOCKED_COMMIT)^{commit}"
+    changed="$(git diff --name-only "$(LOCKED_COMMIT)" HEAD)"
+    if [[ "$changed" != "azure-pipelines-ios.yml" ]]; then
+      echo "Unexpected changes relative to locked release commit:"
+      printf '%s\n' "$changed"
+      exit 1
+    fi
+    test "$(git rev-parse "$(LOCKED_COMMIT)^{commit}")" = "$(LOCKED_COMMIT)"
+    echo "Locked release source verified; only this ephemeral pipeline differs."
+  displayName: Verify locked release source
 
 - task: UseDotNet@2
-  displayName: Use .NET 10 SDK
+  displayName: Use exact .NET 10 SDK
   inputs:
     packageType: sdk
     version: $(DOTNET_VERSION)
 
-- pwsh: |
-    $ErrorActionPreference = 'Stop'
-    sudo xcode-select --switch $(XCODE_PATH)
+- bash: |
+    set -euo pipefail
+    sudo xcode-select --switch "$(XCODE_PATH)"
+    test "$(dotnet --version)" = "$(DOTNET_VERSION)"
     xcodebuild -version
     dotnet --info
-    # Mesh.App targets Android, iOS, and Mac Catalyst on macOS. Restore evaluates all
-    # declared TFMs even when publish selects iOS, so install all declared MAUI workloads.
     dotnet workload install maui-ios maui-android maui-maccatalyst --skip-manifest-update
     dotnet workload list
-  displayName: Select Xcode and install MAUI iOS workload
+  displayName: Select Xcode and install release-aligned workloads
 
-- task: InstallAppleCertificate@2
-  displayName: Install Apple Distribution certificate
-  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
-  inputs:
-    certSecureFile: Mesh-Apple-Distribution.p12
-    certPwd: $(APPLE_CERT_PASSWORD)
-    keychain: temp
-    setUpPartitionIdACLForPrivateKey: true
+- bash: |
+    set -euo pipefail
+    arch="$(uname -m)"
+    case "$arch" in
+      arm64) rid="iossimulator-arm64" ;;
+      x86_64) rid="iossimulator-x64" ;;
+      *) echo "Unsupported macOS host architecture: $arch"; exit 1 ;;
+    esac
+    echo "Simulator RID: $rid"
+    dotnet publish src/Mesh.App/Mesh.App.csproj \
+      -f net10.0-ios \
+      -c Release \
+      -p:RuntimeIdentifier="$rid" \
+      -p:ApplicationDisplayVersion="$(APP_VERSION)" \
+      -p:ApplicationVersion="$(APP_BUILD)" \
+      -p:ArchiveOnBuild=false
 
-- task: InstallAppleProvisioningProfile@1
-  displayName: Install App Store provisioning profile
-  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
-  inputs:
-    provisioningProfileLocation: secureFiles
-    provProfileSecureFile: Mesh-AppStore.mobileprovision
-    removeProfile: true
+    app_path="$(find src/Mesh.App/bin/Release/net10.0-ios -type d -name '*.app' | head -n 1)"
+    test -n "$app_path"
+    bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Info.plist")"
+    version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Info.plist")"
+    build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Info.plist")"
+    test "$bundle_id" = "net.meshrelay.mesh"
+    test "$version" = "$(APP_VERSION)"
+    test "$build" = "$(APP_BUILD)"
+    printf '%s' "$app_path" > "$(Agent.TempDirectory)/app-path.txt"
+    printf '%s' "$rid" > "$(Agent.TempDirectory)/simulator-rid.txt"
+  displayName: Build current release source for iOS Simulator
 
-- ${{ if eq(parameters.pushTestFlight, true) }}:
-  - task: DownloadSecureFile@1
-    name: appStoreKey
-    displayName: Download App Store Connect API key
-    condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
-    inputs:
-      secureFile: Mesh-AppStore-Connect.p8
+- bash: |
+    set -euo pipefail
+    java -version
+    curl -fsSL "https://get.maestro.mobile.dev" | bash
+    export PATH="$HOME/.maestro/bin:$PATH"
+    maestro --version
+    printf '%s' "$(maestro --version | tail -n 1)" > "$(Agent.TempDirectory)/maestro-version.txt"
+  displayName: Install iOS UI automation
 
-- pwsh: |
-    $ErrorActionPreference = 'Stop'
-    $buildNumber = [int]'${{ parameters.buildNumber }}'
-    if ($buildNumber -le 0) {
-      $buildNumber = [int]'$(Build.BuildId)'
+- bash: |
+    set -euo pipefail
+    export PATH="$HOME/.maestro/bin:$PATH"
+    export DEVELOPER_DIR="$(XCODE_PATH)"
+
+    app_path="$(cat "$(Agent.TempDirectory)/app-path.txt")"
+    artifact_root="$(Build.ArtifactStagingDirectory)/sora-apple-screenshots"
+    screenshot_root="$artifact_root/screenshots"
+    flow_root="$(Agent.TempDirectory)/sora-flows"
+    mkdir -p "$screenshot_root/iphone-6.5" "$screenshot_root/ipad-13" "$flow_root"
+
+    runtime_id="$(xcrun simctl list runtimes -j | python3 -c '
+    import json,sys
+    runtimes=json.load(sys.stdin)["runtimes"]
+    ios=[r for r in runtimes if r.get("isAvailable") and r.get("identifier","").startswith("com.apple.CoreSimulator.SimRuntime.iOS-")]
+    if not ios: raise SystemExit("No available iOS Simulator runtime")
+    def key(r):
+        return tuple(int(x) for x in r.get("version","0").split("."))
+    print(sorted(ios,key=key)[-1]["identifier"])
+    ')"
+    runtime_name="$(xcrun simctl list runtimes -j | RUNTIME_ID="$runtime_id" python3 -c '
+    import json,os,sys
+    for r in json.load(sys.stdin)["runtimes"]:
+        if r.get("identifier")==os.environ["RUNTIME_ID"]:
+            print(r.get("name",r.get("version","unknown"))); break
+    ')"
+
+    iphone_type="com.apple.CoreSimulator.SimDeviceType.iPhone-11-Pro-Max"
+    ipad_type="com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M4"
+    available_types="$(xcrun simctl list devicetypes -j)"
+    printf '%s' "$available_types" | grep -q "$iphone_type"
+    printf '%s' "$available_types" | grep -q "$ipad_type"
+
+    iphone_udid="$(xcrun simctl create Sora-iPhone-65 "$iphone_type" "$runtime_id")"
+    ipad_udid="$(xcrun simctl create Sora-iPad-13 "$ipad_type" "$runtime_id")"
+
+    cleanup() {
+      set +e
+      xcrun simctl shutdown "$iphone_udid" >/dev/null 2>&1
+      xcrun simctl shutdown "$ipad_udid" >/dev/null 2>&1
+      xcrun simctl delete "$iphone_udid" >/dev/null 2>&1
+      xcrun simctl delete "$ipad_udid" >/dev/null 2>&1
+    }
+    trap cleanup EXIT
+
+    cat > "$flow_root/launch.yaml" <<'EOF'
+    appId: net.meshrelay.mesh
+    ---
+    - launchApp:
+        clearState: true
+    - extendedWaitUntil:
+        visible: "Create a new identity"
+        timeout: 30000
+    EOF
+
+    cat > "$flow_root/link.yaml" <<'EOF'
+    appId: net.meshrelay.mesh
+    ---
+    - tapOn: "Link an existing device"
+    - extendedWaitUntil:
+        visible: "Link code"
+        timeout: 15000
+    EOF
+
+    cat > "$flow_root/restore.yaml" <<'EOF'
+    appId: net.meshrelay.mesh
+    ---
+    - tapOn: "Back"
+    - tapOn: "Restore from a backup"
+    - extendedWaitUntil:
+        visible: "Backup passphrase"
+        timeout: 15000
+    EOF
+
+    cat > "$flow_root/create.yaml" <<'EOF'
+    appId: net.meshrelay.mesh
+    ---
+    - tapOn: "Back"
+    - tapOn: "Create a new identity"
+    - extendedWaitUntil:
+        visible: "Pick your handle"
+        timeout: 15000
+    EOF
+
+    capture_set() {
+      local udid="$1"
+      local folder="$2"
+      local expected_width="$3"
+      local expected_height="$4"
+
+      xcrun simctl boot "$udid"
+      xcrun simctl bootstatus "$udid" -b
+      xcrun simctl status_bar "$udid" override \
+        --time "9:41" --batteryState charged --batteryLevel 100 \
+        --wifiBars 3 --cellularBars 4
+      xcrun simctl install "$udid" "$app_path"
+
+      maestro --device "$udid" test "$flow_root/launch.yaml"
+      sleep 2
+      xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/01-welcome.png"
+
+      maestro --device "$udid" test "$flow_root/link.yaml"
+      sleep 1
+      xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/02-device-linking.png"
+
+      maestro --device "$udid" test "$flow_root/restore.yaml"
+      sleep 1
+      xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/03-backup-restore.png"
+
+      maestro --device "$udid" test "$flow_root/create.yaml"
+      sleep 1
+      xcrun simctl io "$udid" screenshot "$screenshot_root/$folder/04-new-identity.png"
+
+      for image in "$screenshot_root/$folder"/*.png; do
+        width="$(sips -g pixelWidth "$image" | awk '/pixelWidth/{print $2}')"
+        height="$(sips -g pixelHeight "$image" | awk '/pixelHeight/{print $2}')"
+        format="$(sips -g format "$image" | awk '/format:/{print $2}')"
+        test "$format" = "png"
+        test "$width" = "$expected_width"
+        test "$height" = "$expected_height"
+      done
+
+      xcrun simctl terminate "$udid" net.meshrelay.mesh || true
+      xcrun simctl shutdown "$udid"
     }
 
-    $releaseArgs = @{
-      Version = '${{ parameters.version }}'
-      BuildNumber = $buildNumber
-      CodesignKey = '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)'
-      CodesignProvision = '$(APPLE_PROV_PROFILE_UUID)'
-      UseInterpreter = $true
-      SkipPush = $true
+    capture_set "$iphone_udid" "iphone-6.5" 1242 2688
+    capture_set "$ipad_udid" "ipad-13" 2064 2752
+
+    export ARTIFACT_ROOT="$artifact_root"
+    export RUNTIME_NAME="$runtime_name"
+    export TEMP_COMMIT="$(git rev-parse HEAD)"
+    export MAESTRO_VERSION="$(cat "$(Agent.TempDirectory)/maestro-version.txt")"
+    export SIMULATOR_RID="$(cat "$(Agent.TempDirectory)/simulator-rid.txt")"
+    export XCODE_VERSION="$(xcodebuild -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    export DOTNET_WORKLOADS="$(dotnet workload list | sed -n '/Installed Workload Id/,$p' | tr '\n' ';' | sed 's/"/'\''/g')"
+    export BUILD_ID="$(Build.BuildId)"
+
+    python3 - <<'PY'
+    import datetime, glob, hashlib, json, os
+    root = os.environ["ARTIFACT_ROOT"]
+    shots = []
+    surfaces = {
+        "01-welcome.png": "Onboarding choices",
+        "02-device-linking.png": "Device linking form (empty)",
+        "03-backup-restore.png": "Encrypted backup restore form (empty)",
+        "04-new-identity.png": "New identity form (empty)",
     }
-
-    if ('${{ parameters.pushTestFlight }}' -eq 'True') {
-      foreach ($name in 'ASC_APP_ID', 'ASC_KEY_ID', 'ASC_ISSUER_ID') {
-        $value = [Environment]::GetEnvironmentVariable($name)
-        if ([string]::IsNullOrWhiteSpace($value)) {
-          throw "Pipeline variable $name is required when pushTestFlight=true."
-        }
-      }
-
-      $keyDirectory = Join-Path '$(Agent.TempDirectory)' 'appstoreconnect-private-keys'
-      New-Item -ItemType Directory -Force -Path $keyDirectory | Out-Null
-      $keyPath = Join-Path $keyDirectory ("AuthKey_{0}.p8" -f $env:ASC_KEY_ID)
-      Copy-Item '$(appStoreKey.secureFilePath)' $keyPath
-
-      $releaseArgs['PushTestFlight'] = $true
-      $releaseArgs['AppStoreAppId'] = $env:ASC_APP_ID
-      $releaseArgs['AppStoreKeyId'] = $env:ASC_KEY_ID
-      $releaseArgs['AppStoreIssuerId'] = $env:ASC_ISSUER_ID
-      $releaseArgs['AppStoreKeyPath'] = $keyPath
+    expected = {
+        "iphone-6.5": [1242, 2688],
+        "ipad-13": [2064, 2752],
     }
-
-    & '$(Build.SourcesDirectory)/_deploy/release-ios.ps1' @releaseArgs
-    if ($LASTEXITCODE -ne 0) {
-      throw "release-ios.ps1 failed with exit code $LASTEXITCODE."
+    for path in sorted(glob.glob(os.path.join(root, "screenshots", "*", "*.png"))):
+        device_set = os.path.basename(os.path.dirname(path))
+        data = open(path, "rb").read()
+        shots.append({
+            "path": os.path.relpath(path, root).replace(os.sep, "/"),
+            "deviceSet": device_set,
+            "surface": surfaces[os.path.basename(path)],
+            "format": "PNG",
+            "pixelDimensions": expected[device_set],
+            "orientation": "portrait",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "publicSafety": "Fresh simulator state; all fields empty; no user data, credentials, link codes, diagnostics, internal paths, or account identifiers.",
+        })
+    if len(shots) != 8:
+        raise SystemExit(f"Expected 8 screenshots, found {len(shots)}")
+    manifest = {
+        "status": "SCREENSHOTS-READY",
+        "generatedUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "source": {
+            "repository": "ilyafainberg/Mesh",
+            "lockedCommit": "7de3de3c2ddda0b30abb0c42d5b1fd2c2b859710",
+            "temporaryAutomationCommit": os.environ["TEMP_COMMIT"],
+            "treeVerification": "Only azure-pipelines-ios.yml differed from locked commit; application source was unchanged.",
+            "version": "1.19.0",
+            "build": "76",
+        },
+        "buildEnvironment": {
+            "pipelineRunId": os.environ["BUILD_ID"],
+            "poolImage": "macos-15",
+            "dotnetSdk": "10.0.302",
+            "simulatorRid": os.environ["SIMULATOR_RID"],
+            "xcode": os.environ["XCODE_VERSION"],
+            "iosRuntime": os.environ["RUNTIME_NAME"],
+            "uiAutomation": os.environ["MAESTRO_VERSION"],
+            "workloads": os.environ["DOTNET_WORKLOADS"],
+        },
+        "simulators": [
+            {"name": "iPhone 11 Pro Max", "appStoreClass": "6.5-inch iPhone", "pixelDimensions": [1242, 2688]},
+            {"name": "iPad Pro 13-inch (M4)", "appStoreClass": "13-inch iPad", "pixelDimensions": [2064, 2752]},
+        ],
+        "capture": {
+            "method": "Native iOS Simulator screen capture via xcrun simctl io screenshot.",
+            "transformations": "None. No resizing, stretching, compositing, Android imagery, synthetic chrome, or marketing overlays.",
+            "statusBar": "Native Simulator status bar normalized with simctl.",
+        },
+        "validation": {
+            "format": "PNG for all files",
+            "orientationConsistency": "Portrait within both sets",
+            "dimensions": "Validated exactly against the required device-class dimensions",
+            "visualContent": "Fresh-state public onboarding, linking, backup, and identity surfaces with empty fields",
+            "upload": "Not uploaded or submitted to App Store Connect",
+        },
+        "screenshots": shots,
     }
-  displayName: Build, sign, verify, and optionally upload IPA
-  env:
-    ASC_APP_ID: $(ASC_APP_ID)
-    ASC_KEY_ID: $(ASC_KEY_ID)
-    ASC_ISSUER_ID: $(ASC_ISSUER_ID)
+    with open(os.path.join(root, "manifest-redacted.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+    report = f"""SCREENSHOTS-READY
+Source: ilyafainberg/Mesh @ 7de3de3c2ddda0b30abb0c42d5b1fd2c2b859710
+Version/build: 1.19.0 / 76
+SDK: .NET 10.0.302
+Xcode: {os.environ['XCODE_VERSION']}
+iOS runtime: {os.environ['RUNTIME_NAME']}
+Sets: 4 portrait PNGs at 1242x2688 (6.5-inch iPhone); 4 portrait PNGs at 2064x2752 (13-inch iPad)
+Capture: Native simulator pixels, no transformations or overlays
+Privacy: Fresh simulator state and empty forms; no private data or account identifiers
+App Store Connect: No upload or submission performed
+Evidence: manifest-redacted.json contains per-file SHA-256 values
+"""
+    with open(os.path.join(root, "REPORT-REDACTED.txt"), "w", encoding="utf-8") as f:
+        f.write(report)
+    PY
+
+    (
+      cd "$artifact_root"
+      find screenshots -type f -name '*.png' -print0 | sort -z | xargs -0 shasum -a 256
+      shasum -a 256 manifest-redacted.json REPORT-REDACTED.txt
+    ) > "$artifact_root/SHA256SUMS.txt"
+  displayName: Capture and validate genuine App Store screenshots
 
 - task: PublishPipelineArtifact@1
-  displayName: Publish signed IPA and manifest
+  displayName: Publish screenshots and redacted evidence
   inputs:
-    targetPath: $(Build.SourcesDirectory)/_deploy/artifacts
-    artifactName: Mesh-iOS-${{ parameters.version }}-$(Build.BuildId)
+    targetPath: $(Build.ArtifactStagingDirectory)/sora-apple-screenshots
+    artifactName: Sora-Apple-Screenshots-$(Build.BuildId)
     publishLocation: pipeline
