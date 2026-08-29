@@ -67,6 +67,8 @@ steps:
       -p:RuntimeIdentifier="$rid" \
       -p:ApplicationDisplayVersion="$(APP_VERSION)" \
       -p:ApplicationVersion="$(APP_BUILD)" \
+      -p:CodesignKey=- \
+      -p:CodesignProvision= \
       -p:ArchiveOnBuild=false
 
     app_path="$(find src/Mesh.App/bin/Release/net10.0-ios -type d -name '*.app' | head -n 1)"
