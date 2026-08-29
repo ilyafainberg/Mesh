@@ -61,7 +61,7 @@ steps:
       *) echo "Unsupported macOS host architecture: $arch"; exit 1 ;;
     esac
     echo "Simulator RID: $rid"
-    dotnet publish src/Mesh.App/Mesh.App.csproj \
+    dotnet build src/Mesh.App/Mesh.App.csproj \
       -f net10.0-ios \
       -c Release \
       -p:RuntimeIdentifier="$rid" \
