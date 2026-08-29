@@ -205,11 +205,14 @@ steps:
     xcrun simctl install "$udid" "$app_path"
     xcrun simctl launch "$udid" net.meshrelay.mesh
     sleep 20
+    xcrun simctl io "$udid" screenshot "$artifact_root/screenshots/00-onboarding.png"
 
     cat > "$(Agent.TempDirectory)/finish-onboarding.yaml" <<'EOF'
     appId: net.meshrelay.mesh
     ---
-    - tapOn: "Link an existing device"
+    - tapOn:
+        point: "50%,52%"
+    - waitForAnimationToEnd
     - tapOn: "https://mesh-relay...azurecontainerapps.io"
     EOF
     cat >> "$(Agent.TempDirectory)/finish-onboarding.yaml" <<EOF
@@ -233,7 +236,9 @@ steps:
     - waitForAnimationToEnd
     - assertVisible: "Me"
     EOF
-    maestro --device "$udid" test "$(Agent.TempDirectory)/finish-onboarding.yaml"
+    maestro --device "$udid" test \
+      --debug-output "$artifact_root/maestro-debug" \
+      "$(Agent.TempDirectory)/finish-onboarding.yaml"
     xcrun simctl io "$udid" screenshot "$artifact_root/screenshots/01-authenticated-synthetic-topic.png"
 
     xcrun simctl launch "$udid" com.apple.Preferences
