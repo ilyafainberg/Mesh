@@ -171,13 +171,16 @@ steps:
             handle, publicKey, codeHash, expires,
             Sign(LinkProtocol.InviteMessage(handle, codeHash, expires))));
     invite.EnsureSuccessStatusCode();
-    Console.Write(DeepLink.Pairing(handle, code, relay));
+    Console.WriteLine(DeepLink.Pairing(handle, code, relay));
+    Console.WriteLine(handle);
+    Console.Write(code);
     EOF
     dotnet build "$(Agent.TempDirectory)/sora-link/SoraLink.csproj" -c Release \
       -o "$(Agent.TempDirectory)/sora-link/out" >/dev/null
     handle="sora-ipad-$(Build.BuildId)"
     dotnet "$(Agent.TempDirectory)/sora-link/out/SoraLink.dll" \
       "$(RELAY_URL)" "$handle" > "$(Agent.TempDirectory)/pairing-uri.txt"
+    code="$(sed -n '3p' "$(Agent.TempDirectory)/pairing-uri.txt")"
 
     runtime_id="$(xcrun simctl list runtimes -j | python3 -c '
     import json,sys
@@ -202,12 +205,26 @@ steps:
     xcrun simctl install "$udid" "$app_path"
     xcrun simctl launch "$udid" net.meshrelay.mesh
     sleep 20
-    xcrun simctl openurl "$udid" "$(cat "$(Agent.TempDirectory)/pairing-uri.txt")"
-    sleep 12
 
     cat > "$(Agent.TempDirectory)/finish-onboarding.yaml" <<'EOF'
     appId: net.meshrelay.mesh
     ---
+    - tapOn: "Link an existing device"
+    - tapOn: "https://mesh-relay...azurecontainerapps.io"
+    EOF
+    cat >> "$(Agent.TempDirectory)/finish-onboarding.yaml" <<EOF
+    - inputText: "$(RELAY_URL)"
+    - tapOn: "yourname"
+    - inputText: "$handle"
+    - tapOn: "paste code"
+    - inputText: "$code"
+    EOF
+    cat >> "$(Agent.TempDirectory)/finish-onboarding.yaml" <<'EOF'
+    - hideKeyboard
+    - tapOn: "Link this device"
+    - extendedWaitUntil:
+        visible: "Connect a model"
+        timeout: 30000
     - assertVisible: "Connect a model"
     - tapOn: "Start free"
     - waitForAnimationToEnd
