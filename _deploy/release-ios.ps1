@@ -97,6 +97,7 @@ $SrcDir = Join-Path $RepoRoot "src"
 $Artifacts = Join-Path $Deploy "artifacts"
 $IosTfm = "net10.0-ios"
 $RuntimeId = "ios-arm64"
+$RequiredDotNetSdk = "10.0.302"
 $PrivacyManifest = Join-Path $RepoRoot "src/Mesh.App/Platforms/iOS/Resources/PrivacyInfo.xcprivacy"
 $script:IsMacHost = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
   [System.Runtime.InteropServices.OSPlatform]::OSX)
@@ -222,6 +223,12 @@ function Test-Preflight {
       Fail "Required tool '$tool' is not on PATH."
     }
   }
+  $global:LASTEXITCODE = 0
+  $dotnetVersion = (& dotnet --version 2>$null | Select-Object -First 1)
+  $dotnetExitCode = $global:LASTEXITCODE
+  if ($dotnetExitCode -ne 0 -or $dotnetVersion -ne $RequiredDotNetSdk) {
+    Fail "Mesh iOS releases require .NET SDK $RequiredDotNetSdk; dotnet resolved '$dotnetVersion'."
+  }
   if (-not (Test-Path $Csproj)) { Fail "csproj not found at $Csproj" }
   if (-not (Test-Path $PrivacyManifest)) {
     Fail "Apple privacy manifest is missing: $PrivacyManifest"
@@ -307,7 +314,7 @@ function Test-Preflight {
     Ok "App Store Connect JWT key found (key id $AppStoreKeyId)"
   }
 
-  Ok "bundle id net.meshrelay.mesh; privacy manifest present; signing inputs present"
+  Ok "bundle id net.meshrelay.mesh; privacy manifest present; signing inputs present; .NET SDK $RequiredDotNetSdk"
 }
 
 # ----------------------------------------------------------- version + lint ---

@@ -58,6 +58,8 @@ $RelayPublisher = Join-Path $Deploy "publish-relay-release.ps1"
 
 $WinTfm     = "net10.0-windows10.0.19041.0"
 $AndTfm     = "net10.0-android"
+$RequiredDotNetSdk = "10.0.302"
+$ApprovedDotNet = "C:\Users\ifain\source\repos\dotnet-sdk-$RequiredDotNetSdk-win-x64\dotnet.exe"
 $ISCC       = "C:\Users\ifain\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
 $DefaultJdk = "C:\Program Files\Android\openjdk\jdk-21.0.8"
 
@@ -126,14 +128,30 @@ function Resolve-Jdk {
   Die "JDK not found. Set JAVA_HOME (needed for the Android build)."
 }
 
+function Resolve-DotNet {
+  $candidate = if ($env:MESH_DOTNET) { $env:MESH_DOTNET } elseif (Test-Path $ApprovedDotNet) { $ApprovedDotNet } else { "dotnet" }
+  if ($candidate -eq "dotnet" -and -not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+    Die "Required .NET SDK $RequiredDotNetSdk is not available."
+  }
+  $global:LASTEXITCODE = 0
+  $actual = (& $candidate --version 2>$null | Select-Object -First 1)
+  $exitCode = $global:LASTEXITCODE
+  if ($exitCode -ne 0 -or $actual -ne $RequiredDotNetSdk) {
+    Die "Mesh releases require .NET SDK $RequiredDotNetSdk; '$candidate' resolved '$actual'."
+  }
+  return $candidate
+}
+
 # --------------------------------------------------------------- preflight ----
 function Test-Preflight {
   Say "Preflight"
   if ($Version -notmatch '^\d+\.\d+\.\d+$') { Die "Version '$Version' must look like 1.4.1." }
 
-  foreach ($t in "dotnet","git","gh","az") {
+  foreach ($t in "git","gh","az") {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { Die "Required tool '$t' not on PATH." }
   }
+  $script:DotNet = Resolve-DotNet
+  Ok ".NET SDK ${RequiredDotNetSdk}: $script:DotNet"
   if (-not (Test-Path $Csproj)) { Die "csproj not found at $Csproj" }
   if (-not $SkipWindows -and -not (Test-Path $ISCC)) { Die "Inno Setup ISCC.exe not found at $ISCC" }
 
@@ -209,7 +227,7 @@ function Invoke-EmDashLint {
 function Build-Windows {
   Say "Windows: publish self-contained"
   if (Test-Path $PubDir) { Remove-Item $PubDir -Recurse -Force }
-  Invoke-Native "dotnet" @(
+  Invoke-Native $script:DotNet @(
     "publish", $Csproj, "-f", $WinTfm, "-c", "Release",
     "-p:WindowsPackageType=None", "-p:RuntimeIdentifierOverride=win10-x64",
     "--self-contained", "true", "-o", $PubDir, "--nologo"
@@ -265,7 +283,7 @@ function Build-Android {
   Say "Android: build signed AAB (versionCode $script:AndroidVersionCode)"
   $env:JAVA_HOME = Resolve-Jdk
   $pw = Get-KeystorePassword
-  Invoke-Native "dotnet" @(
+  Invoke-Native $script:DotNet @(
     "publish", $Csproj, "-f", $AndTfm, "-c", "Release",
     "-p:AndroidPackageFormat=aab", "-p:AndroidKeyStore=true",
     "-p:AndroidSigningKeyStore=$Keystore", "-p:AndroidSigningKeyAlias=$KeyAlias",

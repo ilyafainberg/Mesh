@@ -41,10 +41,10 @@
         <ApplicationIcon>Platforms\Windows\appicon.ico</ApplicationIcon>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.18.10</ApplicationDisplayVersion>
-        <ApplicationVersion>75</ApplicationVersion>
+        <ApplicationDisplayVersion>1.19.0</ApplicationDisplayVersion>
+        <ApplicationVersion>76</ApplicationVersion>
         <!-- Drives AssemblyVersion/FileVersion/InformationalVersion, read by the self-updater. -->
-        <Version>1.18.10</Version>
+        <Version>1.19.0</Version>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
@@ -163,7 +163,7 @@
             Condition="'$(DesignTimeBuild)' != 'true'">
         <Error Condition="!Exists('$(BuiltInsCompilerAssembly)')"
                Text="The Mesh built-in content compiler was not built: $(BuiltInsCompilerAssembly)" />
-        <Exec Command="dotnet &quot;$(BuiltInsCompilerAssembly)&quot; &quot;$(BuiltInsRoot)&quot; &quot;$(BuiltInsIndex)&quot;" />
+        <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(BuiltInsCompilerAssembly)&quot; &quot;$(BuiltInsRoot)&quot; &quot;$(BuiltInsIndex)&quot;" />
 
     </Target>
 

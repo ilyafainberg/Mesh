@@ -139,7 +139,7 @@ Expected:
 - JDK 21 and Android SDK for Android
 - Xcode on a supported Mac for iOS and Mac Catalyst
 
-Mesh 1.18.2 uses .NET SDK `10.0.303`. Keep local, pipeline, workload, and Xcode versions aligned.
+Mesh 1.19.0 uses the approved patched .NET SDK `10.0.302`. Keep local, pipeline, workload, and Xcode versions aligned.
 Do not let workload installation silently select a manifest that requires a newer unavailable Xcode.
 
 ### 5.2 Credential names
@@ -216,8 +216,8 @@ Publication to one channel does not imply authorization for another.
 Use the pinned SDK when available:
 
 ```powershell
-$dotnet = 'C:\Users\ifain\source\repos\dotnet-sdk-10.0.303-win-x64\dotnet.exe'
-if (-not (Test-Path $dotnet)) { $dotnet = 'dotnet' }
+$dotnet = 'C:\Users\ifain\source\repos\dotnet-sdk-10.0.302-win-x64\dotnet.exe'
+if (-not (Test-Path $dotnet)) { throw 'Approved .NET SDK 10.0.302 is required.' }
 
 & $dotnet test .\tests\Mesh.App.Tests\Mesh.App.Tests.csproj -c Release --nologo
 & $dotnet build .\src\Mesh.Relay\Mesh.Relay.csproj -c Release --nologo
