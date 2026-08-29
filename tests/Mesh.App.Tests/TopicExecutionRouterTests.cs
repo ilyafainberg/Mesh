@@ -10,12 +10,41 @@ namespace Mesh.App.Services
     // project. The production AppState is intentionally not linked because it brings in MAUI services.
     public sealed class AppState
     {
-        public MeshProfile Profile { get; } = new();
+        private readonly AgentRuntimeScopeTracker runtimeScopes = new();
+        public MeshProfile Profile { get; private set; } = new();
         public int RegisteredRemoteRuns { get; private set; }
         public int ClearedRemoteRuns { get; private set; }
         public bool Busy { get; private set; }
+        public bool? BusyWhenTerminalAnswerAdded { get; private set; }
         public bool RemoteRunUpdatePersistenceSucceeds { get; set; } = true;
-        public QueuedTopicRunState QueuedRuns { get; } = new();
+        public QueuedTopicRunState QueuedRuns { get; private set; } = new();
+
+        internal AgentRuntimeScopeToken CaptureAgentRuntimeScope()
+        {
+            try { return runtimeScopes.CaptureCurrent(); }
+            catch (InvalidOperationException)
+            {
+                runtimeScopes.Activate("test-account");
+                return runtimeScopes.CaptureCurrent();
+            }
+        }
+
+        internal IDisposable EnterAgentRuntimeScope(AgentRuntimeScopeToken scope)
+            => runtimeScopes.Enter(scope);
+
+        internal bool IsCurrentAgentRuntimeScope(AgentRuntimeScopeToken scope)
+            => runtimeScopes.IsCurrent(scope);
+
+        internal bool IsCurrentAgentRuntimeContext => runtimeScopes.IsCurrentContext;
+
+        internal void SwitchRuntimeAccount(string identity, MeshProfile profile)
+        {
+            runtimeScopes.Deactivate();
+            Profile = profile;
+            QueuedRuns = new QueuedTopicRunState();
+            Busy = false;
+            runtimeScopes.Activate(identity);
+        }
 
         public static string Norm(string value) => value.Trim().TrimStart('@').ToLowerInvariant();
         public string TopicTitle(string threadId)
@@ -89,8 +118,19 @@ namespace Mesh.App.Services
             => $"result={result};transport_entered={transportEntered}";
 
 
-        public void AddOwnChatLine(string threadId, ChatLine line)
-            => Profile.OwnThreads.Single(thread => thread.Id == threadId).Lines.Add(line);
+        public void AddOwnChatLine(
+            string threadId,
+            ChatLine line,
+            NotificationIntent? notificationIntent = null,
+            string? terminalRunId = null)
+        {
+            if (terminalRunId is not null)
+            {
+                Busy = false;
+                BusyWhenTerminalAnswerAdded = Busy;
+            }
+            Profile.OwnThreads.Single(thread => thread.Id == threadId).Lines.Add(line);
+        }
 
         public void BindOwnThreadForSend(string threadId, ExecutionDevice target)
         {
@@ -117,6 +157,7 @@ namespace Mesh.App.Services
             string? runId = null,
             DateTimeOffset? clearedAt = null)
         {
+            if (!IsCurrentAgentRuntimeContext) return;
             Profile.OwnThreads.Single(item => item.Id == threadId).ExecutionRunId = null;
             ClearedRemoteRuns++;
         }
@@ -126,13 +167,25 @@ namespace Mesh.App.Services
             string runId,
             string lineId,
             TopicQueueStage stage = TopicQueueStage.Sending)
-            => QueuedRuns.MarkWaiting(threadId, runId, lineId, stage);
+        {
+            if (IsCurrentAgentRuntimeContext)
+                QueuedRuns.MarkWaiting(threadId, runId, lineId, stage);
+        }
         public void SetQueuedTopicRunStage(string threadId, string runId, TopicQueueStage stage)
-            => QueuedRuns.SetStage(threadId, runId, stage);
+        {
+            if (IsCurrentAgentRuntimeContext)
+                QueuedRuns.SetStage(threadId, runId, stage);
+        }
         public void StartQueuedTopicRun(string threadId, string runId)
-            => QueuedRuns.MarkStarted(threadId, runId);
+        {
+            if (IsCurrentAgentRuntimeContext)
+                QueuedRuns.MarkStarted(threadId, runId);
+        }
         public void CompleteQueuedTopicRun(string threadId, string runId)
-            => QueuedRuns.Complete(threadId, runId);
+        {
+            if (IsCurrentAgentRuntimeContext)
+                QueuedRuns.Complete(threadId, runId);
+        }
         public bool IsKnownQueuedTopicRun(string threadId, string runId)
             => QueuedRuns.IsKnownRun(threadId, runId);
         public int QueuedCountForThread(string threadId) => QueuedRuns.WaitingCount(threadId);
@@ -171,12 +224,15 @@ namespace Mesh.App.Services
             return true;
         }
         public void SetAgentRun(AgentRunState run)
-            => Profile.OwnThreads.Single(item => item.Id == run.ThreadId).ExecutionRunId = run.RunId;
+        {
+            if (IsCurrentAgentRuntimeContext)
+                Profile.OwnThreads.Single(item => item.Id == run.ThreadId).ExecutionRunId = run.RunId;
+        }
 
         public bool CancelThreadTurn(string threadId) => true;
         public bool IsThreadBusy(string threadId) => Busy;
 
-        public CancellationToken BeginThreadTurn(string threadId, bool building)
+        public CancellationToken BeginThreadTurn(string threadId, string runId, bool building)
         {
             Busy = true;
             return CancellationToken.None;
@@ -184,15 +240,26 @@ namespace Mesh.App.Services
 
         public void ClearThreadBuilding(string threadId) { }
         public void MarkThreadCompleted(string threadId) { }
-        public void UpdateAgentRun(string threadId, AgentRunPhase phase) { }
-        public void EndThreadTurn(string threadId) => Busy = false;
+        public void UpdateAgentRun(
+            string threadId,
+            AgentRunPhase phase,
+            IReadOnlyList<AgentSubtaskState>? subtasks = null,
+            DateTimeOffset? updatedAt = null,
+            string? runId = null)
+        {
+            if (phase is AgentRunPhase.Completed or AgentRunPhase.Failed or AgentRunPhase.Cancelled)
+                Busy = false;
+        }
+        public void EndThreadTurn(string threadId, string runId) => Busy = false;
         public void Mutate(Action<MeshProfile> change) => change(Profile);
         public void MutateAssets(Action<MeshProfile> change) => change(Profile);
         public void SaveAssetContent(
             AssetKind kind,
             string id,
             Action<MeshProfile> change)
-            => change(Profile);
+        {
+            if (IsCurrentAgentRuntimeContext) change(Profile);
+        }
         public Task<Widget?> LoadFullWidgetAsync(
             string id,
             CancellationToken ct = default)
@@ -930,6 +997,105 @@ namespace Mesh.App.Tests
                 q4, new RecordingProgress(), CancellationToken.None)
                 .WaitAsync(TimeSpan.FromSeconds(2));
             Assert.AreEqual(TopicRunPhase.Completed, fourth.Phase);
+        }
+
+        [TestMethod]
+        public async Task Runner_CommitsTerminalAnswerWithoutTrailingThinkingItem()
+        {
+            var state = StateWithThread();
+            var draft = Draft() with
+            {
+                WidgetId = "widget-1",
+                WidgetContext =
+                    """{"action":"use","widgetId":"widget-1","widgetName":"Demo","widgetPrompt":"demo","widgetHtml":"<p>done</p>"}"""
+            };
+            state.Profile.OwnThreads[0].Lines.Add(new ChatLine
+            {
+                Id = draft.TriggerLineId,
+                Role = "user",
+                Text = draft.Prompt
+            });
+            var runner = new TopicTurnRunner(new AgentService(), state);
+
+            var completion = await runner.ExecuteAsync(
+                draft, new RecordingProgress(), CancellationToken.None);
+
+            Assert.AreEqual(TopicRunPhase.Completed, completion.Phase);
+            Assert.AreEqual(false, state.BusyWhenTerminalAnswerAdded);
+            var transcript = TopicTranscriptPresentation.Compose(
+                state.Profile.OwnThreads[0].Lines,
+                _ => false,
+                state.Busy ? draft.ThreadId : null);
+            CollectionAssert.AreEqual(
+                new[] { "line:line-1", $"line:{state.Profile.OwnThreads[0].Lines[1].Id}" },
+                transcript.Select(item => item.Key).ToArray());
+            Assert.IsFalse(transcript.Any(item => item.IsActiveRun));
+        }
+
+        [TestMethod]
+        public async Task Runner_AccountSwitchRejectsActiveAndQueuedCallbacksWithCollidingIds()
+        {
+            var state = StateWithThread();
+            var accountAThread = state.Profile.OwnThreads[0];
+            accountAThread.Lines.AddRange(
+            [
+                new ChatLine { Id = "line-1", Role = "user", Text = "first" },
+                new ChatLine { Id = "line-2", Role = "user", Text = "second" }
+            ]);
+            var entered = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var agent = new AgentService
+            {
+                Continue = async (_, _, _) =>
+                {
+                    entered.TrySetResult();
+                    await release.Task;
+                    return "";
+                }
+            };
+            await using var runner = new TopicTurnRunner(agent, state);
+            var first = runner.ExecuteAsync(
+                Draft() with { Prompt = "first" },
+                new RecordingProgress(),
+                CancellationToken.None);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            var second = runner.ExecuteAsync(
+                Draft() with
+                {
+                    RunId = "run-2",
+                    TriggerLineId = "line-2",
+                    Prompt = "second"
+                },
+                new RecordingProgress(),
+                CancellationToken.None);
+
+            var accountB = new MeshProfile { Handle = "owner" };
+            accountB.Model.ApiKey = "test";
+            accountB.OwnThreads.Add(new OwnThread
+            {
+                Id = "thread-1",
+                Title = "Account B topic",
+                ExecutionRunId = "account-b-run",
+                Lines =
+                [
+                    new ChatLine { Id = "line-1", Role = "user", Text = "B first" },
+                    new ChatLine { Id = "line-2", Role = "user", Text = "B second" }
+                ]
+            });
+            state.SwitchRuntimeAccount("account-b", accountB);
+            release.TrySetResult();
+
+            var completions = await Task.WhenAll(first, second)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.AreEqual(TopicRunPhase.Completed, completions[0].Phase);
+            Assert.AreEqual(TopicRunPhase.Cancelled, completions[1].Phase);
+            Assert.AreEqual("account-b-run", accountB.OwnThreads[0].ExecutionRunId);
+            Assert.HasCount(2, accountB.OwnThreads[0].Lines);
+            Assert.AreEqual(0, state.ClearedRemoteRuns);
+            Assert.AreEqual(0, state.QueuedCountForThread("thread-1"));
         }
 
         private static Mesh.App.Services.AppState StateWithThread()

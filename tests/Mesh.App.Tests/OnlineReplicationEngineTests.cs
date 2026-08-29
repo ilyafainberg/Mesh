@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Text.Json.Nodes;
+using Mesh.App.Domain;
 using Mesh.App.Services;
 using Mesh.Shared;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -162,6 +163,308 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         Assert.AreEqual(1, b.Applier.Count);
         Assert.AreEqual(ReplicationDeliveryState.Persisted, a.Engine.GetDeliveryState(eid, "bob"));
         Assert.AreEqual(MeshDb.OutboxStatePersisted, a.Db.GetOutboxState(eid, "bob"));
+    }
+
+    [TestMethod]
+    public async Task TopicReplication_MultipleDeletesAndCreatesConvergeOnlineOfflineAndAfterRestart()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("alice", "a2");
+        var targets = new[] { a.Handle };
+        var topicSet = new HashSet<string>(StringComparer.Ordinal);
+        b.Applier.OnApply = (_, _, _, envelope) =>
+        {
+            if (!string.Equals(envelope.Kind, ReplicationOpKinds.Topic, StringComparison.Ordinal))
+                return;
+            if (envelope.Action == ReplicationPayloadCodec.DomainAction.Delete)
+                topicSet.Remove(envelope.EntityId);
+            else
+                topicSet.Add(envelope.EntityId);
+        };
+        static ReplicationPayloadCodec.DomainEnvelope Topic(
+            string id,
+            ReplicationPayloadCodec.DomainAction action,
+            string causal)
+            => Msg(
+                id,
+                conversationId: id,
+                body: action == ReplicationPayloadCodec.DomainAction.Delete
+                    ? """{"clear":false}"""
+                    : $$"""{"id":"{{id}}","title":"{{id}}","createdAt":"2026-08-29T12:00:00Z","sortOrder":0,"isPinned":false}""",
+                kind: ReplicationOpKinds.Topic,
+                action: action,
+                causal: causal);
+
+        foreach (var id in new[] { "topic-1", "topic-2", "topic-3" })
+            await a.Engine.EmitLocalAsync(
+                Topic(id, ReplicationPayloadCodec.DomainAction.Upsert, "initial-" + id),
+                targets);
+        await ConnectAsync(a, b);
+        Assert.AreEqual(3UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        CollectionAssert.AreEquivalent(
+            new[] { "topic-1", "topic-2", "topic-3" },
+            topicSet.ToArray());
+
+        var onlineDelete = await a.Engine.EmitLocalAsync(
+            Topic("topic-1", ReplicationPayloadCodec.DomainAction.Delete, "online-delete"),
+            targets);
+        var onlineCreate = await a.Engine.EmitLocalAsync(
+            Topic("topic-online", ReplicationPayloadCodec.DomainAction.Upsert, "online-create"),
+            targets);
+        await Fabric.DrainAsync();
+        Assert.IsNotNull(b.Db.GetEvent(onlineDelete));
+        Assert.IsNotNull(b.Db.GetEvent(onlineCreate));
+        Assert.AreEqual(5UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        CollectionAssert.AreEquivalent(
+            new[] { "topic-2", "topic-3", "topic-online" },
+            topicSet.ToArray());
+
+        Fabric.SetOnline(b.Device, false);
+        var offlineDeleteTwo = await a.Engine.EmitLocalAsync(
+            Topic("topic-2", ReplicationPayloadCodec.DomainAction.Delete, "offline-delete-2"),
+            targets);
+        var offlineDeleteThree = await a.Engine.EmitLocalAsync(
+            Topic("topic-3", ReplicationPayloadCodec.DomainAction.Delete, "offline-delete-3"),
+            targets);
+        var offlineCreate = await a.Engine.EmitLocalAsync(
+            Topic("topic-offline", ReplicationPayloadCodec.DomainAction.Upsert, "offline-create"),
+            targets);
+        await a.Engine.OnPresenceOnlineAsync(b.Handle, b.Device);
+        await Fabric.DrainAsync();
+
+        Assert.AreEqual(5UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        Assert.IsNull(b.Db.GetEvent(offlineDeleteTwo));
+        Assert.IsNull(b.Db.GetEvent(offlineDeleteThree));
+        Assert.IsNull(b.Db.GetEvent(offlineCreate));
+
+        Fabric.SetOnline(b.Device, true);
+        await Task.WhenAll(
+            a.Engine.OnPresenceOnlineAsync(b.Handle, b.Device),
+            a.Engine.OnPresenceOnlineAsync(b.Handle, b.Device));
+        await Fabric.DrainAsync();
+
+        var reoffered = b.Applier.Applied
+            .Where(item => item.Evt.Seq >= 6)
+            .Select(item => (item.Env.EntityId, item.Env.Action))
+            .ToArray();
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                ("topic-2", ReplicationPayloadCodec.DomainAction.Delete),
+                ("topic-3", ReplicationPayloadCodec.DomainAction.Delete),
+                ("topic-offline", ReplicationPayloadCodec.DomainAction.Upsert)
+            },
+            reoffered);
+        Assert.AreEqual(3, reoffered.Distinct().Count(), "duplicate online events must remain exact-once");
+        CollectionAssert.AreEquivalent(
+            new[] { "topic-online", "topic-offline" },
+            topicSet.ToArray());
+        Assert.AreEqual(8UL, b.Db.GetCursor(a.Device)!.Contiguous);
+
+        var reopened = Reopen(b);
+        Assert.AreEqual(8UL, reopened.Db.GetCursor(a.Device)!.Contiguous);
+        Assert.IsNotNull(reopened.Db.GetEvent(offlineDeleteTwo));
+        Assert.IsNotNull(reopened.Db.GetEvent(offlineDeleteThree));
+        Assert.IsNotNull(reopened.Db.GetEvent(offlineCreate));
+    }
+
+    [TestMethod]
+    public async Task Combined_TerminalThinkingTombstoneDoesNotSuppressReofferedTopicDeleteOrUpsert()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("alice", "a2");
+        var targets = new[] { a.Handle };
+        var topicSet = new HashSet<string>(StringComparer.Ordinal);
+        b.Applier.OnApply = (_, _, _, envelope) =>
+        {
+            if (!string.Equals(envelope.Kind, ReplicationOpKinds.Topic, StringComparison.Ordinal))
+                return;
+            if (envelope.Action == ReplicationPayloadCodec.DomainAction.Delete)
+                topicSet.Remove(envelope.EntityId);
+            else
+                topicSet.Add(envelope.EntityId);
+        };
+        static ReplicationPayloadCodec.DomainEnvelope Topic(
+            string id,
+            ReplicationPayloadCodec.DomainAction action,
+            string causal)
+            => Msg(
+                id,
+                conversationId: id,
+                body: action == ReplicationPayloadCodec.DomainAction.Delete
+                    ? """{"clear":false}"""
+                    : $$"""{"id":"{{id}}","title":"{{id}}","createdAt":"2026-08-29T12:00:00Z","sortOrder":0,"isPinned":false}""",
+                kind: ReplicationOpKinds.Topic,
+                action: action,
+                causal: causal);
+
+        await a.Engine.EmitLocalAsync(
+            Topic("topic-terminal", ReplicationPayloadCodec.DomainAction.Upsert, "initial-terminal"),
+            targets);
+        await a.Engine.EmitLocalAsync(
+            Topic("topic-delete", ReplicationPayloadCodec.DomainAction.Upsert, "initial-delete"),
+            targets);
+        await ConnectAsync(a, b);
+
+        Fabric.SetOnline(b.Device, false);
+        var render = new LiveAgentRenderState();
+        Assert.IsTrue(render.BeginDraft("topic-terminal", "run-terminal"));
+        Assert.IsTrue(render.AppendDraft(
+            "topic-terminal",
+            "run-terminal",
+            new AgentDelta(AgentDeltaKind.Reasoning, "working")));
+        var finalLine = new Mesh.App.Domain.ChatLine
+        {
+            Id = "answer-terminal",
+            Role = "assistant",
+            Text = "Final answer"
+        };
+        Assert.IsTrue(render.CompleteRun("topic-terminal", "run-terminal"));
+        Assert.IsFalse(render.AppendDraft(
+            "topic-terminal",
+            "run-terminal",
+            new AgentDelta(AgentDeltaKind.Reasoning, "late thinking"),
+            beginIfNeeded: true));
+
+        var delete = await a.Engine.EmitLocalAsync(
+            Topic("topic-delete", ReplicationPayloadCodec.DomainAction.Delete, "offline-delete"),
+            targets);
+        var upsert = await a.Engine.EmitLocalAsync(
+            Topic("topic-new", ReplicationPayloadCodec.DomainAction.Upsert, "offline-upsert"),
+            targets);
+        await a.Engine.OnPresenceOnlineAsync(b.Handle, b.Device);
+        await Fabric.DrainAsync();
+        Assert.IsNull(b.Db.GetEvent(delete));
+        Assert.IsNull(b.Db.GetEvent(upsert));
+
+        Fabric.SetOnline(b.Device, true);
+        await Task.WhenAll(
+            a.Engine.OnPresenceOnlineAsync(b.Handle, b.Device),
+            a.Engine.OnPresenceOnlineAsync(b.Handle, b.Device));
+        await Fabric.DrainAsync();
+
+        var terminalSnapshot = render.Capture("topic-terminal");
+        Assert.IsNull(terminalSnapshot.Draft);
+        Assert.IsEmpty(terminalSnapshot.Steps);
+        var transcript = TopicTranscriptPresentation.Compose(
+            new[] { finalLine },
+            _ => false,
+            null);
+        Assert.HasCount(1, transcript);
+        Assert.AreEqual("Final answer", transcript[0].Line?.Text);
+        Assert.IsFalse(transcript.Any(item => item.IsActiveRun));
+        CollectionAssert.AreEquivalent(
+            new[] { "topic-terminal", "topic-new" },
+            topicSet.ToArray());
+        Assert.AreEqual(1, b.Applier.Applied.Count(item => item.Evt.EventId == delete));
+        Assert.AreEqual(1, b.Applier.Applied.Count(item => item.Evt.EventId == upsert));
+    }
+
+    [TestMethod]
+    public async Task Combined_RestartOutOfOrderAndDuplicatePresenceRemainIsolatedAcrossAccountsAndDatabases()
+    {
+        var aliceA = NewNode("alice", "alice-a");
+        var aliceB = NewNode("alice", "alice-b");
+        var carolA = NewNode("carol", "carol-a");
+        var carolB = NewNode("carol", "carol-b");
+        await ConnectAsync(aliceA, aliceB);
+        await ConnectAsync(carolA, carolB);
+
+        Fabric.SetOnline(aliceB.Device, false);
+        Fabric.SetOnline(carolB.Device, false);
+        var aliceEvent = await aliceA.Engine.EmitLocalAsync(
+            Msg(
+                "alice-topic",
+                "alice-topic",
+                """{"id":"alice-topic"}""",
+                ReplicationOpKinds.Topic),
+            new[] { "alice" });
+        var carolEvent = await carolA.Engine.EmitLocalAsync(
+            Msg(
+                "carol-topic",
+                "carol-topic",
+                """{"id":"carol-topic"}""",
+                ReplicationOpKinds.Topic),
+            new[] { "carol" });
+        await aliceA.Engine.OnPresenceOnlineAsync(aliceB.Handle, aliceB.Device);
+        await carolA.Engine.OnPresenceOnlineAsync(carolB.Handle, carolB.Device);
+        await Fabric.DrainAsync();
+
+        Fabric.SetOnline(aliceB.Device, true);
+        Fabric.SetOnline(carolB.Device, true);
+        await Task.WhenAll(
+            aliceA.Engine.OnPresenceOnlineAsync(aliceB.Handle, aliceB.Device),
+            aliceA.Engine.OnPresenceOnlineAsync(aliceB.Handle, aliceB.Device),
+            carolA.Engine.OnPresenceOnlineAsync(carolB.Handle, carolB.Device),
+            carolA.Engine.OnPresenceOnlineAsync(carolB.Handle, carolB.Device));
+        await Fabric.DrainAsync();
+
+        Assert.AreEqual(1, aliceB.Applier.Applied.Count(item => item.Evt.EventId == aliceEvent));
+        Assert.AreEqual(1, carolB.Applier.Applied.Count(item => item.Evt.EventId == carolEvent));
+        Assert.IsNull(aliceB.Db.GetEvent(carolEvent));
+        Assert.IsNull(carolB.Db.GetEvent(aliceEvent));
+
+        aliceB = Reopen(aliceB);
+        carolB = Reopen(carolB);
+        await ConnectAsync(aliceA, aliceB);
+        await ConnectAsync(carolA, carolB);
+        Assert.AreEqual(0, aliceB.Applier.Count, "restart bootstrap must not replay a persisted event");
+        Assert.AreEqual(0, carolB.Applier.Count, "restart bootstrap must not replay a persisted event");
+
+        var aliceOrigin = AddOrigin("alice-origin", "alice-origin-device");
+        var carolOrigin = AddOrigin("carol-origin", "carol-origin-device");
+        var aliceOne = MakeEvent(
+            aliceOrigin,
+            "alice-origin",
+            "alice-origin-device",
+            1,
+            Msg("alice-out-1"),
+            new[] { aliceB.Keys.PublicB64 });
+        var aliceTwo = MakeEvent(
+            aliceOrigin,
+            "alice-origin",
+            "alice-origin-device",
+            2,
+            Msg("alice-out-2"),
+            new[] { aliceB.Keys.PublicB64 });
+        var aliceThree = MakeEvent(
+            aliceOrigin,
+            "alice-origin",
+            "alice-origin-device",
+            3,
+            Msg("alice-out-3"),
+            new[] { aliceB.Keys.PublicB64 });
+        var carolOne = MakeEvent(
+            carolOrigin,
+            "carol-origin",
+            "carol-origin-device",
+            1,
+            Msg("carol-out-1"),
+            new[] { carolB.Keys.PublicB64 });
+        var carolTwo = MakeEvent(
+            carolOrigin,
+            "carol-origin",
+            "carol-origin-device",
+            2,
+            Msg("carol-out-2"),
+            new[] { carolB.Keys.PublicB64 });
+        var carolThree = MakeEvent(
+            carolOrigin,
+            "carol-origin",
+            "carol-origin-device",
+            3,
+            Msg("carol-out-3"),
+            new[] { carolB.Keys.PublicB64 });
+
+        await DeliverBatchAsync(aliceA, aliceB, Batch("alice-origin-device", new[] { aliceThree }));
+        await DeliverBatchAsync(carolA, carolB, Batch("carol-origin-device", new[] { carolThree }));
+        await DeliverBatchAsync(aliceA, aliceB, Batch("alice-origin-device", new[] { aliceOne, aliceTwo }));
+        await DeliverBatchAsync(carolA, carolB, Batch("carol-origin-device", new[] { carolOne, carolTwo }));
+
+        Assert.AreEqual(3UL, aliceB.Db.GetCursor("alice-origin-device")!.Contiguous);
+        Assert.AreEqual(3UL, carolB.Db.GetCursor("carol-origin-device")!.Contiguous);
+        Assert.IsNull(aliceB.Db.GetCursor("carol-origin-device"));
+        Assert.IsNull(carolB.Db.GetCursor("alice-origin-device"));
     }
 
     [TestMethod]

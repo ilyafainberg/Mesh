@@ -419,6 +419,270 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
     }
 
     [TestMethod]
+    public async Task ActualProgram_ValidLinkedDevices_OfflineTopicsRenderAndAccountScopesConverge()
+    {
+        var repository = FindRepositoryRoot();
+        var root = Path.Combine(
+            repository, "_artifacts", "sora-live-validation", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        await using var relay = await RelayProcess.StartAsync(
+            TestRelayAssembly(repository), "Test", enabled: true, AdminKey);
+        ClientHarness? laptop = null;
+        ClientHarness? tablet = null;
+        ClientHarness? relaunchedTablet = null;
+        string? isolatedAccountId = null;
+        try
+        {
+            laptop = CreateClient(
+                "sora-live", "Laptop", relay.BaseUrl, relay.BaseUrl, root, "laptop");
+            tablet = CreateClient(
+                "sora-live", "Tablet", relay.BaseUrl, relay.BaseUrl, root, "tablet");
+            await RegisterLinkedDevicesAsync(relay.Http, laptop.State, tablet.State);
+            await tablet.Client.ConnectAsync();
+            await laptop.Client.ConnectAsync();
+            await EventuallyAsync(
+                () => laptop.Client.Connected
+                      && tablet.Client.Connected
+                      && laptop.Client.IsReplicationRosterDeviceAvailable(
+                          "sora-live", tablet.Client.MyDeviceId)
+                      && tablet.Client.IsReplicationRosterDeviceAvailable(
+                          "sora-live", laptop.Client.MyDeviceId),
+                TimeSpan.FromSeconds(20));
+
+            var initialHandshake = (await RuntimeAsync(relay.Http)).Handshakes.Last(item =>
+                item.Stage == "authenticate"
+                && item.DeviceId == tablet.Client.MyDeviceId
+                && item.Accepted == true);
+            Assert.IsFalse(string.IsNullOrWhiteSpace(initialHandshake.Nonce));
+
+            var first = laptop.State.NewOwnThread("synthetic-topic-1");
+            var second = laptop.State.NewOwnThread("synthetic-topic-2");
+            var retained = laptop.State.NewOwnThread("synthetic-topic-3");
+            await EventuallyAsync(
+                () => tablet.State.Profile.OwnThreads.Select(item => item.Id).ToHashSet()
+                    .SetEquals(new[] { first.Id, second.Id, retained.Id }),
+                TimeSpan.FromSeconds(20));
+
+            var tabletSecrets = tablet.Secrets;
+            var tabletAccountId = tablet.State.ActiveAccountId!;
+            var tabletDeviceId = tablet.Client.MyDeviceId;
+            await tablet.State.FlushPersistenceAsync();
+            await tablet.Client.DisconnectAsync();
+            await EventuallyAsync(
+                () => !tablet.Client.Connected,
+                TimeSpan.FromSeconds(10));
+
+            laptop.State.DeleteOwnThread(first.Id);
+            laptop.State.DeleteOwnThread(second.Id);
+            var createdOffline = laptop.State.NewOwnThread("synthetic-topic-offline");
+            await EventuallyAsync(
+                () => laptop.State.CountPendingReplicationEvents() >= 3,
+                TimeSpan.FromSeconds(10));
+
+            tablet.State.SignOut();
+            relaunchedTablet = CreateClient(
+                "sora-live", "Tablet", relay.BaseUrl, relay.BaseUrl, root, "tablet",
+                secrets: tabletSecrets, initializeIdentity: false);
+            Assert.IsTrue(relaunchedTablet.State.SwitchAccount(tabletAccountId));
+            Assert.AreEqual(tabletDeviceId, relaunchedTablet.Client.MyDeviceId);
+            await relaunchedTablet.Client.ConnectAsync();
+            await EventuallyAsync(
+                () => relaunchedTablet.Client.Connected
+                      && laptop.Client.IsReplicationRosterDeviceAvailable(
+                          "sora-live", relaunchedTablet.Client.MyDeviceId),
+                TimeSpan.FromSeconds(20));
+            await EventuallyAsync(
+                () => relaunchedTablet.State.Profile.OwnThreads.Select(item => item.Id).ToHashSet()
+                          .SetEquals(new[] { retained.Id, createdOffline.Id })
+                      && laptop.State.CountPendingReplicationEvents() == 0,
+                TimeSpan.FromSeconds(25));
+
+            var recoveredHandshake = (await RuntimeAsync(relay.Http)).Handshakes.Last(item =>
+                item.Stage == "authenticate"
+                && item.DeviceId == tabletDeviceId
+                && item.Accepted == true);
+            Assert.IsFalse(string.IsNullOrWhiteSpace(recoveredHandshake.Nonce));
+            Assert.AreNotEqual(initialHandshake.Nonce, recoveredHandshake.Nonce);
+            Assert.AreEqual(
+                3,
+                relaunchedTablet.Client.OnlineReplicationEngine!.GetProgress().CommittedEvents,
+                "two tombstones and one upsert must commit exactly once after recovery");
+            using var cursorDb = MeshDb.Open(
+                relaunchedTablet.State.ActiveDatabasePath!,
+                relaunchedTablet.Secrets.GetDbKey(tabletAccountId)!);
+            var recoveredCursor = cursorDb.GetCursor(laptop.Client.MyDeviceId);
+            Assert.IsNotNull(recoveredCursor);
+            Assert.AreEqual(12UL, recoveredCursor.Contiguous);
+            Assert.IsTrue(recoveredCursor.AheadBits.All(value => value == 0));
+
+            const string terminalRun = "sora-terminal-run";
+            laptop.State.BeginThreadTurn(retained.Id, terminalRun, building: false);
+            laptop.State.SetAgentRun(new AgentRunState(
+                terminalRun,
+                retained.Id,
+                AgentRunPhase.Planning,
+                "",
+                Array.Empty<AgentSubtaskState>(),
+                DateTimeOffset.UtcNow));
+            laptop.State.BeginAgentSteps(retained.Id, terminalRun);
+            laptop.State.BeginAssistantDraft(retained.Id, terminalRun);
+            Assert.IsTrue(laptop.State.AppendAssistantDelta(
+                retained.Id,
+                terminalRun,
+                new AgentDelta(AgentDeltaKind.Reasoning, "synthetic-thinking")));
+            laptop.State.AddOwnChatLine(
+                retained.Id,
+                new ChatLine
+                {
+                    Id = "sora-terminal-answer",
+                    Role = "assistant",
+                    Text = "synthetic-final",
+                    At = DateTimeOffset.UtcNow
+                },
+                terminalRunId: terminalRun);
+            Assert.IsFalse(laptop.State.IsThreadBusy(retained.Id));
+            Assert.IsFalse(laptop.State.AppendAssistantDelta(
+                retained.Id,
+                terminalRun,
+                new AgentDelta(AgentDeltaKind.Reasoning, "delayed-thinking")));
+            Assert.IsNull(laptop.State.AssistantDraftFor(retained.Id));
+            Assert.IsEmpty(laptop.State.AgentStepsFor(retained.Id));
+
+            await laptop.Client.DisconnectAsync();
+            await laptop.Client.ConnectAsync();
+            await EventuallyAsync(() => laptop.Client.Connected, TimeSpan.FromSeconds(15));
+            Assert.IsFalse(laptop.State.AppendAssistantDelta(
+                retained.Id,
+                terminalRun,
+                new AgentDelta(AgentDeltaKind.Reasoning, "post-reconnect-delayed-thinking")));
+
+            const string nextRun = "sora-next-run";
+            laptop.State.BeginThreadTurn(retained.Id, nextRun, building: false);
+            laptop.State.SetAgentRun(new AgentRunState(
+                nextRun,
+                retained.Id,
+                AgentRunPhase.Planning,
+                "",
+                Array.Empty<AgentSubtaskState>(),
+                DateTimeOffset.UtcNow.AddSeconds(1)));
+            laptop.State.BeginAssistantDraft(retained.Id, nextRun);
+            Assert.IsTrue(laptop.State.AppendAssistantDelta(
+                retained.Id,
+                nextRun,
+                new AgentDelta(AgentDeltaKind.Reasoning, "valid-next-run-thinking")));
+            Assert.AreEqual(
+                "valid-next-run-thinking",
+                laptop.State.AssistantDraftFor(retained.Id)?.Reasoning);
+
+            var originalAccountId = laptop.State.ActiveAccountId!;
+            var originalScope = laptop.State.CaptureAgentRuntimeScope();
+            var releaseStaleCallback = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<bool> staleCallback;
+            using (laptop.State.EnterAgentRuntimeScope(originalScope))
+            {
+                staleCallback = Task.Run(async () =>
+                {
+                    await releaseStaleCallback.Task;
+                    return laptop.State.AppendAssistantDelta(
+                        retained.Id,
+                        nextRun,
+                        new AgentDelta(AgentDeltaKind.Answer, "stale-account-a"));
+                });
+            }
+
+            var isolated = new MeshProfile
+            {
+                Handle = "sora-isolated",
+                DisplayName = "Isolated",
+                DeviceName = "Isolated device"
+            };
+            isolated.OwnThreads.Add(new OwnThread
+            {
+                Id = retained.Id,
+                Title = "isolated-topic",
+                CreatedAt = DateTimeOffset.UtcNow
+            });
+            isolatedAccountId = laptop.State.ImportProfile(isolated);
+            laptop.State.BeginThreadTurn(retained.Id, nextRun, building: false);
+            laptop.State.SetAgentRun(new AgentRunState(
+                nextRun,
+                retained.Id,
+                AgentRunPhase.Planning,
+                "",
+                Array.Empty<AgentSubtaskState>(),
+                DateTimeOffset.UtcNow.AddSeconds(2)));
+            laptop.State.BeginAssistantDraft(retained.Id, nextRun);
+            Assert.IsTrue(laptop.State.AppendAssistantDelta(
+                retained.Id,
+                nextRun,
+                new AgentDelta(AgentDeltaKind.Answer, "account-b")));
+            releaseStaleCallback.TrySetResult();
+            Assert.IsFalse(await staleCallback.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.AreEqual("account-b", laptop.State.AssistantDraftFor(retained.Id)?.Answer);
+            Assert.IsTrue(laptop.State.SwitchAccount(originalAccountId));
+            Assert.IsFalse(laptop.State.IsThreadBusy(retained.Id));
+
+            Console.WriteLine(
+                $"SORA_LIVE_AUTH linked=true device={tabletDeviceId} " +
+                $"initialNonceHash={LiveFaultIds.Hash(initialHandshake.Nonce!)} " +
+                $"recoveredNonceHash={LiveFaultIds.Hash(recoveredHandshake.Nonce!)} authenticated=true");
+            Console.WriteLine(
+                $"SORA_LIVE_TOPICS final=2 ids={retained.Id},{createdOffline.Id} " +
+                "deletes=2 upserts=1 committedExactlyOnce=3 pending=0");
+            Console.WriteLine(
+                "SORA_LIVE_RENDER terminalDominant=true delayedThinkingIgnored=true " +
+                "postReconnectIgnored=true nextRunThinkingAccepted=true accountIsolation=true");
+            if (Environment.GetEnvironmentVariable("MESH_SORA_EVIDENCE_FILE") is { Length: > 0 } evidenceFile)
+            {
+                var evidence = new
+                {
+                    linked = true,
+                    authenticated = true,
+                    deviceIdHash = LiveFaultIds.Hash(tabletDeviceId),
+                    initialNonceHash = LiveFaultIds.Hash(initialHandshake.Nonce!),
+                    recoveredNonceHash = LiveFaultIds.Hash(recoveredHandshake.Nonce!),
+                    recoveredWithFreshChallenge = initialHandshake.Nonce != recoveredHandshake.Nonce,
+                    finalTopicIds = new[] { retained.Id, createdOffline.Id },
+                    deletedTopics = 2,
+                    createdTopics = 1,
+                    recoveryFrames = 3,
+                    committedExactlyOnce = 3,
+                    cursorContiguous = recoveredCursor.Contiguous,
+                    cursorAheadBitsClear = recoveredCursor.AheadBits.All(value => value == 0),
+                    pendingOutbox = 0,
+                    terminalDominant = true,
+                    delayedThinkingIgnored = true,
+                    postReconnectThinkingIgnored = true,
+                    nextRunThinkingAccepted = true,
+                    accountIsolation = true
+                };
+                await File.WriteAllTextAsync(
+                    evidenceFile,
+                    JsonSerializer.Serialize(evidence, new JsonSerializerOptions { WriteIndented = true }));
+            }
+        }
+        finally
+        {
+            if (laptop is not null) await laptop.Client.DisconnectAsync();
+            if (tablet is not null) await tablet.Client.DisconnectAsync();
+            if (relaunchedTablet is not null) await relaunchedTablet.Client.DisconnectAsync();
+            if (laptop?.State.ActiveAccountId is { } laptopId)
+                laptop.State.DeleteAccount(laptopId);
+            if (isolatedAccountId is not null)
+                laptop?.State.DeleteAccount(isolatedAccountId);
+            if (relaunchedTablet?.State.ActiveAccountId is { } relaunchedId)
+                relaunchedTablet.State.DeleteAccount(relaunchedId);
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try
+            {
+                if (Directory.Exists(root)) Directory.Delete(root, true);
+            }
+            catch (IOException) { }
+        }
+    }
+
+    [TestMethod]
     public async Task ActualProgram_TerminalAnswerRestartAndLateControlSoakConverge()
     {
         var repository = FindRepositoryRoot();

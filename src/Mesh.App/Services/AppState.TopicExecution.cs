@@ -931,12 +931,12 @@ public sealed partial class AppState
                     thread.ExecutionRunId = null;
                     terminalRemoteRuns.Add(item.ThreadId + "\0" + item.RunId);
                     remoteDeltaSeq.Remove(item.ThreadId + "\0" + item.RunId);
+                    liveAgentRenderState.CompleteRun(thread.Id, item.RunId);
+                    assistantDraftRefreshGate.Reset(thread.Id);
                     if (remoteRuns.TryGetValue(thread.Id, out var projection)
                         && string.Equals(projection.RunId, item.RunId, StringComparison.Ordinal))
                     {
                         remoteRuns.TryRemove(thread.Id, out _);
-                        liveAgentRenderState.EndDraft(thread.Id);
-                        assistantDraftRefreshGate.Reset(thread.Id);
                     }
                     repairedAnswers++;
                     continue;
@@ -997,11 +997,11 @@ public sealed partial class AppState
                 thread.ExecutionRunId = null;
                 terminalRemoteRuns.Add(thread.Id + "\0" + correlation.RunId);
                 remoteDeltaSeq.Remove(thread.Id + "\0" + correlation.RunId);
+                liveAgentRenderState.CompleteRun(thread.Id, correlation.RunId);
+                assistantDraftRefreshGate.Reset(thread.Id);
                 if (projectionMatches)
                 {
                     remoteRuns.TryRemove(thread.Id, out _);
-                    liveAgentRenderState.EndDraft(thread.Id);
-                    assistantDraftRefreshGate.Reset(thread.Id);
                 }
                 repairedAnswers++;
             }

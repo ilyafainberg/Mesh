@@ -41,6 +41,7 @@ public sealed partial class AppState
     /// <summary>Signals listeners that the active account is about to change. Called off the hot path.</summary>
     private void RaiseActiveAccountChanging()
     {
+        ResetAgentRuntimeStateForAccountChange();
         lock (localJournalGate) { localJournal = null; localJournalDb = null; }
         // A misbehaving listener must not abort the account switch, but its failure is surfaced
         // rather than swallowed.

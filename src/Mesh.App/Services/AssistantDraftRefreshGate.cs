@@ -49,4 +49,10 @@ internal sealed class AssistantDraftRefreshGate
         lock (gate)
             states.Remove(key);
     }
+
+    public void ResetForAccount()
+    {
+        lock (gate)
+            states.Clear();
+    }
 }

@@ -46,6 +46,7 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         public required TopicTurnDraft Draft { get; init; }
         public required IProgress<TopicRunUpdatePayload> Progress { get; init; }
         public required CancellationToken CancellationToken { get; init; }
+        public required AgentRuntimeScopeToken RuntimeScope { get; init; }
         public Func<CancellationToken, Task>? OnStarted { get; init; }
         public TaskCompletionSource<TopicRunCompletion> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -76,15 +77,19 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(draft);
         ArgumentNullException.ThrowIfNull(progress);
 
+        var runtimeScope = state.CaptureAgentRuntimeScope();
+        using var runtimeContext = state.EnterAgentRuntimeScope(runtimeScope);
         using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, lifetime.Token);
         var effectiveCancellation = linkedCancellation.Token;
-        var queue = queues.GetOrAdd(draft.ThreadId, static _ => new TopicQueue());
+        var queueKey = runtimeScope.Generation + "\0" + draft.ThreadId;
+        var queue = queues.GetOrAdd(queueKey, static _ => new TopicQueue());
         var item = new WorkItem
         {
             Draft = draft,
             Progress = progress,
             CancellationToken = effectiveCancellation,
+            RuntimeScope = runtimeScope,
             OnStarted = onStarted
         };
         var startDrain = false;
@@ -138,9 +143,20 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         {
             while (TryDequeue(queue, out var item))
             {
+                using var runtimeContext = state.EnterAgentRuntimeScope(item.RuntimeScope);
                 TopicRunCompletion completion;
                 try
                 {
+                    if (!state.IsCurrentAgentRuntimeScope(item.RuntimeScope))
+                    {
+                        completion = Complete(
+                            item.Progress,
+                            item.Draft,
+                            TopicRunPhase.Cancelled,
+                            "Cancelled");
+                        item.Completion.TrySetResult(completion);
+                        continue;
+                    }
                     if (item.OnStarted is not null)
                         await item.OnStarted(item.CancellationToken);
                     if (item.WasQueued)
@@ -276,7 +292,8 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         IProgress<TopicRunUpdatePayload> progress,
         CancellationToken cancellationToken)
     {
-        var stateToken = state.BeginThreadTurn(draft.ThreadId, IsWidgetBuild(draft.WidgetContext));
+        var stateToken = state.BeginThreadTurn(
+            draft.ThreadId, draft.RunId, IsWidgetBuild(draft.WidgetContext));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, stateToken);
         ChatLine? trigger = null;
@@ -286,7 +303,7 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
             state.SetAgentRun(new AgentRunState(
                 draft.RunId,
                 draft.ThreadId,
-                AgentRunPhase.Executing,
+                AgentRunPhase.Planning,
                 "",
                 Array.Empty<AgentSubtaskState>(),
                 draft.TriggerAt));
@@ -299,20 +316,21 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
             else
                 await ExecuteWidgetAsync(draft, widgetTurn, progress, linked.Token);
 
-            state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Completed);
             await PublishTerminalAsync(draft, NotificationKind.TopicCompleted).ConfigureAwait(false);
             state.MarkThreadCompleted(draft.ThreadId);
             return Complete(progress, draft, TopicRunPhase.Completed, "Completed");
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested)
         {
-            state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Cancelled);
+            state.UpdateAgentRun(
+                draft.ThreadId, AgentRunPhase.Cancelled, runId: draft.RunId);
             await PublishTerminalAsync(draft, NotificationKind.TopicCancelled).ConfigureAwait(false);
             return Complete(progress, draft, TopicRunPhase.Cancelled, "Cancelled");
         }
         catch (InvalidWidgetContextException ex)
         {
-            state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Failed);
+            state.UpdateAgentRun(
+                draft.ThreadId, AgentRunPhase.Failed, runId: draft.RunId);
             await PublishTerminalAsync(draft, NotificationKind.TopicFailed).ConfigureAwait(false);
             return Complete(
                 progress, draft, TopicRunPhase.Failed, "Failed",
@@ -320,7 +338,8 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Failed);
+            state.UpdateAgentRun(
+                draft.ThreadId, AgentRunPhase.Failed, runId: draft.RunId);
             await PublishTerminalAsync(draft, NotificationKind.TopicFailed).ConfigureAwait(false);
             return Complete(
                 progress, draft, TopicRunPhase.Failed, "Failed",
@@ -330,13 +349,15 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         {
             if (trigger is not null) trigger.Attachments.Clear();
             state.ClearThreadBuilding(draft.ThreadId);
-            state.EndThreadTurn(draft.ThreadId);
+            state.EndThreadTurn(draft.ThreadId, draft.RunId);
             state.ClearRemoteRunProjection(draft.ThreadId, draft.RunId);
         }
     }
     private async Task PublishTerminalAsync(TopicTurnDraft draft, NotificationKind kind)
     {
+        if (!state.IsCurrentAgentRuntimeContext) return;
         await state.FlushPersistenceAsync(CancellationToken.None).ConfigureAwait(false);
+        if (!state.IsCurrentAgentRuntimeContext) return;
         var now = DateTimeOffset.UtcNow;
         var response = kind == NotificationKind.TopicCompleted
             ? state.Profile.OwnThreads
@@ -365,6 +386,7 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
 
     private void ClearTriggerAttachments(TopicTurnDraft draft)
     {
+        if (!state.IsCurrentAgentRuntimeContext) return;
         var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
             string.Equals(item.Id, draft.ThreadId, StringComparison.Ordinal));
         var line = thread?.Lines.FirstOrDefault(item =>
@@ -464,7 +486,7 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         if (action == "use")
         {
             AddWidgetLine(
-                draft.ThreadId, draft.TriggerLineId,
+                draft.ThreadId, draft.TriggerLineId, draft.RunId,
                 FirstNonBlank(turn.WidgetHtml),
                 FirstNonBlank(turn.WidgetPrompt));
             return;
@@ -476,7 +498,7 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
             var reply = await agent.BuildWidgetAsync(prompt, cancellationToken);
             var html = ExtractWidgetHtml(reply);
             if (html is null) throw new InvalidOperationException(reply);
-            AddWidgetLine(draft.ThreadId, draft.TriggerLineId, html, prompt);
+            AddWidgetLine(draft.ThreadId, draft.TriggerLineId, draft.RunId, html, prompt);
             return;
         }
 
@@ -518,7 +540,11 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
             throw new InvalidOperationException(
                 "The saved widget changed while it was being refined. Retry from the latest version.");
         AddWidgetLine(
-            draft.ThreadId, draft.TriggerLineId, refinedHtml, $"{originalPrompt}\n\nChange request: {change}");
+            draft.ThreadId,
+            draft.TriggerLineId,
+            draft.RunId,
+            refinedHtml,
+            $"{originalPrompt}\n\nChange request: {change}");
     }
 
     private async Task<Widget> LoadFullWidgetForRefineAsync(
@@ -530,14 +556,19 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
                ?? throw new InvalidWidgetContextException("The saved widget was not found.");
     }
 
-    private void AddWidgetLine(string threadId, string triggerLineId, string html, string prompt)
+    private void AddWidgetLine(
+        string threadId,
+        string triggerLineId,
+        string runId,
+        string html,
+        string prompt)
         => state.AddOwnChatLine(threadId, new ChatLine
         {
             Role = "assistant",
             Text = $"```html-app\n{html}\n```",
             WidgetPrompt = prompt,
             ReplyToLineId = triggerLineId
-        });
+        }, terminalRunId: runId);
 
     private static WidgetTurn? ParseWidgetTurn(string? json)
     {
