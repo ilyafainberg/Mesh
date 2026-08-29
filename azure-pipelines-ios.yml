@@ -299,18 +299,20 @@ steps:
     with open(os.path.join(root, "manifest-redacted.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
-    report = f"""SCREENSHOTS-READY
-Source: ilyafainberg/Mesh @ 7de3de3c2ddda0b30abb0c42d5b1fd2c2b859710
-Version/build: 1.19.0 / 76
-SDK: .NET 10.0.302
-Xcode: {os.environ['XCODE_VERSION']}
-iOS runtime: {os.environ['RUNTIME_NAME']}
-Sets: 4 portrait PNGs at 1242x2688 (6.5-inch iPhone); 4 portrait PNGs at 2064x2752 (13-inch iPad)
-Capture: Native simulator pixels, no transformations or overlays
-Privacy: Fresh simulator state and empty forms; no private data or account identifiers
-App Store Connect: No upload or submission performed
-Evidence: manifest-redacted.json contains per-file SHA-256 values
-"""
+    report = "\n".join([
+        "SCREENSHOTS-READY",
+        "Source: ilyafainberg/Mesh @ 7de3de3c2ddda0b30abb0c42d5b1fd2c2b859710",
+        "Version/build: 1.19.0 / 76",
+        "SDK: .NET 10.0.302",
+        f"Xcode: {os.environ['XCODE_VERSION']}",
+        f"iOS runtime: {os.environ['RUNTIME_NAME']}",
+        "Sets: 4 portrait PNGs at 1242x2688 (6.5-inch iPhone); 4 portrait PNGs at 2064x2752 (13-inch iPad)",
+        "Capture: Native simulator pixels, no transformations or overlays",
+        "Privacy: Fresh simulator state and empty forms; no private data or account identifiers",
+        "App Store Connect: No upload or submission performed",
+        "Evidence: manifest-redacted.json contains per-file SHA-256 values",
+        "",
+    ])
     with open(os.path.join(root, "REPORT-REDACTED.txt"), "w", encoding="utf-8") as f:
         f.write(report)
     PY
