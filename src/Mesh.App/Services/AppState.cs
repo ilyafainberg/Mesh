@@ -1940,6 +1940,9 @@ public sealed partial class AppState :
         lock (profileSyncGate)
         {
             if (!IsCurrentAgentRuntimeContext) return;
+            if (terminalRemoteRuns.Contains(run.ThreadId + "\0" + run.RunId)
+                || liveAgentRenderState.IsTerminal(run.ThreadId, run.RunId))
+                return;
             if (agentRuns.TryGetValue(run.ThreadId, out var current))
             {
                 if (string.Equals(current.RunId, run.RunId, StringComparison.Ordinal))
@@ -2021,6 +2024,9 @@ public sealed partial class AppState :
         {
             thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId)
                      ?? throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
+            if (terminalRemoteRuns.Contains(threadId + "\0" + runId)
+                || liveAgentRenderState.IsTerminal(threadId, runId))
+                throw new InvalidOperationException("The run is already terminal.");
             if (thread.ExecutionRunId is not null
                 && !string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
                 throw new InvalidOperationException("The topic already has a different active run.");
@@ -2038,7 +2044,6 @@ public sealed partial class AppState :
                     runId,
                     activityAt)))
                 throw new InvalidOperationException("The expected remote run could not be persisted.");
-            terminalRemoteRuns.Remove(threadId + "\0" + runId);
             thread.ExecutionDeviceId = target.DeviceId;
             thread.ExecutionDeviceName = target.DeviceName;
             thread.ExecutionDevicePlatform = target.Platform;
@@ -2081,6 +2086,7 @@ public sealed partial class AppState :
         var correlationKey = update.ThreadId + "\0" + update.RunId;
         OwnThread? thread;
         var terminal = TopicControlProtocol.IsTerminal(update);
+        CancellationTokenSource? completedCts = null;
         lock (profileSyncGate)
         {
             var alreadyTerminal = terminalRemoteRuns.Contains(correlationKey);
@@ -2111,7 +2117,8 @@ public sealed partial class AppState :
                 thread!.LastActivityAt, update.Timestamp);
             thread.LastActivityAt = activityAt;
             thread.ExecutionAt ??= update.Timestamp;
-            thread.ExecutionRunId = terminal ? null : update.RunId;
+            if (!terminal)
+                thread.ExecutionRunId = update.RunId;
             if (terminal)
             {
                 if (update.Result is { } terminalResult
@@ -2129,11 +2136,15 @@ public sealed partial class AppState :
                         Reasoning = terminalResult.Reasoning
                     });
                 }
-                remoteRuns.TryRemove(update.ThreadId, out _);
-                terminalRemoteRuns.Add(correlationKey);
-                remoteDeltaSeq.Remove(correlationKey);
-                liveAgentRenderState.CompleteRun(update.ThreadId, update.RunId);
-                assistantDraftRefreshGate.Reset(update.ThreadId);
+                completedCts = RetireExecutionRunLocked(
+                    update.ThreadId,
+                    update.RunId,
+                    update.Phase switch
+                    {
+                        TopicRunPhase.Completed => AgentRunPhase.Completed,
+                        TopicRunPhase.Cancelled => AgentRunPhase.Cancelled,
+                        _ => AgentRunPhase.Failed
+                    });
             }
             else if (update.Delta is not { Length: > 0 })
             {
@@ -2154,6 +2165,7 @@ public sealed partial class AppState :
             }
         }
 
+        completedCts?.Dispose();
         ApplyQueuedTopicRunUpdate(update);
         if (!terminal && update.Delta is { Length: > 0 })
             ApplyRemoteAssistantDelta(update);
@@ -2230,6 +2242,7 @@ public sealed partial class AppState :
         DateTimeOffset? clearedAt = null)
     {
         OwnThread? thread;
+        CancellationTokenSource? completedCts = null;
         lock (profileSyncGate)
         {
             if (!IsCurrentAgentRuntimeContext) return;
@@ -2254,13 +2267,11 @@ public sealed partial class AppState :
                     null,
                     activityAt)))
                 return;
-            remoteRuns.TryRemove(threadId, out _);
-            terminalRemoteRuns.Add(threadId + "\0" + correlatedRunId);
-            thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
-            liveAgentRenderState.CompleteRun(threadId, correlatedRunId!);
-            assistantDraftRefreshGate.Reset(threadId);
+            completedCts = RetireExecutionRunLocked(
+                threadId, correlatedRunId!, AgentRunPhase.Completed);
         }
+        completedCts?.Dispose();
         EmitTopicUpsert(thread!);
         NotifyChanged();
     }
@@ -2337,16 +2348,9 @@ public sealed partial class AppState :
                 return false;
 
             thread.LastActivityAt = activityAt;
-            thread.ExecutionRunId = null;
             queuedTopicRuns.Complete(thread.Id, runId);
-            terminalRemoteRuns.Add(correlationKey);
-            remoteDeltaSeq.Remove(correlationKey);
-            liveAgentRenderState.CompleteRun(thread.Id, runId);
-            assistantDraftRefreshGate.Reset(thread.Id);
-            if (projectionMatches)
-            {
-                remoteRuns.TryRemove(thread.Id, out _);
-            }
+            _ = RetireExecutionRunLocked(
+                thread.Id, runId, AgentRunPhase.Completed);
             RuntimeDiagnostics.Current?.RecordEvent(
                 "topic-terminal-cleanup",
                 $"thread={StableDiagnosticId(thread.Id)}"
@@ -2481,6 +2485,12 @@ public sealed partial class AppState :
                 cts.Dispose();
                 return new CancellationToken(canceled: true);
             }
+            if (terminalRemoteRuns.Contains(threadId + "\0" + runId)
+                || liveAgentRenderState.IsTerminal(threadId, runId))
+            {
+                cts.Dispose();
+                return new CancellationToken(canceled: true);
+            }
             threadCts.Remove(threadId, out old);
             cancelledThreads.Remove(threadId);
             threadCts[threadId] = cts;
@@ -2566,21 +2576,62 @@ public sealed partial class AppState :
         string threadId,
         string runId,
         AgentRunPhase phase)
+        => RetireExecutionRunLocked(threadId, runId, phase);
+
+    private CancellationTokenSource? RetireExecutionRunLocked(
+        string threadId,
+        string runId,
+        AgentRunPhase phase)
     {
+        var correlationKey = threadId + "\0" + runId;
+        terminalRemoteRuns.Add(correlationKey);
+        remoteDeltaSeq.Remove(correlationKey);
+        liveAgentRenderState.CompleteRun(threadId, runId);
+        assistantDraftRefreshGate.Reset(threadId);
+
+        if (remoteRuns.TryGetValue(threadId, out var projection)
+            && string.Equals(projection.RunId, runId, StringComparison.Ordinal))
+            remoteRuns.TryRemove(threadId, out _);
+
         if (agentRuns.TryGetValue(threadId, out var run)
             && string.Equals(run.RunId, runId, StringComparison.Ordinal)
             && AgentRunLifecycle.CanTransition(run.Phase, phase))
             agentRuns[threadId] = run with { Phase = phase };
 
-        liveAgentRenderState.CompleteRun(threadId, runId);
-        assistantDraftRefreshGate.Reset(threadId);
-        if (!activeThreadRuns.TryGetValue(threadId, out var activeRunId)
-            || !string.Equals(activeRunId, runId, StringComparison.Ordinal))
-            return null;
-        activeThreadRuns.Remove(threadId);
-        busyThreads.Remove(threadId);
-        buildingThreads.Remove(threadId);
-        threadCts.Remove(threadId, out var cts);
+        CancellationTokenSource? cts = null;
+        if (activeThreadRuns.TryGetValue(threadId, out var activeRunId)
+            && string.Equals(activeRunId, runId, StringComparison.Ordinal))
+        {
+            activeThreadRuns.Remove(threadId);
+            buildingThreads.Remove(threadId);
+            threadCts.Remove(threadId, out cts);
+        }
+
+        var thread = Profile.OwnThreads.FirstOrDefault(item =>
+            string.Equals(item.Id, threadId, StringComparison.Ordinal));
+        if (thread is not null
+            && string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
+        {
+            thread.ExecutionRunId = null;
+            if (thread.LastActivityAt is { } activityAt)
+                activeDb?.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
+                    thread.Id,
+                    thread.ExecutionDeviceId,
+                    thread.ExecutionDeviceName,
+                    thread.ExecutionDevicePlatform,
+                    thread.ExecutionAt,
+                    null,
+                    activityAt));
+        }
+
+        var hasActiveRun = activeThreadRuns.ContainsKey(threadId)
+                           || remoteRuns.ContainsKey(threadId)
+                           || thread?.ExecutionRunId is not null;
+        if (!hasActiveRun)
+        {
+            busyThreads.Remove(threadId);
+            buildingThreads.Remove(threadId);
+        }
         return cts;
     }
 

@@ -40,6 +40,7 @@ namespace Mesh.App.Tests;
 /// where the relay forwarded a JSON string that the typed client handler could not bind.
 /// </summary>
 [TestClass]
+[DoNotParallelize]
 public sealed class RelaySignalRIntegrationTests
 {
     private WebApplication _app = null!;
@@ -172,13 +173,28 @@ public sealed class RelaySignalRIntegrationTests
     }
 
     [TestMethod]
-    public async Task ResolvePresence_Reports_Online_Sibling_Over_Real_SignalR()
+    public async Task AuthenticatedDesktopAndIosRoster_SeparatesPresenceFromExecution()
     {
         var alice = await RegisterAsync("alice");
+        await _store.SetDeviceMetadataAsync(
+            "alice",
+            alice.DeviceId,
+            "desktop",
+            DevicePlatforms.Windows,
+            remoteAgentEnabled: true,
+            agentHostEnabled: true,
+            protocolVersion: MeshProtocol.Version);
         var bobKeys = KeyPair.New();
         var bobDevice = DeviceProtocol.DeviceId(bobKeys.PublicB64);
         await _store.UpsertHandleAsync("alice", bobKeys.PublicB64, "display", allowNewDevice: true);
-        await _store.SetDeviceMetadataAsync("alice", bobDevice, "sibling", DevicePlatforms.IOS, false, false, MeshProtocol.Version);
+        await _store.SetDeviceMetadataAsync(
+            "alice",
+            bobDevice,
+            "phone",
+            DevicePlatforms.IOS,
+            remoteAgentEnabled: false,
+            agentHostEnabled: false,
+            protocolVersion: MeshProtocol.Version);
         var bob = new Registration("alice", bobDevice, bobKeys);
 
         var (connA, _) = await ConnectAsync(alice);
@@ -191,6 +207,36 @@ public sealed class RelaySignalRIntegrationTests
         Assert.IsTrue(presence.Online, "alice handle should be online");
         CollectionAssert.Contains(presence.Devices.ToArray(), alice.DeviceId);
         CollectionAssert.Contains(presence.Devices.ToArray(), bobDevice);
+
+        var stored = (await _store.GetHandleAsync("alice"))!;
+        var roster = new[]
+        {
+            new DeviceInfo(
+                alice.DeviceId,
+                "desktop",
+                presence.Devices.Contains(alice.DeviceId),
+                DevicePlatforms.Windows,
+                RemoteAgentEnabled: true,
+                AgentHostEnabled: true),
+            new DeviceInfo(
+                bobDevice,
+                "phone",
+                presence.Devices.Contains(bobDevice),
+                DevicePlatforms.IOS,
+                RemoteAgentEnabled: false,
+                AgentHostEnabled: false)
+        };
+        Assert.HasCount(2, roster);
+        Assert.IsTrue(roster.All(device => device.Online));
+        var eligible = DeviceExecutionEligibility.EligibleHosts(roster);
+        Assert.HasCount(1, eligible);
+        Assert.AreEqual(alice.DeviceId, eligible[0].DeviceId);
+        Assert.AreEqual(
+            alice.DeviceId,
+            AgentRoutingPolicy.ChooseOnlineDevice(
+                stored,
+                presence.Devices.ToHashSet(StringComparer.Ordinal)));
+        Assert.IsFalse(DeviceExecutionEligibility.IsEligible(roster[1]));
     }
 
     [TestMethod]

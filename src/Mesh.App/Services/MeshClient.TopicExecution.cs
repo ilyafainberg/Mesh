@@ -463,6 +463,14 @@ public sealed partial class MeshClient
 
     private void RecoverInboundTopicRuns()
     {
+        if (!CanCurrentDeviceExecuteTopics)
+        {
+            foreach (var item in state.ListInboundTopicRuns(
+                         InboundTopicRunStates.Accepted,
+                         InboundTopicRunStates.Running))
+                QueueInterruptedInboundRun(item, "device_not_agent_capable");
+            return;
+        }
         var resumedThreads = new HashSet<string>(StringComparer.Ordinal);
         foreach (var item in state.ListInboundTopicRuns(
                      InboundTopicRunStates.Accepted,
@@ -506,6 +514,7 @@ public sealed partial class MeshClient
 
     private bool TryStartInboundTopicRun(TopicRunRequestPayload request, string sourceDeviceId)
     {
+        if (!CanCurrentDeviceExecuteTopics) return false;
         if (!EnsureInboundTopicContext(request)) return false;
         var next = state.ListInboundTopicRuns(
                 InboundTopicRunStates.Accepted,
@@ -553,6 +562,10 @@ public sealed partial class MeshClient
             return;
         }
     }
+
+    private bool CanCurrentDeviceExecuteTopics
+        => PlatformCaps.CanRunAgent && agent.IsModelReady;
+
     private bool EnsureInboundTopicContext(TopicRunRequestPayload request)
     {
         OwnThread thread;
@@ -568,6 +581,7 @@ public sealed partial class MeshClient
                     PlatformCaps.DevicePlatform),
                 request.TriggerAt);
         }
+
         catch (Exception ex) when (ex is ArgumentException
                                    or InvalidOperationException
                                    or KeyNotFoundException)
@@ -601,6 +615,11 @@ public sealed partial class MeshClient
         IReadOnlyList<ChatAttachment> attachments,
         CancellationToken ct)
     {
+        if (!await IsExecutionTargetEligibleAsync(targetDeviceId, ct))
+            return TopicDispatchResult.Reject(
+                "device_not_eligible",
+                request.RunId,
+                "The selected device is not online and agent-ready.");
         MeshDb.TopicOutboxItem item;
         try
         {
@@ -629,8 +648,11 @@ public sealed partial class MeshClient
         var identity = authenticatedReplicationConnectionIdentity;
         if (identity is null || !Connected || !IsCurrentReplicationConnectionIdentity(identity))
         {
-            ScheduleRecovery();
-            return TopicDispatchResult.Ok(request.RunId, "local_pending");
+            state.DeleteTopicOutbox(request.RunId);
+            return TopicDispatchResult.Reject(
+                "sender_offline",
+                request.RunId,
+                "This device must be authenticated online to send an agent turn.");
         }
 
         await onlineFlushGate.WaitAsync(ct);
@@ -659,6 +681,15 @@ public sealed partial class MeshClient
         MeshDb.TopicOutboxItem item,
         CancellationToken ct)
     {
+        if (!await IsExecutionTargetEligibleAsync(item.TargetDeviceId, ct))
+        {
+            RejectIneligibleTopicOutbox(item);
+            return TopicDispatchResult.Reject(
+                "device_not_eligible",
+                item.RunId,
+                "The selected device is not online and agent-ready.",
+                durable: true);
+        }
         if (IsExpired(item))
         {
             ExpireTopicRequest(item);
@@ -708,6 +739,12 @@ public sealed partial class MeshClient
                 timeProvider.GetUtcNow()))
             return null;
 
+        if (!await IsExecutionTargetEligibleAsync(item.TargetDeviceId, ct))
+        {
+            RejectIneligibleTopicOutbox(item);
+            return MeshSendResult.Reject("device_not_eligible");
+        }
+
         var prepared = await PrepareTopicOutboxItemAsync(item, ct);
         if (prepared is null) return null;
         item = prepared;
@@ -748,6 +785,45 @@ public sealed partial class MeshClient
         TraceTransport("topic-request-deferred", result.Code);
         ScheduleOnlineDeliveryRetry();
         return null;
+    }
+
+    private async Task<bool> IsExecutionTargetEligibleAsync(
+        string targetDeviceId,
+        CancellationToken cancellationToken)
+    {
+        var identity = authenticatedReplicationConnectionIdentity;
+        if (identity is null
+            || !Connected
+            || !IsCurrentReplicationConnectionIdentity(identity))
+            return false;
+        try
+        {
+            return (await ListDevicesAsync(cancellationToken)).Any(device =>
+                string.Equals(device.DeviceId, targetDeviceId, StringComparison.Ordinal)
+                && DeviceExecutionEligibility.IsEligible(device));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            TraceTransport("topic-eligibility-unavailable", ex.GetType().Name);
+            return false;
+        }
+    }
+
+    private void RejectIneligibleTopicOutbox(MeshDb.TopicOutboxItem item)
+    {
+        var terminal = new TopicRunUpdatePayload(
+            item.RunId,
+            item.ThreadId,
+            TopicRunPhase.Failed,
+            "Unavailable",
+            Error: "The assigned device is not online and agent-ready.",
+            FailureCode: "device_not_eligible",
+            Timestamp: timeProvider.GetUtcNow(),
+            TriggerLineId: item.TriggerLineId);
+        _ = state.TryApplyRemoteRunUpdate(terminal);
+        state.DeleteTopicOutbox(item.RunId);
+        state.CompleteQueuedTopicRun(item.ThreadId, item.RunId);
+        TraceTransport("topic-request-ineligible", item.TargetDeviceId);
     }
 
     private void TraceStaleTopicSendCompletion(

@@ -261,25 +261,28 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             "topic.list-devices",
             () => ListEligibleDevicesCoreAsync(cancellationToken));
 
+    public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
+        CancellationToken cancellationToken)
+        => RunOffDispatcherAsync(
+            "topic.list-roster",
+            () => ListDevicesCoreAsync(cancellationToken));
+
     private async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesCoreAsync(
+        CancellationToken cancellationToken)
+        => Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(
+            await ListDevicesCoreAsync(cancellationToken));
+
+    private async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesCoreAsync(
         CancellationToken cancellationToken)
     {
         await deviceListGate.WaitAsync(cancellationToken);
         try
         {
-            var devices = await deviceTransport.ListEligibleDevicesAsync(cancellationToken);
-            var eligible = devices
-                .Where(device => device.CanHostRemoteTurn)
+            return (await deviceTransport.ListDevicesAsync(cancellationToken))
                 .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
                 .Select(group => group.First())
                 .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            var current = CurrentDevice();
-            if (current is null) return eligible;
-            eligible.RemoveAll(device =>
-                string.Equals(device.DeviceId, current.DeviceId, StringComparison.Ordinal));
-            eligible.Insert(0, current);
-            return eligible;
+                .ToArray();
         }
         finally
         {
@@ -304,9 +307,21 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 "trigger_line_conflict", draft.RunId,
                 "The trigger line ID already refers to different content.");
         }
-        var current = CurrentDevice();
+        IReadOnlyList<Mesh.Shared.DeviceInfo> eligible;
+        try
+        {
+            eligible = await ListEligibleDevicesCoreAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            eligible = [];
+        }
+        var currentDeviceId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+        var preferred = eligible.FirstOrDefault(device =>
+            string.Equals(device.DeviceId, currentDeviceId, StringComparison.Ordinal))
+            ?? eligible.FirstOrDefault();
         var targetId = string.IsNullOrWhiteSpace(draft.TargetDeviceId)
-            ? thread.ExecutionDeviceId ?? current?.DeviceId
+            ? thread.ExecutionDeviceId ?? preferred?.DeviceId
             : draft.TargetDeviceId;
         if (targetId is null)
             return TopicDispatchResult.Reject(
@@ -316,26 +331,8 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         Mesh.Shared.DeviceInfo? target = null;
         if (targetId is not null)
         {
-            try
-            {
-                var devices = await ListEligibleDevicesCoreAsync(cancellationToken);
-                target = devices.FirstOrDefault(device =>
-                    string.Equals(device.DeviceId, targetId, StringComparison.Ordinal));
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                target = null;
-            }
-            if (target is null
-                && string.Equals(thread.ExecutionDeviceId, targetId, StringComparison.Ordinal)
-                && DevicePlatforms.CanHostRemoteAgent(
-                    true, thread.ExecutionDevicePlatform ?? DevicePlatforms.Unknown))
-                target = new Mesh.Shared.DeviceInfo(
-                    targetId,
-                    thread.ExecutionDeviceName,
-                    false,
-                    thread.ExecutionDevicePlatform ?? DevicePlatforms.Unknown,
-                    true);
+            target = eligible.FirstOrDefault(device =>
+                string.Equals(device.DeviceId, targetId, StringComparison.Ordinal));
             if (target is null)
                 return TopicDispatchResult.Reject(
                     "device_not_eligible", draft.RunId,
@@ -361,8 +358,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         var executionTarget = new ExecutionDevice(
             target!.DeviceId, target.Name, target.Platform);
 
-        if (current is not null
-            && string.Equals(target.DeviceId, current.DeviceId, StringComparison.Ordinal))
+        if (string.Equals(target.DeviceId, currentDeviceId, StringComparison.Ordinal))
         {
             var beginCommand = new TopicRunBeginCommand(
                     draft,
@@ -485,6 +481,18 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 remoteBegin.Outbox, cancellationToken);
             if (!result.Accepted)
             {
+                if (result.Code is "device_not_eligible" or "sender_offline")
+                {
+                    state.TryApplyRemoteRunUpdate(new TopicRunUpdatePayload(
+                        authoritativeRemoteDraft.RunId,
+                        authoritativeRemoteDraft.ThreadId,
+                        TopicRunPhase.Failed,
+                        "Unavailable",
+                        Error: result.Error,
+                        FailureCode: result.Code,
+                        Timestamp: DateTimeOffset.UtcNow,
+                        TriggerLineId: authoritativeRemoteDraft.TriggerLineId));
+                }
                 state.SetQueuedTopicRunStage(
                     thread.Id, authoritativeRemoteDraft.RunId, TopicQueueStage.Failed);
             }
@@ -787,27 +795,6 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                     attachment.MimeType,
                     attachment.Data.ToArray())).ToList()
         };
-
-    private Mesh.Shared.DeviceInfo? CurrentDevice()
-    {
-        if (!state.Profile.Model.IsConfigured) return null;
-        var deviceId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
-        return new Mesh.Shared.DeviceInfo(
-            deviceId,
-            string.IsNullOrWhiteSpace(state.Profile.DeviceName)
-                ? null
-                : state.Profile.DeviceName.Trim(),
-            true,
-            CurrentPlatform(),
-            true);
-    }
-
-    private static string CurrentPlatform() =>
-        OperatingSystem.IsWindows() ? DevicePlatforms.Windows :
-        OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS() ? DevicePlatforms.MacOS :
-        OperatingSystem.IsAndroid() ? DevicePlatforms.Android :
-        OperatingSystem.IsIOS() ? DevicePlatforms.IOS :
-        DevicePlatforms.Unknown;
 
     private void RememberCompletion(RunEntry entry)
     {

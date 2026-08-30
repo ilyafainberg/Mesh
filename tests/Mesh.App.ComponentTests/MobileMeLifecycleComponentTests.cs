@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using Mesh.App.Components.Pages;
 using Mesh.App.Components.Mobile;
 using Mesh.App.Domain;
 using Mesh.App.Services;
@@ -21,6 +22,101 @@ namespace Mesh.App.ComponentTests;
 [DoNotParallelize]
 public sealed class MobileMeLifecycleComponentTests
 {
+    [DataTestMethod]
+    [DataRow(true, true, true, DevicePlatforms.Windows, 9, true, "online · agent ready")]
+    [DataRow(true, true, true, DevicePlatforms.Windows, 8, false, "online · unavailable")]
+    [DataRow(true, false, true, DevicePlatforms.Windows, 9, false, "online · unavailable")]
+    [DataRow(true, true, false, DevicePlatforms.Windows, 9, false, "online · unavailable")]
+    [DataRow(true, true, true, DevicePlatforms.IOS, 9, false, "online · unavailable")]
+    [DataRow(false, true, true, DevicePlatforms.Windows, 9, false, "offline · unavailable")]
+    public async Task DesktopCurrentDeviceMenu_UsesSharedRosterEligibility(
+        bool online,
+        bool remoteAgentEnabled,
+        bool agentHostEnabled,
+        string platform,
+        int protocolVersion,
+        bool expectedEligible,
+        string expectedAvailability)
+    {
+        var state = CreateFirstRunState(
+            NewStateRoot(),
+            new MemorySecretStore(),
+            "thread");
+        var currentDeviceId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+        var transport = new ControllableDeviceTransport
+        {
+            Devices =
+            [
+                new(
+                    currentDeviceId,
+                    "Current desktop",
+                    online,
+                    platform,
+                    remoteAgentEnabled,
+                    agentHostEnabled,
+                    protocolVersion)
+            ]
+        };
+        var harness = CreateHarness(transport, state: state);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<Home>();
+        var initialTopics = state.Profile.OwnThreads.Count;
+
+        var primaryDisabled = renderer.MatchedAttributeValue(
+            mounted.Id,
+            "button",
+            "aria-label",
+            "Start new chat on this device",
+            "disabled");
+        Assert.AreEqual(expectedEligible, primaryDisabled is null);
+
+        await renderer.ClickAsync(mounted.Id, "Choose device for new chat");
+        Assert.IsTrue(
+            renderer.MarkupContains(mounted.Id, expectedAvailability),
+            renderer.RenderedText(mounted.Id));
+        var menuDisabled = renderer.MatchedElementHasAttribute(
+            mounted.Id,
+            "button",
+            "aria-label",
+            "Choose this device for new chat",
+            "disabled");
+        Assert.AreEqual(!expectedEligible, menuDisabled);
+
+        await renderer.ClickAsync(mounted.Id, "Start new chat on this device");
+        Assert.AreEqual(
+            initialTopics + (expectedEligible ? 1 : 0),
+            state.Profile.OwnThreads.Count);
+    }
+
+    [TestMethod]
+    public async Task DesktopCurrentDeviceMenu_MissingRosterEntry_IsUnavailableAndCannotCreate()
+    {
+        var state = CreateFirstRunState(
+            NewStateRoot(),
+            new MemorySecretStore(),
+            "thread");
+        var transport = new ControllableDeviceTransport { Devices = [] };
+        var harness = CreateHarness(transport, state: state);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<Home>();
+        var initialTopics = state.Profile.OwnThreads.Count;
+
+        await renderer.ClickAsync(mounted.Id, "Choose device for new chat");
+        Assert.IsTrue(renderer.MarkupContains(
+            mounted.Id,
+            "presence unknown · unavailable"),
+            renderer.RenderedText(mounted.Id));
+        Assert.IsTrue(renderer.MatchedElementHasAttribute(
+            mounted.Id,
+            "button",
+            "aria-label",
+            "Choose this device for new chat",
+            "disabled"));
+
+        await renderer.ClickAsync(mounted.Id, "Start new chat on this device");
+        Assert.AreEqual(initialTopics, state.Profile.OwnThreads.Count);
+    }
+
     [TestMethod]
     public async Task AtomicRetry_AccountSwitchBeforeBegin_CommitsNowhereAndRequiresFreshReconciliation()
     {
@@ -1030,6 +1126,7 @@ public sealed class MobileMeLifecycleComponentTests
             secrets,
             storagePaths: StoragePaths.ForRoot(root));
         var restartedStore = new FileTopicSendIdentityStore(journalRoot);
+        var finalizations = new FinalizationProbe();
         var restarted = CreateHarness(
             new ControllableDeviceTransport(),
             identities: restartedStore,
@@ -1040,6 +1137,7 @@ public sealed class MobileMeLifecycleComponentTests
                 restartedState,
                 new NoopTurnRunner(),
                 new DurableObservingTransport(restartedState, counter)),
+            lifecycleObserver: finalizations,
             initializeState: false);
         var recoveredSubmission = restarted.Sends.CreateSnapshot(
             "thread",
@@ -1067,10 +1165,14 @@ public sealed class MobileMeLifecycleComponentTests
                     out var outcome)
                       && outcome?.Kind == TopicSendOutcomeKind.RetryableFailed,
                 TimeSpan.FromSeconds(5));
+            Assert.IsTrue(restarted.Sends.TryGetOutcome(
+                persisted.OperationId,
+                out var retryOutcome));
+            Assert.AreEqual(TopicSendOutcomeKind.RetryableFailed, retryOutcome?.Kind);
+            var acceptedFinalized = finalizations.Track(persisted.OperationId);
             await renderer.ClickAsync(rendered.Id, "Send");
-            await restartedStore.WaitUntilAsync(
-                () => restartedState.GetTopicDraft("thread") == "",
-                TimeSpan.FromSeconds(10));
+            await acceptedFinalized.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.AreEqual("", restartedState.GetTopicDraft("thread"));
             Assert.AreEqual(1, counter.ForwardCount);
             Assert.AreEqual(
                 TopicRunTriggerLookupKind.Found,
@@ -1863,7 +1965,7 @@ public sealed class MobileMeLifecycleComponentTests
                         ?? throw new InvalidOperationException("Identity was not created.");
         var runner = new RecordingLocalRunner();
         var router = new TopicExecutionRouter(
-            state, runner, new LocalOnlyDeviceTransport());
+            state, runner, new LocalOnlyDeviceTransport(localDeviceId));
         var draft = new TopicTurnDraft(
             "first-local-run",
             "first-local-thread",
@@ -1901,7 +2003,7 @@ public sealed class MobileMeLifecycleComponentTests
         var retry = await new TopicExecutionRouter(
                 restartedState,
                 restartedRunner,
-                new LocalOnlyDeviceTransport())
+                new LocalOnlyDeviceTransport(localDeviceId))
             .SubmitAsync(draft, null, CancellationToken.None);
 
         Assert.IsTrue(retry.Accepted);
@@ -1923,6 +2025,7 @@ public sealed class MobileMeLifecycleComponentTests
         MemorySecretStore? secrets = null,
         ITopicSendObserverDispatcherFactory? observerDispatcherFactory = null,
         ITopicExecutionRouter? router = null,
+        ITopicSendLifecycleTestObserver? lifecycleObserver = null,
         bool initializeState = true)
     {
         stateRoot ??= NewStateRoot();
@@ -2000,9 +2103,11 @@ public sealed class MobileMeLifecycleComponentTests
                 ReconciliationInitialBackoff = TimeSpan.FromMilliseconds(5),
                 ReconciliationMaximumBackoff = TimeSpan.FromMilliseconds(20)
             },
+            timeProvider: null,
             identityStore: identities,
             reconciliationQuery: query,
-            journalFaultInjector: faultInjector);
+            journalFaultInjector: faultInjector,
+            testObserver: lifecycleObserver);
 
         var services = new ServiceCollection();
         services.AddSingleton(state);
@@ -2388,7 +2493,10 @@ public sealed class MobileMeLifecycleComponentTests
                 if (callback is EventCallback eventCallback)
                     await eventCallback.InvokeAsync();
                 else if (callback is Func<Task> action)
+                {
                     await action();
+                    await RenderRootComponentAsync(componentId, ParameterView.Empty);
+                }
                 else
                     Assert.Fail($"Unsupported click callback type {callback?.GetType()}.");
             });
@@ -2402,6 +2510,59 @@ public sealed class MobileMeLifecycleComponentTests
                     Attribute(componentId, element, null, null, attribute)?.ToString())
                 .GetAwaiter()
                 .GetResult();
+
+        public object? MatchedAttributeValue(
+            int componentId,
+            string element,
+            string matchAttribute,
+            string matchValue,
+            string attribute)
+            => Dispatcher.InvokeAsync(() =>
+                    Attribute(
+                        componentId,
+                        element,
+                        matchAttribute,
+                        matchValue,
+                        attribute,
+                        required: false))
+                .GetAwaiter()
+                .GetResult();
+
+        public bool MatchedElementHasAttribute(
+            int componentId,
+            string element,
+            string matchAttribute,
+            string matchValue,
+            string attribute)
+            => Dispatcher.InvokeAsync(() =>
+            {
+                var frames = GetCurrentRenderTreeFrames(componentId);
+                for (var i = 0; i < frames.Count; i++)
+                {
+                    var frame = frames.Array[i];
+                    if (frame.FrameType != RenderTreeFrameType.Element
+                        || !string.Equals(frame.ElementName, element, StringComparison.Ordinal))
+                        continue;
+                    var matched = false;
+                    var found = false;
+                    for (var j = i + 1;
+                         j < frames.Count && frames.Array[j].FrameType == RenderTreeFrameType.Attribute;
+                         j++)
+                    {
+                        var candidate = frames.Array[j];
+                        if (candidate.AttributeName == matchAttribute
+                            && string.Equals(
+                                candidate.AttributeValue?.ToString(),
+                                matchValue,
+                                StringComparison.OrdinalIgnoreCase))
+                            matched = true;
+                        if (candidate.AttributeName == attribute)
+                            found = true;
+                    }
+                    if (matched) return found;
+                }
+                return false;
+            }).GetAwaiter().GetResult();
 
         public bool MarkupContains(int componentId, string value)
             => Dispatcher.InvokeAsync(() =>
@@ -2518,6 +2679,56 @@ public sealed class MobileMeLifecycleComponentTests
         async ValueTask IAsyncDisposable.DisposeAsync()
         {
             await Dispatcher.InvokeAsync(Dispose);
+        }
+    }
+
+    private sealed class FinalizationProbe : ITopicSendLifecycleTestObserver
+    {
+        private readonly object gate = new();
+        private readonly Dictionary<string, Queue<TaskCompletionSource>> signals =
+            new(StringComparer.Ordinal);
+
+        public Task Track(string operationId)
+        {
+            lock (gate)
+            {
+                if (!signals.TryGetValue(operationId, out var operationSignals))
+                {
+                    operationSignals = new();
+                    signals.Add(operationId, operationSignals);
+                }
+                var signal = NewSignal();
+                operationSignals.Enqueue(signal);
+                return signal.Task;
+            }
+        }
+
+        public void FinalizationCompleted(
+            string operationId,
+            TopicSendIdentityRecord record,
+            bool cached)
+        {
+            TaskCompletionSource? signal = null;
+            lock (gate)
+            {
+                if (signals.TryGetValue(operationId, out var operationSignals)
+                    && operationSignals.TryDequeue(out signal)
+                    && operationSignals.Count == 0)
+                    signals.Remove(operationId);
+            }
+            signal?.TrySetResult();
+        }
+
+        public void Checkpoint(string name)
+        {
+        }
+
+        public void JournalWrite(string transition, bool disposalCompleted)
+        {
+        }
+
+        public void CallbackQueued(string operationId, bool disposalCompleted)
+        {
         }
     }
 
@@ -2704,7 +2915,19 @@ public sealed class MobileMeLifecycleComponentTests
     {
         public AppState? State { private get; set; }
         public Mesh.Shared.DeviceInfo Device { get; } =
-            new("remote-device", "Remote", true, DevicePlatforms.Windows, true);
+            new(
+                "remote-device",
+                "Remote",
+                true,
+                DevicePlatforms.Windows,
+                true,
+                AgentHostEnabled: true);
+        public IReadOnlyList<Mesh.Shared.DeviceInfo> Devices { get; init; }
+
+        public ControllableDeviceTransport()
+        {
+            Devices = [Device];
+        }
         public TaskCompletionSource Entered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } =
@@ -2756,7 +2979,12 @@ public sealed class MobileMeLifecycleComponentTests
 
         public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
             CancellationToken cancellationToken)
-            => Task.FromResult<IReadOnlyList<Mesh.Shared.DeviceInfo>>([Device]);
+            => Task.FromResult(
+                DeviceExecutionEligibility.EligibleHosts(Devices));
+
+        public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
+            CancellationToken cancellationToken)
+            => Task.FromResult(Devices);
     }
 
     private sealed class DurableTransportCounter
@@ -2779,7 +3007,13 @@ public sealed class MobileMeLifecycleComponentTests
         bool completeRemoteRun = false) : IDeviceTopicTransport
     {
         private readonly Mesh.Shared.DeviceInfo remote =
-            new("remote-device", "Remote", true, DevicePlatforms.Windows, true);
+            new(
+                "remote-device",
+                "Remote",
+                true,
+                DevicePlatforms.Windows,
+                true,
+                AgentHostEnabled: true);
         private readonly HashSet<string> observedOutboxes = new(StringComparer.Ordinal);
         private readonly HashSet<string> observedCorrelations = new(StringComparer.Ordinal);
         private readonly HashSet<string> requestEnvelopes = new(StringComparer.Ordinal);
@@ -2891,7 +3125,7 @@ public sealed class MobileMeLifecycleComponentTests
         }
     }
 
-    private sealed class LocalOnlyDeviceTransport : IDeviceTopicTransport
+    private sealed class LocalOnlyDeviceTransport(string localDeviceId) : IDeviceTopicTransport
     {
         public Task<TopicDispatchResult> DispatchAsync(
             string targetDeviceId,
@@ -2908,7 +3142,16 @@ public sealed class MobileMeLifecycleComponentTests
 
         public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
             CancellationToken cancellationToken)
-            => Task.FromResult<IReadOnlyList<Mesh.Shared.DeviceInfo>>([]);
+            => Task.FromResult<IReadOnlyList<Mesh.Shared.DeviceInfo>>
+            ([
+                new(
+                    localDeviceId,
+                    "Local",
+                    true,
+                    DevicePlatforms.Windows,
+                    true,
+                    AgentHostEnabled: true)
+            ]);
     }
 
     private sealed class FailingTopicSendIdentityStore(int saveFailures)

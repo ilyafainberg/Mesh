@@ -385,7 +385,7 @@ namespace Mesh.App.Tests
             {
                 Devices =
                 [
-                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)
                 ]
             };
             var router = new TopicExecutionRouter(state, runner, transport);
@@ -414,7 +414,7 @@ namespace Mesh.App.Tests
             {
                 Devices =
                 [
-                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)
                 ]
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
@@ -438,7 +438,7 @@ namespace Mesh.App.Tests
             {
                 Devices =
                 [
-                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)
                 ]
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
@@ -460,8 +460,8 @@ namespace Mesh.App.Tests
             {
                 Devices =
                 [
-                    new DeviceInfo("offline", "Offline", false, DevicePlatforms.Windows, true),
-                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true),
+                    new DeviceInfo("offline", "Offline", false, DevicePlatforms.Windows, true, AgentHostEnabled: true),
+                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true, AgentHostEnabled: true),
                     new DeviceInfo("not-ready", "Tablet", true, DevicePlatforms.Android, false)
                 ]
             };
@@ -487,9 +487,8 @@ namespace Mesh.App.Tests
                 transport.Request.Attachments[0].Id,
                 transport.Request.AttachmentIds![0]);
             Assert.AreEqual(3L, transport.Request.Attachments[0].Length);
-            Assert.AreEqual(3, listed.Count);
-            Assert.AreEqual("offline", listed[1].DeviceId);
-            Assert.AreEqual("target", listed[2].DeviceId);
+            Assert.AreEqual(1, listed.Count);
+            Assert.AreEqual("target", listed[0].DeviceId);
             Assert.AreEqual(0, state.Profile.OwnThreads[0].Lines[0].Attachments.Count);
             Assert.AreEqual(
                 TopicQueueStage.Relay,
@@ -572,7 +571,7 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
-        public async Task RemoteSubmission_ToOfflineBoundDeviceIsQueued()
+        public async Task RemoteSubmission_ToOfflineBoundDeviceIsUnavailableAndNeverQueued()
         {
             var state = StateWithThread();
             var thread = state.Profile.OwnThreads[0];
@@ -581,7 +580,7 @@ namespace Mesh.App.Tests
             thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true, AgentHostEnabled: true)],
                 ResultCode = TopicExecutionStatus.LocalQueued
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
@@ -589,11 +588,142 @@ namespace Mesh.App.Tests
 
             var result = await router.SubmitAsync(draft, null, CancellationToken.None);
 
+            Assert.IsFalse(result.Accepted);
+            Assert.AreEqual("device_not_eligible", result.Code);
+            Assert.AreEqual(0, transport.Dispatches);
+            Assert.IsFalse(state.IsLineQueued(draft.TriggerLineId));
+            Assert.IsEmpty(thread.Lines);
+        }
+
+        [TestMethod]
+        public async Task FullRosterKeepsOnlineIosVisibleButOnlyOnlineAgentHostIsExecutable()
+        {
+            var state = StateWithThread();
+            state.Profile.PublicKey = "ios-public-key";
+            var iosId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo(
+                        iosId, "Phone", true, DevicePlatforms.IOS, false,
+                        AgentHostEnabled: false, ProtocolVersion: MeshProtocol.Version),
+                    new DeviceInfo(
+                        "desktop", "Desktop", true, DevicePlatforms.Windows, true,
+                        AgentHostEnabled: true, ProtocolVersion: MeshProtocol.Version)
+                ]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+
+            var roster = await router.ListDevicesAsync(CancellationToken.None);
+            var executable = await router.ListEligibleDevicesAsync(CancellationToken.None);
+
+            Assert.HasCount(2, roster);
+            Assert.IsTrue(roster.Single(device => device.DeviceId == iosId).Online);
+            Assert.HasCount(1, executable);
+            Assert.AreEqual("desktop", executable[0].DeviceId);
+        }
+
+        [TestMethod]
+        public async Task IosOriginatedPromptRoutesToOnlineDesktopAndNeverToPhone()
+        {
+            var state = StateWithThread();
+            state.Profile.PublicKey = "ios-public-key";
+            var iosId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo(
+                        iosId, "Phone", true, DevicePlatforms.IOS, false,
+                        AgentHostEnabled: false, ProtocolVersion: MeshProtocol.Version),
+                    new DeviceInfo(
+                        "desktop", "Desktop", true, DevicePlatforms.Windows, true,
+                        AgentHostEnabled: true, ProtocolVersion: MeshProtocol.Version)
+                ]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+
+            var result = await router.SubmitAsync(Draft(), null, CancellationToken.None);
+
             Assert.IsTrue(result.Accepted);
-            Assert.AreEqual(TopicExecutionStatus.LocalQueued, result.Code);
             Assert.AreEqual(1, transport.Dispatches);
-            Assert.IsTrue(state.IsLineQueued(draft.TriggerLineId));
-            Assert.AreEqual(TopicQueueStage.Sending, state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
+            Assert.AreEqual("desktop", transport.Request?.TargetDeviceId);
+            Assert.AreEqual("desktop", state.Profile.OwnThreads[0].ExecutionDeviceId);
+        }
+
+        [TestMethod]
+        public async Task PhoneAssignmentRemainsVisibleButSendIsBlockedUntilEligibleHostReturns()
+        {
+            var state = StateWithThread();
+            state.Profile.PublicKey = "ios-public-key";
+            var iosId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+            var thread = state.Profile.OwnThreads[0];
+            thread.ExecutionDeviceId = iosId;
+            thread.ExecutionDeviceName = "Phone";
+            thread.ExecutionDevicePlatform = DevicePlatforms.IOS;
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo(
+                        iosId, "Phone", true, DevicePlatforms.IOS, false,
+                        AgentHostEnabled: false, ProtocolVersion: MeshProtocol.Version)
+                ]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+
+            var result = await router.SubmitAsync(
+                Draft() with { TargetDeviceId = iosId }, null, CancellationToken.None);
+
+            Assert.IsFalse(result.Accepted);
+            Assert.AreEqual("device_not_eligible", result.Code);
+            Assert.AreEqual(iosId, thread.ExecutionDeviceId);
+            Assert.AreEqual("Phone", thread.ExecutionDeviceName);
+            Assert.AreEqual(0, transport.Dispatches);
+            Assert.IsFalse(state.IsLineQueued(Draft().TriggerLineId));
+        }
+
+        [TestMethod]
+        public async Task OfflineDesktopMakesMobilePromptUnavailableAndReconnectRestoresEligibility()
+        {
+            var state = StateWithThread();
+            state.Profile.PublicKey = "ios-public-key";
+            var iosId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo(
+                        iosId, "Phone", true, DevicePlatforms.IOS, false,
+                        AgentHostEnabled: false, ProtocolVersion: MeshProtocol.Version),
+                    new DeviceInfo(
+                        "desktop", "Desktop", false, DevicePlatforms.Windows, true,
+                        AgentHostEnabled: true, ProtocolVersion: MeshProtocol.Version)
+                ]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+
+            var unavailable = await router.SubmitAsync(Draft(), null, CancellationToken.None);
+            transport.Devices =
+            [
+                transport.Devices[0],
+                transport.Devices[1] with { Online = true }
+            ];
+            var restoredDraft = Draft() with
+            {
+                RunId = "run-2",
+                TriggerLineId = "line-2"
+            };
+            var restored = await router.SubmitAsync(
+                restoredDraft, null, CancellationToken.None);
+
+            Assert.IsFalse(unavailable.Accepted);
+            Assert.AreEqual("device_not_eligible", unavailable.Code);
+            Assert.IsFalse(state.IsLineQueued(Draft().TriggerLineId));
+            Assert.IsTrue(restored.Accepted);
+            Assert.AreEqual("desktop", transport.Request?.TargetDeviceId);
+            Assert.AreEqual(1, transport.Dispatches);
         }
         [TestMethod]
         public async Task CancellingQueuedSubmission_KeepsPromptUntilTerminalUpdate()
@@ -605,7 +735,7 @@ namespace Mesh.App.Tests
             thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                Devices = [new DeviceInfo("offline", "Laptop", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)],
                 ResultCode = TopicExecutionStatus.LocalQueued
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
@@ -634,7 +764,7 @@ namespace Mesh.App.Tests
             thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                Devices = [new DeviceInfo("offline", "Laptop", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)],
                 ResultCode = TopicExecutionStatus.LocalQueued,
                 CancellationAccepted = false
             };
@@ -663,7 +793,7 @@ namespace Mesh.App.Tests
             using var release = new ManualResetEventSlim();
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                Devices = [new DeviceInfo("offline", "Laptop", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)],
                 ResultCode = TopicExecutionStatus.LocalQueued,
                 CancellationRelease = release
             };
@@ -700,13 +830,13 @@ namespace Mesh.App.Tests
             await transport.SecondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
             transport.SecondResult.SetResult(
             [
-                new DeviceInfo("desktop", "Desktop", true, DevicePlatforms.Windows, true)
+                new DeviceInfo("desktop", "Desktop", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)
             ]);
             var pickerDevices = await pickerLoad;
 
-            Assert.AreEqual(1, startupDevices.Count);
-            Assert.AreEqual(2, pickerDevices.Count);
-            Assert.AreEqual("desktop", pickerDevices[1].DeviceId);
+            Assert.AreEqual(0, startupDevices.Count);
+            Assert.AreEqual(1, pickerDevices.Count);
+            Assert.AreEqual("desktop", pickerDevices[0].DeviceId);
         }
 
         [TestMethod]
@@ -718,7 +848,7 @@ namespace Mesh.App.Tests
             thread.ExecutionRunId = "active-run";
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)]
+                Devices = [new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true, AgentHostEnabled: true)]
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
             var progress = new RecordingProgress();
@@ -1172,7 +1302,16 @@ namespace Mesh.App.Tests
 
         private sealed class RecordingTransport : IDeviceTopicTransport
         {
-            public IReadOnlyList<DeviceInfo> Devices { get; set; } = [];
+            public IReadOnlyList<DeviceInfo> Devices { get; set; } =
+            [
+                new DeviceInfo(
+                    DeviceProtocol.DeviceId(""),
+                    "This device",
+                    true,
+                    DevicePlatforms.Windows,
+                    true,
+                    AgentHostEnabled: true)
+            ];
             public int Dispatches { get; private set; }
             public int Cancellations { get; private set; }
             public TaskCompletionSource CancellationStarted { get; } =

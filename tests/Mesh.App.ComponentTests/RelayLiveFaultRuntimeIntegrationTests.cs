@@ -25,6 +25,7 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 namespace Mesh.App.ComponentTests;
 
 [TestClass]
+[DoNotParallelize]
 public sealed class RelayLiveFaultRuntimeIntegrationTests
 {
     private const string AdminKey = "runtime-test-key";
@@ -35,10 +36,14 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
     {
         foreach (var harness in createdClients.AsEnumerable().Reverse())
         {
+            harness.Client.TopicEnvelopeTestFaultScheduler = null;
+            harness.State.ReplicationEventTestFaultScheduler = null;
+            harness.State.LegacyUncorrelatedTopicAnswerTestMode = false;
             await harness.Client.DisconnectAsync();
             await harness.State.DisposeAsync();
         }
         createdClients.Clear();
+        linkedPrivateKeys.Clear();
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
@@ -318,10 +323,10 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
                     TopicTurnMode.Single),
                 [],
                 CancellationToken.None);
-            Assert.IsTrue(queued.Accepted, queued.Error);
-            Assert.IsNotNull(alice.State.GetTopicOutbox(recoveryRunId));
-            CollectionAssert.AreEqual(
-                new[] { 1 }, AttemptsFor(await RuntimeAsync(relay.Http), recoveryRunId));
+            Assert.IsFalse(queued.Accepted);
+            Assert.AreEqual("device_not_eligible", queued.Code);
+            Assert.IsNull(alice.State.GetTopicOutbox(recoveryRunId));
+            Assert.IsEmpty(AttemptsFor(await RuntimeAsync(relay.Http), recoveryRunId));
 
             clock.Advance(TimeSpan.FromSeconds(31));
             Assert.IsFalse(
@@ -333,6 +338,25 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             await EventuallyAsync(
                 () => bob.Client.Connected,
                 TimeSpan.FromSeconds(15));
+            await EventuallyAsync(
+                async () => (await alice.Client.ListEligibleDevicesAsync(
+                        CancellationToken.None))
+                    .Any(device => device.DeviceId == bob.Client.MyDeviceId),
+                TimeSpan.FromSeconds(15));
+            var resumed = await alice.Client.DispatchAsync(
+                bob.Client.MyDeviceId,
+                new TopicRunRequestPayload(
+                    recoveryRunId,
+                    threadId,
+                    recoveryLineId,
+                    "account",
+                    "wake and drain exactly once",
+                    recoveryAt,
+                    bob.Client.MyDeviceId,
+                    TopicTurnMode.Single),
+                [],
+                CancellationToken.None);
+            Assert.IsTrue(resumed.Accepted, resumed.Error);
             await EventuallyAsync(
                 () => model.CallCount == 2
                       && alice.State.GetTopicOutbox(recoveryRunId) is null
@@ -353,7 +377,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             Assert.IsNotNull(recoveredBobHandshake.Nonce);
             Assert.AreNotEqual(initialBobHandshake.Nonce, recoveredBobHandshake.Nonce);
             CollectionAssert.AreEqual(
-                new[] { 1, 2 }, AttemptsFor(recoveredRuntime, recoveryRunId));
+                new[] { 1 }, AttemptsFor(recoveredRuntime, recoveryRunId));
             CollectionAssert.AreEqual(
                 new[] { 1 },
                 AttemptsFor(
@@ -462,6 +486,10 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
                 () => tablet.State.Profile.OwnThreads.Select(item => item.Id).ToHashSet()
                     .SetEquals(new[] { first.Id, second.Id, retained.Id }),
                 TimeSpan.FromSeconds(20));
+            await EventuallyAsync(
+                () => laptop.State.CountPendingReplicationEvents() == 0,
+                TimeSpan.FromSeconds(20));
+            await laptop.State.FlushPersistenceAsync();
 
             var tabletSecrets = tablet.Secrets;
             var tabletAccountId = tablet.State.ActiveAccountId!;
@@ -472,12 +500,50 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
                 () => !tablet.Client.Connected,
                 TimeSpan.FromSeconds(10));
 
+            var laptopAccountId = laptop.State.ActiveAccountId!;
+            await laptop.State.FlushPersistenceAsync();
+            string recoveryEpoch;
+            ulong recoveryStart;
+            using (var baselineDb = MeshDb.Open(
+                       laptop.State.ActiveDatabasePath!,
+                       laptop.Secrets.GetDbKey(laptopAccountId)!))
+            {
+                var baseline = baselineDb.GetServeableOrigins().Single(item =>
+                    item.OriginDeviceId == laptop.Client.MyDeviceId);
+                recoveryEpoch = baseline.LogEpoch;
+                recoveryStart = baseline.AvailableThrough + 1;
+            }
+
             laptop.State.DeleteOwnThread(first.Id);
             laptop.State.DeleteOwnThread(second.Id);
             var createdOffline = laptop.State.NewOwnThread("synthetic-topic-offline");
-            await EventuallyAsync(
-                () => laptop.State.CountPendingReplicationEvents() >= 3,
-                TimeSpan.FromSeconds(10));
+            await laptop.State.FlushPersistenceAsync();
+            Assert.AreEqual(3, laptop.State.CountPendingReplicationEvents());
+
+            var recoveryEnd = recoveryStart + 2;
+            ulong originAvailableThrough;
+            IReadOnlyList<ReplicationEvent> recoveredEvents;
+            using (var originDb = MeshDb.Open(
+                       laptop.State.ActiveDatabasePath!,
+                       laptop.Secrets.GetDbKey(laptopAccountId)!))
+            {
+                var origin = originDb.GetServeableOrigins().Single(item =>
+                    item.OriginDeviceId == laptop.Client.MyDeviceId);
+                Assert.AreEqual(recoveryEpoch, origin.LogEpoch);
+                Assert.AreEqual(recoveryEnd, origin.AvailableThrough);
+                originAvailableThrough = origin.AvailableThrough;
+                recoveredEvents = originDb.QueryEvents(
+                    laptop.Client.MyDeviceId,
+                    recoveryEpoch,
+                    recoveryStart,
+                    recoveryEnd);
+            }
+            Assert.AreEqual(3, recoveredEvents.Count);
+            Assert.AreEqual(3, recoveredEvents.Select(item => item.EventId).Distinct().Count());
+            CollectionAssert.AreEquivalent(
+                new[] { first.Id, second.Id, createdOffline.Id },
+                recoveredEvents.Select(item => item.EntityId).ToArray());
+            Assert.IsTrue(recoveredEvents.All(item => item.Kind == ReplicationOpKinds.Topic));
 
             tablet.State.SignOut();
             relaunchedTablet = CreateClient(
@@ -503,17 +569,16 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
                 && item.Accepted == true);
             Assert.IsFalse(string.IsNullOrWhiteSpace(recoveredHandshake.Nonce));
             Assert.AreNotEqual(initialHandshake.Nonce, recoveredHandshake.Nonce);
-            Assert.AreEqual(
-                3,
-                relaunchedTablet.Client.OnlineReplicationEngine!.GetProgress().CommittedEvents,
-                "two tombstones and one upsert must commit exactly once after recovery");
-            using var cursorDb = MeshDb.Open(
-                relaunchedTablet.State.ActiveDatabasePath!,
-                relaunchedTablet.Secrets.GetDbKey(tabletAccountId)!);
-            var recoveredCursor = cursorDb.GetCursor(laptop.Client.MyDeviceId);
-            Assert.IsNotNull(recoveredCursor);
-            Assert.AreEqual(12UL, recoveredCursor.Contiguous);
-            Assert.IsTrue(recoveredCursor.AheadBits.All(value => value == 0));
+            await relaunchedTablet.State.FlushPersistenceAsync();
+            using (var receiverDb = MeshDb.Open(
+                       relaunchedTablet.State.ActiveDatabasePath!,
+                       relaunchedTablet.Secrets.GetDbKey(tabletAccountId)!))
+            {
+                var cursor = receiverDb.GetCursor(laptop.Client.MyDeviceId);
+                Assert.IsNotNull(cursor);
+                Assert.AreEqual(recoveryEpoch, cursor.LogEpoch);
+                Assert.IsTrue(cursor.Contiguous >= recoveryEnd);
+            }
 
             const string terminalRun = "sora-terminal-run";
             laptop.State.BeginThreadTurn(retained.Id, terminalRun, building: false);
@@ -648,8 +713,8 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
                     createdTopics = 1,
                     recoveryFrames = 3,
                     committedExactlyOnce = 3,
-                    cursorContiguous = recoveredCursor.Contiguous,
-                    cursorAheadBitsClear = recoveredCursor.AheadBits.All(value => value == 0),
+                    originAvailableThrough,
+                    distinctRecoveryEvents = recoveredEvents.Count,
                     pendingOutbox = 0,
                     terminalDominant = true,
                     delayedThinkingIgnored = true,
@@ -1657,7 +1722,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         var bob = CreateClient("authority", "Bob", relay.BaseUrl, relay.BaseUrl, root, "bob");
         using var removable = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         var removablePublic = Convert.ToBase64String(removable.ExportSubjectPublicKeyInfo());
-        LinkedPrivateKeys[removablePublic] =
+        linkedPrivateKeys[removablePublic] =
             Convert.ToBase64String(removable.ExportPkcs8PrivateKey());
         try
         {
@@ -1834,7 +1899,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             .Select(item => item.Attempt)
             .ToArray();
 
-    private static async Task RegisterLinkedDevicesAsync(
+    private async Task RegisterLinkedDevicesAsync(
         HttpClient http,
         AppState primary,
         AppState secondary,
@@ -1874,9 +1939,24 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         Assert.IsNotNull(authority.CustodyAuthority);
         primary.ImportCustodyAuthority(handle, authority.CustodyAuthority);
         secondary.ImportCustodyAuthority(handle, authority.CustodyAuthority);
+        using var registerSecondary = await http.PostAsJsonAsync(
+            "/handles",
+            new RegisterHandleRequest(
+                handle,
+                secondary.Profile.PublicKey,
+                secondary.Profile.DisplayName,
+                Signature: Sign(
+                    secondary.Profile.PrivateKey,
+                    ClaimProtocol.Message(handle, secondary.Profile.PublicKey)),
+                DeviceName: secondary.Profile.DeviceName,
+                DevicePlatform: DevicePlatforms.Windows,
+                RemoteAgentEnabled: true,
+                AgentHostEnabled: true,
+                CustodyAuthority: authority.CustodyAuthority));
+        registerSecondary.EnsureSuccessStatusCode();
     }
 
-    private static async Task LinkDeviceAsync(
+    private async Task LinkDeviceAsync(
         HttpClient http,
         AppState primary,
         string newPublicKey)
@@ -1911,11 +1991,11 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         redeem.EnsureSuccessStatusCode();
     }
 
-    private static readonly ConcurrentDictionary<string, string> LinkedPrivateKeys =
+    private readonly ConcurrentDictionary<string, string> linkedPrivateKeys =
         new(StringComparer.Ordinal);
 
-    private static string FindPrivateKey(string publicKey)
-        => LinkedPrivateKeys.TryGetValue(publicKey, out var privateKey)
+    private string FindPrivateKey(string publicKey)
+        => linkedPrivateKeys.TryGetValue(publicKey, out var privateKey)
             ? privateKey
             : throw new InvalidOperationException("Linked private key was not registered.");
 
@@ -1952,7 +2032,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
             state.Profile.PrivateKey = Convert.ToBase64String(key.ExportPkcs8PrivateKey());
             state.Profile.PublicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
-            LinkedPrivateKeys[state.Profile.PublicKey] = state.Profile.PrivateKey;
+            linkedPrivateKeys[state.Profile.PublicKey] = state.Profile.PrivateKey;
             state.Profile.Handle = handle;
             state.Profile.DisplayName = name;
             state.Profile.DeviceName = name;

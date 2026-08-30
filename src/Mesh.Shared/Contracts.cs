@@ -416,15 +416,40 @@ public record DeviceInfo(
     /// remote hosts. The relay clamps to this at registration and clients apply the same rule.
     /// </summary>
     [System.Text.Json.Serialization.JsonIgnore]
-    public bool CanHostRemoteTurn => DevicePlatforms.CanHostRemoteAgent(RemoteAgentEnabled, Platform);
+    public bool CanHostRemoteTurn => DeviceExecutionEligibility.IsEligible(this);
 
     [System.Text.Json.Serialization.JsonIgnore]
     public bool AgentReady => RemoteAgentEnabled;
 
     [System.Text.Json.Serialization.JsonIgnore]
-    public bool CanAnswerAgentHostRequests =>
-        IsDesktop && RemoteAgentEnabled && AgentHostEnabled;
+    public bool CanAnswerAgentHostRequests => DeviceExecutionEligibility.IsEligible(this);
 
+}
+
+/// <summary>
+/// The single client-side authority for deciding whether a roster device may execute a topic run.
+/// Roster visibility is intentionally separate: an authenticated device remains visible while
+/// offline or incapable, but is never selectable, dispatchable, restorable, or retryable.
+/// </summary>
+public static class DeviceExecutionEligibility
+{
+    public static bool HasAgentHostCapability(DeviceInfo? device)
+        => device is not null
+           && device.ProtocolVersion >= MeshProtocol.Version
+           && device.RemoteAgentEnabled
+           && device.AgentHostEnabled
+           && DevicePlatforms.IsDesktop(device.Platform);
+
+    public static bool IsEligible(DeviceInfo? device)
+        => device is { Online: true } && HasAgentHostCapability(device);
+
+    public static IReadOnlyList<DeviceInfo> EligibleHosts(IEnumerable<DeviceInfo> roster)
+        => roster
+            .Where(IsEligible)
+            .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 }
 
 public static class DevicePlatforms

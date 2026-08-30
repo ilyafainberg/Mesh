@@ -1032,6 +1032,10 @@ public interface IDeviceTopicTransport
     Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken);
 
+    Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
+        CancellationToken cancellationToken)
+        => ListEligibleDevicesAsync(cancellationToken);
+
     Task<TopicDispatchResult> DispatchPersistedAsync(
         MeshDb.TopicOutboxItem item,
         CancellationToken cancellationToken)
@@ -1093,6 +1097,9 @@ public interface ITopicExecutionRouter
         CancellationToken cancellationToken);
 
     Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
+        CancellationToken cancellationToken);
+
+    Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
         CancellationToken cancellationToken);
 }
 

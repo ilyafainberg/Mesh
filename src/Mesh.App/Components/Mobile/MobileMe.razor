@@ -32,11 +32,11 @@
         </header>
 
         <div class="new-chat-split">
-            <button class="new-chat-primary" @onclick="() => NewThread(CurrentDevice)"
-                    disabled="@(!Agent.IsModelReady)" aria-label="New chat on this device">
+            <button class="new-chat-primary" @onclick="NewThreadOnDefault"
+                    disabled="@(eligibleDevices.Count == 0)" aria-label="New chat on an online agent-ready device">
                 <span class="new-chat-icon"><i class="bi bi-plus-lg"></i></span>
                 <span class="new-chat-label">New chat</span>
-                <span class="new-chat-device">This device</span>
+                <span class="new-chat-device">Online agent host</span>
             </button>
             <button class="new-chat-menu-button" @onclick="OpenNewDeviceMenu" aria-label="Choose a device for new chat"
                     aria-haspopup="dialog" aria-expanded="@newDeviceMenuOpen">
@@ -75,7 +75,8 @@
                                         <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
                                         @if (IsAssignedElsewhere(t))
                                         {
-                                            <span class="device-pill @(IsDeviceOnline(t.ExecutionDeviceId) ? "" : "offline")">
+                                            <span class="device-pill @(IsDeviceOnline(t.ExecutionDeviceId) ? "" : "offline")"
+                                                  title="@DeviceStatus(t)">
                                                 <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
                                                 @DeviceLabel(t)
                                             </span>
@@ -122,7 +123,7 @@
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "Talk to this device" : $"Talk to {FriendlyName(device)}")</strong>
-                            <small>@(device.Online ? "Online" : "Offline")</small>
+                            <small>@DeviceAvailability(device)</small>
                         </span>
                     </button>
                 }
@@ -147,7 +148,8 @@ else
                 </div>
                 @if (IsAssignedElsewhere(Active))
                 {
-                    <span class="device-pill @(ActiveDeviceOnline ? "" : "offline")">
+                    <span class="device-pill @(ActiveDeviceOnline ? "" : "offline")"
+                          title="@DeviceStatus(Active)">
                         <i class="bi @PlatformIcon(Active.ExecutionDevicePlatform)"></i>
                         @DeviceLabel(Active)
                     </span>
@@ -545,9 +547,9 @@ else
                         @DraftError <button class="link-btn" @onclick="RetryDraft">Retry save</button>
                     </p>
                 }
-                @if (Active is not null && !ActiveDeviceOnline)
+                @if (Active is not null && !ActiveExecutionEligible)
                 {
-                    <div class="warn-banner" role="status"><i class="bi bi-cloud-arrow-up"></i> @DeviceLabel(Active) is offline. New turns will wait securely until it reconnects.</div>
+                    <div class="warn-banner" role="status"><i class="bi bi-exclamation-triangle"></i> @DeviceLabel(Active) is unavailable for execution. Reassign this topic to an online agent-ready device.</div>
                 }
                 @if (ActiveUsesCurrentDevice && !Agent.IsModelReady)
                 {
@@ -581,7 +583,7 @@ else
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "This device" : FriendlyName(device))</strong>
-                            <small>@(device.Online ? "Online" : "Offline")</small>
+                            <small>@DeviceAvailability(device)</small>
                         </span>
                     </button>
                 }
@@ -645,6 +647,7 @@ else
     bool moveMenuOpen;
     bool actionsMenuOpen;
     global::Mesh.Shared.DeviceInfo? pendingMove;
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> rosterDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> eligibleDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
     bool confirmDelete;
     bool renaming;
@@ -731,6 +734,10 @@ else
     bool ActiveUsesCurrentDevice => Active is null
         || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
         || string.Equals(Active.ExecutionDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+    bool ActiveExecutionEligible => Active is not null
+        && (Active.ExecutionDeviceId is { } id
+            ? eligibleDevices.Any(device => device.DeviceId == id)
+            : eligibleDevices.Count > 0);
     bool HasSendableDraft => !string.IsNullOrWhiteSpace(input)
         || attachments.Count > 0
         || selectedWidget is not null;
@@ -772,12 +779,13 @@ else
         && outcome?.Kind == TopicSendOutcomeKind.Reconciling;
     bool CanSend => !widgetLoading
         && widgetLoadError is null
-        && (!ActiveUsesCurrentDevice || Agent.IsModelReady)
+        && ActiveExecutionEligible
         && HasSendableDraft;
-    string SendTitle => ActiveUsesCurrentDevice && !Agent.IsModelReady
-        ? "Configure a model to use this device"
-        : !ActiveDeviceOnline && Active is not null
-            ? $"Send when {DeviceLabel(Active)} is available"
+    string SendTitle => Active is not null && Active.ExecutionDeviceId is not null
+                        && !ActiveExecutionEligible
+        ? $"Reassign from unavailable {DeviceLabel(Active)}"
+        : !ActiveExecutionEligible
+            ? "No online agent-ready device is available"
             : "Send";
 
     readonly List<StagedFile> attachments = new();
@@ -880,17 +888,13 @@ else
         }
     }
     OwnThread? Active => activeThread is null ? null : State.Profile.OwnThreads.FirstOrDefault(t => t.Id == activeThread);
-    global::Mesh.Shared.DeviceInfo CurrentDevice => new(
-        Mesh.MyDeviceId,
-        string.IsNullOrWhiteSpace(State.Profile.DeviceName) ? "This device" : State.Profile.DeviceName,
-        true,
-        PlatformCaps.DevicePlatform,
-        PlatformCaps.CanRunAgent && Agent.IsModelReady);
-    IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => new[] { CurrentDevice }
-        .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d)))
-        .GroupBy(d => d.DeviceId, StringComparer.Ordinal)
-        .Select(g => g.First())
-        .ToList();
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => rosterDevices
+        .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
+        .Select(group => group.First())
+        .OrderByDescending(CanRunHere)
+        .ThenByDescending(device => device.Online)
+        .ThenBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
+        .ToArray();
 
     // The free model returns a friendly limit message when the daily token budget is spent.
     bool QuotaExhausted
@@ -1069,13 +1073,16 @@ else
         deviceRefreshes.Request(
             async cancellationToken =>
             {
-                var devices = await TopicRouter.ListEligibleDevicesAsync(cancellationToken)
+                var devices = await TopicRouter.ListDevicesAsync(cancellationToken)
                     .ConfigureAwait(false);
+                var executable =
+                    global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(devices);
                 if (disposed) return;
                 await InvokeAsync(() =>
                 {
                     if (disposed) return;
-                    eligibleDevices = devices;
+                    rosterDevices = devices;
+                    eligibleDevices = executable;
                     StateHasChanged();
                 });
             },
@@ -1351,7 +1358,7 @@ else
 
     async Task NewThread(global::Mesh.Shared.DeviceInfo device)
     {
-        if (!device.Online) return;
+        if (!global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)) return;
         var target = ToExecutionDevice(device);
         var t = await State.NewOwnThreadAsync("New chat", target);
         activeThread = t.Id;
@@ -1361,9 +1368,16 @@ else
         CloseDeviceMenus();
     }
 
+    Task NewThreadOnDefault()
+        => eligibleDevices.FirstOrDefault() is { } device
+            ? NewThread(device)
+            : Task.CompletedTask;
+
     void ChooseMoveTarget(global::Mesh.Shared.DeviceInfo device)
     {
-        if (Active is null || !device.Online || IsActiveDevice(device)) return;
+        if (Active is null
+            || !global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)
+            || IsActiveDevice(device)) return;
         moveMenuOpen = false;
         if (ActiveBusy)
         {
@@ -1384,7 +1398,8 @@ else
 
     void MoveActiveTo(global::Mesh.Shared.DeviceInfo device)
     {
-        if (Active is null || !device.Online) return;
+        if (Active is null
+            || !global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)) return;
         State.MoveOwnThreadToDevice(Active.Id, ToExecutionDevice(device));
         ScheduleComposerSnapshot();
         CloseDeviceMenus();
@@ -2084,7 +2099,11 @@ else
 
     ExecutionDevice ResolveTarget(OwnThread thread)
     {
-        if (string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)) return ToExecutionDevice(CurrentDevice);
+        if (string.IsNullOrWhiteSpace(thread.ExecutionDeviceId))
+            return eligibleDevices.FirstOrDefault() is { } eligible
+                ? ToExecutionDevice(eligible)
+                : new ExecutionDevice(
+                    "", null, global::Mesh.Shared.DevicePlatforms.Unknown);
         var known = DeviceChoices.FirstOrDefault(d =>
             string.Equals(d.DeviceId, thread.ExecutionDeviceId, StringComparison.Ordinal));
         return known is not null
@@ -2101,14 +2120,14 @@ else
     bool IsCurrentDevice(global::Mesh.Shared.DeviceInfo device) =>
         string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
 
-    // Whether a device can be chosen to run a topic. The current device runs the turn locally (in the
-    // foreground), so it only needs a ready local model. This holds on mobile, which can run its own
-    // chats but cannot host a remote turn for another device. Any other device must be an online,
-    // eligible remote host (a desktop with the remote agent enabled).
     bool CanRunHere(global::Mesh.Shared.DeviceInfo device) =>
-        IsCurrentDevice(device)
-            ? Agent.IsModelReady
-            : device.Online && device.CanHostRemoteTurn;
+        global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device);
+
+    static string DeviceAvailability(global::Mesh.Shared.DeviceInfo? device) =>
+        device is null
+            ? "Presence unknown · Unavailable"
+            : $"{(device.Online ? "Online" : "Offline")} · " +
+              $"{(global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device) ? "Agent ready" : "Unavailable")}";
 
     bool IsTopicBusy(OwnThread thread) => RemoteRunActivity.IsBusy(
         thread,
@@ -2130,10 +2149,8 @@ else
 
     bool IsDeviceOnline(string? deviceId)
     {
-        if (string.IsNullOrWhiteSpace(deviceId)
-            || string.Equals(deviceId, Mesh.MyDeviceId, StringComparison.Ordinal))
-            return true;
-        return eligibleDevices.FirstOrDefault(d =>
+        if (string.IsNullOrWhiteSpace(deviceId)) return false;
+        return rosterDevices.FirstOrDefault(d =>
             string.Equals(d.DeviceId, deviceId, StringComparison.Ordinal))?.Online == true;
     }
 
@@ -2151,6 +2168,14 @@ else
         string.IsNullOrWhiteSpace(thread.ExecutionDeviceName)
             ? PlatformName(thread.ExecutionDevicePlatform)
             : thread.ExecutionDeviceName;
+
+    string DeviceStatus(OwnThread thread)
+    {
+        var deviceId = thread.ExecutionDeviceId ?? Mesh.MyDeviceId;
+        var device = rosterDevices.FirstOrDefault(item =>
+            string.Equals(item.DeviceId, deviceId, StringComparison.Ordinal));
+        return $"{DeviceLabel(thread)} · {DeviceAvailability(device)}";
+    }
 
     static string PlatformName(string? platform) => platform?.ToLowerInvariant() switch
     {

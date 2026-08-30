@@ -118,6 +118,25 @@ public sealed class LiveAgentRenderStateTests
     }
 
     [TestMethod]
+    public void TerminalBeforeRenderSuppressesDelayedThinkingButAllowsNextRun()
+    {
+        var state = new LiveAgentRenderState();
+
+        Assert.IsTrue(state.CompleteRun("thread", "run-1"));
+        Assert.IsFalse(state.BeginSteps("thread", "run-1"));
+        Assert.IsFalse(state.BeginDraft("thread", "run-1"));
+        Assert.IsFalse(state.ReportStep("thread", "run-1", Step("late-thinking")));
+        Assert.IsFalse(state.AppendDraft(
+            "thread", "run-1", new AgentDelta(AgentDeltaKind.Reasoning, "late")));
+
+        Assert.IsTrue(state.BeginSteps("thread", "run-2"));
+        Assert.IsTrue(state.BeginDraft("thread", "run-2"));
+        Assert.IsTrue(state.ReportStep("thread", "run-2", Step("next-thinking")));
+        Assert.IsTrue(state.AppendDraft(
+            "thread", "run-2", new AgentDelta(AgentDeltaKind.Reasoning, "valid")));
+    }
+
+    [TestMethod]
     public void NewRunSurvivesRecreatedRendererAndRejectsPriorRunCallbacks()
     {
         var state = new LiveAgentRenderState();

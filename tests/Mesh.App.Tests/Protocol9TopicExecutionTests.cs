@@ -170,7 +170,8 @@ public sealed class Protocol9TopicExecutionTests
         Assert.IsFalse(DevicePlatforms.CanHostRemoteAgent(false, DevicePlatforms.Windows));
 
         var phone = new DeviceInfo("d1", "Phone", true, DevicePlatforms.Android, RemoteAgentEnabled: true);
-        var desktop = new DeviceInfo("d2", "PC", true, DevicePlatforms.Windows, RemoteAgentEnabled: true);
+        var desktop = new DeviceInfo(
+            "d2", "PC", true, DevicePlatforms.Windows, RemoteAgentEnabled: true, AgentHostEnabled: true);
         var desktopNoModel = new DeviceInfo("d3", "PC2", true, DevicePlatforms.Windows, RemoteAgentEnabled: false);
         Assert.IsFalse(phone.CanHostRemoteTurn, "a mobile device is never an eligible remote host");
         Assert.IsTrue(desktop.CanHostRemoteTurn);

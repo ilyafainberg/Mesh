@@ -17,8 +17,9 @@
         <div class="new-conv create-topic-row">
             <h2><i class="bi bi-person-badge"></i> Me</h2>
             <div class="split-create">
-                <button class="primary new-chat-primary" @onclick="NewLocalThread" disabled="@(!Agent.IsModelReady)"
-                        title="@(Agent.IsModelReady ? "New chat on this device" : "Configure a model to use this device")">
+                <button class="primary new-chat-primary" @onclick="NewLocalThread" disabled="@(!CurrentDeviceEligible)"
+                        aria-label="Start new chat on this device"
+                        title="@(CurrentDeviceEligible ? "New chat on this device" : "This device must be online and agent-ready")">
                     <i class="bi bi-plus-lg"></i> New chat
                 </button>
                 <button class="primary new-chat-chevron" @ref="createMenuButton" @onclick="ToggleCreateMenu"
@@ -38,24 +39,26 @@
                         }
                         else
                         {
-                            <button class="device-menu-item" role="menuitem" disabled="@(!Agent.IsModelReady)"
-                                    @onclick="() => CreateThreadOn(CurrentDevice)">
+                            var current = CurrentRosterDevice;
+                            <button class="device-menu-item" role="menuitem" disabled="@(!CanExecute(current))"
+                                    aria-label="Choose this device for new chat"
+                                    @onclick="NewLocalThread">
                                 <i class="bi @PlatformIcon(CurrentDevice.Platform)"></i>
                                 <span><b>Talk to this device</b><small>@DeviceName(CurrentDevice)</small></span>
-                                <span class="device-state online">online</span>
+                                <span class="device-state @(current?.Online == true ? "online" : "offline")">@DeviceAvailability(current)</span>
                             </button>
-                            @foreach (var device in OtherEligibleDevices)
+                            @foreach (var device in OtherRosterDevices)
                             {
-                                <button class="device-menu-item" role="menuitem" disabled="@(!device.Online)"
+                                <button class="device-menu-item" role="menuitem" disabled="@(!CanExecute(device))"
                                         @onclick="() => CreateThreadOn(ToExecutionDevice(device))">
                                     <i class="bi @PlatformIcon(device.Platform)"></i>
                                     <span><b>Talk to @DeviceName(device)</b><small>@PlatformLabel(device.Platform)</small></span>
-                                    <span class="device-state @(device.Online ? "online" : "offline")">@(device.Online ? "online" : "offline")</span>
+                                    <span class="device-state @(device.Online ? "online" : "offline")">@DeviceAvailability(device)</span>
                                 </button>
                             }
-                            @if (OtherEligibleDevices.Count == 0)
+                            @if (OtherRosterDevices.Count == 0)
                             {
-                                <div class="device-menu-state">No other agent-ready devices</div>
+                                <div class="device-menu-state">No other linked devices</div>
                             }
                         }
                         @if (deviceError is not null)
@@ -192,11 +195,11 @@
                                     {
                                         var selected = Active.ExecutionDeviceId == device.DeviceId
                                             || Active.ExecutionDeviceId is null && device.DeviceId == Mesh.MyDeviceId;
-                                        <button class="device-menu-item" role="menuitem" disabled="@(!device.Online || selected)"
+                                        <button class="device-menu-item" role="menuitem" disabled="@(!CanExecute(device) || selected)"
                                                 @onclick="() => RequestMove(ToExecutionDevice(device))">
                                             <i class="bi @PlatformIcon(device.Platform)"></i>
                                             <span><b>@(device.DeviceId == Mesh.MyDeviceId ? "This device" : DeviceName(device))</b><small>@(selected ? "assigned" : PlatformLabel(device.Platform))</small></span>
-                                            <span class="device-state @(device.Online ? "online" : "offline")">@(device.Online ? "online" : "offline")</span>
+                                            <span class="device-state @(device.Online ? "online" : "offline")">@DeviceAvailability(device)</span>
                                         </button>
                                     }
                                 }
@@ -574,9 +577,9 @@
                         @DraftError <button class="link-btn" @onclick="RetryDraft">Retry save</button>
                     </p>
                 }
-                @if (Active is not null && !ActiveDeviceOnline)
+                @if (Active is not null && !ActiveExecutionEligible)
                 {
-                    <div class="warn-banner"><i class="bi bi-cloud-arrow-up"></i> @ThreadDeviceName(Active) is offline. New turns will wait securely until it reconnects.</div>
+                    <div class="warn-banner"><i class="bi bi-exclamation-triangle"></i> @ThreadDeviceName(Active) is unavailable for execution. Reassign this topic to an online agent-ready device.</div>
                 }
                 @if (ActiveUsesCurrentDevice && !Agent.IsModelReady)
                 {
@@ -663,6 +666,7 @@
         if (activeThread is not null) State.RetryTopicDraft(activeThread);
     }
     PendingTopicMove? pendingMove;
+    readonly List<global::Mesh.Shared.DeviceInfo> rosterDevices = new();
     readonly List<global::Mesh.Shared.DeviceInfo> eligibleDevices = new();
     sealed record PendingTopicMove(string ThreadId, string TopicTitle, string RunId, ExecutionDevice Target);
 
@@ -684,12 +688,20 @@
         || attachments.Count > 0
         || selectedWidget is not null;
     bool ShowStopAction => TopicComposerPresentation.ShowStop(ActiveBusy, HasSendableDraft);
-    bool SendDisabled => ActiveUsesCurrentDevice && !Agent.IsModelReady
-        || !HasSendableDraft;
-    string SendTitle => ActiveUsesCurrentDevice && !Agent.IsModelReady
-        ? "Configure a model to use this device"
-        : Active is not null && !ActiveDeviceOnline
-            ? $"Send when {ThreadDeviceName(Active)} is available"
+    global::Mesh.Shared.DeviceInfo? CurrentRosterDevice => rosterDevices.FirstOrDefault(device =>
+        string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal));
+    bool CurrentDeviceEligible => CanExecute(CurrentRosterDevice);
+    bool ActiveExecutionEligible => Active is not null
+        && CanExecute(Active.ExecutionDeviceId is { } id
+            ? rosterDevices.FirstOrDefault(device =>
+                string.Equals(device.DeviceId, id, StringComparison.Ordinal))
+            : CurrentRosterDevice);
+    bool SendDisabled => !ActiveExecutionEligible || !HasSendableDraft;
+    string SendTitle => Active is not null && Active.ExecutionDeviceId is not null
+                        && !ActiveExecutionEligible
+        ? $"Reassign from unavailable {ThreadDeviceName(Active)}"
+        : !ActiveExecutionEligible
+            ? "No online agent-ready device is available"
             : "Send";
 
     readonly List<StagedFile> attachments = new();
@@ -760,25 +772,26 @@
     IReadOnlyList<OwnThread> PinnedThreads => Threads.Where(t => t.IsPinned).ToList();
     IReadOnlyList<OwnThread> RecentThreads => Threads.Where(t => !t.IsPinned).ToList();
     OwnThread? Active => activeThread is null ? null : State.Profile.OwnThreads.FirstOrDefault(t => t.Id == activeThread);
-    ExecutionDevice CurrentDevice => new(Mesh.MyDeviceId, State.Profile.DeviceName, PlatformCaps.DevicePlatform);
-    IReadOnlyList<global::Mesh.Shared.DeviceInfo> OtherEligibleDevices => eligibleDevices
-        .Where(d => d.CanHostRemoteTurn && d.DeviceId != Mesh.MyDeviceId)
-        .OrderByDescending(d => d.Online).ThenBy(d => DeviceName(d), StringComparer.OrdinalIgnoreCase).ToList();
-    IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices
-    {
-        get
-        {
-            var current = new global::Mesh.Shared.DeviceInfo(Mesh.MyDeviceId, State.Profile.DeviceName, true, PlatformCaps.DevicePlatform, true);
-            return new[] { current }.Concat(OtherEligibleDevices).ToList();
-        }
-    }
+    ExecutionDevice CurrentDevice => CurrentRosterDevice is { } current
+        ? ToExecutionDevice(current)
+        : new(Mesh.MyDeviceId, State.Profile.DeviceName, PlatformCaps.DevicePlatform);
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> OtherRosterDevices => DeviceChoices
+        .Where(d => d.DeviceId != Mesh.MyDeviceId)
+        .ToList();
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => rosterDevices
+        .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
+        .Select(group => group.First())
+        .OrderByDescending(CanExecute)
+        .ThenByDescending(device => device.Online)
+        .ThenBy(device => DeviceName(device), StringComparer.OrdinalIgnoreCase)
+        .ToList();
     bool ActiveDeviceOnline => Active is null || Active.ExecutionDeviceId is null
-        || Active.ExecutionDeviceId == Mesh.MyDeviceId || IsDeviceOnline(Active.ExecutionDeviceId);
+        || IsDeviceOnline(Active.ExecutionDeviceId);
     bool ActiveUsesCurrentDevice => Active is null || Active.ExecutionDeviceId is null
         || Active.ExecutionDeviceId == Mesh.MyDeviceId;
     string ActiveDeviceStatus => Active is null ? "" : Active.ExecutionDeviceId is null
-        ? "This device on next send"
-        : $"{ThreadDeviceName(Active)} ({(ActiveDeviceOnline ? "online" : "offline")})";
+        ? $"This device ({DeviceAvailability(CurrentRosterDevice)})"
+        : DeviceStatusText(Active);
 
     // The free model returns a friendly limit message when the daily token budget is spent.
     bool QuotaExhausted
@@ -965,11 +978,15 @@
             l => l.Role == "assistant" ? "agent" : "me", State.CurrentModelKey());
     }
 
-    async Task NewLocalThread() => await CreateThreadOn(CurrentDevice);
+    async Task NewLocalThread()
+    {
+        if (!CanExecute(CurrentRosterDevice)) return;
+        await CreateThreadOn(CurrentDevice);
+    }
 
     async Task CreateThreadOn(ExecutionDevice device)
     {
-        if (device.DeviceId != Mesh.MyDeviceId && !IsDeviceOnline(device.DeviceId)) return;
+        if (!eligibleDevices.Any(item => item.DeviceId == device.DeviceId)) return;
         var t = await State.NewOwnThreadAsync("New chat", device);
         activeThread = t.Id;
         confirmDelete = false;
@@ -984,8 +1001,11 @@
         deviceError = null;
         try
         {
+            rosterDevices.Clear();
             eligibleDevices.Clear();
-            eligibleDevices.AddRange(await TopicRouter.ListEligibleDevicesAsync(CancellationToken.None));
+            rosterDevices.AddRange(await TopicRouter.ListDevicesAsync(CancellationToken.None));
+            eligibleDevices.AddRange(
+                global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(rosterDevices));
         }
         catch
         {
@@ -1036,7 +1056,8 @@
     void RequestMove(ExecutionDevice target)
     {
         moveMenuOpen = false;
-        if (Active is null) return;
+        if (Active is null
+            || !eligibleDevices.Any(device => device.DeviceId == target.DeviceId)) return;
         if (ActiveBusy)
         {
             var runId = CurrentRunId(Active);
@@ -1056,6 +1077,12 @@
         var target = pendingMove;
         pendingMove = null;
         if (target is null) return;
+        await LoadDevicesAsync();
+        if (!eligibleDevices.Any(device => device.DeviceId == target.Target.DeviceId))
+        {
+            dispatchError = $"{DeviceName(target.Target)} is no longer available for execution.";
+            return;
+        }
         if (!await TopicRouter.StopAsync(target.ThreadId, target.RunId, CancellationToken.None))
         {
             dispatchError = $"Could not stop {target.TopicTitle}. It was not moved.";
@@ -1066,7 +1093,8 @@
 
     void MoveActiveTo(ExecutionDevice target)
     {
-        if (Active is null) return;
+        if (Active is null
+            || !eligibleDevices.Any(device => device.DeviceId == target.DeviceId)) return;
         State.MoveOwnThreadToDevice(Active.Id, target);
     }
 
@@ -1089,14 +1117,25 @@
 
     bool IsRemoteBound(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
         && thread.ExecutionDeviceId != Mesh.MyDeviceId;
-    bool IsDeviceOnline(string? deviceId) => deviceId == Mesh.MyDeviceId
-        || eligibleDevices.Any(d => d.DeviceId == deviceId && d.Online && d.CanHostRemoteTurn);
+    bool IsDeviceOnline(string? deviceId)
+        => rosterDevices.Any(device => device.DeviceId == deviceId && device.Online);
     string ThreadTitle(OwnThread thread) => string.IsNullOrWhiteSpace(thread.Title) ? "New chat" : thread.Title;
     string ThreadDeviceName(OwnThread thread) => !string.IsNullOrWhiteSpace(thread.ExecutionDeviceName)
         ? thread.ExecutionDeviceName : DeviceNameForId(thread.ExecutionDeviceId);
-    string DeviceNameForId(string? id) => eligibleDevices.FirstOrDefault(d => d.DeviceId == id) is { } d
+    string DeviceNameForId(string? id) => rosterDevices.FirstOrDefault(d => d.DeviceId == id) is { } d
         ? DeviceName(d) : "Linked device";
-    string DeviceStatusText(OwnThread thread) => $"{ThreadDeviceName(thread)} is {(IsDeviceOnline(thread.ExecutionDeviceId) ? "online" : "offline")}";
+    string DeviceStatusText(OwnThread thread)
+    {
+        var device = rosterDevices.FirstOrDefault(item =>
+            string.Equals(item.DeviceId, thread.ExecutionDeviceId ?? Mesh.MyDeviceId, StringComparison.Ordinal));
+        return $"{ThreadDeviceName(thread)} is {DeviceAvailability(device)}";
+    }
+    static bool CanExecute(global::Mesh.Shared.DeviceInfo? device) =>
+        global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device);
+    static string DeviceAvailability(global::Mesh.Shared.DeviceInfo? device) =>
+        device is null
+            ? "presence unknown · unavailable"
+            : $"{(device.Online ? "online" : "offline")} · {(CanExecute(device) ? "agent ready" : "unavailable")}";
     static string DeviceName(global::Mesh.Shared.DeviceInfo device) => string.IsNullOrWhiteSpace(device.Name) ? "Linked device" : device.Name;
     static string DeviceName(ExecutionDevice device) => string.IsNullOrWhiteSpace(device.DeviceName) ? "Linked device" : device.DeviceName;
     static ExecutionDevice ToExecutionDevice(global::Mesh.Shared.DeviceInfo device) => new(device.DeviceId, device.Name, device.Platform);

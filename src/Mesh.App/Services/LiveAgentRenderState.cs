@@ -179,22 +179,26 @@ internal sealed class LiveAgentRenderState
         Validate(key, runId);
         lock (gate)
         {
+            var runKey = RunKey(key, runId);
+            if (!terminalRuns.Add(runKey)) return false;
             if (!runs.TryGetValue(key, out var run)
                 || !string.Equals(run.RunId, runId, StringComparison.Ordinal))
-                return false;
-            var changed = !run.Terminal
-                          || run.Steps is not null
-                          || run.Reasoning is not null
-                          || run.Answer is not null;
+                return true;
             run.Terminal = true;
-            terminalRuns.Add(RunKey(key, runId));
             run.StepsOpen = false;
             run.DraftOpen = false;
             run.Steps = null;
             run.Reasoning = null;
             run.Answer = null;
-            return changed;
+            return true;
         }
+    }
+
+    public bool IsTerminal(string key, string runId)
+    {
+        Validate(key, runId);
+        lock (gate)
+            return terminalRuns.Contains(RunKey(key, runId));
     }
 
     public void ResetForAccount()

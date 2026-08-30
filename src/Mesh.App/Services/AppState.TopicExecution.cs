@@ -901,9 +901,8 @@ public sealed partial class AppState
                     || !TopicControlProtocol.IsTerminal(update)
                     || TopicControlProtocol.IsReceipt(update))
                     continue;
-                terminalRemoteRuns.Add(control.ThreadId + "\0" + control.RunId);
-                remoteRuns.TryRemove(control.ThreadId, out _);
-                remoteDeltaSeq.Remove(control.ThreadId + "\0" + control.RunId);
+                _ = RetireExecutionRunLocked(
+                    control.ThreadId, control.RunId, AgentRunPhase.Completed);
             }
             var repairedAnswers = 0;
             foreach (var item in activeDb.ListTopicOutbox())
@@ -928,16 +927,8 @@ public sealed partial class AppState
                                 thread.ExecutionAt ?? answerAt,
                                 ActivityTimestamp.Advance(thread.LastActivityAt, answerAt))))
                         continue;
-                    thread.ExecutionRunId = null;
-                    terminalRemoteRuns.Add(item.ThreadId + "\0" + item.RunId);
-                    remoteDeltaSeq.Remove(item.ThreadId + "\0" + item.RunId);
-                    liveAgentRenderState.CompleteRun(thread.Id, item.RunId);
-                    assistantDraftRefreshGate.Reset(thread.Id);
-                    if (remoteRuns.TryGetValue(thread.Id, out var projection)
-                        && string.Equals(projection.RunId, item.RunId, StringComparison.Ordinal))
-                    {
-                        remoteRuns.TryRemove(thread.Id, out _);
-                    }
+                    _ = RetireExecutionRunLocked(
+                        thread.Id, item.RunId, AgentRunPhase.Completed);
                     repairedAnswers++;
                     continue;
                 }
@@ -994,15 +985,8 @@ public sealed partial class AppState
                             thread.ExecutionAt ?? answerAt,
                             ActivityTimestamp.Advance(thread.LastActivityAt, answerAt))))
                     continue;
-                thread.ExecutionRunId = null;
-                terminalRemoteRuns.Add(thread.Id + "\0" + correlation.RunId);
-                remoteDeltaSeq.Remove(thread.Id + "\0" + correlation.RunId);
-                liveAgentRenderState.CompleteRun(thread.Id, correlation.RunId);
-                assistantDraftRefreshGate.Reset(thread.Id);
-                if (projectionMatches)
-                {
-                    remoteRuns.TryRemove(thread.Id, out _);
-                }
+                _ = RetireExecutionRunLocked(
+                    thread.Id, correlation.RunId, AgentRunPhase.Completed);
                 repairedAnswers++;
             }
             if (repairedAnswers > 0)

@@ -280,7 +280,7 @@ public sealed partial class MeshClient :
                     deviceName,
                     PlatformCaps.DevicePlatform,
                     PlatformCaps.CanRunAgent && agent.IsModelReady,
-                    AgentHostEnabled: true,
+                    AgentHostEnabled: PlatformCaps.CanRunAgent,
                     ProtocolVersion: MeshProtocol.Version,
                     CustodyAuthority: custody),
                 ct);
@@ -1654,6 +1654,11 @@ public sealed partial class MeshClient :
             case MeshKinds.TopicRunRequest:
                 if (!TopicRunProtocol.TryParseRequest(plaintext, out var request))
                     throw new InboundPermanentRejectException("topic_request_payload_invalid");
+                if (!CanCurrentDeviceExecuteTopics)
+                {
+                    attachmentAssembler.RejectRun(env.FromDevice, request.RunId);
+                    throw new InboundPermanentRejectException("device_not_agent_capable");
+                }
                 if (!string.Equals(request.TargetDeviceId, MyDeviceId, StringComparison.Ordinal)
                     || !string.Equals(AppState.Norm(request.TriggerHandle), me, StringComparison.Ordinal))
                 {
@@ -2881,9 +2886,12 @@ public sealed partial class MeshClient :
 
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken)
-        => (await ListMyDevicesCoreAsync(cancellationToken))
-            .Where(device => device.CanHostRemoteTurn)
-            .ToArray();
+        => DeviceExecutionEligibility.EligibleHosts(
+            await ListDevicesAsync(cancellationToken));
+
+    public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
+        CancellationToken cancellationToken)
+        => ListMyDevicesCoreAsync(cancellationToken);
 
     private Task<bool> SendTargetedTopicEnvelopeAsync(
         string targetDeviceId,
