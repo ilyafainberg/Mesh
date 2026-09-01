@@ -115,9 +115,9 @@ public sealed partial class AppState
                                                     thread.ExecutionRunId,
                                                     draft.RunId,
                                                     StringComparison.Ordinal);
-                    thread.ExecutionDeviceId = command.Target.DeviceId;
-                    thread.ExecutionDeviceName = command.Target.DeviceName;
-                    thread.ExecutionDevicePlatform = command.Target.Platform;
+                    thread.AgentExecutionHostDeviceId = command.Target.DeviceId;
+                    thread.AgentExecutionHostDeviceName = command.Target.DeviceName;
+                    thread.AgentExecutionHostDevicePlatform = command.Target.Platform;
                     if (!queuedBehindActiveRun)
                     {
                         thread.ExecutionAt = draft.TriggerAt;
@@ -503,6 +503,21 @@ public sealed partial class AppState
         lock (profileSyncGate)
             activeDb?.ExecuteDurableWrite(
                 () => activeDb.CompleteLocalTopicRun(runId, terminalAt));
+    }
+
+    internal bool TryCompleteLocalTopicRun(
+        AgentRuntimeScopeToken scope,
+        string runId,
+        DateTimeOffset terminalAt)
+    {
+        lock (profileSyncGate)
+        {
+            if (!agentRuntimeScopes.IsCurrent(scope) || activeDb is null)
+                return false;
+            activeDb.ExecuteDurableWrite(
+                () => activeDb.CompleteLocalTopicRun(runId, terminalAt));
+            return true;
+        }
     }
 
     private static ChatAttachment CloneBeginAttachment(ChatAttachment attachment)
@@ -921,9 +936,9 @@ public sealed partial class AppState
                                 thread.Id,
                                 item.RunId,
                                 item.TriggerLineId,
-                                thread.ExecutionDeviceId,
-                                thread.ExecutionDeviceName,
-                                thread.ExecutionDevicePlatform,
+                                thread.AgentExecutionHostDeviceId,
+                                thread.AgentExecutionHostDeviceName,
+                                thread.AgentExecutionHostDevicePlatform,
                                 thread.ExecutionAt ?? answerAt,
                                 ActivityTimestamp.Advance(thread.LastActivityAt, answerAt))))
                         continue;
@@ -979,9 +994,9 @@ public sealed partial class AppState
                             thread.Id,
                             correlation.RunId,
                             correlation.TriggerLineId!,
-                            thread.ExecutionDeviceId,
-                            thread.ExecutionDeviceName,
-                            thread.ExecutionDevicePlatform,
+                            thread.AgentExecutionHostDeviceId,
+                            thread.AgentExecutionHostDeviceName,
+                            thread.AgentExecutionHostDevicePlatform,
                             thread.ExecutionAt ?? answerAt,
                             ActivityTimestamp.Advance(thread.LastActivityAt, answerAt))))
                     continue;

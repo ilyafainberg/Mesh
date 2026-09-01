@@ -6,6 +6,18 @@ using Mesh.Shared;
 
 namespace Mesh.App.Services;
 
+public sealed record ScopedAsyncOperation(
+    string AccountId,
+    string DatabaseIdentity,
+    long Epoch,
+    string ScopeKey,
+    string OperationId,
+    string? TopicId,
+    string? MessageId,
+    string? RequestId,
+    string? RunId,
+    string? ConversationId);
+
 public sealed class OnlineDeliveryTargetScope
 {
     private readonly HashSet<string>? targets;
@@ -72,7 +84,7 @@ internal enum TopicProjectionCheckpoint
 
 public sealed record TopicRunBeginCommand(
     TopicTurnDraft Draft,
-    ExecutionDevice Target,
+    AgentExecutionHost Target,
     TopicRunBeginMode Mode,
     TopicRunUpdatePayload InitialProjection,
     TopicRunRequestPayload? Request = null,
@@ -1025,6 +1037,7 @@ public interface IDeviceTopicTransport
         CancellationToken cancellationToken);
 
     Task<bool> CancelAsync(
+        ScopedAsyncOperation operation,
         string targetDeviceId,
         TopicRunCancelPayload cancel,
         CancellationToken cancellationToken);
@@ -1086,14 +1099,11 @@ public interface ITopicExecutionRouter
         TopicSendHandoffContext? handoffContext = null);
 
     Task<bool> CancelQueuedAsync(
-        string threadId,
-        string runId,
-        string lineId,
+        ScopedAsyncOperation operation,
         CancellationToken cancellationToken);
 
     Task<bool> StopAsync(
-        string threadId,
-        string runId,
+        ScopedAsyncOperation operation,
         CancellationToken cancellationToken);
 
     Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(

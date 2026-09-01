@@ -33,13 +33,17 @@ public static class ReplicationDomainMaterializer
         string? Title,
         DateTimeOffset CreatedAt,
         int SortOrder,
-        string? ExecutionDeviceId,
-        string? ExecutionDeviceName,
-        string? ExecutionDevicePlatform,
+        string? CommunicationDestinationDeviceId,
+        string? CommunicationDestinationDeviceName,
+        string? CommunicationDestinationDevicePlatform,
+        string? AgentExecutionHostDeviceId,
+        string? AgentExecutionHostDeviceName,
+        string? AgentExecutionHostDevicePlatform,
         DateTimeOffset? LastActivityAt,
         bool IsPinned,
         DateTimeOffset? ExecutionAt,
-        string? ExecutionRunId);
+        string? ExecutionRunId,
+        ConversationKind ConversationKind = ConversationKind.Assistant);
 
     /// <summary>Wire shape of a replicated asset (summary plus its bytes).</summary>
     internal sealed record AssetBody(
@@ -180,9 +184,13 @@ public static class ReplicationDomainMaterializer
                     CreatedAt = topic.CreatedAt == default ? DateTimeOffset.UtcNow : topic.CreatedAt,
                     LastActivityAt = topic.LastActivityAt,
                     IsPinned = topic.IsPinned,
-                    ExecutionDeviceId = topic.ExecutionDeviceId,
-                    ExecutionDeviceName = topic.ExecutionDeviceName,
-                    ExecutionDevicePlatform = topic.ExecutionDevicePlatform,
+                    ConversationKind = topic.ConversationKind,
+                    CommunicationDestinationDeviceId = topic.CommunicationDestinationDeviceId,
+                    CommunicationDestinationDeviceName = topic.CommunicationDestinationDeviceName,
+                    CommunicationDestinationDevicePlatform = topic.CommunicationDestinationDevicePlatform,
+                    AgentExecutionHostDeviceId = topic.AgentExecutionHostDeviceId,
+                    AgentExecutionHostDeviceName = topic.AgentExecutionHostDeviceName,
+                    AgentExecutionHostDevicePlatform = topic.AgentExecutionHostDevicePlatform,
                     ExecutionAt = topic.ExecutionAt,
                     ExecutionRunId = topic.ExecutionRunId
                 };
@@ -638,4 +646,3 @@ public static class ReplicationDomainMaterializer
         };
     }
 }
-

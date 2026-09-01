@@ -573,7 +573,7 @@ public sealed partial class MeshClient
         {
             thread = state.EnsureOwnThreadForDeviceRun(
                 request.ThreadId,
-                new ExecutionDevice(
+                new AgentExecutionHost(
                     MyDeviceId,
                     string.IsNullOrWhiteSpace(state.Profile.DeviceName)
                         ? null
@@ -892,28 +892,47 @@ public sealed partial class MeshClient
     }
 
     private async Task<bool> QueueTopicCancellationAsync(
+        ScopedAsyncOperation operation,
         string targetDeviceId,
         TopicRunCancelPayload cancel,
         CancellationToken ct)
     {
-        var request = state.GetTopicOutbox(cancel.RunId);
+        MeshDb.TopicOutboxItem? request = null;
+        MeshDb.DeviceEnvelopeOutboxItem? item = null;
+        ReplicationConnectionIdentity? identity = null;
+        var committed = state.TryApplyScopedTopicCancellation(
+            operation,
+            operation.MessageId is not null,
+            () =>
+            {
+                request = state.GetTopicOutbox(cancel.RunId);
+                if (request is not null
+                    && string.Equals(request.State, TopicOutboxStates.Failed, StringComparison.Ordinal))
+                {
+                    state.DeleteTopicOutbox(cancel.RunId);
+                    state.CompleteQueuedTopicRun(request.ThreadId, request.RunId);
+                    return true;
+                }
+
+                item = PersistDeviceEnvelopeOutbox(
+                    targetDeviceId,
+                    MeshKinds.TopicRunCancel,
+                    TopicRunProtocol.CancelBody(cancel),
+                    null);
+                identity = authenticatedReplicationConnectionIdentity;
+                if (identity is null || !Connected || !IsCurrentReplicationConnectionIdentity(identity))
+                    MarkTopicCancellationPending(request);
+                return true;
+            });
+        if (!committed) return false;
         if (request is not null
             && string.Equals(request.State, TopicOutboxStates.Failed, StringComparison.Ordinal))
         {
-            state.DeleteTopicOutbox(cancel.RunId);
-            state.CompleteQueuedTopicRun(request.ThreadId, request.RunId);
             return true;
         }
 
-        var item = PersistDeviceEnvelopeOutbox(
-            targetDeviceId,
-            MeshKinds.TopicRunCancel,
-            TopicRunProtocol.CancelBody(cancel),
-            null);
-        var identity = authenticatedReplicationConnectionIdentity;
         if (identity is null || !Connected || !IsCurrentReplicationConnectionIdentity(identity))
         {
-            MarkTopicCancellationPending(request);
             ScheduleRecovery();
             return true;
         }
@@ -925,20 +944,27 @@ public sealed partial class MeshClient
                                  && await TryCancelRelayTopicRequestAsync(identity, request, ct);
             if (relayCancelled)
             {
-                state.DeleteDeviceEnvelopeOutbox(item.EnvelopeId);
-                CompletePreDeliveryCancelledTopicRequest(request!);
+                if (!state.TryApplyScopedAsyncOperation(operation, () =>
+                    {
+                        state.DeleteDeviceEnvelopeOutbox(item!.EnvelopeId);
+                        CompletePreDeliveryCancelledTopicRequest(request!);
+                    }))
+                    return false;
                 return true;
             }
 
-            var sent = await TrySendDeviceEnvelopeOutboxItemAsync(identity, item, ct);
+            var sent = await TrySendDeviceEnvelopeOutboxItemAsync(identity, item!, ct);
             if (sent is null || sent.Accepted)
             {
-                MarkTopicCancellationPending(request);
-                return true;
+                return state.TryApplyScopedAsyncOperation(
+                    operation,
+                    () => MarkTopicCancellationPending(request));
             }
 
-            state.DeleteDeviceEnvelopeOutbox(item.EnvelopeId);
-            return false;
+            return state.TryApplyScopedAsyncOperation(
+                operation,
+                () => state.DeleteDeviceEnvelopeOutbox(item!.EnvelopeId))
+                && false;
         }
         finally
         {
@@ -954,7 +980,11 @@ public sealed partial class MeshClient
         var relayCancelled = await TryCancelRelayTopicRequestAsync(identity, request, ct);
         var cancellationId = DeviceEnvelopeId(
             MeshKinds.TopicRunCancel,
-            TopicRunProtocol.CancelBody(new TopicRunCancelPayload(request.RunId, request.ThreadId)));
+            TopicRunProtocol.CancelBody(new TopicRunCancelPayload(
+                request.RunId,
+                request.ThreadId,
+                request.Request.RequestId,
+                request.Request.OriginScopeId)));
         var cancellation = state.ListDeviceEnvelopeOutbox().FirstOrDefault(item =>
             string.Equals(item.EnvelopeId, cancellationId, StringComparison.Ordinal));
         if (relayCancelled)
@@ -1194,7 +1224,9 @@ public sealed partial class MeshClient
     {
         if (string.Equals(kind, MeshKinds.TopicRunCancel, StringComparison.Ordinal)
             && TopicRunProtocol.TryParseCancel(plaintext, out var cancel))
-            return StableEnvelopeId("topic.cancel", cancel.RunId);
+            return StableEnvelopeId(
+                "topic.cancel",
+                $"{cancel.RunId}\0{cancel.RequestId}\0{cancel.OriginScopeId}");
         if (string.Equals(kind, MeshKinds.TopicRunUpdate, StringComparison.Ordinal)
             && TopicRunProtocol.TryParseUpdate(plaintext, out var update))
         {

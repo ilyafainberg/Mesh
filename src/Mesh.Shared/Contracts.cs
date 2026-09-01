@@ -412,8 +412,8 @@ public record DeviceInfo(
     /// <summary>
     /// True when this device may host a remote agent turn for another of the owner's devices: it
     /// advertised the capability (ready model, opted in) and runs on a desktop platform. Mobile devices
-    /// run their own chats locally but cannot host a turn for another device, so they are never eligible
-    /// remote hosts. The relay clamps to this at registration and clients apply the same rule.
+    /// participate fully in communication but never execute model work. The relay clamps to this at
+    /// registration and clients apply the same rule.
     /// </summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public bool CanHostRemoteTurn => DeviceExecutionEligibility.IsEligible(this);
@@ -449,6 +449,28 @@ public static class DeviceExecutionEligibility
             .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
             .Select(group => group.First())
             .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+}
+
+/// <summary>
+/// Communication-plane authority for a linked roster device. Addressability is independent of
+/// agent-host capability; presence only describes whether a new online-only delivery can succeed now.
+/// </summary>
+public static class DeviceCommunicationReachability
+{
+    public static bool IsAddressable(DeviceInfo? device)
+        => device is not null && device.ProtocolVersion >= MeshProtocol.Version;
+
+    public static bool CanDeliverNow(DeviceInfo? device)
+        => device is { Online: true } && IsAddressable(device);
+
+    public static IReadOnlyList<DeviceInfo> CommunicationTargets(IEnumerable<DeviceInfo> roster)
+        => roster
+            .Where(IsAddressable)
+            .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .OrderByDescending(device => device.Online)
+            .ThenBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 }
 
@@ -914,11 +936,15 @@ public sealed record TopicRunRequestPayload(
     string? WidgetId = null,
     string? WidgetContext = null,
     IReadOnlyList<TopicRunAttachment>? Attachments = null,
-    IReadOnlyList<string>? AttachmentIds = null);
+    IReadOnlyList<string>? AttachmentIds = null,
+    string? RequestId = null,
+    string? OriginScopeId = null);
 
 public sealed record TopicRunCancelPayload(
     string RunId,
-    string ThreadId);
+    string ThreadId,
+    string? RequestId = null,
+    string? OriginScopeId = null);
 
 public sealed record TopicRunSubtask(
     string Id,
@@ -1030,6 +1056,8 @@ public static class TopicRunProtocol
                 || !ValidId(p.TargetDeviceId)
                 || !Enum.IsDefined(p.TurnMode)
                 || (p.WidgetId is not null && !ValidId(p.WidgetId))
+                || (p.RequestId is not null && !ValidId(p.RequestId))
+                || (p.OriginScopeId is not null && !ValidId(p.OriginScopeId))
                 || p.WidgetContext is not null
                    && (p.WidgetContext.Length == 0
                        || p.WidgetContext.Length > MaxWidgetContextChars)
@@ -1081,7 +1109,12 @@ public static class TopicRunProtocol
         try
         {
             var p = JsonSerializer.Deserialize<TopicRunCancelPayload>(body!, Json);
-            if (p is null || !ValidId(p.RunId) || !ValidId(p.ThreadId)) return false;
+            if (p is null
+                || !ValidId(p.RunId)
+                || !ValidId(p.ThreadId)
+                || p.RequestId is not null && !ValidId(p.RequestId)
+                || p.OriginScopeId is not null && !ValidId(p.OriginScopeId))
+                return false;
             result = p;
             return true;
         }

@@ -402,9 +402,12 @@ public sealed class DeviceTopicDbTests
                 Title: "After",
                 CreatedAt: at,
                 SortOrder: 0,
-                ExecutionDeviceId: null,
-                ExecutionDeviceName: null,
-                ExecutionDevicePlatform: null,
+                CommunicationDestinationDeviceId: null,
+                CommunicationDestinationDeviceName: null,
+                CommunicationDestinationDevicePlatform: null,
+                AgentExecutionHostDeviceId: null,
+                AgentExecutionHostDeviceName: null,
+                AgentExecutionHostDevicePlatform: null,
                 LastActivityAt: at,
                 IsPinned: false,
                 ExecutionAt: null,
@@ -767,11 +770,11 @@ public sealed class DeviceTopicDbTests
         using (var db = MeshDb.Open(databasePath, key))
         {
             db.UpsertOwnThread("targeted", "Targeted", created, 0);
-            Assert.IsTrue(db.TryBindOwnThreadDevice(
+            Assert.IsTrue(db.TryAssignOwnThreadAgentExecutionHost(
                 "targeted", "phone-id", "Phone", "android"));
-            Assert.IsFalse(db.TryBindOwnThreadDevice(
+            Assert.IsFalse(db.TryAssignOwnThreadAgentExecutionHost(
                 "targeted", "other-id", "Other", "windows"));
-            Assert.IsTrue(db.MoveOwnThreadToDevice(
+            Assert.IsTrue(db.MoveOwnThreadAgentExecutionHost(
                 "targeted", "desktop-id", "Desktop", "windows", moved));
             Assert.IsTrue(db.SetOwnThreadExecutionAndActivity(
                 "targeted", "desktop-id", "Desktop", "windows",
@@ -788,6 +791,91 @@ public sealed class DeviceTopicDbTests
         Assert.AreEqual("run-1", thread.ExecutionRunId);
         Assert.AreEqual(runAt.UtcTicks, thread.ExecutionAt?.UtcTicks);
         Assert.AreEqual(runAt.UtcTicks, thread.LastActivityAt?.UtcTicks);
+    }
+
+    [TestMethod]
+    public void AssistantAiRequest_ReopenReassignAndRetryRetainExactIdentity()
+    {
+        var created = new DateTimeOffset(2026, 8, 31, 8, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread("durable-topic", "Durable topic", created, 0);
+            SaveProfile(db);
+            var first = db.CreateAssistantAiRequest(
+                "stable-run",
+                "stable-operation",
+                "durable-topic",
+                "stable-line",
+                "account-a",
+                7,
+                null,
+                created);
+            Assert.AreEqual(AssistantAiRequestState.AwaitingHost, first.State);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var restored = reopened.GetPendingAssistantAiRequest("durable-topic");
+        Assert.IsNotNull(restored);
+        Assert.AreEqual("stable-run", restored.RunId);
+        Assert.AreEqual("stable-operation", restored.OperationId);
+        Assert.AreEqual("stable-line", restored.TriggerLineId);
+        var reassigned = reopened.ReassignAssistantAiRequest(
+            restored.RunId,
+            new AgentExecutionHost("desktop-b", "Desktop B", DevicePlatforms.Windows),
+            created.AddMinutes(1));
+        Assert.AreEqual("stable-run", reassigned.RunId);
+        Assert.AreEqual("stable-line", reassigned.TriggerLineId);
+        var retry = reopened.SetAssistantAiRequestState(
+            reassigned.RunId,
+            AssistantAiRequestState.RetryPending,
+            created.AddMinutes(2),
+            "offline",
+            incrementAttempt: true);
+        Assert.AreEqual(1, retry.DispatchAttempts);
+
+        var duplicate = reopened.CreateAssistantAiRequest(
+            "stable-run",
+            "stable-operation",
+            "durable-topic",
+            "stable-line",
+            "account-a",
+            7,
+            new AgentExecutionHost("desktop-b", "Desktop B", DevicePlatforms.Windows),
+            created.AddMinutes(3));
+        Assert.AreEqual("stable-run", duplicate.RunId);
+        Assert.AreEqual(1, duplicate.DispatchAttempts);
+        Assert.IsTrue(reopened.TryCompleteAssistantAiRequest(
+            duplicate.RunId,
+            created.AddMinutes(4)));
+        Assert.IsNull(reopened.GetPendingAssistantAiRequest("durable-topic"));
+    }
+
+    [TestMethod]
+    public void CommunicationMoveAndAiHostChange_ArePersistedIndependently()
+    {
+        var created = new DateTimeOffset(2026, 8, 31, 9, 0, 0, TimeSpan.Zero);
+        using (var db = MeshDb.Open(databasePath, key))
+        {
+            db.UpsertOwnThread("two-plane", "Two plane", created, 0);
+            db.SetOwnThreadCommunicationDestination(
+                "two-plane", "phone-a", "Phone A", DevicePlatforms.Android, created);
+            Assert.IsTrue(db.TryAssignOwnThreadAgentExecutionHost(
+                "two-plane", "desktop-a", "Desktop A", DevicePlatforms.Windows));
+            db.SetOwnThreadCommunicationDestination(
+                "two-plane", "phone-b", "Phone B", DevicePlatforms.IOS, created.AddMinutes(1));
+            Assert.IsTrue(db.MoveOwnThreadAgentExecutionHost(
+                "two-plane", "desktop-b", "Desktop B", DevicePlatforms.Windows, created.AddMinutes(2)));
+            SaveProfile(db);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = MeshDb.Open(databasePath, key);
+        var thread = reopened.LoadProfile()!.OwnThreads.Single(item => item.Id == "two-plane");
+        Assert.AreEqual("phone-b", thread.CommunicationDestinationDeviceId);
+        Assert.AreEqual(DevicePlatforms.IOS, thread.CommunicationDestinationDevicePlatform);
+        Assert.AreEqual("desktop-b", thread.AgentExecutionHostDeviceId);
+        Assert.AreEqual(DevicePlatforms.Windows, thread.AgentExecutionHostDevicePlatform);
     }
 
     [TestMethod]

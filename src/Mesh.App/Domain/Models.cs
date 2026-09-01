@@ -1010,16 +1010,56 @@ public sealed class OwnThread
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? LastActivityAt { get; set; }
     public bool IsPinned { get; set; }
-    public string? ExecutionDeviceId { get; set; }
-    public string? ExecutionDeviceName { get; set; }
-    public string? ExecutionDevicePlatform { get; set; }
+    public ConversationKind ConversationKind { get; set; } = ConversationKind.Assistant;
+    public string? CommunicationDestinationDeviceId { get; set; }
+    public string? CommunicationDestinationDeviceName { get; set; }
+    public string? CommunicationDestinationDevicePlatform { get; set; }
+    public string? AgentExecutionHostDeviceId { get; set; }
+    public string? AgentExecutionHostDeviceName { get; set; }
+    public string? AgentExecutionHostDevicePlatform { get; set; }
+    [JsonIgnore]
+    public string? ExecutionDeviceId
+    {
+        get => AgentExecutionHostDeviceId;
+        set => AgentExecutionHostDeviceId = value;
+    }
+    [JsonIgnore]
+    public string? ExecutionDeviceName
+    {
+        get => AgentExecutionHostDeviceName;
+        set => AgentExecutionHostDeviceName = value;
+    }
+    [JsonIgnore]
+    public string? ExecutionDevicePlatform
+    {
+        get => AgentExecutionHostDevicePlatform;
+        set => AgentExecutionHostDevicePlatform = value;
+    }
     public DateTimeOffset? ExecutionAt { get; set; }
     public string? ExecutionRunId { get; set; }
     public List<ChatLine> Lines { get; set; } = new();
 }
 
+public enum ConversationKind
+{
+    Assistant = 0,
+    Communication = 1
+}
+
+/// <summary>The linked device that owns or receives an ordinary private topic conversation.</summary>
+public sealed record CommunicationDestination(
+    string DeviceId,
+    string? DeviceName,
+    string Platform);
+
 /// <summary>Immutable snapshot of the device that owns a topic execution run.</summary>
-public sealed record ExecutionDevice(string DeviceId, string? DeviceName, string Platform);
+public sealed record AgentExecutionHost(string DeviceId, string? DeviceName, string Platform);
+
+public sealed record ExecutionDevice(string DeviceId, string? DeviceName, string Platform)
+{
+    public static implicit operator AgentExecutionHost(ExecutionDevice value)
+        => new(value.DeviceId, value.DeviceName, value.Platform);
+}
 
 /// <summary>
 /// A live projection of a remote execution run on an OwnThread, separate from the chat history.

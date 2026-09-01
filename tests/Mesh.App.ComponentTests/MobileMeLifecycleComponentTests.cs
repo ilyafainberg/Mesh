@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using Mesh.App.Components.Pages;
 using Mesh.App.Components.Mobile;
@@ -20,22 +21,22 @@ namespace Mesh.App.ComponentTests;
 
 [TestClass]
 [DoNotParallelize]
-public sealed class MobileMeLifecycleComponentTests
+public sealed partial class MobileMeLifecycleComponentTests
 {
     [DataTestMethod]
     [DataRow(true, true, true, DevicePlatforms.Windows, 9, true, "online · agent ready")]
-    [DataRow(true, true, true, DevicePlatforms.Windows, 8, false, "online · unavailable")]
-    [DataRow(true, false, true, DevicePlatforms.Windows, 9, false, "online · unavailable")]
-    [DataRow(true, true, false, DevicePlatforms.Windows, 9, false, "online · unavailable")]
-    [DataRow(true, true, true, DevicePlatforms.IOS, 9, false, "online · unavailable")]
-    [DataRow(false, true, true, DevicePlatforms.Windows, 9, false, "offline · unavailable")]
-    public async Task DesktopCurrentDeviceMenu_UsesSharedRosterEligibility(
+    [DataRow(true, true, true, DevicePlatforms.Windows, 8, false, "online · no agent runtime")]
+    [DataRow(true, false, true, DevicePlatforms.Windows, 9, true, "online · no agent runtime")]
+    [DataRow(true, true, false, DevicePlatforms.Windows, 9, true, "online · no agent runtime")]
+    [DataRow(true, true, true, DevicePlatforms.IOS, 9, true, "online · no agent runtime")]
+    [DataRow(false, true, true, DevicePlatforms.Windows, 9, true, "offline · agent ready")]
+    public async Task DesktopCurrentDeviceMenu_AllowsCommunicationRegardlessOfAiCapability(
         bool online,
         bool remoteAgentEnabled,
         bool agentHostEnabled,
         string platform,
         int protocolVersion,
-        bool expectedEligible,
+        bool expectedAddressable,
         string expectedAvailability)
     {
         var state = CreateFirstRunState(
@@ -68,7 +69,7 @@ public sealed class MobileMeLifecycleComponentTests
             "aria-label",
             "Start new chat on this device",
             "disabled");
-        Assert.AreEqual(expectedEligible, primaryDisabled is null);
+        Assert.AreEqual(expectedAddressable, primaryDisabled is null);
 
         await renderer.ClickAsync(mounted.Id, "Choose device for new chat");
         Assert.IsTrue(
@@ -80,16 +81,16 @@ public sealed class MobileMeLifecycleComponentTests
             "aria-label",
             "Choose this device for new chat",
             "disabled");
-        Assert.AreEqual(!expectedEligible, menuDisabled);
+        Assert.AreEqual(!expectedAddressable, menuDisabled);
 
         await renderer.ClickAsync(mounted.Id, "Start new chat on this device");
         Assert.AreEqual(
-            initialTopics + (expectedEligible ? 1 : 0),
+            initialTopics + (expectedAddressable ? 1 : 0),
             state.Profile.OwnThreads.Count);
     }
 
     [TestMethod]
-    public async Task DesktopCurrentDeviceMenu_MissingRosterEntry_IsUnavailableAndCannotCreate()
+    public async Task DesktopCurrentDeviceMenu_MissingRosterEntry_StillAllowsSelfCommunication()
     {
         var state = CreateFirstRunState(
             NewStateRoot(),
@@ -104,9 +105,9 @@ public sealed class MobileMeLifecycleComponentTests
         await renderer.ClickAsync(mounted.Id, "Choose device for new chat");
         Assert.IsTrue(renderer.MarkupContains(
             mounted.Id,
-            "presence unknown · unavailable"),
+            "presence unknown"),
             renderer.RenderedText(mounted.Id));
-        Assert.IsTrue(renderer.MatchedElementHasAttribute(
+        Assert.IsFalse(renderer.MatchedElementHasAttribute(
             mounted.Id,
             "button",
             "aria-label",
@@ -114,7 +115,7 @@ public sealed class MobileMeLifecycleComponentTests
             "disabled"));
 
         await renderer.ClickAsync(mounted.Id, "Start new chat on this device");
-        Assert.AreEqual(initialTopics, state.Profile.OwnThreads.Count);
+        Assert.AreEqual(initialTopics + 1, state.Profile.OwnThreads.Count);
     }
 
     [TestMethod]
@@ -422,7 +423,12 @@ public sealed class MobileMeLifecycleComponentTests
             string? accountB = null;
             MobileMe.BeforeBeginTopicRunCheckpointHook = _ =>
                 accountB = state.ImportProfile(CreateAccountProfile("other-owner", "thread"));
-            await renderer.ClickAsync(rendered.Id, "Send");
+            await WaitUntilAsync(
+                () => renderer.RenderedText(rendered.Id).Contains(
+                    "Retry AI response",
+                    StringComparison.Ordinal),
+                TimeSpan.FromSeconds(5));
+            await renderer.ClickAsync(rendered.Id, "Retry AI response");
             await WaitUntilAsync(
                 () => accountB is not null && !harness.Sends.IsRunning(snapshot.OperationId),
                 TimeSpan.FromSeconds(5));
@@ -438,18 +444,139 @@ public sealed class MobileMeLifecycleComponentTests
                       && outcome?.Kind == TopicSendOutcomeKind.RetryableFailed,
                 TimeSpan.FromSeconds(5));
             MobileMe.BeforeBeginTopicRunCheckpointHook = null;
-            await renderer.ClickAsync(rendered.Id, "Send");
+            await renderer.ClickAsync(rendered.Id, "Retry AI response");
             await WaitUntilAsync(
                 () => state.ListTopicOutbox().Count == 1,
                 TimeSpan.FromSeconds(5));
             Assert.HasCount(1, state.ListTopicOutbox());
         }
+
         finally
         {
             MobileMe.BeforeBeginTopicRunCheckpointHook = null;
             await renderer.UnmountAsync(rendered.Id);
             state.SignOut();
         }
+    }
+
+    [TestMethod]
+    public async Task ProductionRouter_RecreatedAccountEpochCanReuseRunAndTriggerIds()
+    {
+        var root = NewStateRoot();
+        var secrets = new MemorySecretStore();
+        var state = CreateFirstRunState(root, secrets, "thread");
+        var accountA = state.ActiveAccountId!;
+        var transport = new EpochBarrierDeviceTransport();
+        await using var router = new TopicExecutionRouter(
+            state, new NoopTurnRunner(), transport);
+        var draft = new TopicTurnDraft(
+            "reused-run",
+            "thread",
+            "reused-trigger",
+            "owner",
+            "same identity in a new epoch",
+            DateTimeOffset.UtcNow,
+            TopicTurnMode.Single,
+            "remote-device",
+            TriggerOperationId: "reused-operation");
+
+        var retired = router.SubmitAsync(draft, null, CancellationToken.None);
+        await transport.FirstListEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        state.ImportProfile(CreateAccountProfile("other-owner", "thread"));
+        Assert.IsTrue(state.SwitchAccount(accountA));
+
+        var current = router.SubmitAsync(draft, null, CancellationToken.None);
+        transport.ReleaseFirstList.TrySetResult();
+        var retiredResult = await retired.WaitAsync(TimeSpan.FromSeconds(5));
+        var currentResult = await current.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.IsFalse(retiredResult.Accepted);
+        Assert.AreEqual("stale_account_scope", retiredResult.Code);
+        Assert.IsTrue(currentResult.Accepted, currentResult.Error);
+        Assert.AreEqual(1, transport.DispatchCount);
+    }
+
+    [TestMethod]
+    public async Task DesktopStopAndMove_SwitchInsideStop_CannotMutateIdenticalAccountRun()
+    {
+        var root = NewStateRoot();
+        var state = CreateFirstRunState(root, new MemorySecretStore(), "thread");
+        state.Profile.OwnThreads.Single().ExecutionRunId = "same-run-id";
+        var accountA = state.ActiveAccountId!;
+        var accountBProfile = CreateAccountProfile("other-owner", "thread");
+        accountBProfile.OwnThreads.Single().ExecutionRunId = "same-run-id";
+        var accountB = state.ImportProfile(accountBProfile);
+        Assert.IsTrue(state.SwitchAccount(accountA));
+        var transport = new ControllableDeviceTransport();
+        var router = new SwitchInsideScopedStopRouter(state, accountB, transport.Device);
+        var harness = CreateHarness(transport, state: state, router: router);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<Home>();
+        var scope = state.CaptureActiveThreadMutationScope("thread");
+        var pendingType = typeof(Home).GetNestedType(
+            "PendingTopicMove",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var pending = Activator.CreateInstance(
+            pendingType,
+            "thread",
+            "Topic",
+            "same-run-id",
+            new AgentExecutionHost(
+                transport.Device.DeviceId,
+                transport.Device.Name,
+                transport.Device.Platform),
+            scope,
+            null)!;
+        typeof(Home).GetField(
+                "pendingMove",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(mounted.Component, pending);
+
+        await renderer.Dispatcher.InvokeAsync(async () =>
+            await (Task)typeof(Home).GetMethod(
+                    "ConfirmActiveMove",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .Invoke(mounted.Component, null)!);
+
+        Assert.AreEqual(0, router.UnauthorizedCancellationMutations);
+        Assert.AreEqual("same-run-id", state.Profile.OwnThreads.Single().ExecutionRunId);
+    }
+
+    [TestMethod]
+    public async Task MobileStopAndMove_SwitchInsideStop_CannotMutateIdenticalAccountRun()
+    {
+        var root = NewStateRoot();
+        var state = CreateFirstRunState(root, new MemorySecretStore(), "thread");
+        state.Profile.OwnThreads.Single().ExecutionRunId = "same-run-id";
+        var accountA = state.ActiveAccountId!;
+        var accountBProfile = CreateAccountProfile("other-owner", "thread");
+        accountBProfile.OwnThreads.Single().ExecutionRunId = "same-run-id";
+        var accountB = state.ImportProfile(accountBProfile);
+        Assert.IsTrue(state.SwitchAccount(accountA));
+        var transport = new ControllableDeviceTransport();
+        var router = new SwitchInsideScopedStopRouter(state, accountB, transport.Device);
+        var harness = CreateHarness(transport, state: state, router: router);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<MobileMe>();
+        state.Profile.OwnThreads.Single().ExecutionRunId = "same-run-id";
+        typeof(MobileMe).GetField(
+                "activeThreadValue",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(mounted.Component, "thread");
+        typeof(MobileMe).GetField(
+                "pendingMove",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(mounted.Component, transport.Device);
+
+        await renderer.Dispatcher.InvokeAsync(async () =>
+            await (Task)typeof(MobileMe).GetMethod(
+                    "ConfirmRunningMove",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .Invoke(mounted.Component, null)!);
+
+        Assert.AreEqual(1, router.StopCalls);
+        Assert.AreEqual(0, router.UnauthorizedCancellationMutations);
+        Assert.AreEqual("same-run-id", state.Profile.OwnThreads.Single().ExecutionRunId);
     }
 
     [TestMethod]
@@ -836,7 +963,7 @@ public sealed class MobileMeLifecycleComponentTests
     }
 
     [TestMethod]
-    public async Task RenderedComposer_BeginPersistenceFailureRetainsRetryableDraft()
+    public async Task RenderedComposer_AiBeginFailureRetainsMessageAndRetriesSameRequest()
     {
         var transport = new ControllableDeviceTransport
         {
@@ -861,16 +988,36 @@ public sealed class MobileMeLifecycleComponentTests
                   && outcome?.Kind == TopicSendOutcomeKind.RetryableFailed,
             TimeSpan.FromSeconds(5));
 
-        Assert.AreEqual("durable retry", harness.State.GetTopicDraft("thread"));
+        Assert.AreEqual("", harness.State.GetTopicDraft("thread"));
         Assert.AreEqual(1, transport.SubmitCount);
-        transport.ImmediateResult = null;
-        await renderer.ClickAsync(rendered.Id, "Send");
-        await transport.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        transport.Release.TrySetResult();
+        var pending = harness.State.GetPendingAssistantAiRequest("thread");
+        Assert.IsNotNull(pending);
+        Assert.AreEqual(AssistantAiRequestState.RetryPending, pending.State);
+        Assert.AreEqual(
+            1,
+            harness.State.Profile.OwnThreads.Single()
+                .Lines.Count(line => line.Id == pending.TriggerLineId));
         await WaitUntilAsync(
-            () => harness.State.GetTopicDraft("thread") == "",
+            () => renderer.RenderedText(rendered.Id).Contains(
+                "Retry AI response",
+                StringComparison.Ordinal),
             TimeSpan.FromSeconds(5));
+        transport.ImmediateResult = null;
+        var retry = renderer.ClickAsync(rendered.Id, "Retry AI response");
+        var entered = await Task.WhenAny(
+            transport.Entered.Task,
+            retry,
+            Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(
+            transport.Entered.Task,
+            entered,
+            $"retryCompleted={retry.IsCompleted}; retryStatus={retry.Status}; "
+            + $"retryError={retry.Exception?.GetBaseException().Message}; submitCount={transport.SubmitCount}; "
+            + renderer.RenderedText(rendered.Id));
+        transport.Release.TrySetResult();
+        await retry;
         Assert.AreEqual(2, transport.SubmitCount);
+        Assert.AreEqual(pending.RunId, transport.LastDraft?.RunId);
         Assert.AreEqual(
             1,
             harness.State.Profile.OwnThreads.Single()
@@ -1169,9 +1316,18 @@ public sealed class MobileMeLifecycleComponentTests
                 persisted.OperationId,
                 out var retryOutcome));
             Assert.AreEqual(TopicSendOutcomeKind.RetryableFailed, retryOutcome?.Kind);
-            var acceptedFinalized = finalizations.Track(persisted.OperationId);
-            await renderer.ClickAsync(rendered.Id, "Send");
-            await acceptedFinalized.WaitAsync(TimeSpan.FromSeconds(10));
+            var pendingRequest = restartedState.GetPendingAssistantAiRequest("thread");
+            Assert.IsNotNull(pendingRequest);
+            Assert.AreEqual(persisted.RunId, pendingRequest.RunId);
+            await WaitUntilAsync(
+                () => renderer.RenderedText(rendered.Id).Contains(
+                    "Retry AI response",
+                    StringComparison.Ordinal),
+                TimeSpan.FromSeconds(5));
+            await renderer.ClickAsync(rendered.Id, "Retry AI response");
+            await WaitUntilAsync(
+                () => counter.ForwardCount == 1,
+                TimeSpan.FromSeconds(10));
             Assert.AreEqual("", restartedState.GetTopicDraft("thread"));
             Assert.AreEqual(1, counter.ForwardCount);
             Assert.AreEqual(
@@ -1285,13 +1441,25 @@ public sealed class MobileMeLifecycleComponentTests
             secrets,
             storagePaths: StoragePaths.ForRoot(stateRoot));
         Assert.IsTrue(secondState.SwitchAccount(identityId));
+        var dispatchRecorded = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var allowCleanup = new ManualResetEventSlim();
+        MobileMe.DurableBeginCheckpointHook = _ =>
+        {
+            dispatchRecorded.TrySetResult();
+            if (!allowCleanup.Wait(TimeSpan.FromSeconds(15)))
+                throw new TimeoutException("Timed out waiting to inject the draft-cleanup write failure.");
+        };
+        transport.Release.TrySetResult();
+        await dispatchRecorded.Task.WaitAsync(TimeSpan.FromSeconds(5));
         using var blocker = OpenDatabaseBlocker(stateRoot, secrets, identityId);
         using var transaction = blocker.BeginTransaction(deferred: false);
-        transport.Release.TrySetResult();
+        allowCleanup.Set();
         await WaitUntilAsync(
             () => firstRenderer.RenderedText(first.Id).Contains(
                 "draft cleanup failed", StringComparison.OrdinalIgnoreCase),
             TimeSpan.FromSeconds(15));
+        MobileMe.DurableBeginCheckpointHook = null;
         await firstRenderer.UnmountAsync(first.Id);
 
         var secondHarness = CreateHarness(
@@ -1457,8 +1625,10 @@ public sealed class MobileMeLifecycleComponentTests
         await using var recoveredRenderer = new ComponentRenderer(recoveredHarness.Services);
         var recovered = await recoveredRenderer.MountAsync<MobileMe>();
         await WaitUntilAsync(
-            () => recoveredRenderer.MarkupContains(recovered.Id, "No durable handoff was found"),
+            () => recoveredRenderer.MarkupContains(recovered.Id, "Retry AI response"),
             TimeSpan.FromSeconds(5));
+        Assert.IsNotNull(
+            recoveredHarness.State.GetPendingAssistantAiRequest("thread"));
         await WaitUntilAsync(
             () => recoveredHarness.State.GetTopicDraft("thread") == "",
             TimeSpan.FromSeconds(5));
@@ -1492,7 +1662,9 @@ public sealed class MobileMeLifecycleComponentTests
         await using var renderer = new ComponentRenderer(harness.Services);
         var rendered = await renderer.MountAsync<MobileMe>();
         await WaitUntilAsync(
-            () => renderer.MarkupContains(rendered.Id, "No durable handoff was found"),
+            () => renderer.MarkupContains(
+                rendered.Id,
+                "Message could not be saved. AI was not requested."),
             TimeSpan.FromSeconds(5));
         Assert.IsFalse(values.ContainsKey($"mesh.ui.topic-send.v4.pending.{scope}"));
         Assert.AreEqual("legacy retry", harness.State.GetTopicDraft("thread"));
@@ -1578,6 +1750,15 @@ public sealed class MobileMeLifecycleComponentTests
         firstHarness.State.Save();
         long submittedRevision;
         long newerRevision;
+        var dispatchRecorded = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var allowCleanup = new ManualResetEventSlim();
+        MobileMe.DurableBeginCheckpointHook = _ =>
+        {
+            dispatchRecorded.TrySetResult();
+            if (!allowCleanup.Wait(TimeSpan.FromSeconds(15)))
+                throw new TimeoutException("Timed out waiting to inject the draft-cleanup write failure.");
+        };
         try
         {
             await using var renderer = new ComponentRenderer(firstHarness.Services);
@@ -1590,9 +1771,11 @@ public sealed class MobileMeLifecycleComponentTests
             await renderer.ClickAsync(first.Id, "Send");
             await transport.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
+            transport.Release.TrySetResult();
+            await dispatchRecorded.Task.WaitAsync(TimeSpan.FromSeconds(5));
             using var blocker = OpenDatabaseBlocker(databaseRoot, secrets, identityId);
             using var transaction = blocker.BeginTransaction(deferred: false);
-            transport.Release.TrySetResult();
+            allowCleanup.Set();
             await identities.WaitUntilAsync(
                 () => identities.TryGetUnresolved(
                         scope,
@@ -1624,6 +1807,8 @@ public sealed class MobileMeLifecycleComponentTests
         }
         finally
         {
+            allowCleanup.Set();
+            MobileMe.DurableBeginCheckpointHook = null;
             transport.Release.TrySetResult();
             await firstHarness.Services.DisposeAsync();
             await firstHarness.State.DisposeAsync();
@@ -2445,6 +2630,7 @@ public sealed class MobileMeLifecycleComponentTests
         : Renderer(services, NullLoggerFactory.Instance), IAsyncDisposable
     {
         private readonly object renderSignalGate = new();
+        private readonly Dictionary<int, IComponent> mountedComponents = new();
         private TaskCompletionSource renderChanged =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -2460,12 +2646,19 @@ public sealed class MobileMeLifecycleComponentTests
             {
                 var component = (T)InstantiateComponent(typeof(T));
                 var id = AssignRootComponentId(component);
+                mountedComponents.Add(id, component);
                 await RenderRootComponentAsync(id, parameters);
                 return new MountedComponent<T>(id, component);
             });
 
         public Task UnmountAsync(int componentId)
-            => Dispatcher.InvokeAsync(() => RemoveRootComponent(componentId));
+            => Dispatcher.InvokeAsync(async () =>
+            {
+                mountedComponents.Remove(componentId, out var component);
+                RemoveRootComponent(componentId);
+                if (component is IAsyncDisposable asyncDisposable)
+                    await asyncDisposable.DisposeAsync();
+            });
 
         public Task InputAsync(int componentId, string ariaLabel, string value)
             => Dispatcher.InvokeAsync(async () =>
@@ -2478,6 +2671,8 @@ public sealed class MobileMeLifecycleComponentTests
 
         public async Task ClickAsync(int componentId, string ariaLabel)
         {
+            if (string.Equals(ariaLabel, "Send", StringComparison.Ordinal))
+                ariaLabel = "Ask AI on agent host";
             await WaitUntilAsync(
                 () => HasAttribute(
                     componentId,
@@ -2674,7 +2869,7 @@ public sealed class MobileMeLifecycleComponentTests
         }
 
         protected override void HandleException(Exception exception)
-            => throw exception;
+            => ExceptionDispatchInfo.Capture(exception).Throw();
 
         async ValueTask IAsyncDisposable.DisposeAsync()
         {
@@ -2965,15 +3160,12 @@ public sealed class MobileMeLifecycleComponentTests
         }
 
         public Task<bool> CancelQueuedAsync(
-            string threadId,
-            string runId,
-            string lineId,
+            ScopedAsyncOperation operation,
             CancellationToken cancellationToken)
             => Task.FromResult(true);
 
         public Task<bool> StopAsync(
-            string threadId,
-            string runId,
+            ScopedAsyncOperation operation,
             CancellationToken cancellationToken)
             => Task.FromResult(true);
 
@@ -2985,6 +3177,99 @@ public sealed class MobileMeLifecycleComponentTests
         public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
             CancellationToken cancellationToken)
             => Task.FromResult(Devices);
+    }
+
+    private sealed class SwitchInsideScopedStopRouter(
+        AppState state,
+        string accountB,
+        Mesh.Shared.DeviceInfo target) : ITopicExecutionRouter
+    {
+        public int StopCalls { get; private set; }
+        public int UnauthorizedCancellationMutations { get; private set; }
+
+        public Task<bool> StopAsync(
+            ScopedAsyncOperation operation,
+            CancellationToken cancellationToken)
+        {
+            StopCalls++;
+            Assert.IsTrue(state.SwitchAccount(accountB));
+            state.TryCompleteScopedAsyncOperation(
+                operation,
+                () => UnauthorizedCancellationMutations++);
+            return Task.FromResult(true);
+        }
+
+        public Task<bool> CancelQueuedAsync(
+            ScopedAsyncOperation operation,
+            CancellationToken cancellationToken)
+            => throw new NotSupportedException();
+
+        public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
+            CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<Mesh.Shared.DeviceInfo>>([target]);
+
+        public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
+            CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<Mesh.Shared.DeviceInfo>>([target]);
+
+        public Task<TopicDispatchResult> SubmitAsync(
+            TopicTurnDraft draft,
+            IProgress<TopicRunUpdatePayload>? progress,
+            CancellationToken cancellationToken,
+            TopicSendHandoffContext? handoffContext = null)
+            => throw new NotSupportedException();
+    }
+
+    private sealed class EpochBarrierDeviceTransport : IDeviceTopicTransport
+    {
+        private readonly Mesh.Shared.DeviceInfo device = new(
+            "remote-device",
+            "Remote",
+            true,
+            DevicePlatforms.Windows,
+            true,
+            AgentHostEnabled: true);
+        private int listCount;
+        public int DispatchCount;
+        public TaskCompletionSource FirstListEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseFirstList { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
+            CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref listCount) == 1)
+            {
+                FirstListEntered.TrySetResult();
+                await ReleaseFirstList.Task.WaitAsync(cancellationToken);
+            }
+            return [device];
+        }
+
+        public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListDevicesAsync(
+            CancellationToken cancellationToken)
+            => ListEligibleDevicesAsync(cancellationToken);
+
+        public Task<TopicDispatchResult> DispatchAsync(
+            string targetDeviceId,
+            TopicRunRequestPayload request,
+            IReadOnlyList<ChatAttachment> attachments,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref DispatchCount);
+            return Task.FromResult(TopicDispatchResult.Ok(
+                request.RunId,
+                TopicExecutionStatus.RelayAccepted,
+                durable: true));
+        }
+
+        public Task<bool> CancelAsync(
+            ScopedAsyncOperation operation,
+            string targetDeviceId,
+            TopicRunCancelPayload cancel,
+            CancellationToken cancellationToken)
+            => Task.FromResult(true);
     }
 
     private sealed class DurableTransportCounter
@@ -3087,6 +3372,7 @@ public sealed class MobileMeLifecycleComponentTests
         }
 
         public Task<bool> CancelAsync(
+            ScopedAsyncOperation operation,
             string targetDeviceId,
             TopicRunCancelPayload cancel,
             CancellationToken cancellationToken)
@@ -3135,6 +3421,7 @@ public sealed class MobileMeLifecycleComponentTests
             => throw new AssertFailedException("A local run must not enter remote transport.");
 
         public Task<bool> CancelAsync(
+            ScopedAsyncOperation operation,
             string targetDeviceId,
             TopicRunCancelPayload cancel,
             CancellationToken cancellationToken)

@@ -1870,6 +1870,9 @@ public sealed partial class MeshClient :
         if (cancellation is null) return false;
         if (!string.Equals(cancellation.SourceDeviceId, sourceDeviceId, StringComparison.Ordinal)
             || !string.Equals(cancellation.ThreadId, request.ThreadId, StringComparison.Ordinal)
+            || !string.Equals(cancellation.RequestId, request.RequestId, StringComparison.Ordinal)
+            || !string.Equals(
+                cancellation.OriginScopeId, request.OriginScopeId, StringComparison.Ordinal)
             || !TopicRunProtocol.TryParseUpdate(cancellation.TerminalUpdateJson, out var cancelled))
             throw new InboundPermanentRejectException("topic_cancellation_identity_conflict");
 
@@ -1919,6 +1922,9 @@ public sealed partial class MeshClient :
             {
                 var record = state.GetInboundTopicRun(cancel.RunId)
                              ?? throw new InboundRetryException("topic_cancellation_persistence_failed");
+                if (!CancellationMatchesRequest(cancel, record.Request))
+                    throw new InboundPermanentRejectException(
+                        "topic_cancellation_identity_conflict");
                 var proposed = new TopicRunUpdatePayload(
                     cancel.RunId,
                     cancel.ThreadId,
@@ -1952,7 +1958,8 @@ public sealed partial class MeshClient :
         if (pending is not null)
         {
             if (!string.Equals(pending.SourceDeviceId, sourceDeviceId, StringComparison.Ordinal)
-                || !string.Equals(pending.Request.ThreadId, cancel.ThreadId, StringComparison.Ordinal))
+                || !string.Equals(pending.Request.ThreadId, cancel.ThreadId, StringComparison.Ordinal)
+                || !CancellationMatchesRequest(cancel, pending.Request))
                 throw new InboundPermanentRejectException("topic_cancellation_identity_conflict");
             var proposed = new TopicRunUpdatePayload(
                 cancel.RunId,
@@ -1986,7 +1993,9 @@ public sealed partial class MeshClient :
             sourceDeviceId,
             cancel.ThreadId,
             TopicRunProtocol.UpdateBody(cancelled),
-            timeProvider.GetUtcNow());
+            timeProvider.GetUtcNow(),
+            cancel.RequestId,
+            cancel.OriginScopeId);
         if (!state.SaveInboundTopicCancellation(item))
             throw new InboundRetryException("topic_cancellation_persistence_failed");
         var persisted = state.GetInboundTopicCancellation(cancel.RunId);
@@ -2001,6 +2010,13 @@ public sealed partial class MeshClient :
                 PushHintProtocol.ForTopicRunPhase(terminalUpdate.Phase)))
             throw new InboundRetryException("topic_cancellation_delivery_failed");
     }
+
+    private static bool CancellationMatchesRequest(
+        TopicRunCancelPayload cancel,
+        TopicRunRequestPayload request)
+        => string.Equals(cancel.RequestId, request.RequestId, StringComparison.Ordinal)
+           && string.Equals(
+               cancel.OriginScopeId, request.OriginScopeId, StringComparison.Ordinal);
     private async Task ExecuteInboundTopicRunAsync(
         TopicRunRequestPayload request,
         ActiveTopicRun active)
@@ -2031,7 +2047,8 @@ public sealed partial class MeshClient :
                 request.TargetDeviceId,
                 request.WidgetId,
                 request.WidgetContext,
-                attachments);
+                attachments,
+                request.RequestId);
             var progress = new OrderedAsyncProgress<TopicRunUpdatePayload>(
                 update => TopicControlProtocol.IsTerminal(update)
                     ? Task.CompletedTask
@@ -2820,7 +2837,7 @@ public sealed partial class MeshClient :
         var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
             string.Equals(item.Id, request.ThreadId, StringComparison.Ordinal));
         if (thread is null
-            || !string.Equals(thread.ExecutionDeviceId, targetDeviceId, StringComparison.Ordinal))
+            || !string.Equals(thread.AgentExecutionHostDeviceId, targetDeviceId, StringComparison.Ordinal))
             return TopicDispatchResult.Reject("invalid_thread_target", request.RunId);
 
         var manifest = request.Attachments ?? Array.Empty<TopicRunAttachment>();
@@ -2865,6 +2882,7 @@ public sealed partial class MeshClient :
     }
 
     public async Task<bool> CancelAsync(
+        ScopedAsyncOperation operation,
         string targetDeviceId,
         TopicRunCancelPayload cancel,
         CancellationToken cancellationToken)
@@ -2872,15 +2890,21 @@ public sealed partial class MeshClient :
         ArgumentNullException.ThrowIfNull(cancel);
         if (!TopicRunProtocol.TryParseCancel(TopicRunProtocol.CancelBody(cancel), out _))
             return false;
-        var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
-            string.Equals(item.Id, cancel.ThreadId, StringComparison.Ordinal));
-        if (thread is null
-            || !string.Equals(thread.ExecutionDeviceId, targetDeviceId, StringComparison.Ordinal)
-            || !string.Equals(thread.ExecutionRunId, cancel.RunId, StringComparison.Ordinal)
-               && !state.IsKnownQueuedTopicRun(cancel.ThreadId, cancel.RunId))
+        var authorized = state.TryApplyScopedTopicCancellation(
+            operation,
+            operation.MessageId is not null,
+            () =>
+            {
+                var thread = state.Profile.OwnThreads.First(item =>
+                    string.Equals(item.Id, cancel.ThreadId, StringComparison.Ordinal));
+                return string.Equals(
+                    thread.AgentExecutionHostDeviceId, targetDeviceId, StringComparison.Ordinal);
+            });
+        if (!authorized)
             return false;
         return await Task.Run(
-            () => QueueTopicCancellationAsync(targetDeviceId, cancel, cancellationToken),
+            () => QueueTopicCancellationAsync(
+                operation, targetDeviceId, cancel, cancellationToken),
             cancellationToken).ConfigureAwait(false);
     }
 

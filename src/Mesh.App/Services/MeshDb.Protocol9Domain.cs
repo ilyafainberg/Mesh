@@ -238,7 +238,7 @@ public static class Protocol9DomainTables
         EnsureOwnThread(conn, tx, threadId, "", line.At);
         if (OwnChatLineExists(conn, tx, threadId, line.Id)) return false;
         using (var cmd = Command(conn, tx, """
-            INSERT INTO own_chat(
+            INSERT OR IGNORE INTO own_chat(
                 line_id, thread_id, role, text, reply_to_line_id, via, status, at,
                 internal, reasoning, sender_handle, model_id)
             VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $i, $rz, $sender, $modelId);
@@ -273,15 +273,19 @@ public static class Protocol9DomainTables
                 title = $title,
                 sort_order = $sort,
                 is_pinned = $pinned,
-                execution_device_id = CASE
+                conversation_kind = $conversationKind,
+                communication_destination_device_id = $communicationDevice,
+                communication_destination_device_name = $communicationName,
+                communication_destination_device_platform = $communicationPlatform,
+                agent_execution_host_device_id = CASE
                     WHEN execution_run_id IS NOT NULL AND $runId IS NULL
-                    THEN execution_device_id ELSE $device END,
-                execution_device_name = CASE
+                    THEN agent_execution_host_device_id ELSE $device END,
+                agent_execution_host_device_name = CASE
                     WHEN execution_run_id IS NOT NULL AND $runId IS NULL
-                    THEN execution_device_name ELSE $deviceName END,
-                execution_device_platform = CASE
+                    THEN agent_execution_host_device_name ELSE $deviceName END,
+                agent_execution_host_device_platform = CASE
                     WHEN execution_run_id IS NOT NULL AND $runId IS NULL
-                    THEN execution_device_platform ELSE $platform END,
+                    THEN agent_execution_host_device_platform ELSE $platform END,
                 execution_at = CASE
                     WHEN execution_run_id IS NOT NULL AND $runId IS NULL
                     THEN execution_at ELSE $execAt END,
@@ -298,9 +302,19 @@ public static class Protocol9DomainTables
         cmd.Parameters.AddWithValue("$title", thread.Title ?? "");
         cmd.Parameters.AddWithValue("$sort", Math.Max(0, sortOrder));
         cmd.Parameters.AddWithValue("$pinned", thread.IsPinned ? 1 : 0);
-        cmd.Parameters.AddWithValue("$device", (object?)thread.ExecutionDeviceId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$deviceName", (object?)thread.ExecutionDeviceName ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$platform", (object?)thread.ExecutionDevicePlatform ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$conversationKind", (int)thread.ConversationKind);
+        cmd.Parameters.AddWithValue(
+            "$communicationDevice",
+            (object?)thread.CommunicationDestinationDeviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$communicationName",
+            (object?)thread.CommunicationDestinationDeviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$communicationPlatform",
+            (object?)thread.CommunicationDestinationDevicePlatform ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$device", (object?)thread.AgentExecutionHostDeviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$deviceName", (object?)thread.AgentExecutionHostDeviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$platform", (object?)thread.AgentExecutionHostDevicePlatform ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execAt", thread.ExecutionAt.HasValue ? Iso(thread.ExecutionAt.Value) : DBNull.Value);
         cmd.Parameters.AddWithValue("$runId", (object?)thread.ExecutionRunId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$activity", thread.LastActivityAt.HasValue ? Iso(thread.LastActivityAt.Value) : DBNull.Value);

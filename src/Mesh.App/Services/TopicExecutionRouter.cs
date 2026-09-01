@@ -16,6 +16,8 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
     private readonly CancellationTokenSource lifetime;
     private readonly ConcurrentDictionary<long, Task> localTasks = new();
     private readonly object stopGate = new();
+    private readonly ConcurrentDictionary<string, Lazy<Task<bool>>> cancellationOperations =
+        new(StringComparer.Ordinal);
     private long nextLocalTaskId;
     private Task? stopTask;
     internal static Action<string>? BeforeTransportCheckpointHook { get; set; }
@@ -41,17 +43,20 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdownState.Token);
         shutdown?.Register(
             "topic-execution-router",
-            cancellationToken => StopAsync().WaitAsync(cancellationToken));
+            cancellationToken => StopForProcessShutdownAsync().WaitAsync(cancellationToken));
     }
 
     private sealed class RunEntry
     {
+        public required AgentRuntimeScopeToken RuntimeScope { get; init; }
         public required TopicTurnDraft Draft { get; set; }
         public required string AttachmentFingerprint { get; init; }
         public required TaskCompletionSource<TopicDispatchResult> Dispatch { get; init; }
         public CancellationTokenSource? LocalCancellation { get; set; }
         public string? RemoteDeviceId { get; set; }
         public bool DurableBeginCommitted { get; set; }
+        public int CancellationCommitted;
+        public required string OriginScopeId { get; init; }
     }
 
     private readonly ConcurrentDictionary<string, RunEntry> runs =
@@ -78,6 +83,13 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         TopicSendHandoffContext? handoffContext)
     {
         ArgumentNullException.ThrowIfNull(draft);
+        if (!state.IsCurrentAgentRuntimeContext
+            || !state.TryCaptureAgentRuntimeScope(out var runtimeScope))
+            return TopicDispatchResult.Reject(
+                "stale_account_scope",
+                draft.RunId,
+                "The active account changed before dispatch started.");
+        using var runtimeContext = state.EnterAgentRuntimeScope(runtimeScope);
         var validation = Validate(draft);
         if (validation is not null)
             return TopicDispatchResult.Reject(validation, draft.RunId);
@@ -87,13 +99,14 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
 
         RunEntry entry;
         var owner = false;
+        var runKey = RunKey(runtimeScope, draft.RunId);
         lock (submitGate)
         {
-            var triggerKey = TriggerKey(draft);
-            if (triggerRuns.TryGetValue(triggerKey, out var triggerRunId)
-                && !string.Equals(triggerRunId, draft.RunId, StringComparison.Ordinal))
+            var triggerKey = TriggerKey(runtimeScope, draft);
+            if (triggerRuns.TryGetValue(triggerKey, out var triggerRunKey)
+                && !string.Equals(triggerRunKey, runKey, StringComparison.Ordinal))
             {
-                if (runs.TryGetValue(triggerRunId, out var triggerEntry)
+                if (runs.TryGetValue(triggerRunKey, out var triggerEntry)
                     && SameRequest(triggerEntry, draft, ignoreRunId: true))
                     entry = triggerEntry;
                 else
@@ -101,7 +114,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                         "trigger_line_conflict", draft.RunId,
                         "The trigger line is already associated with another request.");
             }
-            else if (runs.TryGetValue(draft.RunId, out entry!))
+            else if (runs.TryGetValue(runKey, out entry!))
             {
                 if (!SameRequest(entry, draft))
                     return TopicDispatchResult.Reject(
@@ -112,13 +125,15 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             {
                 entry = new RunEntry
                 {
+                    RuntimeScope = runtimeScope,
                     Draft = Snapshot(draft),
                     AttachmentFingerprint = AttachmentFingerprint(draft.Attachments),
                     Dispatch = new TaskCompletionSource<TopicDispatchResult>(
-                        TaskCreationOptions.RunContinuationsAsynchronously)
+                        TaskCreationOptions.RunContinuationsAsynchronously),
+                    OriginScopeId = OriginScopeId(runtimeScope)
                 };
-                runs[draft.RunId] = entry;
-                triggerRuns[triggerKey] = draft.RunId;
+                runs[runKey] = entry;
+                triggerRuns[triggerKey] = runKey;
                 owner = true;
             }
         }
@@ -129,12 +144,20 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         try
         {
             var result = await DispatchNewAsync(
-                entry, progress, effectiveCancellation, handoffContext);
+                entry, progress, effectiveCancellation, handoffContext, runtimeScope);
+            if (!state.IsCurrentAgentRuntimeScope(runtimeScope))
+                return TopicDispatchResult.Reject(
+                    "stale_account_scope",
+                    draft.RunId,
+                    "The active account changed while dispatch was running.");
             entry.Dispatch.TrySetResult(result);
-            if (!result.Accepted || entry.RemoteDeviceId is not null)
+            if (!result.Accepted && IsRetryablePreDispatch(result))
+                ForgetRetryable(entry);
+            else if (!result.Accepted || entry.RemoteDeviceId is not null)
                 RememberCompletion(entry);
             return result;
         }
+
         catch (OperationCanceledException) when (effectiveCancellation.IsCancellationRequested)
         {
             var result = TopicDispatchResult.Reject("cancelled", draft.RunId);
@@ -147,10 +170,10 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             entry.Dispatch.TrySetException(ex);
             lock (submitGate)
             {
-                runs.TryRemove(draft.RunId, out _);
-                var triggerKey = TriggerKey(draft);
-                if (triggerRuns.TryGetValue(triggerKey, out var runId)
-                    && string.Equals(runId, draft.RunId, StringComparison.Ordinal))
+                runs.TryRemove(runKey, out _);
+                var triggerKey = TriggerKey(runtimeScope, draft);
+                if (triggerRuns.TryGetValue(triggerKey, out var storedRunKey)
+                    && string.Equals(storedRunKey, runKey, StringComparison.Ordinal))
                     triggerRuns.Remove(triggerKey);
             }
             throw;
@@ -168,92 +191,216 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         }
     }
 
+    private static bool IsRetryablePreDispatch(TopicDispatchResult result)
+        => !result.Durable
+           && result.Code is "device_not_eligible" or "dispatch_failed";
+
+    private void ForgetRetryable(RunEntry entry)
+    {
+        lock (submitGate)
+        {
+            var runKey = RunKey(entry.RuntimeScope, entry.Draft.RunId);
+            runs.TryRemove(runKey, out _);
+            var triggerKey = TriggerKey(entry.RuntimeScope, entry.Draft);
+            if (triggerRuns.TryGetValue(triggerKey, out var storedRunKey)
+                && string.Equals(storedRunKey, runKey, StringComparison.Ordinal))
+                triggerRuns.Remove(triggerKey);
+        }
+    }
+
     public Task<bool> CancelQueuedAsync(
-        string threadId,
-        string runId,
-        string lineId,
+        ScopedAsyncOperation operation,
         CancellationToken cancellationToken)
-        => RunOffDispatcherAsync(
-            "topic.cancel-queued",
-            () => CancelQueuedCoreAsync(threadId, runId, lineId, cancellationToken));
+        => GetOrStartCancellation(
+            "queued",
+            operation,
+            () => RunOffDispatcherAsync(
+                "topic.cancel-queued",
+                () => CancelQueuedCoreAsync(operation, cancellationToken)));
 
     private async Task<bool> CancelQueuedCoreAsync(
-        string threadId,
-        string runId,
-        string lineId,
+        ScopedAsyncOperation operation,
         CancellationToken cancellationToken)
     {
-        if (!state.IsQueuedTopicRunLine(threadId, runId, lineId))
+        if (!TryCaptureCancellationTarget(
+                operation, queued: true, out var runtimeScope, out _, out _, out _))
             return false;
+        using var runtimeContext = state.EnterAgentRuntimeScope(runtimeScope);
 
-        if (!await StopCoreAsync(threadId, runId, cancellationToken).ConfigureAwait(false))
+        if (!await StopCoreAsync(operation, cancellationToken, queued: true).ConfigureAwait(false))
             return false;
-        state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
-        return true;
+        return state.TryApplyScopedTopicCancellation(
+            operation,
+            queued: true,
+            () =>
+            {
+                state.SetQueuedTopicRunStage(
+                    operation.TopicId!, operation.RunId!, TopicQueueStage.Cancelling);
+                return true;
+            });
     }
 
     public Task<bool> StopAsync(
-        string threadId,
-        string runId,
+        ScopedAsyncOperation operation,
         CancellationToken cancellationToken)
-        => RunOffDispatcherAsync(
-            "topic.stop",
-            () => StopCoreAsync(threadId, runId, cancellationToken));
+        => GetOrStartCancellation(
+            "stop",
+            operation,
+            () => RunOffDispatcherAsync(
+                "topic.stop",
+                () => StopCoreAsync(operation, cancellationToken, queued: false)));
 
     private async Task<bool> StopCoreAsync(
-        string threadId,
-        string runId,
-        CancellationToken cancellationToken)
+        ScopedAsyncOperation operation,
+        CancellationToken cancellationToken,
+        bool queued)
     {
-        if (!TopicRunProtocol.IsValidIdentifier(threadId)
-            || !TopicRunProtocol.IsValidIdentifier(runId))
+        if (!TryCaptureCancellationTarget(
+                operation,
+                queued,
+                out var runtimeScope,
+                out var threadId,
+                out var runId,
+                out var entry))
             return false;
+        using var runtimeContext = state.EnterAgentRuntimeScope(runtimeScope);
 
-        if (!runs.TryGetValue(runId, out var entry)
-            || !string.Equals(entry.Draft.ThreadId, threadId, StringComparison.Ordinal))
+        if (entry is null)
         {
-            var thread = state.Profile.OwnThreads.FirstOrDefault(item =>
-                string.Equals(item.Id, threadId, StringComparison.Ordinal));
-            if (thread?.ExecutionDeviceId is null
-                || !state.IsKnownQueuedTopicRun(threadId, runId))
+            string? targetDeviceId = null;
+            TopicRunCancelPayload? cancel = null;
+            if (!state.TryApplyScopedTopicCancellation(
+                    operation,
+                    queued,
+                    () =>
+                    {
+                        targetDeviceId = state.Profile.OwnThreads.First(item =>
+                            string.Equals(item.Id, threadId, StringComparison.Ordinal))
+                            .AgentExecutionHostDeviceId;
+                        var outbox = state.GetTopicOutbox(runId);
+                        cancel = new TopicRunCancelPayload(
+                            runId,
+                            threadId,
+                            outbox?.Request.RequestId,
+                            outbox?.Request.OriginScopeId);
+                        return targetDeviceId is not null;
+                    }))
                 return false;
             var queuedCancelled = await deviceTransport.CancelAsync(
-                thread.ExecutionDeviceId,
-                new TopicRunCancelPayload(runId, threadId),
+                operation,
+                targetDeviceId!,
+                cancel!,
                 cancellationToken);
             if (queuedCancelled)
-                state.SetQueuedTopicRunStage(threadId, runId, TopicQueueStage.Cancelling);
+                state.TryApplyScopedTopicCancellation(
+                    operation,
+                    queued,
+                    () =>
+                    {
+                        state.SetQueuedTopicRunStage(
+                            threadId, runId, TopicQueueStage.Cancelling);
+                        return true;
+                    });
             return queuedCancelled;
         }
 
         var localCancellation = entry.LocalCancellation;
         if (localCancellation is not null)
         {
-            var isCurrent = string.Equals(
-                state.Profile.OwnThreads.FirstOrDefault(thread =>
-                    string.Equals(thread.Id, threadId, StringComparison.Ordinal))
-                    ?.ExecutionRunId,
-                runId,
-                StringComparison.Ordinal);
-            if (isCurrent && state.IsThreadBusy(threadId))
-                state.CancelThreadTurn(threadId);
-            try
-            {
-                localCancellation.Cancel();
-                return true;
-            }
-            catch (ObjectDisposedException)
-            {
-                return false;
-            }
+            return state.TryApplyScopedTopicCancellation(
+                operation,
+                queued,
+                () =>
+                {
+                    if (Interlocked.Exchange(ref entry.CancellationCommitted, 1) != 0)
+                        return true;
+                    if (state.IsThreadBusy(threadId))
+                        state.CancelThreadTurn(operation);
+                    try
+                    {
+                        localCancellation.Cancel();
+                        return true;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return false;
+                    }
+                });
         }
 
         if (entry.RemoteDeviceId is null) return false;
-        var cancelled = await deviceTransport.CancelAsync(
+        return await deviceTransport.CancelAsync(
+            operation,
             entry.RemoteDeviceId,
-            new TopicRunCancelPayload(runId, threadId),
+            new TopicRunCancelPayload(
+                runId,
+                threadId,
+                entry.Draft.TriggerOperationId ?? entry.Draft.TriggerLineId,
+                entry.OriginScopeId),
             cancellationToken);
-        return cancelled;
+    }
+
+    private bool TryCaptureCancellationTarget(
+        ScopedAsyncOperation operation,
+        bool queued,
+        out AgentRuntimeScopeToken runtimeScope,
+        out string threadId,
+        out string runId,
+        out RunEntry? entry)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        runtimeScope = default;
+        threadId = operation.TopicId ?? "";
+        runId = operation.RunId ?? "";
+        entry = null;
+        if (!TopicRunProtocol.IsValidIdentifier(threadId)
+            || !TopicRunProtocol.IsValidIdentifier(runId))
+            return false;
+
+        BeforeTransportCheckpointHook?.Invoke("cancellation-callee-lookup");
+        var capturedRuntimeScope = default(AgentRuntimeScopeToken);
+        var capturedThreadId = threadId;
+        var capturedRunId = runId;
+        RunEntry? capturedEntry = null;
+        var captured = state.TryApplyScopedTopicCancellation(
+            operation,
+            queued,
+            () =>
+            {
+                if (!state.TryCaptureAgentRuntimeScope(out capturedRuntimeScope))
+                    return false;
+                runs.TryGetValue(
+                    RunKey(capturedRuntimeScope, capturedRunId), out capturedEntry);
+                if (capturedEntry is not null
+                    && (!string.Equals(
+                            capturedEntry.Draft.ThreadId,
+                            capturedThreadId,
+                            StringComparison.Ordinal)
+                        || !string.Equals(
+                            operation.RequestId,
+                            capturedEntry.Draft.TriggerOperationId
+                            ?? capturedEntry.Draft.TriggerLineId,
+                            StringComparison.Ordinal)))
+                    return false;
+                return true;
+            });
+        runtimeScope = capturedRuntimeScope;
+        entry = capturedEntry;
+        return captured;
+    }
+
+    private Task<bool> GetOrStartCancellation(
+        string kind,
+        ScopedAsyncOperation operation,
+        Func<Task<bool>> start)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        var key = $"{kind}\0{operation.OperationId}";
+        return cancellationOperations.GetOrAdd(
+            key,
+            _ => new Lazy<Task<bool>>(
+                start,
+                LazyThreadSafetyMode.ExecutionAndPublication)).Value;
     }
     public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken)
@@ -294,11 +441,20 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         RunEntry entry,
         IProgress<TopicRunUpdatePayload>? progress,
         CancellationToken cancellationToken,
-        TopicSendHandoffContext? handoffContext)
+        TopicSendHandoffContext? handoffContext,
+        AgentRuntimeScopeToken runtimeScope)
     {
         var draft = entry.Draft;
-        var thread = state.Profile.OwnThreads.First(thread =>
-            string.Equals(thread.Id, draft.ThreadId, StringComparison.Ordinal));
+        OwnThread? thread = null;
+        if (!state.TryApplyAgentRuntimeScope(
+                runtimeScope,
+                () => thread = state.Profile.OwnThreads.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Id, draft.ThreadId, StringComparison.Ordinal)))
+            || thread is null)
+            return TopicDispatchResult.Reject(
+                "stale_account_scope",
+                draft.RunId,
+                "The active account changed before dispatch.");
         var trigger = thread.Lines.FirstOrDefault(line =>
             string.Equals(line.Id, draft.TriggerLineId, StringComparison.Ordinal));
         if (trigger is not null && !MatchingTrigger(trigger, draft))
@@ -311,9 +467,19 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         try
         {
             eligible = await ListEligibleDevicesCoreAsync(cancellationToken);
+            if (!state.IsCurrentAgentRuntimeScope(runtimeScope))
+                return TopicDispatchResult.Reject(
+                    "stale_account_scope",
+                    draft.RunId,
+                    "The active account changed while execution hosts were loaded.");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            if (!state.IsCurrentAgentRuntimeScope(runtimeScope))
+                return TopicDispatchResult.Reject(
+                    "stale_account_scope",
+                    draft.RunId,
+                    "The active account changed while execution hosts were loaded.");
             eligible = [];
         }
         var currentDeviceId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
@@ -321,7 +487,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             string.Equals(device.DeviceId, currentDeviceId, StringComparison.Ordinal))
             ?? eligible.FirstOrDefault();
         var targetId = string.IsNullOrWhiteSpace(draft.TargetDeviceId)
-            ? thread.ExecutionDeviceId ?? preferred?.DeviceId
+            ? thread.AgentExecutionHostDeviceId ?? preferred?.DeviceId
             : draft.TargetDeviceId;
         if (targetId is null)
             return TopicDispatchResult.Reject(
@@ -337,9 +503,9 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 return TopicDispatchResult.Reject(
                     "device_not_eligible", draft.RunId,
                     "The selected device is not agent-ready.");
-            if (thread.ExecutionDeviceId is not null
+            if (thread.AgentExecutionHostDeviceId is not null
                 && !string.Equals(
-                         thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
+                         thread.AgentExecutionHostDeviceId, target.DeviceId, StringComparison.Ordinal))
             {
                 return TopicDispatchResult.Reject(
                     "topic_bound_elsewhere", draft.RunId,
@@ -355,7 +521,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                     + (thread.ExecutionRunId is null ? 0 : 1),
             Timestamp: DateTimeOffset.UtcNow,
             TriggerLineId: draft.TriggerLineId);
-        var executionTarget = new ExecutionDevice(
+        var executionTarget = new AgentExecutionHost(
             target!.DeviceId, target.Name, target.Platform);
 
         if (string.Equals(target.DeviceId, currentDeviceId, StringComparison.Ordinal))
@@ -365,19 +531,27 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                     executionTarget,
                     TopicRunBeginMode.Local,
                     queuedUpdate);
-            var begin = handoffContext?.BeginTopicRun(
-                            beginCommand,
-                            () => state.BeginTopicRun(beginCommand))
-                        ?? state.BeginTopicRun(beginCommand);
-            if (!begin.Committed)
+            TopicRunBeginResult? begin = null;
+            if (!state.TryApplyAgentRuntimeScope(
+                    runtimeScope,
+                    () => begin = handoffContext?.BeginTopicRun(
+                                      beginCommand,
+                                      () => state.BeginTopicRun(beginCommand))
+                                  ?? state.BeginTopicRun(beginCommand)))
+                return TopicDispatchResult.Reject(
+                    "stale_account_scope",
+                    draft.RunId,
+                    "The active account changed before the run was persisted.");
+            var committedBegin = begin!;
+            if (!committedBegin.Committed)
             {
                 return TopicDispatchResult.Reject(
                     "local_persistence_failed",
                     draft.RunId,
-                    $"The run could not be durably started ({begin.Code}).");
+                    $"The run could not be durably started ({committedBegin.Code}).");
             }
             entry.DurableBeginCommitted = true;
-            AdoptAuthoritativeBegin(entry, begin);
+            AdoptAuthoritativeBegin(entry, committedBegin);
             var authoritativeDraft = entry.Draft;
             var authoritativeQueued = queuedUpdate with
             {
@@ -386,30 +560,33 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 TriggerLineId = authoritativeDraft.TriggerLineId
             };
             progress?.Report(authoritativeQueued);
-            if (begin.ProjectionDeferred)
+            if (committedBegin.ProjectionDeferred)
                 return TopicDispatchResult.Ok(
                     authoritativeDraft.RunId, "projection_deferred", durable: true);
-            if (!begin.Created)
+            if (!committedBegin.Created)
                 return TopicDispatchResult.Ok(
-                    authoritativeDraft.RunId, begin.Code, durable: true);
+                    authoritativeDraft.RunId, committedBegin.Code, durable: true);
 
             var linked = CancellationTokenSource.CreateLinkedTokenSource(
                 cancellationToken, lifetime.Token);
             entry.LocalCancellation = linked;
             var projectedProgress = new InlineProgress<TopicRunUpdatePayload>(update =>
             {
-                if (update.Phase == TopicRunPhase.Queued)
-                    state.TrackQueuedTopicRun(
-                        update.ThreadId,
-                        update.RunId,
-                        update.TriggerLineId ?? authoritativeDraft.TriggerLineId);
-                else if (update.Phase is TopicRunPhase.Completed
-                         or TopicRunPhase.Failed
-                         or TopicRunPhase.Cancelled)
-                    state.CompleteQueuedTopicRun(update.ThreadId, update.RunId);
-                else
-                    state.StartQueuedTopicRun(update.ThreadId, update.RunId);
-                progress?.Report(update);
+                state.TryApplyAgentRuntimeScope(entry.RuntimeScope, () =>
+                {
+                    if (update.Phase == TopicRunPhase.Queued)
+                        state.TrackQueuedTopicRun(
+                            update.ThreadId,
+                            update.RunId,
+                            update.TriggerLineId ?? authoritativeDraft.TriggerLineId);
+                    else if (update.Phase is TopicRunPhase.Completed
+                             or TopicRunPhase.Failed
+                             or TopicRunPhase.Cancelled)
+                        state.CompleteQueuedTopicRun(update.ThreadId, update.RunId);
+                    else
+                        state.StartQueuedTopicRun(update.ThreadId, update.RunId);
+                    progress?.Report(update);
+                });
             });
             TrackLocal(
                 RunLocalAsync(entry, authoritativeDraft, projectedProgress, linked),
@@ -439,7 +616,9 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             draft.WidgetId,
             draft.WidgetContext,
             manifests,
-            manifests.Select(manifest => manifest.Id).ToList());
+            manifests.Select(manifest => manifest.Id).ToList(),
+            draft.TriggerOperationId ?? draft.TriggerLineId,
+            entry.OriginScopeId);
         var command = new TopicRunBeginCommand(
             draft,
             executionTarget,
@@ -447,19 +626,27 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             queuedUpdate,
             request,
             attachments);
-        var remoteBegin = handoffContext?.BeginTopicRun(
-                              command,
-                              () => state.BeginTopicRun(command))
-                          ?? state.BeginTopicRun(command);
-        if (!remoteBegin.Committed)
+        TopicRunBeginResult? remoteBegin = null;
+        if (!state.TryApplyAgentRuntimeScope(
+                runtimeScope,
+                () => remoteBegin = handoffContext?.BeginTopicRun(
+                                         command,
+                                         () => state.BeginTopicRun(command))
+                                     ?? state.BeginTopicRun(command)))
+            return TopicDispatchResult.Reject(
+                "stale_account_scope",
+                draft.RunId,
+                "The active account changed before the run was persisted.");
+        var committedRemoteBegin = remoteBegin!;
+        if (!committedRemoteBegin.Committed)
         {
             return TopicDispatchResult.Reject(
                 "local_persistence_failed",
                 draft.RunId,
-                $"The run could not be durably started ({remoteBegin.Code}).");
+                $"The run could not be durably started ({committedRemoteBegin.Code}).");
         }
         entry.DurableBeginCommitted = true;
-        AdoptAuthoritativeBegin(entry, remoteBegin);
+        AdoptAuthoritativeBegin(entry, committedRemoteBegin);
         var authoritativeRemoteDraft = entry.Draft;
         progress?.Report(queuedUpdate with
         {
@@ -467,44 +654,53 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             ThreadId = authoritativeRemoteDraft.ThreadId,
             TriggerLineId = authoritativeRemoteDraft.TriggerLineId
         });
-        if (remoteBegin.ProjectionDeferred)
+        if (committedRemoteBegin.ProjectionDeferred)
             return TopicDispatchResult.Ok(
                 authoritativeRemoteDraft.RunId, "projection_deferred", durable: true);
-        if (remoteBegin.Outbox is null)
+        if (committedRemoteBegin.Outbox is null)
             return TopicDispatchResult.Ok(
-                authoritativeRemoteDraft.RunId, remoteBegin.Code, durable: true);
+                authoritativeRemoteDraft.RunId, committedRemoteBegin.Code, durable: true);
 
         try
         {
             BeforeTransportCheckpointHook?.Invoke(authoritativeRemoteDraft.RunId);
             var result = await deviceTransport.DispatchPersistedAsync(
-                remoteBegin.Outbox, cancellationToken);
-            if (!result.Accepted)
+                committedRemoteBegin.Outbox, cancellationToken);
+            var applied = state.TryApplyAgentRuntimeScope(runtimeScope, () =>
             {
-                if (result.Code is "device_not_eligible" or "sender_offline")
+                if (!result.Accepted)
                 {
-                    state.TryApplyRemoteRunUpdate(new TopicRunUpdatePayload(
-                        authoritativeRemoteDraft.RunId,
-                        authoritativeRemoteDraft.ThreadId,
-                        TopicRunPhase.Failed,
-                        "Unavailable",
-                        Error: result.Error,
-                        FailureCode: result.Code,
-                        Timestamp: DateTimeOffset.UtcNow,
-                        TriggerLineId: authoritativeRemoteDraft.TriggerLineId));
+                    if (result.Code is "device_not_eligible" or "sender_offline")
+                    {
+                        state.TryApplyRemoteRunUpdate(new TopicRunUpdatePayload(
+                            authoritativeRemoteDraft.RunId,
+                            authoritativeRemoteDraft.ThreadId,
+                            TopicRunPhase.Failed,
+                            "Unavailable",
+                            Error: result.Error,
+                            FailureCode: result.Code,
+                            Timestamp: DateTimeOffset.UtcNow,
+                            TriggerLineId: authoritativeRemoteDraft.TriggerLineId));
+                    }
+                    state.SetQueuedTopicRunStage(
+                        thread.Id, authoritativeRemoteDraft.RunId, TopicQueueStage.Failed);
                 }
-                state.SetQueuedTopicRunStage(
-                    thread.Id, authoritativeRemoteDraft.RunId, TopicQueueStage.Failed);
-            }
-            else
-            {
-                state.SetQueuedTopicRunStage(
-                    thread.Id,
+                else
+                {
+                    state.SetQueuedTopicRunStage(
+                        thread.Id,
+                        authoritativeRemoteDraft.RunId,
+                        TopicExecutionStatus.IsRelayAccepted(result.Code)
+                            ? TopicQueueStage.Relay
+                            : TopicQueueStage.Sending);
+                }
+            });
+            if (!applied)
+                return TopicDispatchResult.Reject(
+                    "stale_account_scope",
                     authoritativeRemoteDraft.RunId,
-                    TopicExecutionStatus.IsRelayAccepted(result.Code)
-                        ? TopicQueueStage.Relay
-                        : TopicQueueStage.Sending);
-            }
+                    "The active account changed while the durable request was dispatched.",
+                    durable: true);
             return result with
             {
                 RunId = authoritativeRemoteDraft.RunId,
@@ -518,9 +714,14 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         }
         finally
         {
-            var persistedTrigger = thread.Lines.FirstOrDefault(line =>
-                string.Equals(line.Id, draft.TriggerLineId, StringComparison.Ordinal));
-            persistedTrigger?.Attachments.Clear();
+            state.TryApplyAgentRuntimeScope(runtimeScope, () =>
+            {
+                var currentThread = state.Profile.OwnThreads.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Id, draft.ThreadId, StringComparison.Ordinal));
+                var persistedTrigger = currentThread?.Lines.FirstOrDefault(line =>
+                    string.Equals(line.Id, draft.TriggerLineId, StringComparison.Ordinal));
+                persistedTrigger?.Attachments.Clear();
+            });
         }
     }
 
@@ -533,10 +734,11 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         {
             var proposedRunId = entry.Draft.RunId;
             entry.Draft = Snapshot(begin.AuthoritativeDraft);
-            runs[entry.Draft.RunId] = entry;
-            triggerRuns[TriggerKey(entry.Draft)] = entry.Draft.RunId;
+            var authoritativeRunKey = RunKey(entry.RuntimeScope, entry.Draft.RunId);
+            runs[authoritativeRunKey] = entry;
+            triggerRuns[TriggerKey(entry.RuntimeScope, entry.Draft)] = authoritativeRunKey;
             if (!string.Equals(proposedRunId, entry.Draft.RunId, StringComparison.Ordinal))
-                runs.TryRemove(proposedRunId, out _);
+                runs.TryRemove(RunKey(entry.RuntimeScope, proposedRunId), out _);
         }
     }
 
@@ -555,7 +757,10 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         }
         finally
         {
-            state.CompleteLocalTopicRun(draft.RunId, DateTimeOffset.UtcNow);
+            state.TryCompleteLocalTopicRun(
+                entry.RuntimeScope,
+                draft.RunId,
+                DateTimeOffset.UtcNow);
             entry.LocalCancellation = null;
             cancellation.Dispose();
             RememberCompletion(entry);
@@ -588,7 +793,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         }
     }
 
-    private Task StopAsync()
+    private Task StopForProcessShutdownAsync()
     {
         lock (stopGate)
             return stopTask ??= StopCoreAsync();
@@ -626,7 +831,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync().ConfigureAwait(false);
+        await StopForProcessShutdownAsync().ConfigureAwait(false);
         lifetime.Dispose();
     }
     private string? Validate(TopicTurnDraft draft)
@@ -766,10 +971,20 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
            && string.Equals(
                left.TriggerOperationId, right.TriggerOperationId, StringComparison.Ordinal);
 
-    private static string TriggerKey(TopicTurnDraft draft)
-        => string.IsNullOrWhiteSpace(draft.TriggerOperationId)
-            ? draft.ThreadId + "\0" + draft.TriggerLineId
-            : "operation\0" + draft.TriggerOperationId;
+    private static string RunKey(AgentRuntimeScopeToken scope, string runId)
+        => $"{scope.Identity}\0{scope.Generation}\0{runId}";
+
+    private static string OriginScopeId(AgentRuntimeScopeToken scope)
+        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            $"{scope.Identity}\0{scope.Generation}"))).ToLowerInvariant();
+
+    private static string TriggerKey(
+        AgentRuntimeScopeToken scope,
+        TopicTurnDraft draft)
+        => $"{scope.Identity}\0{scope.Generation}\0"
+           + (string.IsNullOrWhiteSpace(draft.TriggerOperationId)
+               ? draft.ThreadId + "\0" + draft.TriggerLineId
+               : "operation\0" + draft.TriggerOperationId);
 
     private static string AttachmentFingerprint(IReadOnlyList<ChatAttachment>? attachments)
     {
@@ -801,13 +1016,13 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         lock (submitGate)
         {
             entry.Draft = entry.Draft with { Attachments = null };
-            completedRuns.Enqueue(entry.Draft.RunId);
+            completedRuns.Enqueue(RunKey(entry.RuntimeScope, entry.Draft.RunId));
             while (completedRuns.Count > MaxRememberedRuns)
             {
                 var expired = completedRuns.Dequeue();
                 if (runs.TryRemove(expired, out var removed))
                     triggerRuns.Remove(
-                        TriggerKey(removed.Draft));
+                        TriggerKey(removed.RuntimeScope, removed.Draft));
             }
         }
     }

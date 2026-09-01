@@ -33,10 +33,10 @@
 
         <div class="new-chat-split">
             <button class="new-chat-primary" @onclick="NewThreadOnDefault"
-                    disabled="@(eligibleDevices.Count == 0)" aria-label="New chat on an online agent-ready device">
+                    disabled="@(communicationDevices.Count == 0)" aria-label="New chat on a linked device">
                 <span class="new-chat-icon"><i class="bi bi-plus-lg"></i></span>
                 <span class="new-chat-label">New chat</span>
-                <span class="new-chat-device">Online agent host</span>
+                <span class="new-chat-device">Communication destination</span>
             </button>
             <button class="new-chat-menu-button" @onclick="OpenNewDeviceMenu" aria-label="Choose a device for new chat"
                     aria-haspopup="dialog" aria-expanded="@newDeviceMenuOpen">
@@ -75,9 +75,9 @@
                                         <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
                                         @if (IsAssignedElsewhere(t))
                                         {
-                                            <span class="device-pill @(IsDeviceOnline(t.ExecutionDeviceId) ? "" : "offline")"
+                                            <span class="device-pill @(IsDeviceOnline(t.CommunicationDestinationDeviceId) ? "" : "offline")"
                                                   title="@DeviceStatus(t)">
-                                                <i class="bi @PlatformIcon(t.ExecutionDevicePlatform)"></i>
+                                                <i class="bi @PlatformIcon(t.CommunicationDestinationDevicePlatform)"></i>
                                                 @DeviceLabel(t)
                                             </span>
                                         }
@@ -118,7 +118,7 @@
                 @foreach (var device in DeviceChoices)
                 {
                     <button class="device-choice"
-                            disabled="@(!CanRunHere(device))"
+                            disabled="@(!CanCommunicateWith(device))"
                             @onclick="() => NewThread(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -150,8 +150,15 @@ else
                 {
                     <span class="device-pill @(ActiveDeviceOnline ? "" : "offline")"
                           title="@DeviceStatus(Active)">
-                        <i class="bi @PlatformIcon(Active.ExecutionDevicePlatform)"></i>
+                        <i class="bi @PlatformIcon(Active.CommunicationDestinationDevicePlatform)"></i>
                         @DeviceLabel(Active)
+                    </span>
+                }
+                @if (!string.IsNullOrWhiteSpace(Active.AgentExecutionHostDeviceId))
+                {
+                    <span class="device-pill" title="AI execution host">
+                        <i class="bi bi-cpu"></i>
+                        AI host: @ExecutionHostLabel(Active)
                     </span>
                 }
             </div>
@@ -163,7 +170,8 @@ else
                         @(Active.IsPinned ? "Unpin topic" : "Pin topic")
                     </button>
                     <button role="menuitem" @onclick="BeginRenameFromMenu"><i class="bi bi-pencil"></i> Rename</button>
-                    <button role="menuitem" @onclick="OpenMoveMenuFromActions"><i class="bi bi-phone-flip"></i> Move to device</button>
+                    <button role="menuitem" @onclick="OpenMoveMenuFromActions"><i class="bi bi-phone-flip"></i> Change communication destination</button>
+                    <button role="menuitem" @onclick="OpenHostMenu"><i class="bi bi-cpu"></i> Change AI execution host</button>
                     @if (Active.Lines.Count > 0)
                     {
                         <button role="menuitem" @onclick="OpenReportFromActions"><i class="bi bi-flag"></i> Report AI content</button>
@@ -492,6 +500,10 @@ else
                     </button>
                     <textarea @ref="composerEl" @bind="input" @bind:event="oninput" rows="1" class="composer-input"
                               placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
+                    <button class="primary send-btn" @onclick="PrimaryComposerAction" disabled="@(!CanSend || SendPending)"
+                            title="@PrimaryActionTitle" aria-label="@PrimaryActionLabel">
+                        <i class="bi bi-send"></i>
+                    </button>
                     @if (ShowStopAction)
                     {
                         <button class="primary send-btn stop-btn" @onclick="StopActive"
@@ -503,9 +515,18 @@ else
                     }
                     else
                     {
-                        <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend || SendPending)" title="@SendTitle" aria-label="@SendTitle">
-                            <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
-                        </button>
+                        @if (IsCommunicationTopic)
+                        {
+                            <button class="ghost" @onclick="RequestAiResponse" disabled="@(!CanSend || SendPending)"
+                                    title="Request an AI response on the selected agent host"
+                                    aria-label="Ask assistant">Ask assistant</button>
+                        }
+                        else
+                        {
+                            <button class="ghost" @onclick="Send" disabled="@(!CanSend)"
+                                    title="Send message without requesting an AI response"
+                                    aria-label="Send message only">Send message only</button>
+                        }
                     }
                 </div>
                 @if (TopicRestorePending)
@@ -533,7 +554,25 @@ else
                         <button class="link-btn" @onclick="ReconcilePendingSend" aria-label="Retry status">Retry status</button>
                     </div>
                 }
-                @if (attachError is not null) { <p class="err-text">@attachError</p> }
+                @if (VisibleOperationError is not null)
+                {
+                    <p class="err-text" role="alert">
+                        @VisibleOperationError
+                        @if (aiRetryAvailable)
+                        {
+                            <button class="link-btn" @onclick="RetryAiResponse" aria-label="Retry AI response">Retry AI response</button>
+                            <button class="link-btn" @onclick="OpenHostMenu">Change AI host</button>
+                        }
+                    </p>
+                }
+                else if (aiRetryAvailable)
+                {
+                    <p class="err-text" role="status" aria-live="polite">
+                        Message saved. AI response retry pending.
+                        <button class="link-btn" @onclick="RetryAiResponse" aria-label="Retry AI response">Retry AI response</button>
+                        <button class="link-btn" @onclick="OpenHostMenu">Change AI host</button>
+                    </p>
+                }
                 @if (capacityBlockedSubmission is not null)
                 {
                     <p class="err-text" role="alert" aria-live="assertive">
@@ -549,7 +588,15 @@ else
                 }
                 @if (Active is not null && !ActiveExecutionEligible)
                 {
-                    <div class="warn-banner" role="status"><i class="bi bi-exclamation-triangle"></i> @DeviceLabel(Active) is unavailable for execution. Reassign this topic to an online agent-ready device.</div>
+                    <div class="warn-banner" role="status">
+                        <i class="bi bi-exclamation-triangle"></i>
+                        AI response unavailable. Messages remain saved; connect or choose an online agent-ready Desktop.
+                        @if (Active.Lines.Any(line => line.Role == "user"))
+                        {
+                            <button class="link-btn" @onclick="RetryAiResponse" aria-label="Retry AI response">Retry AI response</button>
+                        }
+                        <button class="link-btn" @onclick="OpenHostMenu">Change AI host</button>
+                    </div>
                 }
                 @if (ActiveUsesCurrentDevice && !Agent.IsModelReady)
                 {
@@ -578,7 +625,7 @@ else
                 @foreach (var device in DeviceChoices)
                 {
                     <button class="device-choice"
-                            disabled="@(!CanRunHere(device) || IsActiveDevice(device))"
+                            disabled="@(!CanCommunicateWith(device) || IsActiveDevice(device))"
                             @onclick="() => ChooseMoveTarget(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
@@ -586,6 +633,34 @@ else
                             <small>@DeviceAvailability(device)</small>
                         </span>
                     </button>
+                }
+                @if (hostMenuOpen)
+                {
+                    <MobileOverlayScope />
+                    <div class="sheet-scrim" @onclick="CloseDeviceMenus">
+                        <div class="device-sheet" role="dialog" aria-modal="true" aria-label="Change AI execution host" tabindex="-1" autofocus
+                             @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
+                            <div class="sheet-handle"></div>
+                            <h3>Change AI execution host</h3>
+                            <p class="sheet-copy">Only an online agent-ready Desktop can run the assistant.</p>
+                            @foreach (var device in executionHosts)
+                            {
+                                <button class="device-choice"
+                                        disabled="@(!global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device))"
+                                        @onclick="() => ChooseExecutionHost(device)">
+                                    <i class="bi @PlatformIcon(device.Platform)"></i>
+                                    <span class="device-choice-main">
+                                        <strong>@FriendlyName(device)</strong>
+                                        <small>Online · Agent ready</small>
+                                    </span>
+                                </button>
+                            }
+                            @if (executionHosts.Count == 0)
+                            {
+                                <p class="sheet-copy" role="status">No online agent-ready Desktop is available.</p>
+                            }
+                        </div>
+                    </div>
                 }
             </div>
         </div>
@@ -645,10 +720,12 @@ else
     string? widgetLoadError;
     bool newDeviceMenuOpen;
     bool moveMenuOpen;
+    bool hostMenuOpen;
     bool actionsMenuOpen;
     global::Mesh.Shared.DeviceInfo? pendingMove;
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> rosterDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
-    IReadOnlyList<global::Mesh.Shared.DeviceInfo> eligibleDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> communicationDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
+    IReadOnlyList<global::Mesh.Shared.DeviceInfo> executionHosts = Array.Empty<global::Mesh.Shared.DeviceInfo>();
     bool confirmDelete;
     bool renaming;
     string renameText = "";
@@ -693,6 +770,7 @@ else
     string? lastScrolledThread;
     bool lastBusy;
     bool disposed;
+    readonly string asyncScopeOwner = $"mobile-me:{Guid.NewGuid():n}";
     Task? disposalTask;
     long navigationGeneration;
     long inputRevision;
@@ -700,12 +778,20 @@ else
     string? restoreOperationKey;
     readonly CancellationTokenSource callbackLifetime = new();
     readonly LatestWinsRefreshCoordinator deviceRefreshes = new();
+    string? rosterAccountId;
+    AgentRuntimeScopeToken? rosterRuntimeScope;
+    long rosterGeneration;
+    Task? rosterRefreshLoop;
     readonly string componentLifecycleId = Guid.NewGuid().ToString("n");
     ITopicSendObserverDispatcher? observerDispatcher;
     readonly Dictionary<string, ITopicSendObserverSubscription> sendObserverSubscriptions =
         new(StringComparer.Ordinal);
     readonly HashSet<string> cleanupRecoveryAttempts = new(StringComparer.Ordinal);
     TopicSendSnapshot? capacityBlockedSubmission;
+    bool aiRetryAvailable;
+    PendingMobileAiRetry? pendingMobileAiRetry;
+    bool aiRetryRunning;
+    sealed record PendingMobileAiRetry(string ThreadId, string RunId, string TriggerLineId);
 
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
     RemoteRunProjection? RemoteRun => Active is null ? null : RemoteRunPresentation.VisibleProjection(
@@ -715,29 +801,29 @@ else
         (State.IsThreadBusy(Active.Id)
          || RemoteRun is { } activeRemoteRun && RemoteRunActivity.IsProjectionActive(
              activeRemoteRun, DateTimeOffset.UtcNow, UsesAuthoritativeState(Active))
-         || IsAssignedElsewhere(Active) && RemoteRunActivity.IsPersistedRunActive(
+         || IsExecutionRemote(Active) && RemoteRunActivity.IsPersistedRunActive(
              Active, DateTimeOffset.UtcNow, UsesAuthoritativeState(Active)));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
+    bool IsCommunicationTopic => Active?.ConversationKind == ConversationKind.Communication;
     string ComposerPlaceholder => widgetMode
         ? "Describe the widget you want…"
         : selectedWidget is not null
             ? $"Use or change {selectedWidget.Name}…"
-            : "Message your assistant…";
-    string ComposerAriaLabel => "Message your assistant";
+            : IsCommunicationTopic ? "Message this device…" : "Message your assistant…";
+    string ComposerAriaLabel => IsCommunicationTopic ? "Message this device" : "Message your assistant";
+    string PrimaryActionTitle => IsCommunicationTopic ? "Send message" : "Send message and ask assistant";
+    string PrimaryActionLabel => IsCommunicationTopic ? "Send message" : "Ask AI on agent host";
     string? DraftError => activeThread is null ? null : State.GetTopicDraftError(activeThread);
     void RetryDraft()
     {
         if (activeThread is not null) State.RetryTopicDraft(activeThread);
     }
-    bool ActiveDeviceOnline => Active is null || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
-        || IsDeviceOnline(Active.ExecutionDeviceId);
+    bool ActiveDeviceOnline => Active is null || string.IsNullOrWhiteSpace(Active.CommunicationDestinationDeviceId)
+        || IsDeviceOnline(Active.CommunicationDestinationDeviceId);
     bool ActiveUsesCurrentDevice => Active is null
-        || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
-        || string.Equals(Active.ExecutionDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
-    bool ActiveExecutionEligible => Active is not null
-        && (Active.ExecutionDeviceId is { } id
-            ? eligibleDevices.Any(device => device.DeviceId == id)
-            : eligibleDevices.Count > 0);
+        || string.IsNullOrWhiteSpace(Active.AgentExecutionHostDeviceId)
+        || string.Equals(Active.AgentExecutionHostDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+    bool ActiveExecutionEligible => executionHosts.Count > 0;
     bool HasSendableDraft => !string.IsNullOrWhiteSpace(input)
         || attachments.Count > 0
         || selectedWidget is not null;
@@ -779,17 +865,19 @@ else
         && outcome?.Kind == TopicSendOutcomeKind.Reconciling;
     bool CanSend => !widgetLoading
         && widgetLoadError is null
-        && ActiveExecutionEligible
         && HasSendableDraft;
-    string SendTitle => Active is not null && Active.ExecutionDeviceId is not null
-                        && !ActiveExecutionEligible
-        ? $"Reassign from unavailable {DeviceLabel(Active)}"
-        : !ActiveExecutionEligible
-            ? "No online agent-ready device is available"
-            : "Send";
+    bool CanRequestAi => CanSend;
 
     readonly List<StagedFile> attachments = new();
     string? attachError;
+    string? assistantProjectionError;
+    string? composerPersistenceError;
+    string? topicRestoreError;
+    string? VisibleOperationError =>
+        attachError
+        ?? assistantProjectionError
+        ?? composerPersistenceError
+        ?? topicRestoreError;
 
     // Messages submitted while a topic is busy stay visible below the live response. The runner answers
     // them FIFO, one serialized turn per prompt, and reply correlation restores prompt/answer pairing.
@@ -816,11 +904,19 @@ else
     {
         var queued = QueueInfo(line);
         if (queued is null) return Task.CompletedTask;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:cancel:{queued.ThreadId}",
+            queued.ThreadId,
+            line.Id,
+            runId: queued.RunId);
         UiOperations.TryRun(
             StopKey(queued.ThreadId, queued.RunId),
             "ui.topic.cancel-queued",
-            ct => TopicRouter.CancelQueuedAsync(queued.ThreadId, queued.RunId, line.Id, ct),
-            outcome => ApplyCancellationOutcomeAsync(outcome, queued: true),
+            ct => TopicRouter.CancelQueuedAsync(operationScope, ct),
+            outcome => ApplyCancellationOutcomeAsync(
+                outcome,
+                queued: true,
+                operationScope),
             callbackLifetime.Token);
         return Task.CompletedTask;
     }
@@ -891,7 +987,7 @@ else
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => rosterDevices
         .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
         .Select(group => group.First())
-        .OrderByDescending(CanRunHere)
+        .OrderByDescending(CanCommunicateWith)
         .ThenByDescending(device => device.Online)
         .ThenBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
         .ToArray();
@@ -921,11 +1017,14 @@ else
         {
             activeThread = wanted;
             RestoreTopicState(wanted);
+            RestorePendingAiRequest();
         }
         else
             activeThread = null;
         Mesh.StateChanged += OnMeshStateChanged;
+        EnsureRosterScope();
         RequestDeviceRefresh();
+        rosterRefreshLoop = RefreshRosterWhileMountedAsync();
     }
 
     void OnMeshStateChanged()
@@ -933,6 +1032,37 @@ else
         if (disposed || Shutdown.IsStopping) return;
         RequestDeviceRefresh();
         Refresh();
+    }
+
+    void EnsureRosterScope()
+    {
+        var accountId = State.ActiveAccountId;
+        AgentRuntimeScopeToken? runtimeScope = null;
+        if (accountId is not null
+            && State.TryCaptureAgentRuntimeScope(out var capturedScope))
+            runtimeScope = capturedScope;
+        if (string.Equals(rosterAccountId, accountId, StringComparison.Ordinal)
+            && rosterRuntimeScope == runtimeScope) return;
+        rosterAccountId = accountId;
+        rosterRuntimeScope = runtimeScope;
+        Interlocked.Increment(ref rosterGeneration);
+        rosterDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
+        communicationDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
+        executionHosts = Array.Empty<global::Mesh.Shared.DeviceInfo>();
+        aiRetryRunning = false;
+    }
+
+    async Task RefreshRosterWhileMountedAsync()
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(200));
+            while (await timer.WaitForNextTickAsync(callbackLifetime.Token).ConfigureAwait(false))
+                RequestDeviceRefresh();
+        }
+        catch (OperationCanceledException) when (callbackLifetime.IsCancellationRequested)
+        {
+        }
     }
 
     static string? ParseQueryValue(string queryString, string key)
@@ -953,7 +1083,14 @@ else
         Shutdown.Track(InvokeAsync(() =>
         {
             Interlocked.Exchange(ref renderQueued, 0);
-            if (!disposed && !Shutdown.IsStopping) StateHasChanged();
+            if (!disposed && !Shutdown.IsStopping)
+            {
+                var priorGeneration = rosterGeneration;
+                EnsureRosterScope();
+                if (priorGeneration != rosterGeneration) RequestDeviceRefresh();
+                RestorePendingAiRequest();
+                StateHasChanged();
+            }
         }), "mobile Me refresh");
     }
 
@@ -962,19 +1099,44 @@ else
     async Task ResolveAskAsync(string promptId, string optionId)
     {
         if (!askResolving.Add(promptId)) return; // one click wins; ignore re-entrancy
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:ask:{promptId}");
         try
         {
             await State.ResolveAskUserPromptAsync(promptId, optionId);
         }
         finally
         {
-            askResolving.Remove(promptId);
-            await InvokeAsync(StateHasChanged);
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                askResolving.Remove(promptId);
+                if (!disposed) StateHasChanged();
+            });
         }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        var renderedThread = activeThread;
+        if (!State.TryCaptureScopedAsyncOperation(
+            "ui:mobile-me:render",
+            out var renderScope,
+            renderedThread))
+            return;
+        bool TryApplyRender(Action mutation)
+        {
+            var applied = false;
+            State.TryApplyScopedAsyncOperation(renderScope!, () =>
+            {
+                if (disposed
+                    || !string.Equals(activeThread, renderedThread, StringComparison.Ordinal))
+                    return;
+                mutation();
+                applied = true;
+            });
+            return applied;
+        }
+
         if (firstRender)
             selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
 
@@ -982,14 +1144,20 @@ else
         // mutually exclusive, so firstRender alone cannot initialize both.
         if (Active is null)
         {
-            composerWired = false;
-            lastScrolledThread = null;
-            try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false); } catch { }
+            if (!TryApplyRender(() =>
+                {
+                    composerWired = false;
+                    lastScrolledThread = null;
+                })) return;
+            try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false, asyncScopeOwner); } catch { }
+            if (!TryApplyRender(() => { })) return;
             try { await JS.InvokeVoidAsync("meshUI.swipeActions", threadRowsEl); } catch { }
+            TryApplyRender(() => { });
             return;
         }
 
-        try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", true); } catch { }
+        try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", true, asyncScopeOwner); } catch { }
+        if (!TryApplyRender(() => { })) return;
 
         if (selfRef is not null)
         {
@@ -998,22 +1166,28 @@ else
                 try
                 {
                     await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5);
+                    if (!TryApplyRender(() => { })) return;
                     await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef);
-                    composerWired = true;
+                    if (!TryApplyRender(() => composerWired = true)) return;
                 }
                 catch { }
             }
         }
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
+        if (!TryApplyRender(() => { })) return;
 
-        var scrollToLatest = scrollToLatestRequested;
-        scrollToLatestRequested = false;
-        if (preserveHistoryScroll)
-        {
-            preserveHistoryScroll = false;
-            if (!scrollToLatest) return;
-        }
+        var scrollToLatest = false;
+        var stopForHistory = false;
+        if (!TryApplyRender(() =>
+            {
+                scrollToLatest = scrollToLatestRequested;
+                scrollToLatestRequested = false;
+                if (!preserveHistoryScroll) return;
+                preserveHistoryScroll = false;
+                stopForHistory = !scrollToLatest;
+            })) return;
+        if (stopForHistory) return;
 
         // Scroll on first paint, when a line is added, AND when the active thread's turn finishes
         // (busy true->false): the reply is added while the thread is still busy, so tracking that
@@ -1024,16 +1198,21 @@ else
         if (activeChanged)
         {
             try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
+            if (!TryApplyRender(() => { })) return;
         }
         if (scrollToLatest || firstRender || activeChanged || count != lastCount || ActiveBusy != lastBusy || ActiveBusy)
         {
-            lastCount = count;
-            lastBusy = ActiveBusy;
-            lastScrolledThread = activeThread;
+            if (!TryApplyRender(() =>
+                {
+                    lastCount = count;
+                    lastBusy = ActiveBusy;
+                    lastScrolledThread = renderedThread;
+                })) return;
             var method = scrollToLatest || firstRender || activeChanged
                 ? "meshUI.scrollToBottom"
                 : "meshUI.scrollToBottomIfPinned";
             try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
+            TryApplyRender(() => { });
         }
     }
 
@@ -1044,7 +1223,9 @@ else
 
     /// <summary>Invoked from JS when the user presses Enter (without Shift) in the composer.</summary>
     [Microsoft.JSInterop.JSInvokable]
-    public Task SendFromComposer() => Send();
+    public Task SendFromComposer() => PrimaryComposerAction();
+
+    Task PrimaryComposerAction() => IsCommunicationTopic ? Send() : RequestAiResponse();
 
     /// <summary>
     /// Invoked from paste.js when a file is pasted into the composer. Writes the pasted bytes to a temp
@@ -1070,6 +1251,13 @@ else
 
     void RequestDeviceRefresh()
     {
+        EnsureRosterScope();
+        var requestedAccountId = rosterAccountId;
+        var requestedGeneration = rosterGeneration;
+        if (!State.TryCaptureScopedAsyncOperation(
+                $"{asyncScopeOwner}:roster",
+                out var operationScope))
+            return;
         deviceRefreshes.Request(
             async cancellationToken =>
             {
@@ -1077,13 +1265,21 @@ else
                     .ConfigureAwait(false);
                 var executable =
                     global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(devices);
-                if (disposed) return;
+                if (disposed || !State.IsCurrentScopedAsyncOperation(operationScope!)) return;
                 await InvokeAsync(() =>
                 {
-                    if (disposed) return;
-                    rosterDevices = devices;
-                    eligibleDevices = executable;
-                    StateHasChanged();
+                    EnsureRosterScope();
+                    if (disposed
+                        || requestedGeneration != rosterGeneration
+                        || !string.Equals(requestedAccountId, rosterAccountId, StringComparison.Ordinal)) return;
+                    State.TryCompleteScopedAsyncOperation(operationScope!, () =>
+                    {
+                        rosterDevices = devices;
+                        communicationDevices =
+                            global::Mesh.Shared.DeviceCommunicationReachability.CommunicationTargets(devices);
+                        executionHosts = executable;
+                        StateHasChanged();
+                    });
                 });
             },
             ex =>
@@ -1106,7 +1302,27 @@ else
         actionsMenuOpen = false;
         confirmDelete = false;
         renaming = false;
+        attachError = null;
+        composerPersistenceError = null;
+        topicRestoreError = null;
         RestoreTopicState(id);
+        RestorePendingAiRequest();
+    }
+
+    void RestorePendingAiRequest()
+    {
+        var request = Active is null ? null : State.GetPendingAssistantAiRequest(Active.Id);
+        ApplyAssistantProjection(request);
+    }
+
+    void ApplyAssistantProjection(AssistantAiRequest? request)
+    {
+        var projection = AssistantAiRequestReducer.Project(request);
+        pendingMobileAiRetry = projection.RetryVisible && request is not null
+            ? new PendingMobileAiRetry(request.ThreadId, request.RunId, request.TriggerLineId)
+            : null;
+        aiRetryAvailable = projection.RetryVisible;
+        assistantProjectionError = projection.Error;
     }
 
     void RestoreTopicState(string threadId)
@@ -1117,6 +1333,9 @@ else
             $"topic.open:{componentLifecycleId}:{threadId}";
         var requestId = $"{generation}:{revision}";
         restoreOperationKey = operationKey;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:restore:{threadId}",
+            threadId);
         UiOperations.RunLatest(
             operationKey,
             requestId,
@@ -1125,13 +1344,17 @@ else
             ct =>
             {
                 ct.ThrowIfCancellationRequested();
-                var draft = State.GetTopicDraftState(threadId);
-                ct.ThrowIfCancellationRequested();
-                State.MarkThreadSeen(threadId);
+                MeshDb.ComposerDraft? draft = null;
+                State.TryApplyScopedAsyncOperation(operationScope, () =>
+                {
+                    draft = State.GetTopicDraftState(threadId);
+                    ct.ThrowIfCancellationRequested();
+                    State.MarkThreadSeen(threadId);
+                });
                 return Task.FromResult(draft);
             },
             outcome => ApplyTopicRestoreOutcomeAsync(
-                threadId, generation, revision, operationKey, outcome),
+                threadId, generation, revision, operationKey, operationScope, outcome),
             callbackLifetime.Token,
             TimeSpan.FromSeconds(8));
     }
@@ -1141,59 +1364,63 @@ else
         long generation,
         long revision,
         string operationKey,
+        ScopedAsyncOperation operationScope,
         UiOperationOutcome<MeshDb.ComposerDraft?> outcome)
         => InvokeAsync(() =>
         {
-            if (disposed
-                || generation != navigationGeneration
-                || !string.Equals(activeThread, threadId, StringComparison.Ordinal))
-                return;
-
-            if (string.Equals(restoreOperationKey, operationKey, StringComparison.Ordinal)
-                && !UiOperations.IsRunning(operationKey))
-                restoreOperationKey = null;
-
-            switch (outcome.Kind)
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
             {
-                case UiOperationOutcomeKind.Succeeded:
-                    if (revision != inputRevision)
-                    {
-                        attachError = "Draft state changed while recovery was running; reconciling the latest revision.";
-                        AttachPendingSendObserver(threadId);
-                        RestoreTopicState(threadId);
-                    }
-                    else if (outcome.Result is { IsMalformed: true })
-                    {
-                        inputValue = outcome.Result.Text;
-                        inputRevision = 0;
-                        attachError = "This legacy draft has an invalid revision and must be edited before sending.";
-                        AttachPendingSendObserver(threadId);
-                    }
-                    else
-                    {
-                        var restored = outcome.Result;
-                        inputValue = restored?.Text ?? "";
-                        inputRevision = restored?.Revision ?? 0;
-                        RestoreComposerSnapshot(restored?.TopicSnapshot);
-                        if (inputRevision > 0)
-                            ComposerRevisions.SetExact(threadId, inputRevision, inputValue);
-                        attachError = null;
-                        AttachPendingSendObserver(threadId);
-                    }
-                    break;
-                case UiOperationOutcomeKind.TimedOut:
-                    attachError = "This topic opened, but local draft recovery is still pending.";
-                    ScheduleTopicRestoreRetry(threadId, generation);
-                    break;
-                case UiOperationOutcomeKind.Failed:
-                    attachError = "This topic opened, but its local draft could not be restored.";
-                    ScheduleTopicRestoreRetry(threadId, generation);
-                    break;
-                case UiOperationOutcomeKind.Cancelled:
-                    ScheduleTopicRestoreRetry(threadId, generation);
-                    break;
-            }
-            StateHasChanged();
+                if (disposed
+                    || generation != navigationGeneration
+                    || !string.Equals(activeThread, threadId, StringComparison.Ordinal))
+                    return;
+
+                if (string.Equals(restoreOperationKey, operationKey, StringComparison.Ordinal)
+                    && !UiOperations.IsRunning(operationKey))
+                    restoreOperationKey = null;
+
+                switch (outcome.Kind)
+                {
+                    case UiOperationOutcomeKind.Succeeded:
+                        if (revision != inputRevision)
+                        {
+                            topicRestoreError = "Draft state changed while recovery was running; reconciling the latest revision.";
+                            AttachPendingSendObserver(threadId);
+                            RestoreTopicState(threadId);
+                        }
+                        else if (outcome.Result is { IsMalformed: true })
+                        {
+                            inputValue = outcome.Result.Text;
+                            inputRevision = 0;
+                            topicRestoreError = "This legacy draft has an invalid revision and must be edited before sending.";
+                            AttachPendingSendObserver(threadId);
+                        }
+                        else
+                        {
+                            var restored = outcome.Result;
+                            inputValue = restored?.Text ?? "";
+                            inputRevision = restored?.Revision ?? 0;
+                            RestoreComposerSnapshot(restored?.TopicSnapshot);
+                            if (inputRevision > 0)
+                                ComposerRevisions.SetExact(threadId, inputRevision, inputValue);
+                            topicRestoreError = null;
+                            AttachPendingSendObserver(threadId);
+                        }
+                        break;
+                    case UiOperationOutcomeKind.TimedOut:
+                        topicRestoreError = "This topic opened, but local draft recovery is still pending.";
+                        ScheduleTopicRestoreRetry(threadId, generation);
+                        break;
+                    case UiOperationOutcomeKind.Failed:
+                        topicRestoreError = "This topic opened, but its local draft could not be restored.";
+                        ScheduleTopicRestoreRetry(threadId, generation);
+                        break;
+                    case UiOperationOutcomeKind.Cancelled:
+                        ScheduleTopicRestoreRetry(threadId, generation);
+                        break;
+                }
+                StateHasChanged();
+            });
         });
 
     void AttachPendingSendObserver(string threadId)
@@ -1214,6 +1441,14 @@ else
             threadId,
             submission.ComposerRevision,
             inputValue);
+        if (!State.TryCaptureActiveThreadMutationScope(threadId, out var presentationScope))
+            return;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:send-outcome:{submission.OperationId}",
+            submission.ThreadId,
+            submission.LineId,
+            submission.OperationId,
+            submission.RunId);
         AttachSendObserver(
             submission,
             outcome =>
@@ -1223,17 +1458,19 @@ else
                                       && current.Text.Length == 0
                     ? current.Revision
                     : 0;
-                return ApplySendOutcomeAsync(
+                return ApplySendOutcomeFencedAsync(
                     submission,
                     submittedDraft,
                     clearedRevision,
-                    outcome);
+                    outcome,
+                    presentationScope!,
+                    operationScope);
             });
         if (TopicSends.RequiresRecovery(submission.OperationId))
             ObserveComponentTask(
                 TopicSends.RequestReconciliationAsync(
                     submission,
-                    draftCleanup: CreateDraftCleanup(submittedDraft),
+                    draftCleanup: CreateDraftCleanup(submittedDraft, submission),
                     cancellationToken: callbackLifetime.Token),
                 "reconcile-topic-send");
     }
@@ -1268,6 +1505,10 @@ else
 
     async Task RetryTopicRestoreAsync(string threadId, long generation)
     {
+        if (!State.TryCaptureActiveThreadMutationScope(threadId, out _)) return;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:restore:{threadId}",
+            threadId);
         try
         {
             await Task.Delay(100, callbackLifetime.Token);
@@ -1276,7 +1517,9 @@ else
                 if (!disposed
                     && generation == navigationGeneration
                     && string.Equals(activeThread, threadId, StringComparison.Ordinal))
-                    RestoreTopicState(threadId);
+                    State.TryCompleteScopedAsyncOperation(
+                        operationScope,
+                        () => RestoreTopicState(threadId));
             });
         }
         catch (OperationCanceledException) when (callbackLifetime.IsCancellationRequested)
@@ -1293,6 +1536,7 @@ else
     {
         newDeviceMenuOpen = true;
         moveMenuOpen = false;
+        hostMenuOpen = false;
         RequestDeviceRefresh();
     }
 
@@ -1301,6 +1545,16 @@ else
         moveMenuOpen = true;
         actionsMenuOpen = false;
         newDeviceMenuOpen = false;
+        hostMenuOpen = false;
+        RequestDeviceRefresh();
+    }
+
+    void OpenHostMenu()
+    {
+        hostMenuOpen = true;
+        actionsMenuOpen = false;
+        newDeviceMenuOpen = false;
+        moveMenuOpen = false;
         RequestDeviceRefresh();
     }
 
@@ -1308,6 +1562,7 @@ else
     {
         newDeviceMenuOpen = false;
         moveMenuOpen = false;
+        hostMenuOpen = false;
         actionsMenuOpen = false;
         pendingMove = null;
     }
@@ -1317,6 +1572,7 @@ else
         actionsMenuOpen = !actionsMenuOpen;
         newDeviceMenuOpen = false;
         moveMenuOpen = false;
+        hostMenuOpen = false;
         confirmDelete = false;
     }
 
@@ -1358,33 +1614,133 @@ else
 
     async Task NewThread(global::Mesh.Shared.DeviceInfo device)
     {
-        if (!global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)) return;
-        var target = ToExecutionDevice(device);
-        var t = await State.NewOwnThreadAsync("New chat", target);
-        activeThread = t.Id;
-        confirmDelete = false;
-        renaming = false;
-        input = "";
-        CloseDeviceMenus();
+        if (!global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device)) return;
+        var destination = ToCommunicationDestination(device);
+        var executionHost = global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)
+            ? ToAgentExecutionHost(device)
+            : null;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:new-thread");
+        var t = await State.NewOwnThreadAsync("New chat", destination, executionHost);
+        State.TryCompleteScopedAsyncOperation(operationScope, () =>
+        {
+            activeThread = t.Id;
+            confirmDelete = false;
+            renaming = false;
+            input = "";
+            CloseDeviceMenus();
+        });
     }
 
     Task NewThreadOnDefault()
-        => eligibleDevices.FirstOrDefault() is { } device
-            ? NewThread(device)
-            : Task.CompletedTask;
+    {
+        var device = executionHosts.FirstOrDefault()
+            ?? communicationDevices.FirstOrDefault(IsCurrentDevice)
+            ?? communicationDevices.FirstOrDefault();
+        return device is null ? Task.CompletedTask : NewThread(device);
+    }
 
-    void ChooseMoveTarget(global::Mesh.Shared.DeviceInfo device)
+    async Task ChooseMoveTarget(global::Mesh.Shared.DeviceInfo device)
     {
         if (Active is null
-            || !global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)
+            || !global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device)
             || IsActiveDevice(device)) return;
-        moveMenuOpen = false;
-        if (ActiveBusy)
+        var scope = State.CaptureActiveThreadMutationScope(Active.Id);
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:communication-move:{Active.Id}",
+            Active.Id);
+        IReadOnlyList<global::Mesh.Shared.DeviceInfo> freshDevices;
+        try
         {
-            pendingMove = device;
+            freshDevices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
+        }
+        catch (Exception exception)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError =
+                    $"Could not verify the communication destination: {exception.Message}");
             return;
         }
-        MoveActiveTo(device);
+        if (!State.IsCurrentScopedAsyncOperation(operationScope)
+            || !State.IsCurrentActiveThreadMutationScope(scope)) return;
+        var fresh = freshDevices.FirstOrDefault(candidate =>
+            string.Equals(candidate.DeviceId, device.DeviceId, StringComparison.Ordinal)
+            && global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(candidate));
+        if (fresh is null)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError =
+                    $"{FriendlyName(device)} is no longer a communication destination.");
+            return;
+        }
+        State.TryCompleteScopedAsyncOperation(operationScope, () =>
+        {
+            moveMenuOpen = false;
+            MoveActiveTo(fresh, scope);
+        });
+    }
+
+    async Task ChooseExecutionHost(global::Mesh.Shared.DeviceInfo device)
+    {
+        if (Active is null) return;
+        var threadScope = State.CaptureActiveThreadMutationScope(Active.Id);
+        var requestScope = State.GetPendingAssistantAiRequest(Active.Id) is { } pendingRequest
+            ? State.CaptureAssistantAiRequestMutationScope(pendingRequest)
+            : null;
+        var runtimeScope = State.CaptureAgentRuntimeScope();
+        using var runtimeContext = State.EnterAgentRuntimeScope(runtimeScope);
+        var threadId = Active.Id;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:execution-host:{threadId}",
+            threadId,
+            requestId: requestScope?.OperationId,
+            runId: requestScope?.RunId);
+        IReadOnlyList<global::Mesh.Shared.DeviceInfo> freshDevices;
+        try
+        {
+            freshDevices = await TopicRouter.ListEligibleDevicesAsync(callbackLifetime.Token);
+            if (!State.IsCurrentAgentRuntimeScope(runtimeScope)) return;
+        }
+        catch (Exception exception)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError = $"Could not verify the AI host: {exception.Message}");
+            return;
+        }
+        var fresh = freshDevices.FirstOrDefault(candidate =>
+            string.Equals(candidate.DeviceId, device.DeviceId, StringComparison.Ordinal)
+            && global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(candidate));
+        if (fresh is null)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError =
+                    $"{FriendlyName(device)} is no longer online and agent-ready.");
+            return;
+        }
+        if (ActiveBusy)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError =
+                    "Stop the active run before changing the AI execution host.");
+            return;
+        }
+        var host = ToAgentExecutionHost(fresh);
+        State.TryCompleteScopedAsyncOperation(operationScope, () =>
+        {
+            if (!State.MoveOwnThreadAgentExecutionHost(
+                    threadScope,
+                    host,
+                    requestScope,
+                    operationScope: operationScope))
+                return;
+            attachError = null;
+            CloseDeviceMenus();
+        });
     }
 
     async Task ConfirmRunningMove()
@@ -1392,15 +1748,41 @@ else
         var target = pendingMove;
         pendingMove = null;
         if (target is null || Active is null) return;
-        await StopActive();
-        MoveActiveTo(target);
+        var thread = Active;
+        var runId = RemoteRun?.RunId
+                    ?? thread.ExecutionRunId
+                    ?? State.AgentRunFor(thread.Id)?.RunId;
+        if (string.IsNullOrWhiteSpace(runId)) return;
+        var threadScope = State.CaptureActiveThreadMutationScope(thread.Id);
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:confirm-move:{thread.Id}",
+            thread.Id,
+            runId: runId);
+        if (!await TopicRouter.StopAsync(operationScope, callbackLifetime.Token))
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError = "The active run could not be stopped.");
+            return;
+        }
+        State.TryCompleteScopedAsyncOperation(
+            operationScope,
+            () => MoveActiveTo(target, threadScope, operationScope));
     }
 
-    void MoveActiveTo(global::Mesh.Shared.DeviceInfo device)
+    void MoveActiveTo(
+        global::Mesh.Shared.DeviceInfo device,
+        ActiveThreadMutationScope? capturedScope = null,
+        ScopedAsyncOperation? operationScope = null)
     {
         if (Active is null
-            || !global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)) return;
-        State.MoveOwnThreadToDevice(Active.Id, ToExecutionDevice(device));
+            || !global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device)) return;
+        var scope = capturedScope ?? State.CaptureActiveThreadMutationScope(Active.Id);
+        if (!State.MoveOwnThreadCommunicationDestination(
+                scope,
+                ToCommunicationDestination(device),
+                operationScope: operationScope))
+            return;
         ScheduleComposerSnapshot();
         CloseDeviceMenus();
     }
@@ -1467,12 +1849,19 @@ else
     async Task HydrateSelectedWidgetAsync(string id)
     {
         if (!WidgetConsumerPolicy.RequiresBodyLoad(selectedWidget)) return;
+        var runtimeScope = State.CaptureAgentRuntimeScope();
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:widget:{id}",
+            Active?.Id);
         widgetLoading = true;
         try
         {
             var full = await State.LoadFullWidgetAsync(id);
-            if (selectedWidget is not null && string.Equals(selectedWidget.Id, id, StringComparison.Ordinal))
+            State.TryApplyScopedAsyncOperation(operationScope, () =>
             {
+                if (selectedWidget is null
+                    || !string.Equals(selectedWidget.Id, id, StringComparison.Ordinal))
+                    return;
                 if (full is null) widgetLoadError = "Could not load this widget.";
                 else
                 {
@@ -1480,16 +1869,24 @@ else
                     selectedWidgetId = full.Id;
                     ScheduleComposerSnapshot();
                 }
-            }
+            });
         }
         catch (Exception ex)
         {
-            widgetLoadError = ex.Message;
+            State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => widgetLoadError = ex.Message);
         }
         finally
         {
-            widgetLoading = false;
-            await InvokeAsync(StateHasChanged);
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => widgetLoading = false);
+            await InvokeAsync(() =>
+            {
+                if (!disposed && State.IsCurrentAgentRuntimeScope(runtimeScope))
+                    StateHasChanged();
+            });
         }
     }
 
@@ -1520,7 +1917,7 @@ else
             inputRevision = State.SetTopicDraftSnapshotRevision(
                 activeThreadValue,
                 snapshot);
-            attachError = null;
+            composerPersistenceError = null;
         }
         catch (Exception exception)
         {
@@ -1528,7 +1925,7 @@ else
                 "topic-draft-stage-failed",
                 $"thread={TopicSendSnapshot.StableId("thread", thread.Id)};"
                 + $"exception={exception.GetType().FullName}");
-            attachError = "The latest edit could not be staged durably. Retry before sending.";
+            composerPersistenceError = "The latest edit could not be staged durably. Retry before sending.";
             return 0;
         }
         if (inputRevision > 0)
@@ -1574,6 +1971,9 @@ else
 
     async Task PickFile()
     {
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:pick-file",
+            Active?.Id);
         attachError = null;
         try
         {
@@ -1582,11 +1982,19 @@ else
             if (file is null) return;
             await using var stream = await file.OpenReadAsync();
             var staged = await PickedFileStager.StageAsync(file.FileName, file.ContentType, stream);
-            LocalFiles.Allow(staged.Path);
-            attachments.Add(new StagedFile(staged.Name, staged.Path, staged.Size));
-            ScheduleComposerSnapshot();
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                LocalFiles.Allow(staged.Path);
+                attachments.Add(new StagedFile(staged.Name, staged.Path, staged.Size));
+                ScheduleComposerSnapshot();
+            });
         }
-        catch (Exception ex) { attachError = "Couldn't attach that file: " + ex.Message; }
+        catch (Exception ex)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError = "Couldn't attach that file: " + ex.Message);
+        }
     }
 
     static string Human(long bytes)
@@ -1605,13 +2013,17 @@ else
         if (thread is null || string.IsNullOrWhiteSpace(runId)) return Task.CompletedTask;
 
         var threadId = thread.Id;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:stop:{threadId}",
+            threadId,
+            runId: runId);
         attachError = null;
         UiOperations.TryRun(
             StopKey(threadId, runId),
             "ui.topic.stop",
             async ct =>
             {
-                var stopped = await TopicRouter.StopAsync(threadId, runId, ct).ConfigureAwait(false);
+                var stopped = await TopicRouter.StopAsync(operationScope, ct).ConfigureAwait(false);
                 if (stopped) return true;
 
                 var remote = State.GetRemoteRunProjection(threadId);
@@ -1622,42 +2034,54 @@ else
 
                 // A persisted run without a live projection is stranded. Reconcile it off-dispatcher;
                 // never claim cancellation if the durable state cannot be cleared.
-                if (remote is null && thread.ExecutionDeviceId is not null)
+                if (remote is null && thread.AgentExecutionHostDeviceId is not null)
                 {
                     ct.ThrowIfCancellationRequested();
-                    State.ClearRemoteRunProjection(threadId, runId);
-                    return thread.ExecutionRunId is null;
+                    var cleared = false;
+                    State.TryApplyScopedAsyncOperation(operationScope, () =>
+                    {
+                        State.ClearRemoteRunProjection(threadId, runId);
+                        cleared = thread.ExecutionRunId is null;
+                    });
+                    return cleared;
                 }
                 return false;
             },
-            outcome => ApplyCancellationOutcomeAsync(outcome, queued: false),
+            outcome => ApplyCancellationOutcomeAsync(
+                outcome,
+                queued: false,
+                operationScope),
             callbackLifetime.Token);
         return Task.CompletedTask;
     }
 
     Task ApplyCancellationOutcomeAsync(
         UiOperationOutcome<bool> outcome,
-        bool queued)
+        bool queued,
+        ScopedAsyncOperation operationScope)
         => InvokeAsync(() =>
         {
             if (disposed) return;
-            attachError = outcome.Kind switch
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
             {
-                UiOperationOutcomeKind.TimedOut => queued
-                    ? "Queued cancellation timed out; the turn remains queued until delivery is confirmed."
-                    : "Cancellation timed out; the run remains active until delivery is confirmed.",
-                UiOperationOutcomeKind.Failed => queued
-                    ? "The queued turn could not be cancelled yet."
-                    : "Could not request cancellation for this run.",
-                UiOperationOutcomeKind.Succeeded when outcome.Result != true => queued
-                    ? "The queued turn could not be cancelled yet."
-                    : "The run is still active; cancellation was not acknowledged.",
-                UiOperationOutcomeKind.Cancelled => queued
-                    ? "Queued cancellation was interrupted; the turn remains queued."
-                    : "Cancellation was interrupted; the run remains active.",
-                _ => null
-            };
-            StateHasChanged();
+                attachError = outcome.Kind switch
+                {
+                    UiOperationOutcomeKind.TimedOut => queued
+                        ? "Queued cancellation timed out; the turn remains queued until delivery is confirmed."
+                        : "Cancellation timed out; the run remains active until delivery is confirmed.",
+                    UiOperationOutcomeKind.Failed => queued
+                        ? "The queued turn could not be cancelled yet."
+                        : "Could not request cancellation for this run.",
+                    UiOperationOutcomeKind.Succeeded when outcome.Result != true => queued
+                        ? "The queued turn could not be cancelled yet."
+                        : "The run is still active; cancellation was not acknowledged.",
+                    UiOperationOutcomeKind.Cancelled => queued
+                        ? "Queued cancellation was interrupted; the turn remains queued."
+                        : "Cancellation was interrupted; the run remains active.",
+                    _ => null
+                };
+                StateHasChanged();
+            });
         });
 
     static string StopKey(string threadId, string runId)
@@ -1665,10 +2089,209 @@ else
 
     async Task Send()
     {
-        if (!CanSend) return;
+        if (!CanSend || Active is not { } thread) return;
+        var runtimeScope = State.CaptureAgentRuntimeScope();
+        using var runtimeContext = State.EnterAgentRuntimeScope(runtimeScope);
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:ordinary-send:{thread.Id}",
+            thread.Id);
+        attachError = null;
+        var text = inputValue;
+        var chosenWidget = selectedWidget;
+        var creatingWidget = widgetMode;
+        IReadOnlyList<ChatAttachment> loadedAttachments;
+        try
+        {
+            loadedAttachments = await LoadAttachmentsAsync(
+                attachments.ToList(),
+                callbackLifetime.Token);
+        }
+        catch (Exception exception)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError = exception.Message);
+            return;
+        }
 
-        var thread = Active;
+        var message = BuildTurnPrompt(text, chosenWidget, creatingWidget);
+        var line = new ChatLine
+        {
+            Id = Guid.NewGuid().ToString("n"),
+            Role = "user",
+            Text = message,
+            Via = "person",
+            AddressedToAgent = false,
+            SenderHandle = State.Profile.Handle,
+            Attachments = loadedAttachments.ToList(),
+            At = DateTimeOffset.UtcNow
+        };
+        if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal)
+                    && !string.IsNullOrWhiteSpace(message))
+                    State.RenameOwnThread(thread.Id, Titleize(message));
+                State.AddOwnChatLine(thread.Id, line);
+            })
+            || !State.TryAdvanceScopedAsyncOperation(
+                operationScope,
+                out var messageOperationScope,
+                topicId: thread.Id,
+                messageId: line.Id))
+            return;
+        operationScope = messageOperationScope!;
+        try
+        {
+            await State.FlushPersistenceAsync(callbackLifetime.Token);
+            if (!State.IsCurrentAgentRuntimeScope(runtimeScope)) return;
+        }
+        catch
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError = "Message could not be saved. Nothing was sent.");
+            return;
+        }
+        if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                inputValue = "";
+                attachments.Clear();
+                ClearWidgetMode();
+                ScheduleComposerSnapshot();
+                scrollToLatestRequested = true;
+            })) return;
+        await InvokeAsync(() =>
+        {
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                if (!disposed && State.IsCurrentAgentRuntimeScope(runtimeScope))
+                    StateHasChanged();
+            });
+        });
+    }
+
+    async Task RequestAiResponse()
+    {
+        if (!CanRequestAi) return;
+        var runtimeScope = State.CaptureAgentRuntimeScope();
+        using var runtimeContext = State.EnterAgentRuntimeScope(runtimeScope);
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:assistant-send");
+        try
+        {
+            var freshDevices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
+            if (!State.TryApplyScopedAsyncOperation(
+                    operationScope,
+                    () => executionHosts =
+                        global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices)))
+                return;
+        }
+        catch (Exception exception)
+        {
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "assistant-host-refresh-failed",
+                $"exception={exception.GetType().FullName}");
+        }
+
+        OwnThread? thread = null;
+        if (!State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => thread = Active))
+            return;
         if (thread is null) return;
+        if (!State.TryAdvanceScopedAsyncOperation(
+                operationScope,
+                out var threadOperationScope,
+                scopeKey: $"{asyncScopeOwner}:assistant-send:{thread.Id}",
+                topicId: thread.Id)
+            || !State.TryCaptureActiveThreadMutationScope(
+                thread.Id,
+                out var capturedPresentationScope))
+            return;
+        operationScope = threadOperationScope!;
+        var presentationScope = capturedPresentationScope!;
+        if (!ActiveExecutionEligible)
+        {
+            IReadOnlyList<global::Mesh.Shared.DeviceInfo> freshDevices;
+            try
+            {
+                freshDevices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
+            }
+            catch
+            {
+                freshDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
+            }
+            var freshHost = global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices)
+                .FirstOrDefault();
+            if (freshHost is not null)
+            {
+                if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
+                    {
+                        executionHosts =
+                            global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices);
+                        if (string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId))
+                            State.AssignOwnThreadAgentExecutionHost(
+                                presentationScope,
+                                ToAgentExecutionHost(freshHost));
+                    })) return;
+            }
+            else
+            {
+                if (freshDevices.Count > 0
+                    || !global::Mesh.Shared.DevicePlatforms.IsDesktop(
+                        thread.AgentExecutionHostDevicePlatform))
+                {
+                    var previousIds = thread.Lines.Select(line => line.Id)
+                        .ToHashSet(StringComparer.Ordinal);
+                    await Send();
+                    if (!State.IsCurrentAgentRuntimeScope(runtimeScope)) return;
+                    var trigger = thread.Lines.LastOrDefault(line =>
+                        line.Role == "user" && !previousIds.Contains(line.Id));
+                    if (trigger is null)
+                        return;
+                    if (trigger is not null)
+                    {
+                        var runId = Guid.NewGuid().ToString("n");
+                        try
+                        {
+                            var durableRequest = await State.CommitAssistantAiRequestAsync(
+                                thread.Id,
+                                trigger,
+                                runId,
+                                runId,
+                                target: null,
+                                callbackLifetime.Token);
+                            if (!State.TryApplyScopedAsyncOperation(
+                                    operationScope,
+                                    () => ApplyAssistantProjection(durableRequest)))
+                                return;
+                        }
+                        catch
+                        {
+                            State.TryCompleteScopedAsyncOperation(
+                                operationScope,
+                                () => attachError =
+                                    "Message could not be saved. AI was not requested.");
+                            return;
+                        }
+                    }
+                    State.TryCompleteScopedAsyncOperation(
+                        operationScope,
+                        StateHasChanged);
+                    return;
+                }
+            }
+        }
+        if (string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId)
+            && executionHosts.FirstOrDefault() is { } discoveredHost)
+        {
+            if (!State.TryApplyScopedAsyncOperation(
+                    operationScope,
+                    () => State.AssignOwnThreadAgentExecutionHost(
+                        presentationScope,
+                        ToAgentExecutionHost(discoveredHost))))
+                return;
+        }
         var requestedSnapshot = CaptureComposerSnapshot(thread);
         var requestedRevision = inputRevision;
         MeshDb.ComposerDraft persistedDraft;
@@ -1679,6 +2302,7 @@ else
                 requestedSnapshot,
                 requestedRevision,
                 callbackLifetime.Token);
+            if (!State.IsCurrentAgentRuntimeScope(runtimeScope)) return;
         }
         catch (Exception exception)
         {
@@ -1687,8 +2311,12 @@ else
                 $"thread={TopicSendSnapshot.StableId("thread", thread.Id)};"
                 + $"revision={TopicSendSnapshot.StableId("revision", requestedRevision.ToString(System.Globalization.CultureInfo.InvariantCulture))};"
                 + $"exception={exception.GetType().FullName}");
-            attachError = "The latest draft could not be saved durably. Retry before sending.";
-            StateHasChanged();
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                attachError =
+                    "The latest draft could not be saved durably. Retry before sending.";
+                StateHasChanged();
+            });
             return;
         }
         var durableSnapshot = persistedDraft.TopicSnapshot
@@ -1697,14 +2325,15 @@ else
             thread.Id,
             persistedDraft.Revision,
             durableSnapshot.Text);
-        if (inputRevision == requestedRevision)
-        {
-            inputRevision = persistedDraft.Revision;
-            ComposerRevisions.SetExact(
-                thread.Id,
-                persistedDraft.Revision,
-                durableSnapshot.Text);
-        }
+        if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                if (inputRevision != requestedRevision) return;
+                inputRevision = persistedDraft.Revision;
+                ComposerRevisions.SetExact(
+                    thread.Id,
+                    persistedDraft.Revision,
+                    durableSnapshot.Text);
+            })) return;
         var text = durableSnapshot.Text;
         var chosenWidget = durableSnapshot.Widget is null
             ? null
@@ -1719,8 +2348,12 @@ else
                 durableSnapshot.TargetDeviceId,
                 StringComparison.Ordinal))
         {
-            attachError = "The topic target changed while the draft was being saved. Review and retry.";
-            StateHasChanged();
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                attachError =
+                    "The topic target changed while the draft was being saved. Review and retry.";
+                StateHasChanged();
+            });
             return;
         }
         var fingerprint = durableSnapshot.Fingerprint;
@@ -1731,6 +2364,15 @@ else
             fingerprint,
             DateTimeOffset.UtcNow,
             State.ActiveAccountId);
+        if (!State.TryAdvanceScopedAsyncOperation(
+                operationScope,
+                out var requestOperationScope,
+                topicId: thread.Id,
+                messageId: submission.LineId,
+                requestId: submission.OperationId,
+                runId: submission.RunId))
+            return;
+        operationScope = requestOperationScope!;
         var triggerHandle = State.Profile.Handle;
         var turnMode = State.Profile.PlanBeforeActing
             ? global::Mesh.Shared.TopicTurnMode.Autonomous
@@ -1745,6 +2387,8 @@ else
         var draftCleanup = new TopicSendDraftCleanup(
             outcome => PersistSubmittedDraftCleanupAsync(
                 draftRevision,
+                submission,
+                presentationScope,
                 outcome,
                 appState,
                 composerRevisions,
@@ -1763,36 +2407,116 @@ else
                 text);
             AttachSendObserver(
                 submission,
-                outcome => ApplySendOutcomeAsync(
+                outcome => ApplySendOutcomeFencedAsync(
                     submission,
                     recoveryDraft,
                     Interlocked.Read(ref clearedRevision),
-                    outcome));
+                    outcome,
+                    presentationScope,
+                    operationScope));
             ObserveComponentTask(
                 TopicSends.RequestReconciliationAsync(
                     submission,
-                    draftCleanup: CreateDraftCleanup(recoveryDraft),
+                    draftCleanup: CreateDraftCleanup(recoveryDraft, submission),
                     cancellationToken: callbackLifetime.Token),
                 "reconcile-superseded-topic-send");
-            attachError = "A prior send identity is being reconciled before this revision can be submitted.";
-            StateHasChanged();
+            State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                attachError = "A prior send identity is being reconciled before this revision can be submitted.";
+                StateHasChanged();
+            });
             return;
         }
 
-        attachError = null;
-        capacityBlockedSubmission = null;
+        if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                attachError = null;
+                capacityBlockedSubmission = null;
+            }))
+            return;
+        var outcomePresented = 0;
+        async Task PresentOutcomeAsync(TopicSendOutcome outcome)
+        {
+            if (outcome.Kind != TopicSendOutcomeKind.Reconciling
+                && Interlocked.Exchange(ref outcomePresented, 1) != 0)
+                return;
+            await InvokeAsync(() =>
+            {
+                ApplySendOutcomeFencedAsync(
+                    submission,
+                    draftRevision,
+                    Interlocked.Read(ref clearedRevision),
+                    outcome,
+                    presentationScope,
+                    operationScope);
+            });
+        }
         var submissionResult = TopicSends.Submit(
                 submission,
                 async (stableSubmission, handoffContext) =>
                 {
-                    if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal)
-                        && !string.IsNullOrWhiteSpace(titleText))
-                        appState.RenameOwnThread(thread.Id, Titleize(titleText));
+                    using var handoffRuntimeContext =
+                        appState.EnterAgentRuntimeScope(runtimeScope);
+                    if (!appState.IsCurrentAgentRuntimeScope(runtimeScope))
+                        return new TopicSendHandoff(
+                            false,
+                            "stale_account_scope",
+                            "The active account changed before handoff started.");
+                    if (!appState.TryApplyScopedAsyncOperation(operationScope, () =>
+                        {
+                            if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal)
+                                && !string.IsNullOrWhiteSpace(titleText))
+                                appState.RenameOwnThread(thread.Id, Titleize(titleText));
+                        }))
+                        return new TopicSendHandoff(
+                            false,
+                            "stale_account_scope",
+                            "The active account changed before handoff started.");
 
                     var loadedAttachments = await LoadAttachmentsAsync(
                         files,
                         CancellationToken.None).ConfigureAwait(false);
+                    if (!appState.IsCurrentScopedAsyncOperation(operationScope))
+                        return new TopicSendHandoff(
+                            false,
+                            "stale_account_scope",
+                            "The active account changed while attachments were loaded.");
                     var prompt = BuildTurnPrompt(text, chosenWidget, wasWidget);
+                    var trigger = new ChatLine
+                    {
+                        Id = stableSubmission.LineId,
+                        Role = "user",
+                        Text = prompt,
+                        Via = "person",
+                        AddressedToAgent = true,
+                        SenderHandle = triggerHandle,
+                        Attachments = loadedAttachments.ToList(),
+                        At = stableSubmission.SubmittedAt
+                    };
+                    var durableRequest = await appState.CommitAssistantAiRequestAsync(
+                        stableSubmission.ThreadId,
+                        trigger,
+                        stableSubmission.RunId,
+                        stableSubmission.OperationId,
+                        new AgentExecutionHost(
+                            stableSubmission.TargetDeviceId,
+                            thread.AgentExecutionHostDeviceName,
+                            thread.AgentExecutionHostDevicePlatform
+                                ?? global::Mesh.Shared.DevicePlatforms.Unknown),
+                        CancellationToken.None).ConfigureAwait(false);
+                    if (!appState.IsCurrentAgentRuntimeScope(runtimeScope))
+                        return new TopicSendHandoff(
+                            false,
+                            "stale_account_scope",
+                            "The active account changed while the request was committed.");
+                    if (!appState.TryCaptureAssistantAiRequestMutationScope(
+                            durableRequest,
+                            out var capturedRequestScope))
+                        return new TopicSendHandoff(
+                            false,
+                            "stale_account_scope",
+                            "The active account changed while the request was committed.");
+                    var requestScope = capturedRequestScope!;
                     var draft = new TopicTurnDraft(
                         stableSubmission.RunId,
                         stableSubmission.ThreadId,
@@ -1808,11 +2532,31 @@ else
                         stableSubmission.OperationId);
                     BeforeBeginTopicRunCheckpointHook?.Invoke(
                         stableSubmission.OperationId);
-                    var result = await topicRouter.SubmitAsync(
-                        draft,
-                        null,
-                        CancellationToken.None,
-                        handoffContext).ConfigureAwait(false);
+                    TopicDispatchResult result;
+                    try
+                    {
+                        result = await topicRouter.SubmitAsync(
+                            draft,
+                            null,
+                            CancellationToken.None,
+                            handoffContext).ConfigureAwait(false);
+                    }
+                    catch (Exception exception)
+                    {
+                        appState.RecordAssistantAiDispatch(
+                            requestScope,
+                            TopicDispatchResult.Reject(
+                                "dispatch_failed",
+                                stableSubmission.RunId,
+                                exception.Message));
+                        throw;
+                    }
+                    if (!appState.IsCurrentScopedAsyncOperation(operationScope))
+                        return new TopicSendHandoff(
+                            false,
+                            "stale_account_scope",
+                            "The active account changed before dispatch completed.");
+                    appState.RecordAssistantAiDispatch(requestScope, result);
                     if (!result.Accepted
                         && !result.Durable
                         && string.Equals(
@@ -1831,24 +2575,22 @@ else
                         result.Code,
                         result.Error);
                 },
+                reconcileOutcome: PresentOutcomeAsync,
                 draftCleanup: draftCleanup);
         if (submissionResult.Kind is TopicSendSubmissionKind.Started
             or TopicSendSubmissionKind.AlreadyRunning
-            or TopicSendSubmissionKind.AlreadyCompleted
             or TopicSendSubmissionKind.ReconciliationRequired)
         {
             AttachSendObserver(
                 submissionResult.Snapshot,
-                outcome => ApplySendOutcomeAsync(
-                    submissionResult.Snapshot,
-                    draftRevision,
-                    Interlocked.Read(ref clearedRevision),
-                    outcome));
+                PresentOutcomeAsync);
             if (submissionResult.Kind == TopicSendSubmissionKind.ReconciliationRequired)
                 ObserveComponentTask(
                     TopicSends.RequestReconciliationAsync(
                         submissionResult.Snapshot,
-                        draftCleanup: CreateDraftCleanup(draftRevision),
+                        draftCleanup: CreateDraftCleanup(
+                            draftRevision,
+                            submissionResult.Snapshot),
                         cancellationToken: callbackLifetime.Token),
                     "reconcile-topic-send");
         }
@@ -1858,10 +2600,11 @@ else
         }
         else
         {
-            attachError = submissionResult.Error
-                ?? "This topic turn could not be scheduled. Your draft is unchanged.";
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+                attachError = submissionResult.Error
+                    ?? "This topic turn could not be scheduled. Your draft is unchanged.");
         }
-        StateHasChanged();
+        State.TryApplyScopedAsyncOperation(operationScope, StateHasChanged);
 
     }
 
@@ -1877,20 +2620,67 @@ else
                 blocked.TargetDeviceId,
                 StringComparison.Ordinal)
             && inputRevision == blocked.ComposerRevision)
-            return Send();
+            return RequestAiResponse();
 
         attachError = "The draft changed before retry. Review it and send the latest version.";
         StateHasChanged();
         return Task.CompletedTask;
     }
 
-    Task ApplySendOutcomeAsync(
+    Task ApplySendOutcomeFencedAsync(
         TopicSendSnapshot submission,
         ComposerRevisionSnapshot submittedDraft,
         long clearedRevision,
-        TopicSendOutcome outcome)
+        TopicSendOutcome outcome,
+        ActiveThreadMutationScope presentationScope,
+        ScopedAsyncOperation operationScope)
     {
-        if (disposed) return Task.CompletedTask;
+        Action mutation = () => ApplySendOutcome(
+            submission,
+            submittedDraft,
+            clearedRevision,
+            outcome,
+            presentationScope);
+        if (outcome.Kind == TopicSendOutcomeKind.Reconciling)
+            State.TryApplyScopedAsyncOperation(operationScope, mutation);
+        else
+            State.TryCompleteScopedAsyncOperation(operationScope, mutation);
+        return Task.CompletedTask;
+    }
+
+    void ApplySendOutcome(
+        TopicSendSnapshot submission,
+        ComposerRevisionSnapshot submittedDraft,
+        long clearedRevision,
+        TopicSendOutcome outcome,
+        ActiveThreadMutationScope presentationScope)
+    {
+        if (disposed) return;
+        var authoritativeRequest = State.GetAssistantAiRequest(submission.RunId);
+        if (authoritativeRequest is not null
+            && outcome.Kind is TopicSendOutcomeKind.Rejected
+                or TopicSendOutcomeKind.Failed
+                or TopicSendOutcomeKind.RetryableFailed)
+        {
+            var transition = State.RecordAssistantAiDispatch(
+                presentationScope,
+                submission.RunId,
+                submission.OperationId,
+                submission.LineId,
+                TopicDispatchResult.Reject(
+                    outcome.Handoff?.Code ?? "dispatch_failed",
+                    authoritativeRequest.RunId,
+                    outcome.Handoff?.Error
+                    ?? outcome.Exception?.Message
+                    ?? "The AI request could not be dispatched."));
+            authoritativeRequest = transition.Request;
+        }
+        if (authoritativeRequest?.IsTerminal == true)
+        {
+            ApplyAssistantProjection(authoritativeRequest);
+            StateHasChanged();
+            return;
+        }
 
         if (outcome.Kind == TopicSendOutcomeKind.Accepted)
         {
@@ -1906,21 +2696,27 @@ else
             var clearedVisibleDraft = ClearSubmittedDraftPresentation(
                 submittedDraft,
                 clearedRevision);
-            attachError = null;
             if (clearedVisibleDraft) ObserveComponentTask(
                 ResetComposer(),
                 "reset-composer");
+            ApplyAssistantProjection(authoritativeRequest);
         }
         else if (outcome.Kind == TopicSendOutcomeKind.Reconciling)
         {
-            attachError = outcome.Handoff?.Error
-                ?? "The durable handoff status is still being checked.";
+            if (authoritativeRequest is null)
+                attachError = "The durable handoff status is still being checked.";
+            else
+            {
+                ApplyAssistantProjection(authoritativeRequest);
+                attachError = outcome.Handoff?.Error
+                    ?? "The durable handoff status is still being checked.";
+            }
             if (TopicSends.RequiresRecovery(submission.OperationId)
                 && cleanupRecoveryAttempts.Add(submission.OperationId))
                 ObserveComponentTask(
                     TopicSends.RequestReconciliationAsync(
                         submission,
-                        draftCleanup: CreateDraftCleanup(submittedDraft),
+                        draftCleanup: CreateDraftCleanup(submittedDraft, submission),
                         cancellationToken: callbackLifetime.Token),
                     "recover-topic-draft-cleanup");
         }
@@ -1936,47 +2732,233 @@ else
                         submission.OperationId,
                         current.Revision);
             }
-            attachError = outcome.Kind == TopicSendOutcomeKind.Rejected
-                ? outcome.Handoff?.Error
-                  ?? $"The topic turn was not accepted ({outcome.Handoff?.Code ?? "rejected"})."
-                : $"Could not send this topic turn: {outcome.Exception?.Message ?? "unknown error"}";
+            if (authoritativeRequest is null)
+            {
+                aiRetryAvailable = false;
+                pendingMobileAiRetry = null;
+                attachError = "Message could not be saved. AI was not requested.";
+            }
+            else
+            {
+                ApplyAssistantProjection(authoritativeRequest);
+                var cleanup = State.CompareAndClearTopicDraft(
+                    presentationScope,
+                    submittedDraft.Revision);
+                if (cleanup is MeshDb.ComposerDraftClearResult.Cleared
+                    or MeshDb.ComposerDraftClearResult.Missing)
+                {
+                    var presentationRevision = submittedDraft.Revision;
+                    if (ComposerRevisions.TryClear(submittedDraft, out var clearToken)
+                        && clearToken is not null)
+                        presentationRevision = clearToken.ClearedRevision;
+                    if (ClearSubmittedDraftPresentation(
+                            submittedDraft,
+                            presentationRevision))
+                        ObserveComponentTask(
+                            ResetComposer(),
+                            "reset-durable-assistant-composer");
+                }
+            }
         }
         StateHasChanged();
-        return Task.CompletedTask;
+    }
+
+    async Task RetryAiResponse()
+    {
+        if (aiRetryRunning) return;
+        aiRetryRunning = true;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:assistant-retry");
+        try
+        {
+        RestorePendingAiRequest();
+        var pending = pendingMobileAiRetry;
+        if (pending is null)
+        {
+            await RequestAiResponse();
+            return;
+        }
+        var durableRequest = State.GetPendingAssistantAiRequest(pending.ThreadId);
+        if (durableRequest is null
+            || !string.Equals(durableRequest.RunId, pending.RunId, StringComparison.Ordinal))
+        {
+            pendingMobileAiRetry = null;
+            aiRetryAvailable = false;
+            return;
+        }
+        if (!State.TryCaptureAssistantAiRequestMutationScope(
+                durableRequest,
+                out var capturedRequestScope))
+            return;
+        var requestScope = capturedRequestScope!;
+        if (!State.TryAdvanceScopedAsyncOperation(
+                operationScope,
+                out var retryOperationScope,
+                scopeKey: $"{asyncScopeOwner}:assistant-retry:{pending.ThreadId}",
+                topicId: pending.ThreadId,
+                messageId: pending.TriggerLineId,
+                requestId: requestScope.OperationId,
+                runId: requestScope.RunId))
+            return;
+        operationScope = retryOperationScope!;
+        var threadScope = State.CaptureActiveThreadMutationScope(pending.ThreadId);
+        var retryScope = State.CaptureAgentRuntimeScope();
+
+        var thread = State.Profile.OwnThreads.FirstOrDefault(item => item.Id == pending.ThreadId);
+        var trigger = thread?.Lines.FirstOrDefault(line => line.Id == pending.TriggerLineId);
+        if (thread is null || trigger is null)
+        {
+            pendingMobileAiRetry = null;
+            aiRetryAvailable = false;
+            attachError = "The original message is no longer available for AI retry.";
+            return;
+        }
+
+        IReadOnlyList<global::Mesh.Shared.DeviceInfo> devices;
+        try
+        {
+            devices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
+        }
+        catch (Exception exception)
+        {
+            State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => attachError =
+                    $"Message retained. Could not verify an AI host: {exception.Message}");
+            return;
+        }
+        var target = global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(devices)
+            .FirstOrDefault(device => string.Equals(
+                device.DeviceId, thread.AgentExecutionHostDeviceId, StringComparison.Ordinal))
+            ?? global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(devices).FirstOrDefault();
+        if (target is null)
+        {
+            State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => attachError =
+                    "Message retained. AI response unavailable — choose an online agent-ready Desktop, then retry.");
+            return;
+        }
+        if (!State.IsCurrentAgentRuntimeScope(retryScope))
+            return;
+        using var retryContext = State.EnterAgentRuntimeScope(retryScope);
+        if (!State.MoveOwnThreadAgentExecutionHost(
+                threadScope,
+                ToAgentExecutionHost(target),
+                requestScope))
+            return;
+        var reassignedRequest = State.GetAssistantAiRequest(requestScope.RunId);
+        if (!State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => ApplyAssistantProjection(reassignedRequest)))
+            return;
+        if (reassignedRequest?.IsTerminal == true) return;
+        var draft = new TopicTurnDraft(
+            pending.RunId,
+            thread.Id,
+            trigger.Id,
+            State.Profile.Handle,
+            trigger.Text,
+            trigger.At,
+            global::Mesh.Shared.TopicTurnMode.Single,
+            target.DeviceId,
+            Attachments: trigger.Attachments,
+            TriggerOperationId: durableRequest?.OperationId ?? pending.RunId);
+        BeforeBeginTopicRunCheckpointHook?.Invoke(pending.RunId);
+        if (!State.IsCurrentAgentRuntimeScope(retryScope))
+            return;
+        TopicDispatchResult result;
+        try
+        {
+            result = await TopicRouter.SubmitAsync(draft, null, callbackLifetime.Token);
+        }
+        catch (Exception exception)
+        {
+            State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                var rejected = State.RecordAssistantAiDispatch(
+                    requestScope,
+                    TopicDispatchResult.Reject(
+                        "dispatch_failed",
+                        pending.RunId,
+                        exception.Message));
+                ApplyAssistantProjection(rejected.Request);
+            });
+            return;
+        }
+        State.TryApplyScopedAsyncOperation(operationScope, () =>
+        {
+            var transition = State.RecordAssistantAiDispatch(requestScope, result);
+            ApplyAssistantProjection(transition.Request);
+        });
+        }
+        finally
+        {
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                EnsureRosterScope();
+                aiRetryRunning = false;
+            });
+        }
     }
 
     TopicSendDraftCleanup CreateDraftCleanup(
-        ComposerRevisionSnapshot submittedDraft)
-        => new(outcome => PersistSubmittedDraftCleanupAsync(
+        ComposerRevisionSnapshot submittedDraft,
+        TopicSendSnapshot submission)
+    {
+        if (!State.TryCaptureActiveThreadMutationScope(
+                submission.ThreadId,
+                out var presentationScope))
+            throw new InvalidOperationException(
+                "The active account changed before draft cleanup was scheduled.");
+        return new(outcome => PersistSubmittedDraftCleanupAsync(
             submittedDraft,
+            submission,
+            presentationScope!,
             outcome,
             State,
             ComposerRevisions,
             null,
             callbackLifetime.Token));
+    }
 
-    static async Task<TopicSendDraftCleanupResult> PersistSubmittedDraftCleanupAsync(
+    static Task<TopicSendDraftCleanupResult> PersistSubmittedDraftCleanupAsync(
         ComposerRevisionSnapshot submittedDraft,
+        TopicSendSnapshot submission,
+        ActiveThreadMutationScope presentationScope,
         TopicSendOutcome outcome,
         AppState state,
         ComposerRevisionGuard revisions,
         Action<long>? cleared,
         CancellationToken cancellationToken)
     {
-        var result = await state.CompareAndClearTopicDraftAsync(
-                submittedDraft.EntityId,
-                submittedDraft.Revision,
-                cancellationToken)
-            .ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (outcome.Kind is TopicSendOutcomeKind.Rejected
+            or TopicSendOutcomeKind.Failed
+            or TopicSendOutcomeKind.RetryableFailed)
+            state.RecordAssistantAiDispatch(
+                presentationScope,
+                submission.RunId,
+                submission.OperationId,
+                submission.LineId,
+                TopicDispatchResult.Reject(
+                    outcome.Handoff?.Code ?? "dispatch_failed",
+                    submission.RunId,
+                    outcome.Handoff?.Error
+                    ?? outcome.Exception?.Message
+                    ?? "The AI request could not be dispatched."));
+        var result = state.CompareAndClearTopicDraft(
+            presentationScope,
+            submittedDraft.Revision);
         if (result == MeshDb.ComposerDraftClearResult.Superseded)
-            return TopicSendDraftCleanupResult.DraftClearSuperseded;
+            return Task.FromResult(TopicSendDraftCleanupResult.DraftClearSuperseded);
 
         if (revisions.TryClear(submittedDraft, out var clearToken)
             && clearToken is not null)
             cleared?.Invoke(clearToken.ClearedRevision);
         else
             cleared?.Invoke(submittedDraft.Revision);
-        return TopicSendDraftCleanupResult.DraftClearPersisted;
+        return Task.FromResult(TopicSendDraftCleanupResult.DraftClearPersisted);
     }
 
     Task ReconcilePendingSend()
@@ -1990,7 +2972,7 @@ else
         ObserveComponentTask(
             TopicSends.RequestReconciliationAsync(
                 snapshot,
-                draftCleanup: CreateDraftCleanup(submitted),
+                draftCleanup: CreateDraftCleanup(submitted, snapshot),
                 cancellationToken: callbackLifetime.Token),
             "reconcile-topic-send");
         return Task.CompletedTask;
@@ -2097,55 +3079,64 @@ else
                 }
             });
 
-    ExecutionDevice ResolveTarget(OwnThread thread)
+    AgentExecutionHost ResolveTarget(OwnThread thread)
     {
-        if (string.IsNullOrWhiteSpace(thread.ExecutionDeviceId))
-            return eligibleDevices.FirstOrDefault() is { } eligible
-                ? ToExecutionDevice(eligible)
-                : new ExecutionDevice(
+        if (string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId))
+            return executionHosts.FirstOrDefault() is { } eligible
+                ? ToAgentExecutionHost(eligible)
+                : new AgentExecutionHost(
                     "", null, global::Mesh.Shared.DevicePlatforms.Unknown);
         var known = DeviceChoices.FirstOrDefault(d =>
-            string.Equals(d.DeviceId, thread.ExecutionDeviceId, StringComparison.Ordinal));
+            string.Equals(d.DeviceId, thread.AgentExecutionHostDeviceId, StringComparison.Ordinal));
         return known is not null
-            ? ToExecutionDevice(known)
-            : new ExecutionDevice(
-                thread.ExecutionDeviceId,
-                thread.ExecutionDeviceName,
-                thread.ExecutionDevicePlatform ?? global::Mesh.Shared.DevicePlatforms.Unknown);
+               && global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(known)
+            ? ToAgentExecutionHost(known)
+            : executionHosts.FirstOrDefault() is { } host
+                ? ToAgentExecutionHost(host)
+            : new AgentExecutionHost(
+                thread.AgentExecutionHostDeviceId,
+                thread.AgentExecutionHostDeviceName,
+                thread.AgentExecutionHostDevicePlatform ?? global::Mesh.Shared.DevicePlatforms.Unknown);
     }
 
-    static ExecutionDevice ToExecutionDevice(global::Mesh.Shared.DeviceInfo device) =>
+    static AgentExecutionHost ToAgentExecutionHost(global::Mesh.Shared.DeviceInfo device) =>
+        new(device.DeviceId, device.Name, device.Platform);
+    static CommunicationDestination ToCommunicationDestination(global::Mesh.Shared.DeviceInfo device) =>
         new(device.DeviceId, device.Name, device.Platform);
 
     bool IsCurrentDevice(global::Mesh.Shared.DeviceInfo device) =>
         string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
 
-    bool CanRunHere(global::Mesh.Shared.DeviceInfo device) =>
-        global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device);
+    static bool CanCommunicateWith(global::Mesh.Shared.DeviceInfo device) =>
+        global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device);
 
     static string DeviceAvailability(global::Mesh.Shared.DeviceInfo? device) =>
         device is null
-            ? "Presence unknown · Unavailable"
+            ? "Presence unknown"
             : $"{(device.Online ? "Online" : "Offline")} · " +
-              $"{(global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device) ? "Agent ready" : "Unavailable")}";
+              $"{(global::Mesh.Shared.DeviceExecutionEligibility.HasAgentHostCapability(device) ? "Agent ready" : "No agent runtime")}";
 
     bool IsTopicBusy(OwnThread thread) => RemoteRunActivity.IsBusy(
         thread,
         State.IsThreadBusy(thread.Id),
         State.GetRemoteRunProjection(thread.Id),
-        IsAssignedElsewhere(thread),
+        IsExecutionRemote(thread),
         DateTimeOffset.UtcNow,
         UsesAuthoritativeState(thread));
 
     bool UsesAuthoritativeState(OwnThread thread) => RemoteRunActivity.UsesAuthoritativeState(
         Mesh.SupportsAuthoritativeTopicState,
-        thread.ExecutionDeviceId,
+        thread.AgentExecutionHostDeviceId,
         Mesh.MyDeviceId,
-        eligibleDevices);
+        executionHosts);
 
     bool IsAssignedElsewhere(OwnThread thread) =>
-        !string.IsNullOrWhiteSpace(thread.ExecutionDeviceId)
-        && !string.Equals(thread.ExecutionDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+        !string.IsNullOrWhiteSpace(thread.CommunicationDestinationDeviceId)
+        && !string.Equals(thread.CommunicationDestinationDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
+
+    bool IsExecutionRemote(OwnThread thread) =>
+        !string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId)
+        && !string.Equals(thread.AgentExecutionHostDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
 
     bool IsDeviceOnline(string? deviceId)
     {
@@ -2156,22 +3147,27 @@ else
 
     bool IsActiveDevice(global::Mesh.Shared.DeviceInfo device) =>
         Active is not null
-        && string.Equals(Active.ExecutionDeviceId ?? Mesh.MyDeviceId, device.DeviceId, StringComparison.Ordinal);
+        && string.Equals(Active.CommunicationDestinationDeviceId ?? Mesh.MyDeviceId, device.DeviceId, StringComparison.Ordinal);
 
     static string FriendlyName(global::Mesh.Shared.DeviceInfo device) =>
         string.IsNullOrWhiteSpace(device.Name) ? PlatformName(device.Platform) : device.Name;
 
-    static string FriendlyName(ExecutionDevice device) =>
+    static string FriendlyName(AgentExecutionHost device) =>
         string.IsNullOrWhiteSpace(device.DeviceName) ? PlatformName(device.Platform) : device.DeviceName;
 
     static string DeviceLabel(OwnThread thread) =>
-        string.IsNullOrWhiteSpace(thread.ExecutionDeviceName)
-            ? PlatformName(thread.ExecutionDevicePlatform)
-            : thread.ExecutionDeviceName;
+        string.IsNullOrWhiteSpace(thread.CommunicationDestinationDeviceName)
+            ? PlatformName(thread.CommunicationDestinationDevicePlatform)
+            : thread.CommunicationDestinationDeviceName;
+
+    static string ExecutionHostLabel(OwnThread thread) =>
+        string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceName)
+            ? PlatformName(thread.AgentExecutionHostDevicePlatform)
+            : thread.AgentExecutionHostDeviceName;
 
     string DeviceStatus(OwnThread thread)
     {
-        var deviceId = thread.ExecutionDeviceId ?? Mesh.MyDeviceId;
+        var deviceId = thread.CommunicationDestinationDeviceId ?? Mesh.MyDeviceId;
         var device = rosterDevices.FirstOrDefault(item =>
             string.Equals(item.DeviceId, deviceId, StringComparison.Ordinal));
         return $"{DeviceLabel(thread)} · {DeviceAvailability(device)}";
@@ -2253,18 +3249,23 @@ else
     {
         NotificationViews.Clear("mobile-topics");
         disposed = true;
+        State.Changed -= Refresh;
+        Mesh.StateChanged -= OnMeshStateChanged;
+        Mesh.ReplicationStateChanged -= Refresh;
         var detachments = sendObserverSubscriptions.Values
             .Select(subscription => subscription.DisposeAsync().AsTask())
             .ToArray();
         sendObserverSubscriptions.Clear();
         callbackLifetime.Cancel();
+        if (rosterRefreshLoop is not null)
+        {
+            try { await rosterRefreshLoop.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
         await Task.WhenAll(detachments).ConfigureAwait(false);
         callbackLifetime.Dispose();
         deviceRefreshes.Dispose();
         await ResetMobileThreadFlagAsync();
-        State.Changed -= Refresh;
-        Mesh.StateChanged -= OnMeshStateChanged;
-        Mesh.ReplicationStateChanged -= Refresh;
         selfRef?.Dispose();
     }
 
@@ -2272,7 +3273,7 @@ else
     {
         try
         {
-            await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
+            await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false, asyncScopeOwner);
         }
         catch (Exception ex) when (ex is JSDisconnectedException or ObjectDisposedException)
         {

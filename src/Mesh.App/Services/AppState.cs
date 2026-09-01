@@ -71,7 +71,7 @@ public sealed partial class AppState :
         string Identity,
         long Generation);
     private ActiveDatabaseIdentity? activeDatabaseIdentity;
-    private long activeDatabaseGeneration;
+    private static long activeDatabaseEpoch;
     private readonly AgentRuntimeScopeTracker agentRuntimeScopes = new();
     private readonly Dictionary<string, TopicSendRetryAuthorization>
         issuedTopicSendAuthorizations = new(StringComparer.Ordinal);
@@ -83,11 +83,23 @@ public sealed partial class AppState :
     public MeshProfile Profile { get; private set; } = new();
     /// <summary>OwnThreads sorted by pin (pinned first), then activity (newest), then created (newest), then stable id.</summary>
     public IReadOnlyList<OwnThread> OrderedOwnThreads
-        => OwnThreadOrdering.ByActivity(Profile.OwnThreads).ToList();
+    {
+        get
+        {
+            lock (profileSyncGate)
+                return OwnThreadOrdering.ByActivity(Profile.OwnThreads).ToList();
+        }
+    }
 
     /// <summary>Conversations sorted by pin (pinned first), then activity (newest), then created (newest), then stable handle.</summary>
     public IReadOnlyList<Conversation> OrderedConversations
-        => ConversationOrdering.ByActivity(Profile.Conversations).ToList();
+    {
+        get
+        {
+            lock (profileSyncGate)
+                return ConversationOrdering.ByActivity(Profile.Conversations).ToList();
+        }
+    }
 
     public event Action? Changed;
 
@@ -174,17 +186,34 @@ public sealed partial class AppState :
             database,
             accountId,
             identity,
-            Interlocked.Increment(ref activeDatabaseGeneration));
+            Interlocked.Increment(ref activeDatabaseEpoch));
     }
 
     internal AgentRuntimeScopeToken CaptureAgentRuntimeScope()
         => agentRuntimeScopes.CaptureCurrent();
+
+    internal bool TryCaptureAgentRuntimeScope(out AgentRuntimeScopeToken scope)
+        => agentRuntimeScopes.TryCaptureCurrent(out scope);
 
     internal IDisposable EnterAgentRuntimeScope(AgentRuntimeScopeToken scope)
         => agentRuntimeScopes.Enter(scope);
 
     internal bool IsCurrentAgentRuntimeScope(AgentRuntimeScopeToken scope)
         => agentRuntimeScopes.IsCurrent(scope);
+
+    internal bool TryApplyAgentRuntimeScope(
+        AgentRuntimeScopeToken scope,
+        Action mutation)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        lock (profileSyncGate)
+        {
+            if (!agentRuntimeScopes.IsCurrent(scope))
+                return false;
+            mutation();
+            return true;
+        }
+    }
 
     internal bool IsCurrentAgentRuntimeContext
         => agentRuntimeScopes.IsCurrentContext;
@@ -195,6 +224,7 @@ public sealed partial class AppState :
         lock (profileSyncGate)
         {
             agentRuntimeScopes.Deactivate();
+            scopedAsyncOperations.Clear();
             cancellationSources = threadCts.Values.Distinct().ToArray();
             threadCts.Clear();
             awaiting.Clear();
@@ -382,7 +412,7 @@ public sealed partial class AppState :
     public long SetConversationDraftRevision(string handle, string text)
     {
         var normalized = Norm(handle);
-        var db = activeDb;
+        var db = Volatile.Read(ref activeDatabaseIdentity)?.Database;
         if (normalized.Length == 0 || db is null) return 0;
         var revision = ComposerDraftRevision.New();
         EnsureDraftPersistence().Schedule(
@@ -444,7 +474,7 @@ public sealed partial class AppState :
         string threadId,
         MeshDb.TopicComposerSnapshot snapshot)
     {
-        var db = activeDb;
+        var db = Volatile.Read(ref activeDatabaseIdentity)?.Database;
         if (string.IsNullOrWhiteSpace(threadId) || db is null) return 0;
         ArgumentNullException.ThrowIfNull(snapshot);
         var revision = ComposerDraftRevision.New();
@@ -462,7 +492,11 @@ public sealed partial class AppState :
         long revision,
         CancellationToken cancellationToken = default)
     {
-        var db = activeDb ?? throw new InvalidOperationException("No active profile database.");
+        ActiveDatabaseIdentity identity;
+        lock (profileSyncGate)
+            identity = activeDatabaseIdentity
+                ?? throw new InvalidOperationException("No active profile database.");
+        var db = identity.Database;
         if (string.IsNullOrWhiteSpace(threadId))
             throw new ArgumentException("A thread id is required.", nameof(threadId));
         ArgumentNullException.ThrowIfNull(snapshot);
@@ -498,7 +532,14 @@ public sealed partial class AppState :
         if (result == ComposerDraftMutationResult.Superseded)
             throw new InvalidOperationException(
                 $"Draft revision {RevisionHash(revision)} was superseded before it could be committed.");
-        var stored = db.GetTopicDraftState(threadId);
+        MeshDb.ComposerDraft? stored;
+        lock (profileSyncGate)
+        {
+            if (!ReferenceEquals(activeDatabaseIdentity, identity))
+                throw new InvalidOperationException(
+                    "The active account changed while the topic draft was being persisted.");
+            stored = db.GetTopicDraftState(threadId);
+        }
         if (stored is null
             || stored.IsMalformed
             || stored.Revision != revision
@@ -533,13 +574,17 @@ public sealed partial class AppState :
         long expectedRevision,
         CancellationToken cancellationToken = default)
     {
-        var db = activeDb ?? throw new InvalidOperationException("No active profile database.");
+        ActiveDatabaseIdentity identity;
+        lock (profileSyncGate)
+            identity = activeDatabaseIdentity
+                ?? throw new InvalidOperationException("No active profile database.");
+        var db = identity.Database;
         if (string.IsNullOrWhiteSpace(threadId))
             throw new ArgumentException("A thread id is required.", nameof(threadId));
         if (expectedRevision <= 0)
             throw new ArgumentOutOfRangeException(nameof(expectedRevision));
 
-        return draftPersistence is null
+        var result = draftPersistence is null
             ? await db.ResolveTopicDraftCleanupAsync(
                     threadId,
                     expectedRevision,
@@ -552,6 +597,31 @@ public sealed partial class AppState :
                     expectedRevision,
                     cancellationToken)
                 .ConfigureAwait(false);
+        lock (profileSyncGate)
+        {
+            if (!ReferenceEquals(activeDatabaseIdentity, identity))
+                return MeshDb.ComposerDraftClearResult.Superseded;
+            return result;
+        }
+    }
+
+    public MeshDb.ComposerDraftClearResult CompareAndClearTopicDraft(
+        ActiveThreadMutationScope scope,
+        long expectedRevision)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        if (expectedRevision <= 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        lock (profileSyncGate)
+        {
+            if (!TryGetActiveThreadForScope(scope, out var db, out _))
+                return MeshDb.ComposerDraftClearResult.Superseded;
+            return db!.ExecuteDurableWrite(() =>
+                db.ResolveTopicDraftCleanup(
+                    scope.ThreadId,
+                    expectedRevision,
+                    null));
+        }
     }
 
     private static string RevisionHash(long revision)
@@ -760,18 +830,25 @@ public sealed partial class AppState :
                         () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
                 if (thread.IsPinned)
                     activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadPin(thread.Id, true));
-                if (thread.ExecutionDeviceId is not null
-                    || thread.ExecutionDeviceName is not null
-                    || thread.ExecutionDevicePlatform is not null
+                if (thread.CommunicationDestinationDeviceId is not null)
+                    activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadCommunicationDestination(
+                        thread.Id,
+                        thread.CommunicationDestinationDeviceId,
+                        thread.CommunicationDestinationDeviceName,
+                        thread.CommunicationDestinationDevicePlatform ?? DevicePlatforms.Unknown,
+                        thread.LastActivityAt ?? thread.CreatedAt));
+                if (thread.AgentExecutionHostDeviceId is not null
+                    || thread.AgentExecutionHostDeviceName is not null
+                    || thread.AgentExecutionHostDevicePlatform is not null
                     || thread.ExecutionAt.HasValue
                     || thread.ExecutionRunId is not null)
                     activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecution(
                         thread.Id,
-                        thread.ExecutionDeviceId,
+                        thread.AgentExecutionHostDeviceId,
                         thread.ExecutionAt,
                         thread.ExecutionRunId,
-                        thread.ExecutionDeviceName,
-                        thread.ExecutionDevicePlatform));
+                        thread.AgentExecutionHostDeviceName,
+                        thread.AgentExecutionHostDevicePlatform));
                 foreach (var line in thread.Lines)
                     activeDb.ExecuteDurableWrite(() => activeDb.AppendOwnChat(thread.Id, line));
             }
@@ -1016,6 +1093,9 @@ public sealed partial class AppState :
                 || IsTopicLineDeleted(threadId, line.ReplyToLineId))
                 return;
             var thread = GetOrCreateOwnThread(threadId);
+            if (thread.Lines.Any(existing =>
+                    string.Equals(existing.Id, line.Id, StringComparison.Ordinal)))
+                return;
             thread.Lines.Add(line);
             thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, line.At);
             if (terminalRunId is not null)
@@ -1026,6 +1106,8 @@ public sealed partial class AppState :
         }
 
         completedCts?.Dispose();
+        if (terminalRunId is not null)
+            CompleteAssistantAiRequest(terminalRunId);
         NotifyChanged();
     }
 
@@ -1059,7 +1141,7 @@ public sealed partial class AppState :
             && (targetDeviceName is not null || targetDevicePlatform is not null))
             throw new ArgumentException("Execution device metadata requires a device ID.");
         if (targetDeviceId is not null)
-            ValidateExecutionDevice(new ExecutionDevice(
+            ValidateAgentExecutionHost(new AgentExecutionHost(
                 targetDeviceId,
                 targetDeviceName,
                 targetDevicePlatform ?? DevicePlatforms.Unknown));
@@ -1069,19 +1151,21 @@ public sealed partial class AppState :
             CreatedAt = createdAt ?? DateTimeOffset.UtcNow,
             LastActivityAt = lastActivityAt,
             IsPinned = isPinned,
-            ExecutionDeviceId = targetDeviceId,
-            ExecutionDeviceName = targetDeviceName,
-            ExecutionDevicePlatform = targetDevicePlatform,
+            ConversationKind = ConversationKind.Assistant,
+            AgentExecutionHostDeviceId = targetDeviceId,
+            AgentExecutionHostDeviceName = targetDeviceName,
+            AgentExecutionHostDevicePlatform = targetDevicePlatform,
             ExecutionAt = executionAt,
             ExecutionRunId = executionRunId
         };
         Profile.OwnThreads.Add(thread);
         activeDb?.ExecuteDurableWrite(() => activeDb.UpsertOwnThread(
             thread.Id, thread.Title, thread.CreatedAt, Profile.OwnThreads.Count - 1,
-            thread.LastActivityAt, thread.IsPinned, thread.ExecutionDeviceId,
+            thread.LastActivityAt, thread.IsPinned, thread.AgentExecutionHostDeviceId,
             thread.ExecutionAt, thread.ExecutionRunId, replaceExecutionMetadata: true,
-            executionDeviceName: thread.ExecutionDeviceName,
-            executionDevicePlatform: thread.ExecutionDevicePlatform));
+            executionDeviceName: thread.AgentExecutionHostDeviceName,
+            executionDevicePlatform: thread.AgentExecutionHostDevicePlatform,
+            conversationKind: thread.ConversationKind));
         EmitTopicUpsert(thread);
         NotifyChanged();
         return thread;
@@ -1089,7 +1173,7 @@ public sealed partial class AppState :
 
     public OwnThread NewOwnThread(
         string title,
-        ExecutionDevice? executionDevice,
+        AgentExecutionHost? executionDevice,
         DateTimeOffset? createdAt = null,
         DateTimeOffset? lastActivityAt = null,
         bool isPinned = false)
@@ -1104,51 +1188,98 @@ public sealed partial class AppState :
 
     public async Task<OwnThread> NewOwnThreadAsync(
         string title,
-        ExecutionDevice? executionDevice,
+        AgentExecutionHost? executionDevice,
+        DateTimeOffset? createdAt = null,
+        DateTimeOffset? lastActivityAt = null,
+        bool isPinned = false,
+        CancellationToken cancellationToken = default)
+        => await NewOwnThreadCoreAsync(
+            title,
+            communicationDestination: null,
+            executionDevice,
+            createdAt,
+            lastActivityAt,
+            isPinned,
+            cancellationToken);
+
+    public async Task<OwnThread> NewOwnThreadAsync(
+        string title,
+        CommunicationDestination communicationDestination,
+        AgentExecutionHost? agentExecutionHost,
         DateTimeOffset? createdAt = null,
         DateTimeOffset? lastActivityAt = null,
         bool isPinned = false,
         CancellationToken cancellationToken = default)
     {
-        if (executionDevice is not null) ValidateExecutionDevice(executionDevice);
+        ValidateCommunicationDestination(communicationDestination);
+        return await NewOwnThreadCoreAsync(
+            title,
+            communicationDestination,
+            agentExecutionHost,
+            createdAt,
+            lastActivityAt,
+            isPinned,
+            cancellationToken);
+    }
+
+    private async Task<OwnThread> NewOwnThreadCoreAsync(
+        string title,
+        CommunicationDestination? communicationDestination,
+        AgentExecutionHost? executionDevice,
+        DateTimeOffset? createdAt,
+        DateTimeOffset? lastActivityAt,
+        bool isPinned,
+        CancellationToken cancellationToken)
+    {
+        if (executionDevice is not null) ValidateAgentExecutionHost(executionDevice);
         var thread = new OwnThread
         {
             Title = title,
             CreatedAt = createdAt ?? DateTimeOffset.UtcNow,
             LastActivityAt = lastActivityAt,
             IsPinned = isPinned,
-            ExecutionDeviceId = executionDevice?.DeviceId,
-            ExecutionDeviceName = executionDevice?.DeviceName,
-            ExecutionDevicePlatform = executionDevice?.Platform
+            ConversationKind = communicationDestination is null
+                ? ConversationKind.Assistant
+                : ConversationKind.Communication,
+            CommunicationDestinationDeviceId = communicationDestination?.DeviceId,
+            CommunicationDestinationDeviceName = communicationDestination?.DeviceName,
+            CommunicationDestinationDevicePlatform = communicationDestination?.Platform,
+            AgentExecutionHostDeviceId = executionDevice?.DeviceId,
+            AgentExecutionHostDeviceName = executionDevice?.DeviceName,
+            AgentExecutionHostDevicePlatform = executionDevice?.Platform
         };
 
-        MeshDb? db;
+        ActiveDatabaseIdentity? identity;
         int sortOrder;
         lock (profileSyncGate)
         {
-            db = activeDb;
+            identity = activeDatabaseIdentity;
             sortOrder = Profile.OwnThreads.Count;
         }
-        if (db is not null)
+        if (identity is not null)
         {
-            await db.ExecuteDurableWriteAsync(
-                () => db.UpsertOwnThread(
+            await identity.Database.ExecuteDurableWriteAsync(
+                () => identity.Database.UpsertOwnThread(
                     thread.Id, thread.Title, thread.CreatedAt, sortOrder,
-                    thread.LastActivityAt, thread.IsPinned, thread.ExecutionDeviceId,
+                    thread.LastActivityAt, thread.IsPinned, thread.AgentExecutionHostDeviceId,
                     thread.ExecutionAt, thread.ExecutionRunId, replaceExecutionMetadata: true,
-                    executionDeviceName: thread.ExecutionDeviceName,
-                    executionDevicePlatform: thread.ExecutionDevicePlatform),
+                    executionDeviceName: thread.AgentExecutionHostDeviceName,
+                    executionDevicePlatform: thread.AgentExecutionHostDevicePlatform,
+                    communicationDestinationDeviceId: thread.CommunicationDestinationDeviceId,
+                    communicationDestinationDeviceName: thread.CommunicationDestinationDeviceName,
+                    communicationDestinationDevicePlatform: thread.CommunicationDestinationDevicePlatform,
+                    conversationKind: thread.ConversationKind),
                 cancellationToken);
         }
 
         lock (profileSyncGate)
         {
-            if (db is not null && !ReferenceEquals(activeDb, db))
+            if (!ReferenceEquals(activeDatabaseIdentity, identity))
                 throw new InvalidOperationException("The active identity changed while the topic was being created.");
             Profile.OwnThreads.Add(thread);
+            EmitTopicUpsert(thread);
+            NotifyChanged();
         }
-        EmitTopicUpsert(thread);
-        NotifyChanged();
         return thread;
     }
 
@@ -1204,68 +1335,289 @@ public sealed partial class AppState :
     public void UnpinOwnThread(string threadId)
         => SetOwnThreadPinned(threadId, false);
 
-    public void BindOwnThreadForSend(string threadId, ExecutionDevice target)
+    public ActiveThreadMutationScope CaptureActiveThreadMutationScope(string threadId)
     {
         ValidateThreadId(threadId);
-        ValidateExecutionDevice(target);
+        lock (profileSyncGate)
+        {
+            var identity = activeDatabaseIdentity
+                ?? throw new InvalidOperationException("No active profile database.");
+            if (!Profile.OwnThreads.Any(thread =>
+                    string.Equals(thread.Id, threadId, StringComparison.Ordinal)))
+                throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
+            return new(
+                identity.AccountId,
+                identity.Identity,
+                identity.Generation,
+                threadId);
+        }
+    }
+
+    public bool TryCaptureActiveThreadMutationScope(
+        string threadId,
+        out ActiveThreadMutationScope? scope)
+    {
+        ValidateThreadId(threadId);
+        lock (profileSyncGate)
+        {
+            var identity = activeDatabaseIdentity;
+            if (identity is null
+                || !Profile.OwnThreads.Any(thread =>
+                    string.Equals(thread.Id, threadId, StringComparison.Ordinal)))
+            {
+                scope = null;
+                return false;
+            }
+            scope = new(
+                identity.AccountId,
+                identity.Identity,
+                identity.Generation,
+                threadId);
+            return true;
+        }
+    }
+
+    internal bool TryCaptureActiveThreadMutationScope(
+        AgentRuntimeScopeToken runtimeScope,
+        string threadId,
+        out ActiveThreadMutationScope? scope)
+    {
+        ValidateThreadId(threadId);
+        lock (profileSyncGate)
+        {
+            if (!agentRuntimeScopes.IsCurrent(runtimeScope))
+            {
+                scope = null;
+                return false;
+            }
+            return TryCaptureActiveThreadMutationScope(threadId, out scope);
+        }
+    }
+
+    public bool IsCurrentActiveThreadMutationScope(ActiveThreadMutationScope scope)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        lock (profileSyncGate)
+            return TryGetActiveThreadForScope(scope, out _, out _);
+    }
+
+    public bool TryApplyActiveThreadMutationScope(
+        ActiveThreadMutationScope scope,
+        Action<OwnThread> mutation)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        ArgumentNullException.ThrowIfNull(mutation);
+        lock (profileSyncGate)
+        {
+            if (!TryGetActiveThreadForScope(scope, out _, out var thread))
+                return false;
+            mutation(thread!);
+            return true;
+        }
+    }
+
+    private bool TryGetActiveThreadForScope(
+        ActiveThreadMutationScope scope,
+        out MeshDb? database,
+        out OwnThread? thread)
+    {
+        var identity = activeDatabaseIdentity;
+        if (identity is null
+            || !ReferenceEquals(activeDb, identity.Database)
+            || !string.Equals(identity.AccountId, scope.AccountId, StringComparison.Ordinal)
+            || !string.Equals(identity.Identity, scope.DatabaseIdentity, StringComparison.Ordinal)
+            || identity.Generation != scope.Epoch)
+        {
+            database = null;
+            thread = null;
+            return false;
+        }
+
+        database = identity.Database;
+        thread = Profile.OwnThreads.FirstOrDefault(candidate =>
+            string.Equals(candidate.Id, scope.ThreadId, StringComparison.Ordinal));
+        return thread is not null;
+    }
+
+    public void AssignOwnThreadAgentExecutionHost(string threadId, AgentExecutionHost target)
+    {
+        ValidateThreadId(threadId);
+        ValidateAgentExecutionHost(target);
         OwnThread? thread;
         lock (profileSyncGate)
         {
             thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId);
             if (thread is null)
                 throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
-            if (!string.IsNullOrWhiteSpace(thread.ExecutionDeviceId))
+            if (!string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId))
                 throw new InvalidOperationException("The topic is already bound to an execution device.");
             if (activeDb is not null
-                && !activeDb.ExecuteDurableWrite(() => activeDb.TryBindOwnThreadDevice(
+                && !activeDb.ExecuteDurableWrite(() => activeDb.TryAssignOwnThreadAgentExecutionHost(
                     thread.Id, target.DeviceId, target.DeviceName, target.Platform)))
                 throw new InvalidOperationException("The topic could not be bound atomically.");
-            thread.ExecutionDeviceId = target.DeviceId;
-            thread.ExecutionDeviceName = target.DeviceName;
-            thread.ExecutionDevicePlatform = target.Platform;
+            thread.AgentExecutionHostDeviceId = target.DeviceId;
+            thread.AgentExecutionHostDeviceName = target.DeviceName;
+            thread.AgentExecutionHostDevicePlatform = target.Platform;
         }
         EmitTopicUpsert(thread);
         NotifyChanged();
     }
 
-    public void MoveOwnThreadToDevice(
-        string threadId,
-        ExecutionDevice target,
-        DateTimeOffset? movedAt = null)
+    public bool AssignOwnThreadAgentExecutionHost(
+        ActiveThreadMutationScope scope,
+        AgentExecutionHost target)
     {
-        ValidateThreadId(threadId);
-        ValidateExecutionDevice(target);
-        var at = movedAt ?? DateTimeOffset.UtcNow;
-        if (at == default) throw new ArgumentException("A move timestamp is required.", nameof(movedAt));
-        OwnThread thread;
+        ArgumentNullException.ThrowIfNull(scope);
+        ValidateAgentExecutionHost(target);
         lock (profileSyncGate)
         {
-            thread = Profile.OwnThreads.FirstOrDefault(t => t.Id == threadId)
-                     ?? throw new KeyNotFoundException($"Topic '{threadId}' does not exist.");
-            var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, at);
-            if (activeDb is not null
-                && !activeDb.ExecuteDurableWrite(() => activeDb.MoveOwnThreadToDevice(
-                    thread.Id, target.DeviceId, target.DeviceName, target.Platform, activityAt)))
-                throw new InvalidOperationException("The topic could not be moved atomically.");
-            thread.ExecutionDeviceId = target.DeviceId;
-            thread.ExecutionDeviceName = target.DeviceName;
-            thread.ExecutionDevicePlatform = target.Platform;
+            if (!TryGetActiveThreadForScope(scope, out var database, out var thread))
+                return false;
+            if (!string.IsNullOrWhiteSpace(thread!.AgentExecutionHostDeviceId))
+                return string.Equals(
+                    thread.AgentExecutionHostDeviceId,
+                    target.DeviceId,
+                    StringComparison.Ordinal);
+            if (!database!.ExecuteDurableWrite(() =>
+                    database.TryAssignOwnThreadAgentExecutionHost(
+                        thread.Id,
+                        target.DeviceId,
+                        target.DeviceName,
+                        target.Platform)))
+                return false;
+            thread.AgentExecutionHostDeviceId = target.DeviceId;
+            thread.AgentExecutionHostDeviceName = target.DeviceName;
+            thread.AgentExecutionHostDevicePlatform = target.Platform;
+            EmitTopicUpsert(thread);
+            NotifyChanged();
+            return true;
+        }
+    }
+
+    public bool MoveOwnThreadAgentExecutionHost(
+        ActiveThreadMutationScope scope,
+        AgentExecutionHost target,
+        AssistantAiRequestMutationScope? requestScope = null,
+        DateTimeOffset? movedAt = null,
+        ScopedAsyncOperation? operationScope = null)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        ValidateAgentExecutionHost(target);
+        var at = movedAt ?? timeProvider.GetUtcNow();
+        if (at == default) throw new ArgumentException("A move timestamp is required.", nameof(movedAt));
+
+        lock (profileSyncGate)
+        {
+            TopicCancellationBoundaryHook?.Invoke("move-mutation");
+            if (operationScope is not null
+                && (!IsCurrentScopedAsyncOperation(operationScope)
+                    || !string.Equals(
+                        operationScope.TopicId, scope.ThreadId, StringComparison.Ordinal)))
+                return false;
+            if (!TryGetActiveThreadForScope(scope, out var database, out var thread))
+                return false;
+
+            AssistantAiRequest? request = null;
+            if (requestScope is not null)
+            {
+                if (!string.Equals(requestScope.AccountId, scope.AccountId, StringComparison.Ordinal)
+                    || !string.Equals(
+                        requestScope.DatabaseIdentity,
+                        scope.DatabaseIdentity,
+                        StringComparison.Ordinal)
+                    || requestScope.DatabaseGeneration != scope.Epoch
+                    || !string.Equals(requestScope.ThreadId, scope.ThreadId, StringComparison.Ordinal)
+                    || !TryGetScopedAssistantAiRequest(requestScope, out _, out request))
+                    return false;
+            }
+
+            var activityAt = ActivityTimestamp.Advance(thread!.LastActivityAt, at);
+            database!.ExecuteDurableWrite(() =>
+            {
+                if (!database.MoveOwnThreadAgentExecutionHost(
+                        thread.Id,
+                        target.DeviceId,
+                        target.DeviceName,
+                        target.Platform,
+                        activityAt))
+                    throw new InvalidOperationException("The topic could not be moved atomically.");
+
+                if (requestScope is not null && request is { IsTerminal: false })
+                {
+                    var transition = database.TryReassignAssistantAiRequest(
+                        requestScope.RunId,
+                        requestScope.OperationId,
+                        requestScope.ThreadId,
+                        requestScope.TriggerLineId,
+                        requestScope.AccountId,
+                        requestScope.RequestAccountGeneration,
+                        target,
+                        at);
+                    if (transition.Outcome is AssistantAiRequestTransitionOutcome.StaleIdentity
+                        or AssistantAiRequestTransitionOutcome.Missing)
+                        throw new InvalidOperationException(
+                            "The pending assistant request changed during the scoped move.");
+                }
+            });
+
+            thread.AgentExecutionHostDeviceId = target.DeviceId;
+            thread.AgentExecutionHostDeviceName = target.DeviceName;
+            thread.AgentExecutionHostDevicePlatform = target.Platform;
             thread.ExecutionAt = null;
             thread.ExecutionRunId = null;
             thread.LastActivityAt = activityAt;
             remoteRuns.TryRemove(thread.Id, out _);
+            EmitTopicUpsert(thread);
+            NotifyChanged();
+            return true;
         }
-        EmitTopicUpsert(thread);
-        NotifyChanged();
+    }
+
+    public bool MoveOwnThreadCommunicationDestination(
+        ActiveThreadMutationScope scope,
+        CommunicationDestination destination,
+        DateTimeOffset? movedAt = null,
+        ScopedAsyncOperation? operationScope = null)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        ValidateCommunicationDestination(destination);
+        var at = movedAt ?? timeProvider.GetUtcNow();
+
+        lock (profileSyncGate)
+        {
+            TopicCancellationBoundaryHook?.Invoke("move-mutation");
+            if (operationScope is not null
+                && (!IsCurrentScopedAsyncOperation(operationScope)
+                    || !string.Equals(
+                        operationScope.TopicId, scope.ThreadId, StringComparison.Ordinal)))
+                return false;
+            if (!TryGetActiveThreadForScope(scope, out var database, out var thread))
+                return false;
+
+            var activityAt = ActivityTimestamp.Advance(thread!.LastActivityAt, at);
+            database!.ExecuteDurableWrite(() => database.SetOwnThreadCommunicationDestination(
+                thread.Id,
+                destination.DeviceId,
+                destination.DeviceName,
+                destination.Platform,
+                activityAt));
+            thread.CommunicationDestinationDeviceId = destination.DeviceId;
+            thread.CommunicationDestinationDeviceName = destination.DeviceName;
+            thread.CommunicationDestinationDevicePlatform = destination.Platform;
+            thread.LastActivityAt = activityAt;
+            EmitTopicUpsert(thread);
+            NotifyChanged();
+            return true;
+        }
     }
 
     public OwnThread EnsureOwnThreadForDeviceRun(
         string threadId,
-        ExecutionDevice target,
+        AgentExecutionHost target,
         DateTimeOffset createdAt)
     {
         ValidateThreadId(threadId);
-        ValidateExecutionDevice(target);
+        ValidateAgentExecutionHost(target);
         if (createdAt == default)
             throw new ArgumentException("A topic timestamp is required.", nameof(createdAt));
 
@@ -1282,8 +1634,8 @@ public sealed partial class AppState :
                      };
             if (!Profile.OwnThreads.Contains(thread))
                 Profile.OwnThreads.Add(thread);
-            if (thread.ExecutionDeviceId is not null
-                && !string.Equals(thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
+            if (thread.AgentExecutionHostDeviceId is not null
+                && !string.Equals(thread.AgentExecutionHostDeviceId, target.DeviceId, StringComparison.Ordinal))
                 throw new InvalidOperationException("The topic is bound to another execution device.");
 
             var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, createdAt);
@@ -1299,28 +1651,16 @@ public sealed partial class AppState :
                 thread.ExecutionRunId,
                 replaceExecutionMetadata: true,
                 executionDeviceName: target.DeviceName,
-                executionDevicePlatform: target.Platform));
-            thread.ExecutionDeviceId = target.DeviceId;
-            thread.ExecutionDeviceName = target.DeviceName;
-            thread.ExecutionDevicePlatform = target.Platform;
+                executionDevicePlatform: target.Platform,
+                conversationKind: thread.ConversationKind));
+            thread.AgentExecutionHostDeviceId = target.DeviceId;
+            thread.AgentExecutionHostDeviceName = target.DeviceName;
+            thread.AgentExecutionHostDevicePlatform = target.Platform;
             thread.LastActivityAt = activityAt;
         }
         EmitTopicUpsert(thread);
         NotifyChanged();
         return thread;
-    }
-
-    /// <summary>Compatibility alias. Prefer <see cref="BindOwnThreadForSend"/>.</summary>
-    public bool BindThreadDevice(string threadId, string deviceId)
-    {
-        try
-        {
-            BindOwnThreadForSend(threadId, new ExecutionDevice(deviceId, null, DevicePlatforms.Unknown));
-            return true;
-        }
-        catch (ArgumentException) { return false; }
-        catch (InvalidOperationException) { return false; }
-        catch (KeyNotFoundException) { return false; }
     }
 
     public void RenameOwnThread(string threadId, string title)
@@ -1373,9 +1713,13 @@ public sealed partial class AppState :
             thread.Title,
             thread.CreatedAt,
             SortOrder = Math.Max(0, sortOrder),
-            thread.ExecutionDeviceId,
-            thread.ExecutionDeviceName,
-            thread.ExecutionDevicePlatform,
+            thread.ConversationKind,
+            thread.CommunicationDestinationDeviceId,
+            thread.CommunicationDestinationDeviceName,
+            thread.CommunicationDestinationDevicePlatform,
+            thread.AgentExecutionHostDeviceId,
+            thread.AgentExecutionHostDeviceName,
+            thread.AgentExecutionHostDevicePlatform,
             thread.LastActivityAt,
             thread.IsPinned,
             thread.ExecutionAt,
@@ -1383,6 +1727,15 @@ public sealed partial class AppState :
         }, ReplicationJson);
         EmitReplicatedChange(ReplicationOpKinds.Topic, ReplicationPayloadCodec.DomainAction.Upsert,
             thread.Id, thread.Id, body, TargetsForOwnerState(), notificationIntent);
+    }
+
+    private static void ValidateCommunicationDestination(CommunicationDestination destination)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        if (!TopicRunProtocol.IsValidIdentifier(destination.DeviceId))
+            throw new ArgumentException("A valid communication destination device ID is required.");
+        if (string.IsNullOrWhiteSpace(destination.Platform))
+            throw new ArgumentException("A communication destination platform is required.");
     }
 
     private void EmitConversationUpsert(Conversation conversation)
@@ -1969,9 +2322,9 @@ public sealed partial class AppState :
                     thread.LastActivityAt, run.StartedAt);
                 activeDb?.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
                     thread.Id,
-                    thread.ExecutionDeviceId,
-                    thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform,
+                    thread.AgentExecutionHostDeviceId,
+                    thread.AgentExecutionHostDeviceName,
+                    thread.AgentExecutionHostDevicePlatform,
                     thread.ExecutionAt,
                     thread.ExecutionRunId,
                     thread.LastActivityAt!.Value));
@@ -2009,13 +2362,13 @@ public sealed partial class AppState :
     public void RegisterExpectedRemoteRun(
         string threadId,
         string runId,
-        ExecutionDevice target,
+        AgentExecutionHost target,
         DateTimeOffset startedAt)
     {
         ValidateThreadId(threadId);
         if (!TopicRunProtocol.IsValidIdentifier(runId))
             throw new ArgumentException("A run ID is required.", nameof(runId));
-        ValidateExecutionDevice(target);
+        ValidateAgentExecutionHost(target);
         if (startedAt == default)
             throw new ArgumentException("A run timestamp is required.", nameof(startedAt));
 
@@ -2030,8 +2383,8 @@ public sealed partial class AppState :
             if (thread.ExecutionRunId is not null
                 && !string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal))
                 throw new InvalidOperationException("The topic already has a different active run.");
-            if (thread.ExecutionDeviceId is not null
-                && !string.Equals(thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
+            if (thread.AgentExecutionHostDeviceId is not null
+                && !string.Equals(thread.AgentExecutionHostDeviceId, target.DeviceId, StringComparison.Ordinal))
                 throw new InvalidOperationException("The run target does not match the bound execution device.");
             var activityAt = ActivityTimestamp.Advance(thread.LastActivityAt, startedAt);
             if (activeDb is not null
@@ -2044,9 +2397,9 @@ public sealed partial class AppState :
                     runId,
                     activityAt)))
                 throw new InvalidOperationException("The expected remote run could not be persisted.");
-            thread.ExecutionDeviceId = target.DeviceId;
-            thread.ExecutionDeviceName = target.DeviceName;
-            thread.ExecutionDevicePlatform = target.Platform;
+            thread.AgentExecutionHostDeviceId = target.DeviceId;
+            thread.AgentExecutionHostDeviceName = target.DeviceName;
+            thread.AgentExecutionHostDevicePlatform = target.Platform;
             thread.ExecutionRunId = runId;
             thread.ExecutionAt = startedAt;
             thread.LastActivityAt = activityAt;
@@ -2104,7 +2457,7 @@ public sealed partial class AppState :
                 return activeDb is null
                     ? RemoteTopicUpdatePersistenceResult.PersistenceFailed
                     : RemoteTopicUpdatePersistenceResult.NotCorrelated;
-            sourceDeviceId ??= thread?.ExecutionDeviceId;
+            sourceDeviceId ??= thread?.AgentExecutionHostDeviceId;
             if (!TopicRunProtocol.IsValidIdentifier(sourceDeviceId))
                 return RemoteTopicUpdatePersistenceResult.NotCorrelated;
 
@@ -2260,9 +2613,9 @@ public sealed partial class AppState :
             if (activeDb is not null
                 && !activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
                     thread.Id,
-                    thread.ExecutionDeviceId,
-                    thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform,
+                    thread.AgentExecutionHostDeviceId,
+                    thread.AgentExecutionHostDeviceName,
+                    thread.AgentExecutionHostDevicePlatform,
                     thread.ExecutionAt,
                     null,
                     activityAt)))
@@ -2340,9 +2693,9 @@ public sealed partial class AppState :
                     thread.Id,
                     runId,
                     replyToLineId,
-                    thread.ExecutionDeviceId,
-                    thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform,
+                    thread.AgentExecutionHostDeviceId,
+                    thread.AgentExecutionHostDeviceName,
+                    thread.AgentExecutionHostDevicePlatform,
                     thread.ExecutionAt ?? answerAt,
                     activityAt)))
                 return false;
@@ -2516,17 +2869,24 @@ public sealed partial class AppState :
     }
 
     /// <summary>
-    /// Requests cancellation of a thread's in-progress turn. Returns true if a turn was actually
+    /// Requests cancellation of the exact scoped thread turn. Returns true if that turn was actually
     /// running. The turn's task observes the token, stops, and the caller records it as cancelled.
     /// </summary>
-    public bool CancelThreadTurn(string threadId)
+    internal bool CancelThreadTurn(ScopedAsyncOperation operation)
     {
+        ArgumentNullException.ThrowIfNull(operation);
         CancellationTokenSource? cts;
         lock (profileSyncGate)
         {
-            if (!IsCurrentAgentRuntimeContext) return false;
-            if (!threadCts.TryGetValue(threadId, out cts)) return false;
-            cancelledThreads.Add(threadId);
+            if (!IsCurrentAgentRuntimeContext
+                || !IsCurrentScopedAsyncOperationUnderLock(operation)
+                || string.IsNullOrWhiteSpace(operation.TopicId)
+                || string.IsNullOrWhiteSpace(operation.RunId)
+                || !activeThreadRuns.TryGetValue(operation.TopicId, out var activeRunId)
+                || !string.Equals(activeRunId, operation.RunId, StringComparison.Ordinal)
+                || !threadCts.TryGetValue(operation.TopicId, out cts))
+                return false;
+            cancelledThreads.Add(operation.TopicId);
         }
         try
         {
@@ -2616,9 +2976,9 @@ public sealed partial class AppState :
             if (thread.LastActivityAt is { } activityAt)
                 activeDb?.ExecuteDurableWrite(() => activeDb.SetOwnThreadExecutionAndActivity(
                     thread.Id,
-                    thread.ExecutionDeviceId,
-                    thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform,
+                    thread.AgentExecutionHostDeviceId,
+                    thread.AgentExecutionHostDeviceName,
+                    thread.AgentExecutionHostDevicePlatform,
                     thread.ExecutionAt,
                     null,
                     activityAt));
@@ -3002,6 +3362,7 @@ public sealed partial class AppState :
 
         if (activeId is not null && activeDb is not null)
         {
+            Volatile.Write(ref activeDatabaseIdentity, null);
             FlushBlocking();
             RaiseActiveAccountChanging();
         }
@@ -3048,14 +3409,21 @@ public sealed partial class AppState :
                     () => db.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
             if (thread.IsPinned)
                 db.ExecuteDurableWrite(() => db.SetOwnThreadPin(thread.Id, true));
-            if (thread.ExecutionDeviceId is not null || thread.ExecutionAt.HasValue || thread.ExecutionRunId is not null)
+            if (thread.CommunicationDestinationDeviceId is not null)
+                db.ExecuteDurableWrite(() => db.SetOwnThreadCommunicationDestination(
+                    thread.Id,
+                    thread.CommunicationDestinationDeviceId,
+                    thread.CommunicationDestinationDeviceName,
+                    thread.CommunicationDestinationDevicePlatform ?? DevicePlatforms.Unknown,
+                    thread.LastActivityAt ?? thread.CreatedAt));
+            if (thread.AgentExecutionHostDeviceId is not null || thread.ExecutionAt.HasValue || thread.ExecutionRunId is not null)
                 db.ExecuteDurableWrite(() => db.SetOwnThreadExecution(
                     thread.Id,
-                    thread.ExecutionDeviceId,
+                    thread.AgentExecutionHostDeviceId,
                     thread.ExecutionAt,
                     thread.ExecutionRunId,
-                    thread.ExecutionDeviceName,
-                    thread.ExecutionDevicePlatform));
+                    thread.AgentExecutionHostDeviceName,
+                    thread.AgentExecutionHostDevicePlatform));
             foreach (var line in thread.Lines)
                 db.ExecuteDurableWrite(() => db.AppendOwnChat(thread.Id, line));
         }
@@ -3098,6 +3466,7 @@ public sealed partial class AppState :
     {
         if (activeId is not null)
         {
+            Volatile.Write(ref activeDatabaseIdentity, null);
             FlushBlocking();
             RaiseActiveAccountChanging();
         }
@@ -3124,13 +3493,19 @@ public sealed partial class AppState :
             if (id == activeId) return true;
         }
         MeshDb? db = null;
+        ActiveDatabaseIdentity? previousIdentity = null;
         try
         {
             db = OpenDb(id);
             var loaded = db.LoadProfile();
             if (loaded is null) { db.Dispose(); return false; }
-            if (activeId is not null) FlushBlocking();
-            RaiseActiveAccountChanging();
+            if (activeId is not null)
+            {
+                previousIdentity = Volatile.Read(ref activeDatabaseIdentity);
+                Volatile.Write(ref activeDatabaseIdentity, null);
+                FlushBlocking();
+                RaiseActiveAccountChanging();
+            }
 
             lock (profileSyncGate)
             {
@@ -3158,6 +3533,10 @@ public sealed partial class AppState :
         }
         catch (Exception ex)
         {
+            if (previousIdentity is not null
+                && ReferenceEquals(activeDb, previousIdentity.Database)
+                && activeDatabaseIdentity is null)
+                Volatile.Write(ref activeDatabaseIdentity, previousIdentity);
             RuntimeDiagnostics.Current?.RecordException("account-switch", ex);
             db?.Dispose();
             return false;
@@ -3446,7 +3825,7 @@ public sealed partial class AppState :
             throw new ArgumentException("A valid topic ID is required.", nameof(threadId));
     }
 
-    private static void ValidateExecutionDevice(ExecutionDevice target)
+    private static void ValidateAgentExecutionHost(AgentExecutionHost target)
     {
         ArgumentNullException.ThrowIfNull(target);
         if (!TopicRunProtocol.IsValidIdentifier(target.DeviceId))

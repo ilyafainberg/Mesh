@@ -253,7 +253,7 @@ public sealed partial class MeshDb
         {
             thread.Transaction = transaction;
             thread.CommandText = """
-                SELECT execution_device_id
+                SELECT agent_execution_host_device_id
                 FROM own_threads
                 WHERE id = $thread;
                 """;
@@ -349,7 +349,7 @@ public sealed partial class MeshDb
                     || !TopicRunCorrelationMatches(existingCorrelation, command)
                     || existingOutbox is not null
                        && !TopicOutboxMatches(
-                           existingOutbox, command, requestJson!, attachmentsJson!))
+                           existingOutbox, command, attachmentsJson!))
                     return new TopicRunBeginResult(false, false, "run_id_conflict");
                 transaction.Commit();
                 return new TopicRunBeginResult(
@@ -398,9 +398,9 @@ public sealed partial class MeshDb
             bind.Transaction = transaction;
             bind.CommandText = """
                 UPDATE own_threads
-                SET execution_device_id = $device,
-                    execution_device_name = $deviceName,
-                    execution_device_platform = $platform,
+                SET agent_execution_host_device_id = $device,
+                    agent_execution_host_device_name = $deviceName,
+                    agent_execution_host_device_platform = $platform,
                     execution_at = $executionAt,
                     execution_run_id = COALESCE(execution_run_id, $run),
                     last_activity_at = CASE
@@ -409,7 +409,7 @@ public sealed partial class MeshDb
                         THEN $activity ELSE last_activity_at
                     END
                 WHERE id = $thread
-                  AND (execution_device_id IS NULL OR execution_device_id = $device);
+                  AND (agent_execution_host_device_id IS NULL OR agent_execution_host_device_id = $device);
                 """;
             bind.Parameters.AddWithValue("$device", command.Target.DeviceId);
             bind.Parameters.AddWithValue(
@@ -668,7 +668,7 @@ public sealed partial class MeshDb
                 outbox.Attachments);
             var command = new TopicRunBeginCommand(
                 draft,
-                new ExecutionDevice(outbox.TargetDeviceId, null, DevicePlatforms.Unknown),
+                new AgentExecutionHost(outbox.TargetDeviceId, null, DevicePlatforms.Unknown),
                 TopicRunBeginMode.Remote,
                 new TopicRunUpdatePayload(
                     outbox.RunId,
@@ -914,21 +914,29 @@ public sealed partial class MeshDb
     private static bool TopicOutboxMatches(
         TopicOutboxItem existing,
         TopicRunBeginCommand command,
-        string requestJson,
         string attachmentsJson)
-        => string.Equals(existing.ThreadId, command.Draft.ThreadId, StringComparison.Ordinal)
+    {
+        var proposedRequest = command.Request;
+        return proposedRequest is not null
+           && string.Equals(existing.ThreadId, command.Draft.ThreadId, StringComparison.Ordinal)
            && string.Equals(
                existing.TriggerLineId, command.Draft.TriggerLineId, StringComparison.Ordinal)
            && string.Equals(
                existing.TargetDeviceId, command.Target.DeviceId, StringComparison.Ordinal)
            && string.Equals(
                JsonSerializer.Serialize(existing.Request, JsonOpts),
-               requestJson,
+               JsonSerializer.Serialize(
+                   proposedRequest with
+                   {
+                       OriginScopeId = existing.Request.OriginScopeId
+                   },
+                   JsonOpts),
                StringComparison.Ordinal)
            && string.Equals(
                JsonSerializer.Serialize(existing.Attachments, JsonOpts),
                attachmentsJson,
                StringComparison.Ordinal);
+    }
 
     private static ChatAttachment CloneAttachment(ChatAttachment attachment)
         => new(attachment.Name, attachment.MimeType, attachment.Data.ToArray());
@@ -1020,7 +1028,7 @@ public sealed partial class MeshDb
             item.Attachments);
         var command = new TopicRunBeginCommand(
             draft,
-            new ExecutionDevice(item.TargetDeviceId, null, DevicePlatforms.Unknown),
+            new AgentExecutionHost(item.TargetDeviceId, null, DevicePlatforms.Unknown),
             TopicRunBeginMode.Remote,
             new TopicRunUpdatePayload(
                 item.RunId,
@@ -1220,7 +1228,7 @@ public sealed partial class MeshDb
                       END
                   WHERE id = $thread
                        AND (execution_run_id = $run OR execution_run_id IS NULL)
-                    AND execution_device_id = $source;
+                    AND agent_execution_host_device_id = $source;
                   """
                 : """
                   UPDATE own_threads
@@ -1232,7 +1240,7 @@ public sealed partial class MeshDb
                       END
                   WHERE id = $thread
                     AND execution_run_id = $run
-                    AND execution_device_id = $source;
+                    AND agent_execution_host_device_id = $source;
                   """;
             threadUpdate.Parameters.AddWithValue("$thread", update.ThreadId);
             threadUpdate.Parameters.AddWithValue("$run", update.RunId);
@@ -1496,7 +1504,7 @@ public sealed partial class MeshDb
                       SELECT 1 FROM own_threads AS thread
                       WHERE thread.id = correlation.thread_id
                         AND thread.execution_run_id = correlation.run_id
-                        AND thread.execution_device_id = correlation.target_device_id));
+                        AND thread.agent_execution_host_device_id = correlation.target_device_id));
             """;
         bind.Parameters.AddWithValue("$run", runId);
         bind.Parameters.AddWithValue("$thread", threadId);
@@ -1780,7 +1788,13 @@ public sealed partial class MeshDb
                 reader.GetString(reader.GetOrdinal("source_device_id")),
                 reader.GetString(reader.GetOrdinal("thread_id")),
                 reader.GetString(reader.GetOrdinal("terminal_update_json")),
-                DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at"))))
+                DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at"))),
+                reader.IsDBNull(reader.GetOrdinal("request_id"))
+                    ? null
+                    : reader.GetString(reader.GetOrdinal("request_id")),
+                reader.IsDBNull(reader.GetOrdinal("origin_scope_id"))
+                    ? null
+                    : reader.GetString(reader.GetOrdinal("origin_scope_id")))
             : null;
     }
 
@@ -1789,12 +1803,15 @@ public sealed partial class MeshDb
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT OR IGNORE INTO inbound_topic_cancellations(
-                run_id, source_device_id, thread_id, terminal_update_json, created_at)
-            VALUES($run, $source, $thread, $terminal, $created);
+                run_id, source_device_id, thread_id, request_id, origin_scope_id,
+                terminal_update_json, created_at)
+            VALUES($run, $source, $thread, $request, $origin, $terminal, $created);
             """;
         cmd.Parameters.AddWithValue("$run", item.RunId);
         cmd.Parameters.AddWithValue("$source", item.SourceDeviceId);
         cmd.Parameters.AddWithValue("$thread", item.ThreadId);
+        cmd.Parameters.AddWithValue("$request", (object?)item.RequestId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$origin", (object?)item.OriginScopeId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$terminal", item.TerminalUpdateJson);
         cmd.Parameters.AddWithValue("$created", item.CreatedAt.ToString("O"));
         return cmd.ExecuteNonQuery() == 1;

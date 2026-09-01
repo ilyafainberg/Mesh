@@ -262,7 +262,10 @@ public sealed class MeshHub(
             }
 
             var authorizedDevices = AuthorizedDeviceIds(target);
-            var excludeSelf = string.Equals(toHandle, connection.Handle, StringComparison.Ordinal)
+            // A directed self-chat names an exact device and must include that connection. Account
+            // fanout still excludes the originating socket to avoid echoing an undirected frame.
+            var excludeSelf = !directed
+                && string.Equals(toHandle, connection.Handle, StringComparison.Ordinal)
                 ? Context.ConnectionId
                 : null;
 

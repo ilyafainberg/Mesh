@@ -66,10 +66,11 @@ window.meshUI = {
   // Thread screens live inside MobileShell's scrollable body. iOS treats that body as a native
   // scrolling layer, so a fixed child cannot reliably cover the sibling tab bar. Hide the tab bar
   // and suspend body scrolling while a thread is open, then restore the list position on close.
-  setMobileThreadOpen: function (open) {
+  setMobileThreadOpen: function (open, owner) {
     var root = document.documentElement;
     var body = document.querySelector('.m-body');
     if (open) {
+      if (owner) root.dataset.meshMobileThreadOwner = owner;
       if (body && !body.dataset.meshThreadScrollTop)
         body.dataset.meshThreadScrollTop = String(body.scrollTop || 0);
       if (body) body.scrollTop = 0;
@@ -77,6 +78,9 @@ window.meshUI = {
       return;
     }
 
+    if (owner && root.dataset.meshMobileThreadOwner &&
+        root.dataset.meshMobileThreadOwner !== owner) return;
+    delete root.dataset.meshMobileThreadOwner;
     root.classList.remove('mesh-mobile-thread-open');
     if (body && body.dataset.meshThreadScrollTop) {
       var top = Number(body.dataset.meshThreadScrollTop) || 0;

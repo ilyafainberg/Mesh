@@ -7,20 +7,22 @@ internal sealed class AgentRuntimeScopeTracker
     private readonly object gate = new();
     private readonly AsyncLocal<AgentRuntimeScopeToken?> ambient = new();
     private AgentRuntimeScopeToken? active;
-    private long generation;
+    private static long processGeneration;
 
     public void Activate(string identity)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(identity);
         lock (gate)
-            active = new AgentRuntimeScopeToken(identity, ++generation);
+            active = new AgentRuntimeScopeToken(
+                identity,
+                Interlocked.Increment(ref processGeneration));
     }
 
     public void Deactivate()
     {
         lock (gate)
         {
-            generation++;
+            Interlocked.Increment(ref processGeneration);
             active = null;
         }
     }
@@ -31,6 +33,20 @@ internal sealed class AgentRuntimeScopeTracker
             return active
                    ?? throw new InvalidOperationException(
                        "An active account database is required for an agent run.");
+    }
+
+    public bool TryCaptureCurrent(out AgentRuntimeScopeToken scope)
+    {
+        lock (gate)
+        {
+            if (active is { } current)
+            {
+                scope = current;
+                return true;
+            }
+            scope = default;
+            return false;
+        }
     }
 
     public IDisposable Enter(AgentRuntimeScopeToken scope)

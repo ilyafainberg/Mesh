@@ -1027,7 +1027,8 @@ public sealed class KeyValueTopicSendIdentityStore(
                 $"topic.send:{TopicSendSnapshot.StableId("malformed-operation", scopeIdentity)}",
                 TopicSendSnapshot.StableId("malformed-run", scopeIdentity),
                 TopicSendSnapshot.StableId("malformed-line", scopeIdentity),
-                fingerprint);
+                fingerprint,
+                Version: -1);
             return true;
         }
     }
@@ -1144,6 +1145,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
         public TopicSendOutcome? TerminalOutcome;
         public TopicSendOutcome? JournalTerminalOutcome;
         public TopicSendOutcome? LastOutcome;
+        public TopicSendOutcome? ObservableOutcome;
         public TopicSendJournalLifecycle Lifecycle = TopicSendJournalLifecycle.PreHandoff;
         public TopicSendJournalCleanup Cleanup = TopicSendJournalCleanup.None;
         public TopicSendRetryAuthorization? RetryAuthorization;
@@ -1400,6 +1402,8 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
     private readonly Dictionary<LogicalSendKey, CompletedIdentity> completedByKey = new();
     private readonly Dictionary<string, CompletedIdentity> completedByOperation =
         new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (TopicSendOutcome Outcome, DateTimeOffset ExpiresAt)>
+        retryableOutcomes = new(StringComparer.Ordinal);
     private readonly HashSet<ObserverSubscription> queuedSubscriptions = [];
     private long sequence;
     private long availabilityGeneration;
@@ -1593,6 +1597,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
                     scopeIdentity,
                     threadId,
                     targetDeviceId,
+                    composerRevision,
                     submittedAt,
                     out var recovered)
                 && recovered is not null)
@@ -1743,6 +1748,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
                     scopeIdentity,
                     threadId,
                     targetDeviceId,
+                    composerRevision,
                     timeProvider.GetUtcNow(),
                     out snapshot)
                 && snapshot is not null)
@@ -2192,13 +2198,22 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
             if (operations.TryGetValue(operationId, out var operation))
             {
                 lock (operation.Gate)
-                    outcome = operation.TerminalOutcome ?? operation.LastOutcome;
+                    outcome = operation.TerminalOutcome ?? operation.ObservableOutcome;
                 return outcome is not null;
             }
             if (completedByOperation.TryGetValue(operationId, out var completed))
             {
                 outcome = completed.Outcome;
                 return true;
+            }
+            if (retryableOutcomes.TryGetValue(operationId, out var retryable))
+            {
+                if (retryable.ExpiresAt > timeProvider.GetUtcNow())
+                {
+                    outcome = retryable.Outcome;
+                    return true;
+                }
+                retryableOutcomes.Remove(operationId);
             }
         }
         outcome = null;
@@ -3046,13 +3061,13 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
             ? null
             : TryAcquireMutationLease();
         if (inheritedMutation is null && terminalMutation is null) return;
-        Volatile.Write(ref state.Running, 0);
         try
         {
             WriteJournal(terminal, "terminal");
         }
         catch (TopicSendJournalStaleException)
         {
+            Volatile.Write(ref state.Running, 0);
             return;
         }
         catch (Exception exception)
@@ -3067,6 +3082,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
                 state.LastOutcome = ReconcilingOutcome(
                     "The terminal outcome could not be journaled; authoritative reconciliation is required.");
             }
+            Volatile.Write(ref state.Running, 0);
             return;
         }
 
@@ -3092,7 +3108,11 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
 
             terminal = AdvanceRecord(terminal with { Cleanup = cleanup.Value });
             using var cleanupMutation = TryAcquireMutationLease();
-            if (cleanupMutation is null) return;
+            if (cleanupMutation is null)
+            {
+                Volatile.Write(ref state.Running, 0);
+                return;
+            }
             try
             {
                 WriteJournal(
@@ -3103,6 +3123,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
             }
             catch (TopicSendJournalStaleException)
             {
+                Volatile.Write(ref state.Running, 0);
                 return;
             }
             catch (Exception exception)
@@ -3110,19 +3131,23 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
                 RuntimeDiagnostics.Current?.RecordEvent(
                     "topic-send-cleanup-persist-failed",
                     $"operation={snapshot.OperationId};exception={exception.GetType().FullName}");
+                Volatile.Write(ref state.Running, 0);
                 return;
             }
             lock (state.Gate)
                 state.Cleanup = cleanup.Value;
         }
-        else if (reconcileOutcome is not null)
-        {
-            await NotifyOnceAsync(reconcileOutcome, outcome).ConfigureAwait(false);
-        }
-
-        await CompleteFinalizationAsync(
-                snapshot, logicalKey, state, outcome, terminal.Cleanup, cacheCompleted)
+        var completed = await CompleteFinalizationAsync(
+                snapshot,
+                logicalKey,
+                state,
+                outcome,
+                terminal.Cleanup,
+                cacheCompleted,
+                !requiresDraftCleanup ? reconcileOutcome : null)
             .ConfigureAwait(false);
+        if (!completed)
+            Volatile.Write(ref state.Running, 0);
     }
 
     private async Task CompleteTerminalRecoveryAsync(
@@ -3255,16 +3280,17 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task CompleteFinalizationAsync(
+    private async Task<bool> CompleteFinalizationAsync(
         TopicSendSnapshot snapshot,
         LogicalSendKey logicalKey,
         OperationState state,
         TopicSendOutcome outcome,
         TopicSendJournalCleanup cleanup,
-        bool cacheCompleted)
+        bool cacheCompleted,
+        Func<TopicSendOutcome, Task>? finalCallback = null)
     {
         using var mutation = TryAcquireMutationLease();
-        if (mutation is null) return;
+        if (mutation is null) return false;
         TopicSendIdentityRecord compacted;
         try
         {
@@ -3278,7 +3304,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
         }
         catch (TopicSendJournalStaleException)
         {
-            return;
+            return false;
         }
         catch (Exception exception)
         {
@@ -3286,23 +3312,23 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
                 "topic-send-identity-cleanup-failed",
                 $"operation={snapshot.OperationId};exception={exception.GetType().FullName}");
             Volatile.Write(ref state.Running, 0);
-            return;
+            return false;
         }
 
         List<ObserverSubscription> observers;
         List<TaskCompletionSource> detachBarriers;
-        lock (state.Gate)
-        {
-            state.LastOutcome = outcome;
-            state.TerminalOutcome = outcome;
-            observers = state.Observers.Values.ToList();
-            state.Observers.Clear();
-            detachBarriers = state.ObserverDetachBarriers.Values.ToList();
-            state.ObserverDetachBarriers.Clear();
-        }
         var cached = false;
         lock (identityGate)
         {
+            lock (state.Gate)
+            {
+                state.LastOutcome = outcome;
+                state.TerminalOutcome = outcome;
+                observers = state.Observers.Values.ToList();
+                state.Observers.Clear();
+                detachBarriers = state.ObserverDetachBarriers.Values.ToList();
+                state.ObserverDetachBarriers.Clear();
+            }
             operations.Remove(snapshot.OperationId);
             snapshots.Remove(logicalKey);
             if (cacheCompleted)
@@ -3322,8 +3348,22 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
         foreach (var barrier in detachBarriers)
             barrier.TrySetResult();
         mutation.Dispose();
-        testObserver?.FinalizationCompleted(snapshot.OperationId, compacted, cached);
         await Task.WhenAll(dispatches).ConfigureAwait(false);
+        if (finalCallback is not null)
+            await NotifyOnceAsync(finalCallback, outcome).ConfigureAwait(false);
+        if (!cacheCompleted)
+        {
+            lock (identityGate)
+            {
+                if (!operations.ContainsKey(snapshot.OperationId)
+                    && !completedByOperation.ContainsKey(snapshot.OperationId))
+                    retryableOutcomes[snapshot.OperationId] = (
+                        outcome,
+                        timeProvider.GetUtcNow() + retention.CompletedIdentityRetention);
+            }
+        }
+        testObserver?.FinalizationCompleted(snapshot.OperationId, compacted, cached);
+        return true;
     }
 
     private async Task FinalizePreHandoffFailureAsync(
@@ -3372,6 +3412,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
         string scopeIdentity,
         string threadId,
         string targetDeviceId,
+        long composerRevision,
         DateTimeOffset submittedAt,
         out TopicSendSnapshot? snapshot)
     {
@@ -3380,7 +3421,10 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
             || found is null)
             return false;
 
-        var record = NormalizeRecord(found);
+        var record = NormalizeRecord(
+            found.Version == -1
+                ? found with { ComposerRevision = composerRevision }
+                : found);
         if (record.Version != found.Version
             || record.Lifecycle != found.Lifecycle
             || record.Cleanup != found.Cleanup
@@ -3882,6 +3926,13 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
             .ToArray();
         mutation.Dispose();
         await Task.WhenAll(dispatches).ConfigureAwait(false);
+        using var publishedMutation = TryAcquireMutationLease();
+        if (publishedMutation is null) return;
+        lock (state.Gate)
+        {
+            if (ReferenceEquals(state.LastOutcome, outcome))
+                state.ObservableOutcome = outcome;
+        }
     }
 
     private void Detach(
@@ -4054,10 +4105,17 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
                      .OrderBy(value => value.SubmissionSequence)
                      .ToList())
             RemoveCompletedLocked(completed);
+        foreach (var operationId in retryableOutcomes
+                     .Where(pair => pair.Value.ExpiresAt <= now)
+                     .Select(pair => pair.Key)
+                     .ToList())
+            retryableOutcomes.Remove(operationId);
 
         while (completedByKey.Count > retention.MaximumCompletedIdentities)
             RemoveCompletedLocked(
                 completedByKey.Values.MinBy(value => value.SubmissionSequence)!);
+        while (retryableOutcomes.Count > retention.MaximumCompletedIdentities)
+            retryableOutcomes.Remove(retryableOutcomes.Keys.First());
     }
 
     private void PruneSnapshotsLocked()

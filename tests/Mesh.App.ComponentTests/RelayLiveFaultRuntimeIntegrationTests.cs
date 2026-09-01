@@ -483,7 +483,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             var second = laptop.State.NewOwnThread("synthetic-topic-2");
             var retained = laptop.State.NewOwnThread("synthetic-topic-3");
             await EventuallyAsync(
-                () => tablet.State.Profile.OwnThreads.Select(item => item.Id).ToHashSet()
+                () => tablet.State.OrderedOwnThreads.Select(item => item.Id).ToHashSet()
                     .SetEquals(new[] { first.Id, second.Id, retained.Id }),
                 TimeSpan.FromSeconds(20));
             await EventuallyAsync(

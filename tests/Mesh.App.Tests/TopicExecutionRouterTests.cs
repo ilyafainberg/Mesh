@@ -11,6 +11,8 @@ namespace Mesh.App.Services
     public sealed class AppState
     {
         private readonly AgentRuntimeScopeTracker runtimeScopes = new();
+        private readonly Dictionary<string, MeshDb.TopicOutboxItem> outbox = new();
+        private readonly Dictionary<string, string> scopedOperations = new();
         public MeshProfile Profile { get; private set; } = new();
         public int RegisteredRemoteRuns { get; private set; }
         public int ClearedRemoteRuns { get; private set; }
@@ -18,6 +20,7 @@ namespace Mesh.App.Services
         public bool? BusyWhenTerminalAnswerAdded { get; private set; }
         public bool RemoteRunUpdatePersistenceSucceeds { get; set; } = true;
         public QueuedTopicRunState QueuedRuns { get; private set; } = new();
+        internal static Action<string>? TopicCancellationBoundaryHook { get; set; }
 
         internal AgentRuntimeScopeToken CaptureAgentRuntimeScope()
         {
@@ -29,11 +32,35 @@ namespace Mesh.App.Services
             }
         }
 
+        internal bool TryCaptureAgentRuntimeScope(out AgentRuntimeScopeToken scope)
+        {
+            try
+            {
+                scope = CaptureAgentRuntimeScope();
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                scope = default;
+                return false;
+            }
+        }
+
         internal IDisposable EnterAgentRuntimeScope(AgentRuntimeScopeToken scope)
             => runtimeScopes.Enter(scope);
 
         internal bool IsCurrentAgentRuntimeScope(AgentRuntimeScopeToken scope)
             => runtimeScopes.IsCurrent(scope);
+
+        internal bool TryApplyAgentRuntimeScope(
+            AgentRuntimeScopeToken scope,
+            Action mutation)
+        {
+            if (!runtimeScopes.IsCurrent(scope))
+                return false;
+            mutation();
+            return true;
+        }
 
         internal bool IsCurrentAgentRuntimeContext => runtimeScopes.IsCurrentContext;
 
@@ -43,7 +70,61 @@ namespace Mesh.App.Services
             Profile = profile;
             QueuedRuns = new QueuedTopicRunState();
             Busy = false;
+            scopedOperations.Clear();
             runtimeScopes.Activate(identity);
+        }
+
+        public ScopedAsyncOperation CaptureScopedAsyncOperation(
+            string scopeKey,
+            string? topicId = null,
+            string? messageId = null,
+            string? requestId = null,
+            string? runId = null,
+            string? conversationId = null)
+        {
+            var runtime = CaptureAgentRuntimeScope();
+            if (requestId is null
+                && runId is not null
+                && outbox.TryGetValue(runId, out var request))
+                requestId = request.Request.RequestId;
+            requestId ??= messageId;
+            var operationId = Guid.NewGuid().ToString("n");
+            scopedOperations[scopeKey] = operationId;
+            return new(
+                "test-account",
+                runtime.Identity,
+                runtime.Generation,
+                scopeKey,
+                operationId,
+                topicId,
+                messageId,
+                requestId,
+                runId,
+                conversationId);
+        }
+
+        internal bool TryApplyScopedTopicCancellation(
+            ScopedAsyncOperation operation,
+            bool queued,
+            Func<bool> mutation)
+        {
+            TopicCancellationBoundaryHook?.Invoke("cancellation-commit");
+            var current = CaptureAgentRuntimeScope();
+            if (current.Identity != operation.DatabaseIdentity
+                || current.Generation != operation.Epoch
+                || !scopedOperations.TryGetValue(operation.ScopeKey, out var id)
+                || id != operation.OperationId
+                || operation.TopicId is null
+                || operation.RunId is null
+                || !Profile.OwnThreads.Any(thread => thread.Id == operation.TopicId)
+                || !IsKnownQueuedTopicRun(operation.TopicId, operation.RunId))
+                return false;
+            if (queued
+                && (operation.MessageId is null
+                    || !IsQueuedTopicRunLine(
+                        operation.TopicId, operation.RunId, operation.MessageId)))
+                return false;
+            return mutation();
         }
 
         public static string Norm(string value) => value.Trim().TrimStart('@').ToLowerInvariant();
@@ -96,6 +177,7 @@ namespace Mesh.App.Services
                     now,
                     now,
                     RemoteStage: "sender_queued");
+                this.outbox[outbox.RunId] = outbox;
             }
             return new TopicRunBeginResult(
                 true,
@@ -110,6 +192,12 @@ namespace Mesh.App.Services
         }
 
         public void CompleteLocalTopicRun(string runId, DateTimeOffset terminalAt) { }
+
+        internal bool TryCompleteLocalTopicRun(
+            AgentRuntimeScopeToken scope,
+            string runId,
+            DateTimeOffset terminalAt)
+            => runtimeScopes.IsCurrent(scope);
 
         internal static string BeginDiagnostic(
             TopicRunBeginCommand command,
@@ -132,7 +220,7 @@ namespace Mesh.App.Services
             Profile.OwnThreads.Single(thread => thread.Id == threadId).Lines.Add(line);
         }
 
-        public void BindOwnThreadForSend(string threadId, ExecutionDevice target)
+        public void BindOwnThreadForSend(string threadId, AgentExecutionHost target)
         {
             var thread = Profile.OwnThreads.Single(item => item.Id == threadId);
             if (thread.ExecutionDeviceId is not null)
@@ -144,7 +232,7 @@ namespace Mesh.App.Services
         public void RegisterExpectedRemoteRun(
             string threadId,
             string runId,
-            ExecutionDevice target,
+            AgentExecutionHost target,
             DateTimeOffset startedAt)
         {
             var thread = Profile.OwnThreads.Single(item => item.Id == threadId);
@@ -188,6 +276,8 @@ namespace Mesh.App.Services
         }
         public bool IsKnownQueuedTopicRun(string threadId, string runId)
             => QueuedRuns.IsKnownRun(threadId, runId);
+        public MeshDb.TopicOutboxItem? GetTopicOutbox(string runId)
+            => outbox.GetValueOrDefault(runId);
         public int QueuedCountForThread(string threadId) => QueuedRuns.WaitingCount(threadId);
         public bool IsLineQueued(string lineId) => QueuedRuns.IsLineWaiting(lineId);
         public bool IsQueuedTopicRunLine(string threadId, string runId, string lineId)
@@ -229,7 +319,7 @@ namespace Mesh.App.Services
                 Profile.OwnThreads.Single(item => item.Id == run.ThreadId).ExecutionRunId = run.RunId;
         }
 
-        public bool CancelThreadTurn(string threadId) => true;
+        internal bool CancelThreadTurn(ScopedAsyncOperation operation) => true;
         public bool IsThreadBusy(string threadId) => Busy;
 
         public CancellationToken BeginThreadTurn(string threadId, string runId, bool building)
@@ -743,7 +833,12 @@ namespace Mesh.App.Tests
             Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
 
             var cancelled = await router.CancelQueuedAsync(
-                draft.ThreadId, draft.RunId, draft.TriggerLineId, CancellationToken.None);
+                state.CaptureScopedAsyncOperation(
+                    "test:cancel-queued",
+                    draft.ThreadId,
+                    draft.TriggerLineId,
+                    runId: draft.RunId),
+                CancellationToken.None);
 
             Assert.IsTrue(cancelled);
             Assert.AreEqual(1, transport.Cancellations);
@@ -773,7 +868,12 @@ namespace Mesh.App.Tests
             Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
 
             var cancelled = await router.CancelQueuedAsync(
-                draft.ThreadId, draft.RunId, draft.TriggerLineId, CancellationToken.None);
+                state.CaptureScopedAsyncOperation(
+                    "test:reject-cancel-queued",
+                    draft.ThreadId,
+                    draft.TriggerLineId,
+                    runId: draft.RunId),
+                CancellationToken.None);
 
             Assert.IsFalse(cancelled);
             Assert.AreEqual(1, transport.Cancellations);
@@ -803,7 +903,11 @@ namespace Mesh.App.Tests
 
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             var cancellation = router.StopAsync(
-                draft.ThreadId, draft.RunId, CancellationToken.None);
+                state.CaptureScopedAsyncOperation(
+                    "test:stop",
+                    draft.ThreadId,
+                    runId: draft.RunId),
+                CancellationToken.None);
             stopwatch.Stop();
 
             Assert.IsTrue(stopwatch.ElapsedMilliseconds < 250);
@@ -811,6 +915,164 @@ namespace Mesh.App.Tests
             Assert.IsFalse(cancellation.IsCompleted);
             release.Set();
             Assert.IsTrue(await cancellation.WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+
+        [TestMethod]
+        public async Task Stop_AtoBWithIdenticalIds_CannotCancelNewAccountRun()
+        {
+            var state = StateWithThread();
+            var transport = RemoteTransport();
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var stale = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId);
+
+            state.SwitchRuntimeAccount("account-b", ProfileWithThread());
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var current = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId);
+
+            Assert.IsFalse(await router.StopAsync(stale, CancellationToken.None));
+            Assert.AreEqual(0, transport.Cancellations);
+            Assert.IsTrue(await router.StopAsync(current, CancellationToken.None));
+            Assert.AreEqual(1, transport.Cancellations);
+        }
+
+        [TestMethod]
+        public async Task Stop_AtoBtoAWithIdenticalIds_RejectsRetiredEpoch()
+        {
+            var state = StateWithThread();
+            var transport = RemoteTransport();
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var retired = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId);
+
+            state.SwitchRuntimeAccount("account-b", ProfileWithThread());
+            state.SwitchRuntimeAccount("test-account", ProfileWithThread());
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var current = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId);
+
+            Assert.IsFalse(await router.StopAsync(retired, CancellationToken.None));
+            Assert.IsTrue(await router.StopAsync(current, CancellationToken.None));
+            Assert.AreEqual(1, transport.Cancellations);
+        }
+
+        [TestMethod]
+        public async Task Stop_SwitchAtCalleeLookup_FencesCancellationTarget()
+        {
+            var state = StateWithThread();
+            var transport = RemoteTransport();
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var operation = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId);
+            TopicExecutionRouter.BeforeTransportCheckpointHook = checkpoint =>
+            {
+                if (checkpoint == "cancellation-callee-lookup")
+                    state.SwitchRuntimeAccount("account-b", ProfileWithThread());
+            };
+            try
+            {
+                Assert.IsFalse(await router.StopAsync(operation, CancellationToken.None));
+                Assert.AreEqual(0, transport.Cancellations);
+            }
+            finally
+            {
+                TopicExecutionRouter.BeforeTransportCheckpointHook = null;
+            }
+        }
+
+        [TestMethod]
+        public async Task Stop_SwitchAtCancellationCommit_FencesCancellationTarget()
+        {
+            var state = StateWithThread();
+            var transport = RemoteTransport();
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var operation = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId);
+            AppState.TopicCancellationBoundaryHook = _ =>
+            {
+                AppState.TopicCancellationBoundaryHook = null;
+                state.SwitchRuntimeAccount("account-b", ProfileWithThread());
+            };
+            try
+            {
+                Assert.IsFalse(await router.StopAsync(operation, CancellationToken.None));
+                Assert.AreEqual(0, transport.Cancellations);
+            }
+            finally
+            {
+                AppState.TopicCancellationBoundaryHook = null;
+            }
+        }
+
+        [TestMethod]
+        public async Task Stop_DuplicateCommand_CommitsExactlyOnce()
+        {
+            var state = StateWithThread();
+            var transport = RemoteTransport();
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var operation = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId);
+
+            var results = await Task.WhenAll(
+                router.StopAsync(operation, CancellationToken.None),
+                router.StopAsync(operation, CancellationToken.None));
+
+            Assert.IsTrue(results.All(result => result));
+            Assert.AreEqual(1, transport.Cancellations);
+        }
+
+        [TestMethod]
+        public async Task Stop_WrongRequestIdentity_CannotReachCancellationTarget()
+        {
+            var state = StateWithThread();
+            var transport = RemoteTransport();
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+            var operation = state.CaptureScopedAsyncOperation(
+                "stop", draft.ThreadId, runId: draft.RunId) with
+            {
+                RequestId = "different-request"
+            };
+
+            Assert.IsFalse(await router.StopAsync(operation, CancellationToken.None));
+            Assert.AreEqual(0, transport.Cancellations);
+        }
+
+        [TestMethod]
+        public void ScopedCancellationLease_TenThousandEpochInterleavingsAreStale()
+        {
+            var state = StateWithThread();
+            var unauthorizedMutations = 0;
+            for (var iteration = 0; iteration < 10_000; iteration++)
+            {
+                var operation = state.CaptureScopedAsyncOperation(
+                    $"stress:{iteration}", "thread-1", runId: "run-1");
+                state.SwitchRuntimeAccount(
+                    iteration % 2 == 0 ? "account-b" : "test-account",
+                    ProfileWithThread());
+                if (state.TryApplyScopedTopicCancellation(
+                        operation,
+                        queued: false,
+                        () =>
+                        {
+                            unauthorizedMutations++;
+                            return true;
+                        }))
+                    Assert.Fail($"Retired epoch {iteration} was authorized.");
+            }
+            Assert.AreEqual(0, unauthorizedMutations);
         }
 
         [TestMethod]
@@ -882,7 +1144,11 @@ namespace Mesh.App.Tests
             var conflict = await router.SubmitAsync(
                 Draft() with { Prompt = "different" }, null, CancellationToken.None);
             var wrongStop = await router.StopAsync(
-                "other-thread", Draft().RunId, CancellationToken.None);
+                state.CaptureScopedAsyncOperation(
+                    "test:wrong-stop",
+                    Draft().ThreadId,
+                    runId: Draft().RunId) with { TopicId = "other-thread" },
+                CancellationToken.None);
 
             Assert.IsFalse(rejected.Accepted);
             Assert.AreEqual("invalid_widget_context", rejected.Code);
@@ -1231,15 +1497,35 @@ namespace Mesh.App.Tests
         private static Mesh.App.Services.AppState StateWithThread()
         {
             var state = new Mesh.App.Services.AppState();
-            state.Profile.Handle = "owner";
-            state.Profile.Model.ApiKey = "test";
-            state.Profile.OwnThreads.Add(new OwnThread
-            {
-                Id = "thread-1",
-                Title = "Topic"
-            });
+            var profile = ProfileWithThread();
+            state.Profile.Handle = profile.Handle;
+            state.Profile.Model.ApiKey = profile.Model.ApiKey;
+            state.Profile.OwnThreads.Add(profile.OwnThreads[0]);
             return state;
         }
+
+        private static MeshProfile ProfileWithThread()
+        {
+            var profile = new MeshProfile { Handle = "owner" };
+            profile.Model.ApiKey = "test";
+            profile.OwnThreads.Add(new OwnThread { Id = "thread-1", Title = "Topic" });
+            return profile;
+        }
+
+        private static RecordingTransport RemoteTransport()
+            => new()
+            {
+                Devices =
+                [
+                    new DeviceInfo(
+                        "target",
+                        "Workstation",
+                        true,
+                        DevicePlatforms.Windows,
+                        true,
+                        AgentHostEnabled: true)
+                ]
+            };
 
         private static TopicTurnDraft Draft() => new(
             "run-1",
@@ -1333,6 +1619,7 @@ namespace Mesh.App.Tests
             }
 
             public Task<bool> CancelAsync(
+                ScopedAsyncOperation operation,
                 string targetDeviceId,
                 TopicRunCancelPayload cancel,
                 CancellationToken cancellationToken)
@@ -1368,6 +1655,7 @@ namespace Mesh.App.Tests
                 => Task.FromResult(TopicDispatchResult.Ok(request.RunId));
 
             public Task<bool> CancelAsync(
+                ScopedAsyncOperation operation,
                 string targetDeviceId,
                 TopicRunCancelPayload cancel,
                 CancellationToken cancellationToken)

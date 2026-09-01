@@ -148,7 +148,9 @@ public sealed partial class MeshDb :
         string SourceDeviceId,
         string ThreadId,
         string TerminalUpdateJson,
-        DateTimeOffset CreatedAt);
+        DateTimeOffset CreatedAt,
+        string? RequestId = null,
+        string? OriginScopeId = null);
 
     public sealed record InboundRejectionItem(
         string RejectionId,
@@ -580,6 +582,8 @@ public sealed partial class MeshDb :
                 run_id TEXT PRIMARY KEY,
                 source_device_id TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
+                request_id TEXT,
+                origin_scope_id TEXT,
                 terminal_update_json TEXT NOT NULL,
                 created_at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS ix_inbound_topic_cancellations_created
@@ -671,7 +675,6 @@ public sealed partial class MeshDb :
         AddColumnIfMissing("own_chat", "status", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("composer_drafts", "revision", "INTEGER");
         AddColumnIfMissing("composer_drafts", "snapshot_json", "TEXT");
-        Exec("CREATE INDEX IF NOT EXISTS ix_own_chat_lineid ON own_chat(line_id);");
         Exec("""
             UPDATE chat_lines
             SET line_id = 'conversation-' || printf('%016x', id)
@@ -680,6 +683,7 @@ public sealed partial class MeshDb :
             SET line_id = 'topic-' || printf('%016x', id)
             WHERE line_id IS NULL OR trim(line_id) = '';
             """);
+        Exec("CREATE INDEX IF NOT EXISTS ix_own_chat_lineid ON own_chat(line_id);");
         // Service-thread metadata on conversations (null for normal person DMs).
         AddColumnIfMissing("conversations", "service_id", "TEXT");
         AddColumnIfMissing("conversations", "service_name", "TEXT");
@@ -696,6 +700,19 @@ public sealed partial class MeshDb :
         AddColumnIfMissing("chat_lines", "reasoning", "TEXT");
         AddColumnIfMissing("chat_lines", "model_id", "TEXT");
         AddColumnIfMissing("own_chat", "thread_id", "TEXT");
+        Exec("""
+            DELETE FROM own_chat
+            WHERE thread_id IS NOT NULL
+              AND line_id IS NOT NULL
+              AND id NOT IN (
+                  SELECT MIN(id)
+                  FROM own_chat
+                  WHERE thread_id IS NOT NULL AND line_id IS NOT NULL
+                  GROUP BY thread_id, line_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_own_chat_thread_line
+            ON own_chat(thread_id, line_id)
+            WHERE thread_id IS NOT NULL AND line_id IS NOT NULL;
+            """);
         // Transcript + reasoning persistence: internal lines are the model's hidden execution record;
         // reasoning is the collapsible "thinking" (previously not persisted, so lost on restart).
         AddColumnIfMissing("own_chat", "internal", "INTEGER NOT NULL DEFAULT 0");
@@ -709,13 +726,20 @@ public sealed partial class MeshDb :
         // Phase 1: execution metadata and activity tracking.
         AddColumnIfMissing("own_threads", "last_activity_at", "TEXT");
         AddColumnIfMissing("own_threads", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
-        AddColumnIfMissing("own_threads", "execution_device_id", "TEXT");
-        AddColumnIfMissing("own_threads", "execution_device_name", "TEXT");
-        AddColumnIfMissing("own_threads", "execution_device_platform", "TEXT");
+        AddColumnIfMissing("own_threads", "conversation_kind", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("own_threads", "agent_execution_host_device_id", "TEXT");
+        AddColumnIfMissing("own_threads", "agent_execution_host_device_name", "TEXT");
+        AddColumnIfMissing("own_threads", "agent_execution_host_device_platform", "TEXT");
+        AddColumnIfMissing("own_threads", "communication_destination_device_id", "TEXT");
+        AddColumnIfMissing("own_threads", "communication_destination_device_name", "TEXT");
+        AddColumnIfMissing("own_threads", "communication_destination_device_platform", "TEXT");
         AddColumnIfMissing("own_threads", "execution_at", "TEXT");
         AddColumnIfMissing("own_threads", "execution_run_id", "TEXT");
+        MigrateOwnThreadCommunicationAndExecutionPlanes();
         AddColumnIfMissing("inbound_topic_runs", "terminal_update_json", "TEXT");
         AddColumnIfMissing("inbound_topic_runs", "queue_sequence", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("inbound_topic_cancellations", "request_id", "TEXT");
+        AddColumnIfMissing("inbound_topic_cancellations", "origin_scope_id", "TEXT");
         AddColumnIfMissing("topic_outbox", "remote_stage", "TEXT");
         AddColumnIfMissing(
             "topic_outbox", "remote_stage_ordinal", "INTEGER NOT NULL DEFAULT 0");
@@ -782,6 +806,7 @@ public sealed partial class MeshDb :
         CreateOnlineReplicationSchema();
         CreateNotificationSchema();
         CreateDeferredTopicUpdateSchema();
+        CreateAssistantAiRequestSchema();
         MigrateTopicRunTriggerLedger();
     }
 
@@ -1041,7 +1066,7 @@ public sealed partial class MeshDb :
                              SELECT 1 FROM own_threads AS thread
                              WHERE thread.id = correlation.thread_id
                                AND thread.execution_run_id = correlation.run_id
-                               AND thread.execution_device_id = correlation.target_device_id))
+                               AND thread.agent_execution_host_device_id = correlation.target_device_id))
                     THEN 'legacy-tombstone'
                 ELSE 'legacy-active-null'
                 END
@@ -1133,17 +1158,61 @@ public sealed partial class MeshDb :
         => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value)))
             .ToLowerInvariant();
 
+    private void MigrateOwnThreadCommunicationAndExecutionPlanes()
+    {
+        using var marker = conn.CreateCommand();
+        marker.CommandText = "SELECT v FROM meta WHERE k = 'own_thread_plane_schema_version';";
+        if (string.Equals(marker.ExecuteScalar() as string, "2", StringComparison.Ordinal))
+            return;
+
+        using var transaction = conn.BeginTransaction();
+        if (ColumnExists("own_threads", "execution_device_id"))
+        {
+            using var migrate = conn.CreateCommand();
+            migrate.Transaction = transaction;
+            migrate.CommandText = """
+                UPDATE own_threads SET
+                    communication_destination_device_id = COALESCE(
+                        communication_destination_device_id, execution_device_id),
+                    communication_destination_device_name = COALESCE(
+                        communication_destination_device_name, execution_device_name),
+                    communication_destination_device_platform = COALESCE(
+                        communication_destination_device_platform, execution_device_platform),
+                    agent_execution_host_device_id = COALESCE(
+                        agent_execution_host_device_id, execution_device_id),
+                    agent_execution_host_device_name = COALESCE(
+                        agent_execution_host_device_name, execution_device_name),
+                    agent_execution_host_device_platform = COALESCE(
+                        agent_execution_host_device_platform, execution_device_platform);
+                """;
+            migrate.ExecuteNonQuery();
+        }
+
+        using var complete = conn.CreateCommand();
+        complete.Transaction = transaction;
+        complete.CommandText = """
+            INSERT INTO meta(k, v) VALUES('own_thread_plane_schema_version', '2')
+            ON CONFLICT(k) DO UPDATE SET v = excluded.v;
+            UPDATE meta SET v = '2' WHERE k = 'schema_version';
+            """;
+        complete.ExecuteNonQuery();
+        transaction.Commit();
+    }
+
+    private bool ColumnExists(string table, string column)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info({table});";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
     private bool AddColumnIfMissing(string table, string column, string decl)
     {
-        bool exists = false;
-        using (var cmd = conn.CreateCommand())
-        {
-            cmd.CommandText = $"PRAGMA table_info({table});";
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
-                if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase)) { exists = true; break; }
-        }
-        if (exists) return false;
+        if (ColumnExists(table, column)) return false;
         Exec($"ALTER TABLE {table} ADD COLUMN {column} {decl};");
         return true;
     }
@@ -2029,8 +2098,11 @@ public sealed partial class MeshDb :
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = """
-                SELECT id, title, created_at, last_activity_at, is_pinned,
-                       execution_device_id, execution_device_name, execution_device_platform,
+                SELECT id, title, created_at, last_activity_at, is_pinned, conversation_kind,
+                       communication_destination_device_id,
+                       communication_destination_device_name,
+                       communication_destination_device_platform,
+                       agent_execution_host_device_id, agent_execution_host_device_name, agent_execution_host_device_platform,
                        execution_at, execution_run_id
                 FROM own_threads ORDER BY sort_order, created_at, id;
                 """;
@@ -2044,11 +2116,17 @@ public sealed partial class MeshDb :
                     CreatedAt = ParseAt(r.GetString(2)),
                     LastActivityAt = r.IsDBNull(3) ? null : ParseAt(r.GetString(3)),
                     IsPinned = !r.IsDBNull(4) && r.GetInt64(4) != 0,
-                    ExecutionDeviceId = r.IsDBNull(5) ? null : r.GetString(5),
-                    ExecutionDeviceName = r.IsDBNull(6) ? null : r.GetString(6),
-                    ExecutionDevicePlatform = r.IsDBNull(7) ? null : r.GetString(7),
-                    ExecutionAt = r.IsDBNull(8) ? null : ParseAt(r.GetString(8)),
-                    ExecutionRunId = r.IsDBNull(9) ? null : r.GetString(9)
+                    ConversationKind = r.IsDBNull(5)
+                        ? ConversationKind.Assistant
+                        : (ConversationKind)r.GetInt32(5),
+                    CommunicationDestinationDeviceId = r.IsDBNull(6) ? null : r.GetString(6),
+                    CommunicationDestinationDeviceName = r.IsDBNull(7) ? null : r.GetString(7),
+                    CommunicationDestinationDevicePlatform = r.IsDBNull(8) ? null : r.GetString(8),
+                    AgentExecutionHostDeviceId = r.IsDBNull(9) ? null : r.GetString(9),
+                    AgentExecutionHostDeviceName = r.IsDBNull(10) ? null : r.GetString(10),
+                    AgentExecutionHostDevicePlatform = r.IsDBNull(11) ? null : r.GetString(11),
+                    ExecutionAt = r.IsDBNull(12) ? null : ParseAt(r.GetString(12)),
+                    ExecutionRunId = r.IsDBNull(13) ? null : r.GetString(13)
                 };
                 threads.Add(t);
                 byId[t.Id] = t;
@@ -3047,7 +3125,7 @@ public sealed partial class MeshDb :
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO own_chat(
+            INSERT OR IGNORE INTO own_chat(
                 line_id, thread_id, role, text, reply_to_line_id, via, status, at, internal, reasoning, sender_handle, model_id)
             VALUES($lid, $tid, $r, $x, $replyTo, $v, $s, $a, $i, $rz, $sender, $modelId);
             """;
@@ -3259,14 +3337,21 @@ public sealed partial class MeshDb :
         DateTimeOffset? lastActivityAt = null, bool isPinned = false,
         string? executionDeviceId = null, DateTimeOffset? executionAt = null,
         string? executionRunId = null, bool replaceExecutionMetadata = false,
-        string? executionDeviceName = null, string? executionDevicePlatform = null)
+        string? executionDeviceName = null, string? executionDevicePlatform = null,
+        string? communicationDestinationDeviceId = null,
+        string? communicationDestinationDeviceName = null,
+        string? communicationDestinationDevicePlatform = null,
+        ConversationKind conversationKind = ConversationKind.Assistant)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO own_threads(id, title, created_at, sort_order, last_activity_at, is_pinned,
-                execution_device_id, execution_device_name, execution_device_platform,
+            INSERT INTO own_threads(id, title, created_at, sort_order, last_activity_at, is_pinned, conversation_kind,
+                communication_destination_device_id, communication_destination_device_name,
+                communication_destination_device_platform,
+                agent_execution_host_device_id, agent_execution_host_device_name, agent_execution_host_device_platform,
                 execution_at, execution_run_id)
-            VALUES($id, $title, $created, $sort, $activity, $pinned,
+            VALUES($id, $title, $created, $sort, $activity, $pinned, $conversationKind,
+                $communicationDevice, $communicationName, $communicationPlatform,
                 $execDevice, $execName, $execPlatform, $execAt, $execRun)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
@@ -3280,15 +3365,22 @@ public sealed partial class MeshDb :
                     ELSE last_activity_at
                 END,
                 is_pinned = excluded.is_pinned,
-                execution_device_id = CASE WHEN $replaceExecution = 1
-                    THEN excluded.execution_device_id
-                    ELSE COALESCE(excluded.execution_device_id, execution_device_id) END,
-                execution_device_name = CASE WHEN $replaceExecution = 1
-                    THEN excluded.execution_device_name
-                    ELSE COALESCE(excluded.execution_device_name, execution_device_name) END,
-                execution_device_platform = CASE WHEN $replaceExecution = 1
-                    THEN excluded.execution_device_platform
-                    ELSE COALESCE(excluded.execution_device_platform, execution_device_platform) END,
+                conversation_kind = excluded.conversation_kind,
+                communication_destination_device_id = COALESCE(
+                    excluded.communication_destination_device_id, communication_destination_device_id),
+                communication_destination_device_name = COALESCE(
+                    excluded.communication_destination_device_name, communication_destination_device_name),
+                communication_destination_device_platform = COALESCE(
+                    excluded.communication_destination_device_platform, communication_destination_device_platform),
+                agent_execution_host_device_id = CASE WHEN $replaceExecution = 1
+                    THEN excluded.agent_execution_host_device_id
+                    ELSE COALESCE(excluded.agent_execution_host_device_id, agent_execution_host_device_id) END,
+                agent_execution_host_device_name = CASE WHEN $replaceExecution = 1
+                    THEN excluded.agent_execution_host_device_name
+                    ELSE COALESCE(excluded.agent_execution_host_device_name, agent_execution_host_device_name) END,
+                agent_execution_host_device_platform = CASE WHEN $replaceExecution = 1
+                    THEN excluded.agent_execution_host_device_platform
+                    ELSE COALESCE(excluded.agent_execution_host_device_platform, agent_execution_host_device_platform) END,
                 execution_at = CASE WHEN $replaceExecution = 1
                     THEN excluded.execution_at
                     ELSE COALESCE(excluded.execution_at, execution_at) END,
@@ -3304,6 +3396,16 @@ public sealed partial class MeshDb :
             ? lastActivityAt.Value.UtcDateTime.ToString("O")
             : DBNull.Value);
         cmd.Parameters.AddWithValue("$pinned", isPinned ? 1 : 0);
+        cmd.Parameters.AddWithValue("$conversationKind", (int)conversationKind);
+        cmd.Parameters.AddWithValue(
+            "$communicationDevice",
+            (object?)communicationDestinationDeviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$communicationName",
+            (object?)communicationDestinationDeviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$communicationPlatform",
+            (object?)communicationDestinationDevicePlatform ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execDevice", (object?)executionDeviceId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execName", (object?)executionDeviceName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execPlatform", (object?)executionDevicePlatform ?? DBNull.Value);
@@ -3312,6 +3414,32 @@ public sealed partial class MeshDb :
             : DBNull.Value);
         cmd.Parameters.AddWithValue("$execRun", (object?)executionRunId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$replaceExecution", replaceExecutionMetadata ? 1 : 0);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void SetOwnThreadCommunicationDestination(
+        string id,
+        string deviceId,
+        string? deviceName,
+        string devicePlatform,
+        DateTimeOffset at)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE own_threads
+            SET communication_destination_device_id = $did,
+                communication_destination_device_name = $dname,
+                communication_destination_device_platform = $dplatform,
+                last_activity_at = CASE
+                    WHEN last_activity_at IS NULL OR julianday($activity) > julianday(last_activity_at)
+                    THEN $activity ELSE last_activity_at END
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$did", deviceId);
+        cmd.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$dplatform", devicePlatform);
+        cmd.Parameters.AddWithValue("$activity", at.UtcDateTime.ToString("O"));
+        cmd.Parameters.AddWithValue("$id", id);
         cmd.ExecuteNonQuery();
     }
 
@@ -3442,7 +3570,7 @@ public sealed partial class MeshDb :
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE own_threads
-            SET execution_device_id = $did,
+            SET agent_execution_host_device_id = $did,
                 execution_at = $at,
                 execution_run_id = $rid
             WHERE id = $id;
@@ -3467,9 +3595,9 @@ public sealed partial class MeshDb :
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE own_threads
-            SET execution_device_id = $did,
-                execution_device_name = $dname,
-                execution_device_platform = $dplatform,
+            SET agent_execution_host_device_id = $did,
+                agent_execution_host_device_name = $dname,
+                agent_execution_host_device_platform = $dplatform,
                 execution_at = $at,
                 execution_run_id = $rid
             WHERE id = $id;
@@ -3483,7 +3611,7 @@ public sealed partial class MeshDb :
         cmd.ExecuteNonQuery();
     }
 
-    public bool TryBindOwnThreadDevice(
+    public bool TryAssignOwnThreadAgentExecutionHost(
         string id,
         string deviceId,
         string? deviceName = null,
@@ -3492,11 +3620,11 @@ public sealed partial class MeshDb :
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE own_threads
-            SET execution_device_id = $did,
-                execution_device_name = $dname,
-                execution_device_platform = $dplatform
+            SET agent_execution_host_device_id = $did,
+                agent_execution_host_device_name = $dname,
+                agent_execution_host_device_platform = $dplatform
             WHERE id = $id
-              AND (execution_device_id IS NULL OR trim(execution_device_id) = '');
+              AND (agent_execution_host_device_id IS NULL OR trim(agent_execution_host_device_id) = '');
             """;
         cmd.Parameters.AddWithValue("$did", deviceId);
         cmd.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
@@ -3505,7 +3633,7 @@ public sealed partial class MeshDb :
         return cmd.ExecuteNonQuery() == 1;
     }
 
-    public bool MoveOwnThreadToDevice(
+    public bool MoveOwnThreadAgentExecutionHost(
         string id,
         string deviceId,
         string? deviceName,
@@ -3515,9 +3643,9 @@ public sealed partial class MeshDb :
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE own_threads
-            SET execution_device_id = $did,
-                execution_device_name = $dname,
-                execution_device_platform = $dplatform,
+            SET agent_execution_host_device_id = $did,
+                agent_execution_host_device_name = $dname,
+                agent_execution_host_device_platform = $dplatform,
                 execution_at = NULL,
                 execution_run_id = NULL,
                 last_activity_at = CASE
@@ -3586,9 +3714,9 @@ public sealed partial class MeshDb :
         update.Transaction = transaction;
         update.CommandText = """
             UPDATE own_threads
-            SET execution_device_id = $did,
-                execution_device_name = $dname,
-                execution_device_platform = $dplatform,
+            SET agent_execution_host_device_id = $did,
+                agent_execution_host_device_name = $dname,
+                agent_execution_host_device_platform = $dplatform,
                 execution_at = $at,
                 execution_run_id = NULL,
                 last_activity_at = CASE
@@ -3632,9 +3760,9 @@ public sealed partial class MeshDb :
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE own_threads
-            SET execution_device_id = $did,
-                execution_device_name = $dname,
-                execution_device_platform = $dplatform,
+            SET agent_execution_host_device_id = $did,
+                agent_execution_host_device_name = $dname,
+                agent_execution_host_device_platform = $dplatform,
                 execution_at = $at,
                 execution_run_id = $rid,
                 last_activity_at = CASE

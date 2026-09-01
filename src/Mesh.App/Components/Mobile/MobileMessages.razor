@@ -408,6 +408,9 @@ else
     string pinName = "";
     string? pinPrompt;
     string? pinError;
+    readonly string asyncScopeOwner = $"mobile-messages:{Guid.NewGuid():n}";
+    AgentRuntimeScopeToken? componentRuntimeScope;
+    bool disposed;
     ElementReference scrollEl;
     ElementReference scrollToLatestEl;
     ElementReference composerEl;
@@ -435,7 +438,7 @@ else
 
     sealed record PendingMsg(
         string Handle, ChatLine Line, string Text, List<StagedFile> Files, bool Direct, Widget? Widget,
-        bool ExpectedGroup, bool ExpectedService);
+        bool ExpectedGroup, bool ExpectedService, ScopedAsyncOperation Scope);
 
     sealed record StagedFile(string Name, string Mime, string Base64, long Size)
     {
@@ -458,6 +461,7 @@ else
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
         Mesh.ReplicationStateChanged += Refresh;
+        EnsureComponentScope();
 
         // Deep-link: /m/messages?to=handle opens that conversation (used by Search).
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
@@ -483,53 +487,110 @@ else
         }
         return null;
     }
-    void Refresh() => InvokeAsync(StateHasChanged);
+    void Refresh()
+    {
+        if (disposed) return;
+        _ = InvokeAsync(() =>
+        {
+            if (disposed) return;
+            EnsureComponentScope();
+            StateHasChanged();
+        });
+    }
+
+    void EnsureComponentScope()
+    {
+        AgentRuntimeScopeToken? current = null;
+        if (State.TryCaptureAgentRuntimeScope(out var captured))
+            current = captured;
+        if (componentRuntimeScope == current) return;
+        componentRuntimeScope = current;
+        pending.Clear();
+        queuedIds.Clear();
+        busy = false;
+        reverifying = false;
+        creatingGroup = false;
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        var renderedConversation = active;
+        if (!State.TryCaptureScopedAsyncOperation(
+            "ui:mobile-messages:render",
+            out var renderScope,
+            conversationId: renderedConversation))
+            return;
+        bool TryApplyRender(Action mutation)
+        {
+            var applied = false;
+            State.TryApplyScopedAsyncOperation(renderScope!, () =>
+            {
+                if (disposed
+                    || !string.Equals(active, renderedConversation, StringComparison.Ordinal))
+                    return;
+                mutation();
+                applied = true;
+            });
+            return applied;
+        }
+
         if (firstRender)
             selfRef = Microsoft.JSInterop.DotNetObjectReference.Create(this);
 
         if (active is null)
         {
-            lastActive = null;
-            try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false); } catch { }
+            if (!TryApplyRender(() => lastActive = null)) return;
+            try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false, asyncScopeOwner); } catch { }
+            if (!TryApplyRender(() => { })) return;
             try { await JS.InvokeVoidAsync("meshUI.swipeActions", chatRowsEl); } catch { }
+            TryApplyRender(() => { });
             return;
         }
 
-        try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", true); } catch { }
+        try { await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", true, asyncScopeOwner); } catch { }
+        if (!TryApplyRender(() => { })) return;
 
         if (!composerWired)
         {
-            composerWired = true;
             try { await JS.InvokeVoidAsync("meshUI.composer", composerEl, selfRef, 5); } catch { }
+            if (!TryApplyRender(() => { })) return;
             try { await JS.InvokeVoidAsync("meshPaste.attach", composerEl, selfRef); } catch { }
+            if (!TryApplyRender(() => composerWired = true)) return;
         }
 
         try { await JS.InvokeVoidAsync("meshUI.autoScroll", scrollEl, scrollToLatestEl); } catch { }
+        if (!TryApplyRender(() => { })) return;
 
-        var scrollToLatest = scrollToLatestRequested;
-        scrollToLatestRequested = false;
-        if (preserveHistoryScroll)
-        {
-            preserveHistoryScroll = false;
-            if (!scrollToLatest) return;
-        }
+        var scrollToLatest = false;
+        var stopForHistory = false;
+        if (!TryApplyRender(() =>
+            {
+                scrollToLatest = scrollToLatestRequested;
+                scrollToLatestRequested = false;
+                if (!preserveHistoryScroll) return;
+                preserveHistoryScroll = false;
+                stopForHistory = !scrollToLatest;
+            })) return;
+        if (stopForHistory) return;
 
-        var count = State.GetOrCreateConversation(active).Lines.Count;
+        var count = State.GetOrCreateConversation(renderedConversation!).Lines.Count;
         // Scroll on new messages or when switching into a conversation.
         var activeChanged = active != lastActive;
         if (activeChanged)
         {
             try { await JS.InvokeVoidAsync("meshUI.resizeComposer", composerEl, 5); } catch { }
+            if (!TryApplyRender(() => { })) return;
         }
         if (scrollToLatest || count != lastCount || activeChanged)
         {
-            lastCount = count;
-            lastActive = active;
+            if (!TryApplyRender(() =>
+                {
+                    lastCount = count;
+                    lastActive = renderedConversation;
+                })) return;
             var method = scrollToLatest || activeChanged ? "meshUI.scrollToBottom" : "meshUI.scrollToBottomIfPinned";
             try { await JS.InvokeVoidAsync(method, scrollEl); } catch { }
+            TryApplyRender(() => { });
         }
     }
 
@@ -589,9 +650,27 @@ else
     async Task ReverifyActive()
     {
         if (active is null || reverifying) return;
+        var handle = active;
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:reverify:{handle}",
+            conversationId: handle);
         reverifying = true;
-        try { await Mesh.ReverifyContactAsync(active); }
-        finally { reverifying = false; }
+        try
+        {
+            await Mesh.ReverifyContactAsync(handle);
+        }
+        catch (Exception ex)
+        {
+            State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => attachError = $"Could not verify this contact: {ex.Message}");
+        }
+        finally
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => reverifying = false);
+        }
     }
 
     void Select(string handle)
@@ -691,32 +770,64 @@ else
 
     async Task PickFile()
     {
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:pick-file",
+            conversationId: active);
         attachError = null;
         try
         {
             await JS.InvokeVoidAsync("meshUI.prepareForNativePicker", composerEl);
+            if (!State.IsCurrentScopedAsyncOperation(operationScope)) return;
             var file = await Microsoft.Maui.Storage.FilePicker.Default.PickAsync();
-            if (file is null) return;
+            if (!State.IsCurrentScopedAsyncOperation(operationScope)) return;
+            if (file is null)
+            {
+                State.TryCompleteScopedAsyncOperation(operationScope);
+                return;
+            }
             using var stream = await file.OpenReadAsync();
+            if (!State.IsCurrentScopedAsyncOperation(operationScope)) return;
             using var ms = new MemoryStream();
             var buffer = new byte[81920];
             while (true)
             {
                 var read = await stream.ReadAsync(buffer);
+                if (!State.IsCurrentScopedAsyncOperation(operationScope)) return;
                 if (read == 0) break;
                 if (ms.Length + read > MaxAttachmentBytes)
                 {
-                    attachError = $"\"{file.FileName}\" is over the {Human(MaxAttachmentBytes)} limit.";
+                    State.TryCompleteScopedAsyncOperation(
+                        operationScope,
+                        () => attachError =
+                            $"\"{file.FileName}\" is over the {Human(MaxAttachmentBytes)} limit.");
                     return;
                 }
                 await ms.WriteAsync(buffer.AsMemory(0, read));
+                if (!State.IsCurrentScopedAsyncOperation(operationScope)) return;
             }
             var bytes = ms.ToArray();
-            if (bytes.LongLength == 0) { attachError = "That file is empty."; return; }
+            if (bytes.LongLength == 0)
+            {
+                State.TryCompleteScopedAsyncOperation(
+                    operationScope,
+                    () => attachError = "That file is empty.");
+                return;
+            }
             var mime = string.IsNullOrWhiteSpace(file.ContentType) ? GuessMime(file.FileName) : file.ContentType;
-            attachments.Add(new StagedFile(file.FileName, mime, Convert.ToBase64String(bytes), bytes.LongLength));
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachments.Add(new StagedFile(
+                    file.FileName,
+                    mime,
+                    Convert.ToBase64String(bytes),
+                    bytes.LongLength)));
         }
-        catch (Exception ex) { attachError = "Couldn't attach that file: " + ex.Message; }
+        catch (Exception ex)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError = "Couldn't attach that file: " + ex.Message);
+        }
     }
 
     static string Human(long bytes)
@@ -755,8 +866,12 @@ else
 
     async Task Send()
     {
+        EnsureComponentScope();
         if (active is null) return;
         if (string.IsNullOrWhiteSpace(input) && attachments.Count == 0 && selectedWidget is null) return;
+        var runtimeScope = State.CaptureAgentRuntimeScope();
+        using var runtimeContext = State.EnterAgentRuntimeScope(runtimeScope);
+        var handle = active;
         var text = input;
         var files = attachments.ToList();
         var widget = selectedWidget;
@@ -790,59 +905,100 @@ else
                     : State.Profile.DisplayName,
                 text)
             : null;
-        State.AddChatLine(active, line, notificationIntent);
+        State.AddChatLine(handle, line, notificationIntent);
+        var messageScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:communication-send:{line.Id}",
+            messageId: line.Id,
+            conversationId: handle);
 
         // A send is already running: queue this one for the next turn instead of starting a
         // second concurrent send. The line is already visible; mark it "queued" until delivered.
         if (busy)
         {
             queuedIds.Add(line.Id);
-            pending.Enqueue(new PendingMsg(active, line, text, files, direct, widget, isGroup, isService));
+            pending.Enqueue(new PendingMsg(
+                handle, line, text, files, direct, widget, isGroup, isService, messageScope));
             return;
         }
 
-        busy = true;
+        var batchScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:communication-send-loop");
+        if (!State.TryApplyScopedAsyncOperation(batchScope, () => busy = true))
+            return;
+        var currentScope = messageScope;
+        var currentHandle = handle;
         try
         {
-            await DeliverAsync(active, line, text, files, direct, widget, isGroup, isService);
+            await DeliverAsync(
+                handle, line, text, files, direct, widget, isGroup, isService,
+                messageScope, runtimeScope);
+            if (!State.TryCompleteScopedAsyncOperation(messageScope))
+                return;
 
             // Drain anything queued while the turn(s) above ran, in order, one at a time.
             while (pending.Count > 0)
             {
-                var next = pending.Dequeue();
-                queuedIds.Remove(next.Line.Id);
+                PendingMsg? next = null;
+                if (!State.TryApplyScopedAsyncOperation(batchScope, () =>
+                    {
+                        next = pending.Dequeue();
+                        currentScope = next.Scope;
+                        currentHandle = next.Handle;
+                        queuedIds.Remove(next.Line.Id);
+                    }))
+                    return;
                 await DeliverAsync(
-                    next.Handle, next.Line, next.Text, next.Files, next.Direct, next.Widget,
-                    next.ExpectedGroup, next.ExpectedService);
+                    next!.Handle, next.Line, next.Text, next.Files, next.Direct, next.Widget,
+                    next.ExpectedGroup, next.ExpectedService, next.Scope, runtimeScope);
+                if (!State.TryCompleteScopedAsyncOperation(next.Scope))
+                    return;
             }
         }
         catch (Exception ex)
         {
-            State.AddChatLine(active!, new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" });
+            State.TryCompleteScopedAsyncOperation(currentScope, () =>
+                State.AddChatLine(
+                    currentHandle,
+                    new ChatLine { Role = "assistant", Text = $"[error: {ex.Message}]" }));
         }
-        finally { busy = false; }
+        finally
+        {
+            State.TryCompleteScopedAsyncOperation(batchScope, () => busy = false);
+        }
     }
 
     // Finalizes a bubble's text (saved widget + attachments) and sends it to the peer, reusing
     // the line's stable id so delivery receipts update the right bubble.
     async Task DeliverAsync(
         string handle, ChatLine line, string text, List<StagedFile> files, bool direct, Widget? widget,
-        bool expectedGroup, bool expectedService)
+        bool expectedGroup, bool expectedService, ScopedAsyncOperation operationScope,
+        AgentRuntimeScopeToken runtimeScope)
     {
-        var conv = State.FindConversation(handle);
+        Conversation? conv = null;
+        if (!State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => conv = State.FindConversation(handle)))
+            return;
         if (expectedGroup && conv?.IsGroup != true)
         {
-            State.SetLineStatus(line.Id, "failed");
+            State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => State.SetLineStatus(line.Id, "failed"));
             return;
         }
         if (expectedService && conv?.IsService != true)
         {
-            State.SetLineStatus(line.Id, "failed");
+            State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => State.SetLineStatus(line.Id, "failed"));
             return;
         }
         if (conv?.IsService == true)
         {
-            line.Status = "sent";
+            if (!State.TryApplyScopedAsyncOperation(
+                    operationScope,
+                    () => line.Status = "sent"))
+                return;
             await Mesh.SendServiceRequestAsync(conv);
             return;
         }
@@ -855,11 +1011,17 @@ else
             if (WidgetConsumerPolicy.RequiresBodyLoad(widget))
             {
                 var full = await State.LoadFullWidgetAsync(widget.Id);
+                if (!State.IsCurrentScopedAsyncOperation(operationScope)
+                    || !State.IsCurrentAgentRuntimeScope(runtimeScope))
+                    return;
                 if (full is not null) widget = full;
             }
             if (!WidgetConsumerPolicy.HasSendableBody(widget))
                 throw new InvalidOperationException("The selected widget has no content to send.");
-            line.WidgetPrompt = widget.Prompt;
+            if (!State.TryApplyScopedAsyncOperation(
+                    operationScope,
+                    () => line.WidgetPrompt = widget.Prompt))
+                return;
             var widgetHtml = WidgetForSend(widget.Html);
             toSend = string.IsNullOrWhiteSpace(toSend) ? widgetHtml : $"{toSend.TrimEnd()}\n\n{widgetHtml}";
         }
@@ -875,12 +1037,18 @@ else
             toSend = sb.ToString();
         }
 
-        State.SetLineText(line.Id, toSend); // "assistant" = me, rendered right
+        if (!State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => State.SetLineText(line.Id, toSend)))
+            return;
         if (conv?.IsGroup == true)
         {
             var ok = await Mesh.SendGroupMessageAsync(conv, toSend, line.Id);
-            line.Status = ok ? "sent" : "failed";
-            State.Save();
+            State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                line.Status = ok ? "sent" : "failed";
+                State.Save();
+            });
             return;
         }
         var kind = direct ? MeshKinds.DirectMessage : Mesh.AgentQuestionKind;
@@ -987,18 +1155,38 @@ else
         if (members.Count == 0) { groupCreateError = "Add at least one other person."; return; }
         if (members.Count > MaxOtherGroupMembers) { groupCreateError = $"A group can include at most {MaxOtherGroupMembers} other people."; return; }
 
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:create-group");
+        var runtimeScope = State.CaptureAgentRuntimeScope();
+        using var runtimeContext = State.EnterAgentRuntimeScope(runtimeScope);
         creatingGroup = true;
         try
         {
             var conv = await Mesh.CreateGroupAsync(name, members);
-            active = conv.Handle;
-            composerWired = false;
-            ClearSelectedWidget();
-            State.MarkRead(conv.Handle);
+            State.TryApplyScopedAsyncOperation(operationScope, () =>
+            {
+                active = conv.Handle;
+                composerWired = false;
+                ClearSelectedWidget();
+                State.MarkRead(conv.Handle);
+                showGroupCreator = false;
+                groupName = "";
+                groupMembers = "";
+                groupCreateError = null;
+            });
         }
-        catch (Exception ex) { groupCreateError = ex.Message; }
-        finally { creatingGroup = false; }
-        if (groupCreateError is null) CancelGroupCreator();
+        catch (Exception ex)
+        {
+            State.TryApplyScopedAsyncOperation(
+                operationScope,
+                () => groupCreateError = ex.Message);
+        }
+        finally
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => creatingGroup = false);
+        }
     }
 
     IEnumerable<string> ParseGroupMembers()
@@ -1042,10 +1230,15 @@ else
     async Task Approve(PendingApproval a)
     {
         var edited = GetDraft(a);
+        var operationScope = State.CaptureScopedAsyncOperation(
+            $"{asyncScopeOwner}:approve:{a.Id}");
         await Mesh.ApproveDraftAsync(a.Id, edited);
-        editedDrafts.Remove(a.Id);
-        active = a.From;
-        ClearSelectedWidget();
+        State.TryCompleteScopedAsyncOperation(operationScope, () =>
+        {
+            editedDrafts.Remove(a.Id);
+            active = a.From;
+            ClearSelectedWidget();
+        });
     }
 
     void Reject(PendingApproval a)
@@ -1072,8 +1265,9 @@ else
 
     public void Dispose()
     {
+        disposed = true;
         NotificationViews.Clear("mobile-messages");
-        _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
+        _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false, asyncScopeOwner);
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Mesh.ReplicationStateChanged -= Refresh;

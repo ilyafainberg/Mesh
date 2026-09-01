@@ -34,6 +34,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\ModelCallDispatcher.cs" Link="ModelCallDispatcher.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\CopilotAcpProtocol.cs" Link="CopilotAcpProtocol.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.cs" Link="MeshDb.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\MeshDb.AssistantAiRequests.cs" Link="MeshDb.AssistantAiRequests.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.TopicExecution.cs" Link="MeshDb.TopicExecution.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.Protocol9ReadModels.cs" Link="MeshDb.Protocol9ReadModels.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshDb.AssetsInteractions.cs" Link="MeshDb.AssetsInteractions.cs" />
