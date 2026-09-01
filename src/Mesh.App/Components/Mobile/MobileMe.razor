@@ -2836,7 +2836,7 @@ else
             State.TryApplyScopedAsyncOperation(
                 operationScope,
                 () => attachError =
-                    "Message retained. AI response unavailable — choose an online agent-ready Desktop, then retry.");
+                    "Message retained. AI response unavailable: choose an online agent-ready Desktop, then retry.");
             return;
         }
         if (!State.IsCurrentAgentRuntimeScope(retryScope))
