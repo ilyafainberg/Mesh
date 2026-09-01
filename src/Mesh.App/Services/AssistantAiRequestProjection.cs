@@ -32,7 +32,7 @@ public static class AssistantAiRequestReducer
                     false,
                     true,
                     request.LastError
-                    ?? "Message saved. AI unavailable — choose an online agent-ready Desktop, then retry."),
+                    ?? "Message saved. AI unavailable: choose an online agent-ready Desktop, then retry."),
             AssistantAiRequestState.RetryPending =>
                 new(
                     false,
