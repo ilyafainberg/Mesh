@@ -44,6 +44,12 @@ variables:
   # install update to a newer manifest that requires an Xcode absent from the image.
   DOTNET_VERSION: '10.0.302'
   XCODE_PATH: '/Applications/Xcode_26.0.1.app/Contents/Developer'
+  # VALIDATION-ONLY: exact Mesh 1.19.1 build 80 TestFlight exception.
+  # Never merge this exception to main.
+  ${{ if and(eq(parameters.version, '1.19.1'), eq(parameters.buildNumber, 80), eq(parameters.pushTestFlight, true)) }}:
+    VALIDATION_RELEASE_AUTHORIZED: $[eq(variables['Build.SourceBranch'], 'refs/heads/hotfix/1.19.1-testflight80')]
+  ${{ else }}:
+    VALIDATION_RELEASE_AUTHORIZED: 'False'
 
 pool:
   vmImage: macos-15
@@ -58,8 +64,10 @@ steps:
   persistCredentials: false
 
 - pwsh: |
-    if ('$(Build.SourceBranch)' -ne 'refs/heads/main') {
-      throw 'iOS signing is restricted to refs/heads/main.'
+    $isMain = '$(Build.SourceBranch)' -eq 'refs/heads/main'
+    $isValidationRelease = '$(VALIDATION_RELEASE_AUTHORIZED)' -eq 'True'
+    if (-not $isMain -and -not $isValidationRelease) {
+      throw 'iOS signing is restricted to main or the exact validation-only Mesh 1.19.1 build 80 TestFlight request.'
     }
   displayName: Enforce protected release branch
 
@@ -82,7 +90,7 @@ steps:
 
 - task: InstallAppleCertificate@2
   displayName: Install Apple Distribution certificate
-  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['VALIDATION_RELEASE_AUTHORIZED'], 'True'))
   inputs:
     certSecureFile: Mesh-Apple-Distribution.p12
     certPwd: $(APPLE_CERT_PASSWORD)
@@ -91,7 +99,7 @@ steps:
 
 - task: InstallAppleProvisioningProfile@1
   displayName: Install App Store provisioning profile
-  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['VALIDATION_RELEASE_AUTHORIZED'], 'True'))
   inputs:
     provisioningProfileLocation: secureFiles
     provProfileSecureFile: Mesh-AppStore.mobileprovision
@@ -101,7 +109,7 @@ steps:
   - task: DownloadSecureFile@1
     name: appStoreKey
     displayName: Download App Store Connect API key
-    condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+    condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['VALIDATION_RELEASE_AUTHORIZED'], 'True'))
     inputs:
       secureFile: Mesh-AppStore-Connect.p8
 
