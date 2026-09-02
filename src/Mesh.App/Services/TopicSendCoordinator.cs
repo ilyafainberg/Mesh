@@ -2031,8 +2031,7 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
                     Error: "This draft revision already has a different immutable submission identity.");
             snapshots[logicalKey] = new SnapshotEntry(snapshot, ++sequence);
 
-            if (operations.Values.Count(
-                    operation => Volatile.Read(ref operation.Running) != 0)
+            if (operations.Values.Count(ConsumesCapacity)
                 >= retention.MaximumRunningOperations)
                 return new(
                     TopicSendSubmissionKind.CapacityExceeded,
@@ -3063,7 +3062,21 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
         if (inheritedMutation is null && terminalMutation is null) return;
         try
         {
-            WriteJournal(terminal, "terminal");
+            testObserver?.Checkpoint("terminal-before-commit");
+            lock (identityGate)
+            {
+                WriteJournal(terminal, "terminal");
+                lock (state.Gate)
+                {
+                    state.Lifecycle = TopicSendJournalLifecycle.Terminal;
+                    state.Cleanup = terminal.Cleanup;
+                    state.JournalTerminalOutcome = outcome;
+                    state.LastOutcome = terminal.Cleanup == TopicSendJournalCleanup.DraftClearPending
+                        ? ReconcilingOutcome("The send is final; completing local draft cleanup.")
+                        : outcome;
+                }
+            }
+            testObserver?.Checkpoint("terminal-committed-capacity-released");
         }
         catch (TopicSendJournalStaleException)
         {
@@ -3086,15 +3099,6 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
             return;
         }
 
-        lock (state.Gate)
-        {
-            state.Lifecycle = TopicSendJournalLifecycle.Terminal;
-            state.Cleanup = terminal.Cleanup;
-            state.JournalTerminalOutcome = outcome;
-            state.LastOutcome = terminal.Cleanup == TopicSendJournalCleanup.DraftClearPending
-                ? ReconcilingOutcome("The send is final; completing local draft cleanup.")
-                : outcome;
-        }
         terminalMutation?.Dispose();
         inheritedMutation?.Dispose();
 
@@ -3407,6 +3411,13 @@ public sealed class TopicSendCoordinator : IDisposable, IAsyncDisposable
         => new(
             TopicSendOutcomeKind.Reconciling,
             new TopicSendHandoff(false, "reconciling", detail));
+
+    private static bool ConsumesCapacity(OperationState state)
+    {
+        lock (state.Gate)
+            return state.Lifecycle != TopicSendJournalLifecycle.Terminal
+                   && Volatile.Read(ref state.Running) != 0;
+    }
 
     private bool TryRecoverLocked(
         string scopeIdentity,

@@ -302,16 +302,13 @@ public static class Protocol9DomainTables
         cmd.Parameters.AddWithValue("$title", thread.Title ?? "");
         cmd.Parameters.AddWithValue("$sort", Math.Max(0, sortOrder));
         cmd.Parameters.AddWithValue("$pinned", thread.IsPinned ? 1 : 0);
-        cmd.Parameters.AddWithValue("$conversationKind", (int)thread.ConversationKind);
+        cmd.Parameters.AddWithValue("$conversationKind", (int)ConversationKind.Assistant);
         cmd.Parameters.AddWithValue(
-            "$communicationDevice",
-            (object?)thread.CommunicationDestinationDeviceId ?? DBNull.Value);
+            "$communicationDevice", DBNull.Value);
         cmd.Parameters.AddWithValue(
-            "$communicationName",
-            (object?)thread.CommunicationDestinationDeviceName ?? DBNull.Value);
+            "$communicationName", DBNull.Value);
         cmd.Parameters.AddWithValue(
-            "$communicationPlatform",
-            (object?)thread.CommunicationDestinationDevicePlatform ?? DBNull.Value);
+            "$communicationPlatform", DBNull.Value);
         cmd.Parameters.AddWithValue("$device", (object?)thread.AgentExecutionHostDeviceId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$deviceName", (object?)thread.AgentExecutionHostDeviceName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$platform", (object?)thread.AgentExecutionHostDevicePlatform ?? DBNull.Value);

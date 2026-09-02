@@ -20,7 +20,7 @@ public sealed partial class MobileMeLifecycleComponentTests
         var mounted = await renderer.MountAsync<Home>();
 
         await renderer.InputAsync(mounted.Id, "Message your assistant", "terminal wins");
-        var send = renderer.ClickAsync(mounted.Id, "Ask AI on agent host");
+        var send = renderer.ClickAsync(mounted.Id, "Send");
         await router.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var request = AssertSinglePendingRequest(harness.State);
@@ -47,7 +47,7 @@ public sealed partial class MobileMeLifecycleComponentTests
     }
 
     [TestMethod]
-    public async Task DesktopCommunicationMoveStartedInOldAIsBlockedAfterAtoBtoA()
+    public async Task DesktopExecutionMoveStartedInOldAIsBlockedAfterAtoBtoA()
     {
         var transport = new ControllableDeviceTransport();
         var destination = new Mesh.Shared.DeviceInfo(
@@ -56,7 +56,8 @@ public sealed partial class MobileMeLifecycleComponentTests
             true,
             DevicePlatforms.IOS,
             true,
-            AgentHostEnabled: false);
+            AgentHostEnabled: true,
+            ProtocolVersion: 9);
         var router = new BlockingRosterRouter([transport.Device, destination]);
         var harness = CreateHarness(transport, router: router);
         await using var services = harness.Services;
@@ -66,11 +67,16 @@ public sealed partial class MobileMeLifecycleComponentTests
 
         router.BlockNextList();
         var moveMethod = mounted.Component.GetType().GetMethod(
-            "MoveCommunicationTo",
+            "RequestMoveAsync",
             BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.IsNotNull(moveMethod);
         var move = renderer.Dispatcher.InvokeAsync(
-            () => (Task)moveMethod.Invoke(mounted.Component, [destination])!);
+            () => (Task)moveMethod.Invoke(
+                mounted.Component,
+                [new AgentExecutionHost(
+                    destination.DeviceId,
+                    destination.Name,
+                    destination.Platform)])!);
         await router.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var accountB = harness.State.ImportProfile(
@@ -80,10 +86,12 @@ public sealed partial class MobileMeLifecycleComponentTests
         router.Release.TrySetResult();
         await move;
 
-        Assert.IsNull(
-            harness.State.Profile.OwnThreads.Single(thread => thread.Id == "thread")
-                .CommunicationDestinationDeviceId,
+        var thread = harness.State.Profile.OwnThreads.Single(thread => thread.Id == "thread");
+        Assert.AreNotEqual(
+            destination.DeviceId,
+            thread.AgentExecutionHostDeviceId,
             "An A-generation move continuation mutated the reactivated A database.");
+        Assert.IsNull(thread.CommunicationDestinationDeviceId);
     }
 
     private static AssistantAiRequest AssertSinglePendingRequest(AppState state)

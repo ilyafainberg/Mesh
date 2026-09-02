@@ -146,6 +146,43 @@ public sealed partial class MobileMeLifecycleComponentTests
     }
 
     [TestMethod]
+    public async Task AssistantRequest_TerminalAbsorbsTenThousandConcurrentDispatchOutcomes()
+    {
+        var state = CreateFirstRunState(NewStateRoot(), new MemorySecretStore(), "thread");
+        var request = await CommitRequest(state, "stress-run", "stress-line");
+        var scope = state.CaptureAssistantAiRequestMutationScope(request);
+        state.CompleteAssistantAiRequest(request.RunId);
+        var failures = 0;
+        var outcomes = new[]
+        {
+            TopicDispatchResult.Ok(request.RunId),
+            TopicDispatchResult.Reject("capacity", request.RunId, "host capacity"),
+            TopicDispatchResult.Reject("queue_full", request.RunId, "queue full"),
+            TopicDispatchResult.Reject("rate_limited", request.RunId, "rate limited"),
+            TopicDispatchResult.Reject("transient_unavailable", request.RunId, "unavailable"),
+            TopicDispatchResult.Reject("offline", request.RunId, "offline")
+        };
+
+        Parallel.For(0, 10_000, iteration =>
+        {
+            var transition = state.RecordAssistantAiDispatch(
+                scope,
+                outcomes[iteration % outcomes.Length]);
+            if (transition.Outcome != AssistantAiRequestTransitionOutcome.TerminalNoOp
+                || transition.Request?.State != AssistantAiRequestState.Completed)
+                Interlocked.Increment(ref failures);
+        });
+
+        Assert.AreEqual(0, Volatile.Read(ref failures));
+        var stored = state.GetAssistantAiRequest(request.RunId);
+        Assert.AreEqual(AssistantAiRequestState.Completed, stored?.State);
+        Assert.AreEqual(0, stored?.DispatchAttempts);
+        Assert.AreEqual(
+            AssistantAiRequestProjection.Empty,
+            AssistantAiRequestReducer.Project(stored));
+    }
+
+    [TestMethod]
     public async Task AssistantRequest_CancelledAbsorbsDuplicateCallbacksAndNewRunProceeds()
     {
         var state = CreateFirstRunState(NewStateRoot(), new MemorySecretStore(), "thread");

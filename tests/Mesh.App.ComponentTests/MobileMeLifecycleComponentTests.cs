@@ -24,20 +24,19 @@ namespace Mesh.App.ComponentTests;
 public sealed partial class MobileMeLifecycleComponentTests
 {
     [DataTestMethod]
-    [DataRow(true, true, true, DevicePlatforms.Windows, 9, true, "online · agent ready")]
-    [DataRow(true, true, true, DevicePlatforms.Windows, 8, false, "online · no agent runtime")]
-    [DataRow(true, false, true, DevicePlatforms.Windows, 9, true, "online · no agent runtime")]
-    [DataRow(true, true, false, DevicePlatforms.Windows, 9, true, "online · no agent runtime")]
-    [DataRow(true, true, true, DevicePlatforms.IOS, 9, true, "online · no agent runtime")]
-    [DataRow(false, true, true, DevicePlatforms.Windows, 9, true, "offline · agent ready")]
-    public async Task DesktopCurrentDeviceMenu_AllowsCommunicationRegardlessOfAiCapability(
+    [DataRow(true, true, true, DevicePlatforms.Windows, 9, true)]
+    [DataRow(true, true, true, DevicePlatforms.Windows, 8, false)]
+    [DataRow(true, false, true, DevicePlatforms.Windows, 9, false)]
+    [DataRow(true, true, false, DevicePlatforms.Windows, 9, false)]
+    [DataRow(true, true, true, DevicePlatforms.IOS, 9, false)]
+    [DataRow(false, true, true, DevicePlatforms.Windows, 9, false)]
+    public async Task DesktopNewChat_RequiresOnlineAgentCapableExecutionHost(
         bool online,
         bool remoteAgentEnabled,
         bool agentHostEnabled,
         string platform,
         int protocolVersion,
-        bool expectedAddressable,
-        string expectedAvailability)
+        bool expectedEligible)
     {
         var state = CreateFirstRunState(
             NewStateRoot(),
@@ -63,34 +62,30 @@ public sealed partial class MobileMeLifecycleComponentTests
         var mounted = await renderer.MountAsync<Home>();
         var initialTopics = state.Profile.OwnThreads.Count;
 
-        var primaryDisabled = renderer.MatchedAttributeValue(
-            mounted.Id,
-            "button",
-            "aria-label",
-            "Start new chat on this device",
-            "disabled");
-        Assert.AreEqual(expectedAddressable, primaryDisabled is null);
-
-        await renderer.ClickAsync(mounted.Id, "Choose device for new chat");
-        Assert.IsTrue(
-            renderer.MarkupContains(mounted.Id, expectedAvailability),
-            renderer.RenderedText(mounted.Id));
-        var menuDisabled = renderer.MatchedElementHasAttribute(
-            mounted.Id,
-            "button",
-            "aria-label",
-            "Choose this device for new chat",
-            "disabled");
-        Assert.AreEqual(!expectedAddressable, menuDisabled);
-
-        await renderer.ClickAsync(mounted.Id, "Start new chat on this device");
+        await WaitUntilAsync(
+            () => renderer.MatchedElementHasAttribute(
+                      mounted.Id,
+                      "button",
+                      "aria-label",
+                      "Start new assistant chat",
+                      "disabled") != expectedEligible,
+            TimeSpan.FromSeconds(5));
+        if (expectedEligible)
+            await renderer.ClickAsync(mounted.Id, "Start new assistant chat");
         Assert.AreEqual(
-            initialTopics + (expectedAddressable ? 1 : 0),
+            initialTopics + (expectedEligible ? 1 : 0),
             state.Profile.OwnThreads.Count);
+        if (expectedEligible)
+        {
+            var created = state.Profile.OwnThreads.Last();
+            Assert.AreEqual(ConversationKind.Assistant, created.ConversationKind);
+            Assert.AreEqual(currentDeviceId, created.AgentExecutionHostDeviceId);
+            Assert.IsNull(created.CommunicationDestinationDeviceId);
+        }
     }
 
     [TestMethod]
-    public async Task DesktopCurrentDeviceMenu_MissingRosterEntry_StillAllowsSelfCommunication()
+    public async Task DesktopNewChat_MissingRosterEntryDoesNotCreateInertTopic()
     {
         var state = CreateFirstRunState(
             NewStateRoot(),
@@ -102,20 +97,253 @@ public sealed partial class MobileMeLifecycleComponentTests
         var mounted = await renderer.MountAsync<Home>();
         var initialTopics = state.Profile.OwnThreads.Count;
 
-        await renderer.ClickAsync(mounted.Id, "Choose device for new chat");
-        Assert.IsTrue(renderer.MarkupContains(
-            mounted.Id,
-            "presence unknown"),
-            renderer.RenderedText(mounted.Id));
-        Assert.IsFalse(renderer.MatchedElementHasAttribute(
+        await WaitUntilAsync(
+            () => renderer.MatchedElementHasAttribute(
+                mounted.Id,
+                "button",
+                "aria-label",
+                "Start new assistant chat",
+                "disabled"),
+            TimeSpan.FromSeconds(5));
+        Assert.IsTrue(renderer.MatchedElementHasAttribute(
             mounted.Id,
             "button",
             "aria-label",
-            "Choose this device for new chat",
+            "Start new assistant chat",
             "disabled"));
+        Assert.AreEqual(initialTopics, state.Profile.OwnThreads.Count);
+    }
 
-        await renderer.ClickAsync(mounted.Id, "Start new chat on this device");
-        Assert.AreEqual(initialTopics + 1, state.Profile.OwnThreads.Count);
+    [DataTestMethod]
+    [DataRow(false, false)]
+    [DataRow(false, true)]
+    [DataRow(true, false)]
+    [DataRow(true, true)]
+    public async Task MePrimarySend_ArrowAndEnterPersistAndDispatchOneAiRequest(
+        bool mobile,
+        bool enter)
+    {
+        var transport = new ControllableDeviceTransport();
+        var harness = CreateHarness(transport);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var prompt = $"{(mobile ? "mobile" : "desktop")}-{(enter ? "enter" : "arrow")}";
+        Task send;
+
+        if (mobile)
+        {
+            var mounted = await renderer.MountAsync<MobileMe>();
+            await renderer.InputAsync(mounted.Id, "Message your assistant", prompt);
+            send = enter
+                ? renderer.Dispatcher.InvokeAsync(mounted.Component.SendFromComposer)
+                : renderer.ClickAsync(mounted.Id, "Send");
+        }
+        else
+        {
+            var mounted = await renderer.MountAsync<Home>();
+            await renderer.InputAsync(mounted.Id, "Message your assistant", prompt);
+            send = enter
+                ? renderer.Dispatcher.InvokeAsync(mounted.Component.SendFromComposer)
+                : renderer.ClickAsync(mounted.Id, "Send");
+        }
+
+        await transport.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var thread = harness.State.Profile.OwnThreads.Single();
+        var request = harness.State.GetPendingAssistantAiRequest(thread.Id);
+        Assert.IsNotNull(request);
+        Assert.AreEqual(1, transport.SubmitCount);
+        Assert.AreEqual(1, thread.Lines.Count(line => line.Text == prompt));
+        Assert.AreEqual(transport.Device.DeviceId, transport.LastDraft?.TargetDeviceId);
+        Assert.AreEqual(request.RunId, transport.LastDraft?.RunId);
+        Assert.IsTrue(thread.Lines.Single(line => line.Text == prompt).AddressedToAgent);
+        transport.Release.TrySetResult();
+        await send.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MeComposer_HasOneAssistantActionAndNoOrdinaryMode(bool mobile)
+    {
+        var harness = CreateHarness(new ControllableDeviceTransport());
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var renderedText = mobile
+            ? renderer.RenderedText((await renderer.MountAsync<MobileMe>()).Id)
+            : renderer.RenderedText((await renderer.MountAsync<Home>()).Id);
+
+        Assert.IsFalse(renderedText.Contains("Ask assistant", StringComparison.Ordinal));
+        Assert.IsFalse(renderedText.Contains("Send message only", StringComparison.Ordinal));
+        Assert.IsFalse(renderedText.Contains("Message this device", StringComparison.Ordinal));
+        Assert.IsFalse(renderedText.Contains("communication destination", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MePrimarySend_NoEligibleHostPreservesDraftAndCreatesNothing(bool mobile)
+    {
+        var transport = new ControllableDeviceTransport { Devices = [] };
+        var harness = CreateHarness(transport);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var before = harness.State.Profile.OwnThreads.Single().Lines.Count;
+
+        if (mobile)
+        {
+            var mounted = await renderer.MountAsync<MobileMe>();
+            await renderer.InputAsync(mounted.Id, "Message your assistant", "keep this draft");
+            await renderer.ClickAsync(mounted.Id, "Send");
+            Assert.IsTrue(
+                renderer.RenderedText(mounted.Id).Contains(
+                    "Bring an agent device online",
+                    StringComparison.Ordinal));
+        }
+        else
+        {
+            var mounted = await renderer.MountAsync<Home>();
+            await renderer.InputAsync(mounted.Id, "Message your assistant", "keep this draft");
+            await renderer.ClickAsync(mounted.Id, "Send");
+            Assert.IsTrue(
+                renderer.RenderedText(mounted.Id).Contains(
+                    "Bring an agent device online",
+                    StringComparison.Ordinal));
+        }
+
+        Assert.AreEqual(before, harness.State.Profile.OwnThreads.Single().Lines.Count);
+        Assert.IsNull(harness.State.GetPendingAssistantAiRequest("thread"));
+        Assert.AreEqual(0, transport.SubmitCount);
+        Assert.AreEqual("keep this draft", harness.State.GetTopicDraft("thread"));
+    }
+
+    [TestMethod]
+    public async Task NonCapableMobileOriginRoutesToRemoteDesktopHost()
+    {
+        var transport = new ControllableDeviceTransport();
+        var harness = CreateHarness(transport);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<MobileMe>();
+
+        await renderer.InputAsync(mounted.Id, "Message your assistant", "remote execution");
+        await renderer.ClickAsync(mounted.Id, "Send");
+        await transport.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.AreEqual(transport.Device.DeviceId, transport.LastDraft?.TargetDeviceId);
+        Assert.AreEqual(
+            transport.Device.DeviceId,
+            harness.State.Profile.OwnThreads.Single().AgentExecutionHostDeviceId);
+        transport.Release.TrySetResult();
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MeMoveTopicChangesOnlyAiExecutionHost(bool mobile)
+    {
+        var target = new Mesh.Shared.DeviceInfo(
+            "backup-agent",
+            "Backup agent",
+            true,
+            DevicePlatforms.Windows,
+            RemoteAgentEnabled: true,
+            AgentHostEnabled: true,
+            ProtocolVersion: 9);
+        var transport = new ControllableDeviceTransport
+        {
+            Devices = [new ControllableDeviceTransport().Device, target]
+        };
+        var harness = CreateHarness(transport);
+        await using var renderer = new ComponentRenderer(harness.Services);
+
+        if (mobile)
+        {
+            var mounted = await renderer.MountAsync<MobileMe>();
+            await renderer.ClickAsync(mounted.Id, "Topic actions");
+            await renderer.ClickAsync(mounted.Id, "Move topic to");
+            await renderer.ClickAsync(mounted.Id, "Move topic to Backup agent");
+        }
+        else
+        {
+            var mounted = await renderer.MountAsync<Home>();
+            await renderer.ClickAsync(mounted.Id, "Move topic to");
+            await renderer.ClickAsync(mounted.Id, "Move topic to Backup agent");
+        }
+
+        var thread = harness.State.Profile.OwnThreads.Single();
+        Assert.AreEqual(target.DeviceId, thread.AgentExecutionHostDeviceId);
+        Assert.AreEqual(ConversationKind.Assistant, thread.ConversationKind);
+        Assert.IsNull(thread.CommunicationDestinationDeviceId);
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MessagesPrimarySend_RemainsOrdinaryPersonToPerson(bool mobile)
+    {
+        var harness = CreateHarness(new ControllableDeviceTransport());
+        harness.State.GetOrCreateConversation("peer");
+        var navigation = harness.Services.GetRequiredService<NavigationManager>();
+        navigation.NavigateTo(mobile
+            ? "https://mesh.test/m/messages?to=peer"
+            : "https://mesh.test/messages?to=peer");
+        await using var renderer = new ComponentRenderer(harness.Services);
+
+        if (mobile)
+        {
+            var mounted = await renderer.MountAsync<MobileMessages>();
+            await renderer.InputAsync(mounted.Id, "Message input", "ordinary message");
+            await renderer.ClickAsync(mounted.Id, "Send");
+        }
+        else
+        {
+            var mounted = await renderer.MountAsync<Messages>();
+            await renderer.InputAsync(mounted.Id, "Message input", "ordinary message");
+            await renderer.ClickAsync(mounted.Id, "Send");
+        }
+
+        var line = harness.State.GetOrCreateConversation("peer").Lines
+            .Single(item => item.Text == "ordinary message");
+        Assert.AreEqual("person", line.Via);
+        Assert.IsFalse(line.AddressedToAgent);
+        Assert.IsNull(harness.State.GetPendingAssistantAiRequest("peer"));
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Relaunch_InterruptedPreDispatchRequestBecomesRetryable(bool mobile)
+    {
+        var transport = new ControllableDeviceTransport();
+        var harness = CreateHarness(transport);
+        var trigger = new ChatLine
+        {
+            Id = "interrupted-trigger",
+            Role = "user",
+            Text = "resume this request",
+            Via = "agent",
+            AddressedToAgent = true,
+            At = DateTimeOffset.UtcNow
+        };
+        var request = await harness.State.CommitAssistantAiRequestAsync(
+            "thread",
+            trigger,
+            "interrupted-run",
+            "interrupted-run",
+            new AgentExecutionHost(
+                transport.Device.DeviceId,
+                transport.Device.Name,
+                transport.Device.Platform));
+        Assert.AreEqual(AssistantAiRequestState.DispatchPending, request.State);
+        await using var renderer = new ComponentRenderer(harness.Services);
+
+        var mountedId = mobile
+            ? (await renderer.MountAsync<MobileMe>()).Id
+            : (await renderer.MountAsync<Home>()).Id;
+
+        await WaitUntilAsync(
+            () => harness.State.GetAssistantAiRequest(request.RunId)?.State
+                  == AssistantAiRequestState.RetryPending,
+            TimeSpan.FromSeconds(5));
+        Assert.IsTrue(
+            renderer.RenderedText(mountedId).Contains("Retry AI", StringComparison.Ordinal),
+            renderer.RenderedText(mountedId));
     }
 
     [TestMethod]
@@ -563,10 +791,25 @@ public sealed partial class MobileMeLifecycleComponentTests
                 "activeThreadValue",
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
             .SetValue(mounted.Component, "thread");
+        var scope = state.CaptureActiveThreadMutationScope("thread");
+        var pendingType = typeof(MobileMe).GetNestedType(
+            "PendingTopicMove",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var pending = Activator.CreateInstance(
+            pendingType,
+            "thread",
+            "Topic",
+            "same-run-id",
+            new AgentExecutionHost(
+                transport.Device.DeviceId,
+                transport.Device.Name,
+                transport.Device.Platform),
+            scope,
+            null)!;
         typeof(MobileMe).GetField(
                 "pendingMove",
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
-            .SetValue(mounted.Component, transport.Device);
+            .SetValue(mounted.Component, pending);
 
         await renderer.Dispatcher.InvokeAsync(async () =>
             await (Task)typeof(MobileMe).GetMethod(
@@ -2671,8 +2914,6 @@ public sealed partial class MobileMeLifecycleComponentTests
 
         public async Task ClickAsync(int componentId, string ariaLabel)
         {
-            if (string.Equals(ariaLabel, "Send", StringComparison.Ordinal))
-                ariaLabel = "Ask AI on agent host";
             await WaitUntilAsync(
                 () => HasAttribute(
                     componentId,
@@ -2690,6 +2931,11 @@ public sealed partial class MobileMeLifecycleComponentTests
                 else if (callback is Func<Task> action)
                 {
                     await action();
+                    await RenderRootComponentAsync(componentId, ParameterView.Empty);
+                }
+                else if (callback is Action synchronousAction)
+                {
+                    synchronousAction();
                     await RenderRootComponentAsync(componentId, ParameterView.Empty);
                 }
                 else

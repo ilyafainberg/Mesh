@@ -852,7 +852,7 @@ public sealed class DeviceTopicDbTests
     }
 
     [TestMethod]
-    public void CommunicationMoveAndAiHostChange_ArePersistedIndependently()
+    public void MeTopic_IgnoresCommunicationMoveAndPersistsAiHost()
     {
         var created = new DateTimeOffset(2026, 8, 31, 9, 0, 0, TimeSpan.Zero);
         using (var db = MeshDb.Open(databasePath, key))
@@ -872,8 +872,9 @@ public sealed class DeviceTopicDbTests
 
         using var reopened = MeshDb.Open(databasePath, key);
         var thread = reopened.LoadProfile()!.OwnThreads.Single(item => item.Id == "two-plane");
-        Assert.AreEqual("phone-b", thread.CommunicationDestinationDeviceId);
-        Assert.AreEqual(DevicePlatforms.IOS, thread.CommunicationDestinationDevicePlatform);
+        Assert.AreEqual(ConversationKind.Assistant, thread.ConversationKind);
+        Assert.IsNull(thread.CommunicationDestinationDeviceId);
+        Assert.IsNull(thread.CommunicationDestinationDevicePlatform);
         Assert.AreEqual("desktop-b", thread.AgentExecutionHostDeviceId);
         Assert.AreEqual(DevicePlatforms.Windows, thread.AgentExecutionHostDevicePlatform);
     }

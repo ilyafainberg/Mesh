@@ -1267,6 +1267,102 @@ public sealed class TopicSendLifecycleTests
     }
 
     [TestMethod]
+    public async Task TerminalCommit_ReleasesCapacityBeforeCompletionProjectionReturns()
+    {
+        var coordinator = new TopicSendCoordinator(new TopicSendRetentionOptions
+        {
+            MaximumRunningOperations = 1,
+            MaximumCompletedIdentities = 4,
+            MaximumUnsubmittedSnapshots = 4
+        });
+        var completionEntered = NewSignal();
+        var releaseCompletion = NewSignal();
+        var first = coordinator.CreateSnapshot(
+            "thread-1", "device", 1, "first", DateTimeOffset.UtcNow);
+
+        Assert.IsTrue(coordinator.TrySubmit(
+            first,
+            _ => Task.FromResult(new TopicSendHandoff(true, "accepted")),
+            async _ =>
+            {
+                completionEntered.TrySetResult();
+                await releaseCompletion.Task;
+            }));
+        await completionEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var secondDone = NewSignal();
+        var second = coordinator.CreateSnapshot(
+            "thread-2", "device", 1, "second", DateTimeOffset.UtcNow);
+        var submission = coordinator.Submit(
+            second,
+            _ => Task.FromResult(new TopicSendHandoff(true, "accepted")),
+            _ =>
+            {
+                secondDone.TrySetResult();
+                return Task.CompletedTask;
+            });
+
+        Assert.AreEqual(TopicSendSubmissionKind.Started, submission.Kind);
+        releaseCompletion.TrySetResult();
+        await secondDone.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.AreEqual(second.OperationId, submission.Snapshot.OperationId);
+    }
+
+    [TestMethod]
+    public async Task CapacityAndTerminalBarrier_LinearizesAtTerminalCommit()
+    {
+        var probe = new LifecycleProbe("terminal-before-commit");
+        var coordinator = new TopicSendCoordinator(
+            new TopicSendRetentionOptions
+            {
+                MaximumRunningOperations = 1,
+                MaximumCompletedIdentities = 4,
+                MaximumUnsubmittedSnapshots = 4
+            },
+            null,
+            null,
+            null,
+            null,
+            probe);
+        var firstDone = NewSignal();
+        var first = coordinator.CreateSnapshot(
+            "thread-1", "device", 1, "first", DateTimeOffset.UtcNow);
+        Assert.IsTrue(coordinator.TrySubmit(
+            first,
+            _ => Task.FromResult(new TopicSendHandoff(true, "accepted")),
+            _ =>
+            {
+                firstDone.TrySetResult();
+                return Task.CompletedTask;
+            }));
+        await probe.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var second = coordinator.CreateSnapshot(
+            "thread-2", "device", 1, "second", DateTimeOffset.UtcNow);
+        var beforeCommit = coordinator.Submit(
+            second,
+            _ => Task.FromResult(new TopicSendHandoff(true, "accepted")));
+        Assert.AreEqual(TopicSendSubmissionKind.CapacityExceeded, beforeCommit.Kind);
+        Assert.AreEqual(second.OperationId, beforeCommit.Snapshot.OperationId);
+
+        probe.Release.TrySetResult();
+        await firstDone.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var afterCommitDone = NewSignal();
+        var afterCommit = coordinator.Submit(
+            second,
+            _ => Task.FromResult(new TopicSendHandoff(true, "accepted")),
+            _ =>
+            {
+                afterCommitDone.TrySetResult();
+                return Task.CompletedTask;
+            });
+
+        Assert.AreEqual(TopicSendSubmissionKind.Started, afterCommit.Kind);
+        Assert.AreEqual(second.OperationId, afterCommit.Snapshot.OperationId);
+        await afterCommitDone.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [TestMethod]
     public async Task DraftClearFailure_RestartKeepsFenceAndRetriesBeforeCompaction()
     {
         var store = new InMemoryTopicSendIdentityStore();

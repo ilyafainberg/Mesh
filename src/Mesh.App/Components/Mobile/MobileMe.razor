@@ -33,16 +33,20 @@
 
         <div class="new-chat-split">
             <button class="new-chat-primary" @onclick="NewThreadOnDefault"
-                    disabled="@(communicationDevices.Count == 0)" aria-label="New chat on a linked device">
+                    disabled="@(executionHosts.Count == 0)" aria-label="New assistant chat">
                 <span class="new-chat-icon"><i class="bi bi-plus-lg"></i></span>
                 <span class="new-chat-label">New chat</span>
-                <span class="new-chat-device">Communication destination</span>
+                <span class="new-chat-device">Assistant</span>
             </button>
             <button class="new-chat-menu-button" @onclick="OpenNewDeviceMenu" aria-label="Choose a device for new chat"
                     aria-haspopup="dialog" aria-expanded="@newDeviceMenuOpen">
                 <i class="bi bi-chevron-down"></i>
             </button>
         </div>
+        @if (newThreadError is not null)
+        {
+            <p class="err-text" role="alert">@newThreadError</p>
+        }
 
         @if (State.Profile.OwnThreads.Count == 0)
         {
@@ -73,11 +77,11 @@
                                     <span class="row-avatar"><i class="bi bi-chat-text"></i></span>
                                     <span class="row-main">
                                         <span class="row-title">@(string.IsNullOrWhiteSpace(t.Title) ? "New chat" : t.Title)</span>
-                                        @if (IsAssignedElsewhere(t))
+                                        @if (IsExecutionRemote(t))
                                         {
-                                            <span class="device-pill @(IsDeviceOnline(t.CommunicationDestinationDeviceId) ? "" : "offline")"
+                                            <span class="device-pill @(IsDeviceOnline(t.AgentExecutionHostDeviceId) ? "" : "offline")"
                                                   title="@DeviceStatus(t)">
-                                                <i class="bi @PlatformIcon(t.CommunicationDestinationDevicePlatform)"></i>
+                                                <i class="bi @PlatformIcon(t.AgentExecutionHostDevicePlatform)"></i>
                                                 @DeviceLabel(t)
                                             </span>
                                         }
@@ -115,15 +119,13 @@
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
                 <div class="sheet-handle"></div>
                 <h3>Start a new chat</h3>
-                @foreach (var device in DeviceChoices)
+                @foreach (var device in executionHosts)
                 {
-                    <button class="device-choice"
-                            disabled="@(!CanCommunicateWith(device))"
-                            @onclick="() => NewThread(device)">
+                    <button class="device-choice" @onclick="() => NewThread(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
-                            <strong>@(IsCurrentDevice(device) ? "Talk to this device" : $"Talk to {FriendlyName(device)}")</strong>
-                            <small>@DeviceAvailability(device)</small>
+                            <strong>@(IsCurrentDevice(device) ? "This device" : FriendlyName(device))</strong>
+                            <small>Online · Agent ready</small>
                         </span>
                     </button>
                 }
@@ -146,14 +148,6 @@ else
                             aria-haspopup="menu" aria-expanded="@actionsMenuOpen"
                             @onclick="ToggleActionsMenu"><i class="bi bi-three-dots-vertical"></i></button>
                 </div>
-                @if (IsAssignedElsewhere(Active))
-                {
-                    <span class="device-pill @(ActiveDeviceOnline ? "" : "offline")"
-                          title="@DeviceStatus(Active)">
-                        <i class="bi @PlatformIcon(Active.CommunicationDestinationDevicePlatform)"></i>
-                        @DeviceLabel(Active)
-                    </span>
-                }
                 @if (!string.IsNullOrWhiteSpace(Active.AgentExecutionHostDeviceId))
                 {
                     <span class="device-pill" title="AI execution host">
@@ -170,8 +164,7 @@ else
                         @(Active.IsPinned ? "Unpin topic" : "Pin topic")
                     </button>
                     <button role="menuitem" @onclick="BeginRenameFromMenu"><i class="bi bi-pencil"></i> Rename</button>
-                    <button role="menuitem" @onclick="OpenMoveMenuFromActions"><i class="bi bi-phone-flip"></i> Change communication destination</button>
-                    <button role="menuitem" @onclick="OpenHostMenu"><i class="bi bi-cpu"></i> Change AI execution host</button>
+                    <button role="menuitem" aria-label="Move topic to" @onclick="OpenMoveMenuFromActions"><i class="bi bi-cpu"></i> Move topic to</button>
                     @if (Active.Lines.Count > 0)
                     {
                         <button role="menuitem" @onclick="OpenReportFromActions"><i class="bi bi-flag"></i> Report AI content</button>
@@ -513,21 +506,6 @@ else
                             <i class="bi bi-stop-fill"></i>
                         </button>
                     }
-                    else
-                    {
-                        @if (IsCommunicationTopic)
-                        {
-                            <button class="ghost" @onclick="RequestAiResponse" disabled="@(!CanSend || SendPending)"
-                                    title="Request an AI response on the selected agent host"
-                                    aria-label="Ask assistant">Ask assistant</button>
-                        }
-                        else
-                        {
-                            <button class="ghost" @onclick="Send" disabled="@(!CanSend)"
-                                    title="Send message without requesting an AI response"
-                                    aria-label="Send message only">Send message only</button>
-                        }
-                    }
                 </div>
                 @if (TopicRestorePending)
                 {
@@ -620,13 +598,14 @@ else
             <div class="device-sheet" role="dialog" aria-modal="true" aria-label="Move topic to device" tabindex="-1" autofocus
                  @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
                 <div class="sheet-handle"></div>
-                <h3>Move topic</h3>
-                <p class="sheet-copy">The full topic history stays with this chat.</p>
-                @foreach (var device in DeviceChoices)
+                <h3>Move topic to</h3>
+                <p class="sheet-copy">Choose an online agent-ready Desktop. The full topic history stays with this chat.</p>
+                @foreach (var device in executionHosts)
                 {
                     <button class="device-choice"
-                            disabled="@(!CanCommunicateWith(device) || IsActiveDevice(device))"
-                            @onclick="() => ChooseMoveTarget(device)">
+                            aria-label="@($"Move topic to {FriendlyName(device)}")"
+                            disabled="@(Active?.AgentExecutionHostDeviceId == device.DeviceId)"
+                            @onclick="() => ChooseExecutionHost(device)">
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "This device" : FriendlyName(device))</strong>
@@ -634,33 +613,9 @@ else
                         </span>
                     </button>
                 }
-                @if (hostMenuOpen)
+                @if (executionHosts.Count == 0)
                 {
-                    <MobileOverlayScope />
-                    <div class="sheet-scrim" @onclick="CloseDeviceMenus">
-                        <div class="device-sheet" role="dialog" aria-modal="true" aria-label="Change AI execution host" tabindex="-1" autofocus
-                             @onclick:stopPropagation @onkeydown="OnDeviceMenuKey">
-                            <div class="sheet-handle"></div>
-                            <h3>Change AI execution host</h3>
-                            <p class="sheet-copy">Only an online agent-ready Desktop can run the assistant.</p>
-                            @foreach (var device in executionHosts)
-                            {
-                                <button class="device-choice"
-                                        disabled="@(!global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device))"
-                                        @onclick="() => ChooseExecutionHost(device)">
-                                    <i class="bi @PlatformIcon(device.Platform)"></i>
-                                    <span class="device-choice-main">
-                                        <strong>@FriendlyName(device)</strong>
-                                        <small>Online · Agent ready</small>
-                                    </span>
-                                </button>
-                            }
-                            @if (executionHosts.Count == 0)
-                            {
-                                <p class="sheet-copy" role="status">No online agent-ready Desktop is available.</p>
-                            }
-                        </div>
-                    </div>
+                    <p class="sheet-copy" role="status">Bring an agent device online to move this topic.</p>
                 }
             </div>
         </div>
@@ -672,7 +627,7 @@ else
             <div class="confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="move-confirm-title" tabindex="-1" autofocus
                  @onkeydown="OnDeviceMenuKey">
                 <h3 id="move-confirm-title">Move running topic?</h3>
-                <p>The current run will be stopped before this topic moves to @FriendlyName(pendingMove).</p>
+                <p>The current run will be stopped before this topic moves to @FriendlyName(pendingMove.Target).</p>
                 <div class="confirm-actions">
                     <button class="ghost" @onclick="() => pendingMove = null">Cancel</button>
                     <button class="primary" @onclick="ConfirmRunningMove">Stop and move</button>
@@ -720,12 +675,17 @@ else
     string? widgetLoadError;
     bool newDeviceMenuOpen;
     bool moveMenuOpen;
-    bool hostMenuOpen;
     bool actionsMenuOpen;
-    global::Mesh.Shared.DeviceInfo? pendingMove;
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> rosterDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
-    IReadOnlyList<global::Mesh.Shared.DeviceInfo> communicationDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> executionHosts = Array.Empty<global::Mesh.Shared.DeviceInfo>();
+    sealed record PendingTopicMove(
+        string ThreadId,
+        string TopicTitle,
+        string RunId,
+        AgentExecutionHost Target,
+        ActiveThreadMutationScope Scope,
+        AssistantAiRequestMutationScope? RequestScope);
+    PendingTopicMove? pendingMove;
     bool confirmDelete;
     bool renaming;
     string renameText = "";
@@ -789,6 +749,7 @@ else
     readonly HashSet<string> cleanupRecoveryAttempts = new(StringComparer.Ordinal);
     TopicSendSnapshot? capacityBlockedSubmission;
     bool aiRetryAvailable;
+    string? newThreadError;
     PendingMobileAiRetry? pendingMobileAiRetry;
     bool aiRetryRunning;
     sealed record PendingMobileAiRetry(string ThreadId, string RunId, string TriggerLineId);
@@ -804,22 +765,19 @@ else
          || IsExecutionRemote(Active) && RemoteRunActivity.IsPersistedRunActive(
              Active, DateTimeOffset.UtcNow, UsesAuthoritativeState(Active)));
     bool ActiveBuilding => Active is not null && State.IsThreadBuilding(Active.Id);
-    bool IsCommunicationTopic => Active?.ConversationKind == ConversationKind.Communication;
     string ComposerPlaceholder => widgetMode
         ? "Describe the widget you want…"
         : selectedWidget is not null
             ? $"Use or change {selectedWidget.Name}…"
-            : IsCommunicationTopic ? "Message this device…" : "Message your assistant…";
-    string ComposerAriaLabel => IsCommunicationTopic ? "Message this device" : "Message your assistant";
-    string PrimaryActionTitle => IsCommunicationTopic ? "Send message" : "Send message and ask assistant";
-    string PrimaryActionLabel => IsCommunicationTopic ? "Send message" : "Ask AI on agent host";
+            : "Message your assistant…";
+    string ComposerAriaLabel => "Message your assistant";
+    string PrimaryActionTitle => "Send to your assistant";
+    string PrimaryActionLabel => "Send";
     string? DraftError => activeThread is null ? null : State.GetTopicDraftError(activeThread);
     void RetryDraft()
     {
         if (activeThread is not null) State.RetryTopicDraft(activeThread);
     }
-    bool ActiveDeviceOnline => Active is null || string.IsNullOrWhiteSpace(Active.CommunicationDestinationDeviceId)
-        || IsDeviceOnline(Active.CommunicationDestinationDeviceId);
     bool ActiveUsesCurrentDevice => Active is null
         || string.IsNullOrWhiteSpace(Active.AgentExecutionHostDeviceId)
         || string.Equals(Active.AgentExecutionHostDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
@@ -987,7 +945,7 @@ else
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => rosterDevices
         .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
         .Select(group => group.First())
-        .OrderByDescending(CanCommunicateWith)
+        .OrderByDescending(global::Mesh.Shared.DeviceExecutionEligibility.IsEligible)
         .ThenByDescending(device => device.Online)
         .ThenBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
         .ToArray();
@@ -1047,7 +1005,6 @@ else
         rosterRuntimeScope = runtimeScope;
         Interlocked.Increment(ref rosterGeneration);
         rosterDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
-        communicationDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
         executionHosts = Array.Empty<global::Mesh.Shared.DeviceInfo>();
         aiRetryRunning = false;
     }
@@ -1225,7 +1182,7 @@ else
     [Microsoft.JSInterop.JSInvokable]
     public Task SendFromComposer() => PrimaryComposerAction();
 
-    Task PrimaryComposerAction() => IsCommunicationTopic ? Send() : RequestAiResponse();
+    Task PrimaryComposerAction() => RequestAiResponse();
 
     /// <summary>
     /// Invoked from paste.js when a file is pasted into the composer. Writes the pasted bytes to a temp
@@ -1275,8 +1232,6 @@ else
                     State.TryCompleteScopedAsyncOperation(operationScope!, () =>
                     {
                         rosterDevices = devices;
-                        communicationDevices =
-                            global::Mesh.Shared.DeviceCommunicationReachability.CommunicationTargets(devices);
                         executionHosts = executable;
                         StateHasChanged();
                     });
@@ -1312,6 +1267,18 @@ else
     void RestorePendingAiRequest()
     {
         var request = Active is null ? null : State.GetPendingAssistantAiRequest(Active.Id);
+        if (request?.State == AssistantAiRequestState.DispatchPending
+            && !TopicSends.IsRunning(request.OperationId)
+            && State.TryCaptureAssistantAiRequestMutationScope(request, out var requestScope))
+        {
+            var transition = State.RecordAssistantAiDispatch(
+                requestScope!,
+                TopicDispatchResult.Reject(
+                    "dispatch_interrupted",
+                    request.RunId,
+                    "Dispatch was interrupted. Retry on an online agent device."));
+            request = transition.Request ?? request;
+        }
         ApplyAssistantProjection(request);
     }
 
@@ -1536,7 +1503,6 @@ else
     {
         newDeviceMenuOpen = true;
         moveMenuOpen = false;
-        hostMenuOpen = false;
         RequestDeviceRefresh();
     }
 
@@ -1545,26 +1511,19 @@ else
         moveMenuOpen = true;
         actionsMenuOpen = false;
         newDeviceMenuOpen = false;
-        hostMenuOpen = false;
         RequestDeviceRefresh();
     }
 
     void OpenHostMenu()
     {
-        hostMenuOpen = true;
-        actionsMenuOpen = false;
-        newDeviceMenuOpen = false;
-        moveMenuOpen = false;
-        RequestDeviceRefresh();
+        OpenMoveMenu();
     }
 
     void CloseDeviceMenus()
     {
         newDeviceMenuOpen = false;
         moveMenuOpen = false;
-        hostMenuOpen = false;
         actionsMenuOpen = false;
-        pendingMove = null;
     }
 
     void ToggleActionsMenu()
@@ -1572,7 +1531,6 @@ else
         actionsMenuOpen = !actionsMenuOpen;
         newDeviceMenuOpen = false;
         moveMenuOpen = false;
-        hostMenuOpen = false;
         confirmDelete = false;
     }
 
@@ -1614,16 +1572,48 @@ else
 
     async Task NewThread(global::Mesh.Shared.DeviceInfo device)
     {
-        if (!global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device)) return;
-        var destination = ToCommunicationDestination(device);
-        var executionHost = global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(device)
-            ? ToAgentExecutionHost(device)
-            : null;
         var operationScope = State.CaptureScopedAsyncOperation(
             $"{asyncScopeOwner}:new-thread");
-        var t = await State.NewOwnThreadAsync("New chat", destination, executionHost);
+        IReadOnlyList<global::Mesh.Shared.DeviceInfo> freshDevices;
+        try
+        {
+            freshDevices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
+        }
+        catch
+        {
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+                newThreadError = "Could not verify an execution host. Bring an agent device online and retry.");
+            return;
+        }
+        var freshHosts =
+            global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices);
+        var freshHost = freshHosts.FirstOrDefault(item =>
+            string.Equals(item.DeviceId, device.DeviceId, StringComparison.Ordinal));
+        if (freshHost is null)
+        {
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                executionHosts = freshHosts;
+                newThreadError = "Bring an agent device online to start a chat.";
+            });
+            return;
+        }
+        OwnThread t;
+        try
+        {
+            t = await State.NewOwnThreadAsync("New chat", ToAgentExecutionHost(freshHost));
+        }
+        catch
+        {
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+                newThreadError = "Could not create the assistant chat. Try again.");
+            return;
+        }
         State.TryCompleteScopedAsyncOperation(operationScope, () =>
         {
+            executionHosts = freshHosts;
+            rosterDevices = freshDevices;
+            newThreadError = null;
             activeThread = t.Id;
             confirmDelete = false;
             renaming = false;
@@ -1632,54 +1622,16 @@ else
         });
     }
 
-    Task NewThreadOnDefault()
+    async Task NewThreadOnDefault()
     {
-        var device = executionHosts.FirstOrDefault()
-            ?? communicationDevices.FirstOrDefault(IsCurrentDevice)
-            ?? communicationDevices.FirstOrDefault();
-        return device is null ? Task.CompletedTask : NewThread(device);
-    }
-
-    async Task ChooseMoveTarget(global::Mesh.Shared.DeviceInfo device)
-    {
-        if (Active is null
-            || !global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device)
-            || IsActiveDevice(device)) return;
-        var scope = State.CaptureActiveThreadMutationScope(Active.Id);
-        var operationScope = State.CaptureScopedAsyncOperation(
-            $"{asyncScopeOwner}:communication-move:{Active.Id}",
-            Active.Id);
-        IReadOnlyList<global::Mesh.Shared.DeviceInfo> freshDevices;
-        try
+        var device = executionHosts.FirstOrDefault(IsCurrentDevice)
+            ?? executionHosts.FirstOrDefault();
+        if (device is null)
         {
-            freshDevices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
-        }
-        catch (Exception exception)
-        {
-            State.TryCompleteScopedAsyncOperation(
-                operationScope,
-                () => attachError =
-                    $"Could not verify the communication destination: {exception.Message}");
+            newThreadError = "Bring an agent device online to start a chat.";
             return;
         }
-        if (!State.IsCurrentScopedAsyncOperation(operationScope)
-            || !State.IsCurrentActiveThreadMutationScope(scope)) return;
-        var fresh = freshDevices.FirstOrDefault(candidate =>
-            string.Equals(candidate.DeviceId, device.DeviceId, StringComparison.Ordinal)
-            && global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(candidate));
-        if (fresh is null)
-        {
-            State.TryCompleteScopedAsyncOperation(
-                operationScope,
-                () => attachError =
-                    $"{FriendlyName(device)} is no longer a communication destination.");
-            return;
-        }
-        State.TryCompleteScopedAsyncOperation(operationScope, () =>
-        {
-            moveMenuOpen = false;
-            MoveActiveTo(fresh, scope);
-        });
+        await NewThread(device);
     }
 
     async Task ChooseExecutionHost(global::Mesh.Shared.DeviceInfo device)
@@ -1723,10 +1675,28 @@ else
         }
         if (ActiveBusy)
         {
-            State.TryCompleteScopedAsyncOperation(
-                operationScope,
-                () => attachError =
-                    "Stop the active run before changing the AI execution host.");
+            var runId = RemoteRun?.RunId
+                        ?? Active.ExecutionRunId
+                        ?? State.AgentRunFor(Active.Id)?.RunId;
+            if (string.IsNullOrWhiteSpace(runId))
+            {
+                State.TryCompleteScopedAsyncOperation(
+                    operationScope,
+                    () => attachError =
+                        "The active run could not be identified. Wait for it to finish before moving this topic.");
+                return;
+            }
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                pendingMove = new PendingTopicMove(
+                    Active.Id,
+                    ThreadTitle(Active),
+                    runId,
+                    ToAgentExecutionHost(fresh),
+                    threadScope,
+                    requestScope);
+                moveMenuOpen = false;
+            });
             return;
         }
         var host = ToAgentExecutionHost(fresh);
@@ -1747,44 +1717,51 @@ else
     {
         var target = pendingMove;
         pendingMove = null;
-        if (target is null || Active is null) return;
-        var thread = Active;
-        var runId = RemoteRun?.RunId
-                    ?? thread.ExecutionRunId
-                    ?? State.AgentRunFor(thread.Id)?.RunId;
-        if (string.IsNullOrWhiteSpace(runId)) return;
-        var threadScope = State.CaptureActiveThreadMutationScope(thread.Id);
+        if (target is null) return;
         var operationScope = State.CaptureScopedAsyncOperation(
-            $"{asyncScopeOwner}:confirm-move:{thread.Id}",
-            thread.Id,
-            runId: runId);
+            $"{asyncScopeOwner}:confirm-move:{target.ThreadId}",
+            target.ThreadId,
+            requestId: target.RequestScope?.OperationId,
+            runId: target.RunId);
+        IReadOnlyList<global::Mesh.Shared.DeviceInfo> freshDevices;
+        try
+        {
+            freshDevices = await TopicRouter.ListEligibleDevicesAsync(callbackLifetime.Token);
+        }
+        catch (Exception exception)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError = $"Could not verify the AI host: {exception.Message}");
+            return;
+        }
+        if (!State.IsCurrentActiveThreadMutationScope(target.Scope)) return;
+        var fresh = freshDevices.FirstOrDefault(candidate =>
+            string.Equals(candidate.DeviceId, target.Target.DeviceId, StringComparison.Ordinal)
+            && global::Mesh.Shared.DeviceExecutionEligibility.IsEligible(candidate));
+        if (fresh is null)
+        {
+            State.TryCompleteScopedAsyncOperation(
+                operationScope,
+                () => attachError =
+                    $"{FriendlyName(target.Target)} is no longer online and agent-ready.");
+            return;
+        }
         if (!await TopicRouter.StopAsync(operationScope, callbackLifetime.Token))
         {
             State.TryCompleteScopedAsyncOperation(
                 operationScope,
-                () => attachError = "The active run could not be stopped.");
+                () => attachError = $"Could not stop {target.TopicTitle}. It was not moved.");
             return;
         }
-        State.TryCompleteScopedAsyncOperation(
-            operationScope,
-            () => MoveActiveTo(target, threadScope, operationScope));
-    }
-
-    void MoveActiveTo(
-        global::Mesh.Shared.DeviceInfo device,
-        ActiveThreadMutationScope? capturedScope = null,
-        ScopedAsyncOperation? operationScope = null)
-    {
-        if (Active is null
-            || !global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device)) return;
-        var scope = capturedScope ?? State.CaptureActiveThreadMutationScope(Active.Id);
-        if (!State.MoveOwnThreadCommunicationDestination(
-                scope,
-                ToCommunicationDestination(device),
-                operationScope: operationScope))
-            return;
-        ScheduleComposerSnapshot();
-        CloseDeviceMenus();
+        if (!State.IsCurrentActiveThreadMutationScope(target.Scope)) return;
+        var host = ToAgentExecutionHost(fresh);
+        State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            State.MoveOwnThreadAgentExecutionHost(
+                target.Scope,
+                host,
+                target.RequestScope,
+                operationScope: operationScope));
     }
 
     void BeginRename()
@@ -2087,89 +2064,6 @@ else
     static string StopKey(string threadId, string runId)
         => $"topic.stop:{threadId}:{runId}";
 
-    async Task Send()
-    {
-        if (!CanSend || Active is not { } thread) return;
-        var runtimeScope = State.CaptureAgentRuntimeScope();
-        using var runtimeContext = State.EnterAgentRuntimeScope(runtimeScope);
-        var operationScope = State.CaptureScopedAsyncOperation(
-            $"{asyncScopeOwner}:ordinary-send:{thread.Id}",
-            thread.Id);
-        attachError = null;
-        var text = inputValue;
-        var chosenWidget = selectedWidget;
-        var creatingWidget = widgetMode;
-        IReadOnlyList<ChatAttachment> loadedAttachments;
-        try
-        {
-            loadedAttachments = await LoadAttachmentsAsync(
-                attachments.ToList(),
-                callbackLifetime.Token);
-        }
-        catch (Exception exception)
-        {
-            State.TryCompleteScopedAsyncOperation(
-                operationScope,
-                () => attachError = exception.Message);
-            return;
-        }
-
-        var message = BuildTurnPrompt(text, chosenWidget, creatingWidget);
-        var line = new ChatLine
-        {
-            Id = Guid.NewGuid().ToString("n"),
-            Role = "user",
-            Text = message,
-            Via = "person",
-            AddressedToAgent = false,
-            SenderHandle = State.Profile.Handle,
-            Attachments = loadedAttachments.ToList(),
-            At = DateTimeOffset.UtcNow
-        };
-        if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
-            {
-                if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal)
-                    && !string.IsNullOrWhiteSpace(message))
-                    State.RenameOwnThread(thread.Id, Titleize(message));
-                State.AddOwnChatLine(thread.Id, line);
-            })
-            || !State.TryAdvanceScopedAsyncOperation(
-                operationScope,
-                out var messageOperationScope,
-                topicId: thread.Id,
-                messageId: line.Id))
-            return;
-        operationScope = messageOperationScope!;
-        try
-        {
-            await State.FlushPersistenceAsync(callbackLifetime.Token);
-            if (!State.IsCurrentAgentRuntimeScope(runtimeScope)) return;
-        }
-        catch
-        {
-            State.TryCompleteScopedAsyncOperation(
-                operationScope,
-                () => attachError = "Message could not be saved. Nothing was sent.");
-            return;
-        }
-        if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
-            {
-                inputValue = "";
-                attachments.Clear();
-                ClearWidgetMode();
-                ScheduleComposerSnapshot();
-                scrollToLatestRequested = true;
-            })) return;
-        await InvokeAsync(() =>
-        {
-            State.TryCompleteScopedAsyncOperation(operationScope, () =>
-            {
-                if (!disposed && State.IsCurrentAgentRuntimeScope(runtimeScope))
-                    StateHasChanged();
-            });
-        });
-    }
-
     async Task RequestAiResponse()
     {
         if (!CanRequestAi) return;
@@ -2182,15 +2076,22 @@ else
             var freshDevices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
             if (!State.TryApplyScopedAsyncOperation(
                     operationScope,
-                    () => executionHosts =
-                        global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices)))
+                    () =>
+                    {
+                        rosterDevices = freshDevices;
+                        executionHosts =
+                            global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices);
+                    }))
                 return;
         }
-        catch (Exception exception)
+        catch
         {
-            RuntimeDiagnostics.Current?.RecordEvent(
-                "assistant-host-refresh-failed",
-                $"exception={exception.GetType().FullName}");
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
+            {
+                attachError = "Could not verify an execution host. Bring an agent device online and retry.";
+                StateHasChanged();
+            });
+            return;
         }
 
         OwnThread? thread = null;
@@ -2210,86 +2111,32 @@ else
             return;
         operationScope = threadOperationScope!;
         var presentationScope = capturedPresentationScope!;
-        if (!ActiveExecutionEligible)
+        var selectedHost = executionHosts.FirstOrDefault(device =>
+                               string.Equals(
+                                   device.DeviceId,
+                                   thread.AgentExecutionHostDeviceId,
+                                   StringComparison.Ordinal))
+                           ?? executionHosts.FirstOrDefault(IsCurrentDevice)
+                           ?? executionHosts.FirstOrDefault();
+        if (selectedHost is null)
         {
-            IReadOnlyList<global::Mesh.Shared.DeviceInfo> freshDevices;
-            try
+            State.TryCompleteScopedAsyncOperation(operationScope, () =>
             {
-                freshDevices = await TopicRouter.ListDevicesAsync(callbackLifetime.Token);
-            }
-            catch
-            {
-                freshDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
-            }
-            var freshHost = global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices)
-                .FirstOrDefault();
-            if (freshHost is not null)
-            {
-                if (!State.TryApplyScopedAsyncOperation(operationScope, () =>
-                    {
-                        executionHosts =
-                            global::Mesh.Shared.DeviceExecutionEligibility.EligibleHosts(freshDevices);
-                        if (string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId))
-                            State.AssignOwnThreadAgentExecutionHost(
-                                presentationScope,
-                                ToAgentExecutionHost(freshHost));
-                    })) return;
-            }
-            else
-            {
-                if (freshDevices.Count > 0
-                    || !global::Mesh.Shared.DevicePlatforms.IsDesktop(
-                        thread.AgentExecutionHostDevicePlatform))
-                {
-                    var previousIds = thread.Lines.Select(line => line.Id)
-                        .ToHashSet(StringComparer.Ordinal);
-                    await Send();
-                    if (!State.IsCurrentAgentRuntimeScope(runtimeScope)) return;
-                    var trigger = thread.Lines.LastOrDefault(line =>
-                        line.Role == "user" && !previousIds.Contains(line.Id));
-                    if (trigger is null)
-                        return;
-                    if (trigger is not null)
-                    {
-                        var runId = Guid.NewGuid().ToString("n");
-                        try
-                        {
-                            var durableRequest = await State.CommitAssistantAiRequestAsync(
-                                thread.Id,
-                                trigger,
-                                runId,
-                                runId,
-                                target: null,
-                                callbackLifetime.Token);
-                            if (!State.TryApplyScopedAsyncOperation(
-                                    operationScope,
-                                    () => ApplyAssistantProjection(durableRequest)))
-                                return;
-                        }
-                        catch
-                        {
-                            State.TryCompleteScopedAsyncOperation(
-                                operationScope,
-                                () => attachError =
-                                    "Message could not be saved. AI was not requested.");
-                            return;
-                        }
-                    }
-                    State.TryCompleteScopedAsyncOperation(
-                        operationScope,
-                        StateHasChanged);
-                    return;
-                }
-            }
+                attachError = "Bring an agent device online or move this topic to an online agent-ready Desktop.";
+                StateHasChanged();
+            });
+            return;
         }
-        if (string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId)
-            && executionHosts.FirstOrDefault() is { } discoveredHost)
+        if (!string.Equals(
+                thread.AgentExecutionHostDeviceId,
+                selectedHost.DeviceId,
+                StringComparison.Ordinal))
         {
             if (!State.TryApplyScopedAsyncOperation(
                     operationScope,
                     () => State.AssignOwnThreadAgentExecutionHost(
                         presentationScope,
-                        ToAgentExecutionHost(discoveredHost))))
+                        ToAgentExecutionHost(selectedHost))))
                 return;
         }
         var requestedSnapshot = CaptureComposerSnapshot(thread);
@@ -2487,7 +2334,7 @@ else
                         Id = stableSubmission.LineId,
                         Role = "user",
                         Text = prompt,
-                        Via = "person",
+                        Via = "agent",
                         AddressedToAgent = true,
                         SenderHandle = triggerHandle,
                         Attachments = loadedAttachments.ToList(),
@@ -3101,14 +2948,10 @@ else
 
     static AgentExecutionHost ToAgentExecutionHost(global::Mesh.Shared.DeviceInfo device) =>
         new(device.DeviceId, device.Name, device.Platform);
-    static CommunicationDestination ToCommunicationDestination(global::Mesh.Shared.DeviceInfo device) =>
-        new(device.DeviceId, device.Name, device.Platform);
 
     bool IsCurrentDevice(global::Mesh.Shared.DeviceInfo device) =>
         string.Equals(device.DeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
 
-    static bool CanCommunicateWith(global::Mesh.Shared.DeviceInfo device) =>
-        global::Mesh.Shared.DeviceCommunicationReachability.IsAddressable(device);
 
     static string DeviceAvailability(global::Mesh.Shared.DeviceInfo? device) =>
         device is null
@@ -3130,10 +2973,6 @@ else
         Mesh.MyDeviceId,
         executionHosts);
 
-    bool IsAssignedElsewhere(OwnThread thread) =>
-        !string.IsNullOrWhiteSpace(thread.CommunicationDestinationDeviceId)
-        && !string.Equals(thread.CommunicationDestinationDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
-
     bool IsExecutionRemote(OwnThread thread) =>
         !string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceId)
         && !string.Equals(thread.AgentExecutionHostDeviceId, Mesh.MyDeviceId, StringComparison.Ordinal);
@@ -3145,20 +2984,13 @@ else
             string.Equals(d.DeviceId, deviceId, StringComparison.Ordinal))?.Online == true;
     }
 
-    bool IsActiveDevice(global::Mesh.Shared.DeviceInfo device) =>
-        Active is not null
-        && string.Equals(Active.CommunicationDestinationDeviceId ?? Mesh.MyDeviceId, device.DeviceId, StringComparison.Ordinal);
-
     static string FriendlyName(global::Mesh.Shared.DeviceInfo device) =>
         string.IsNullOrWhiteSpace(device.Name) ? PlatformName(device.Platform) : device.Name;
 
     static string FriendlyName(AgentExecutionHost device) =>
         string.IsNullOrWhiteSpace(device.DeviceName) ? PlatformName(device.Platform) : device.DeviceName;
 
-    static string DeviceLabel(OwnThread thread) =>
-        string.IsNullOrWhiteSpace(thread.CommunicationDestinationDeviceName)
-            ? PlatformName(thread.CommunicationDestinationDevicePlatform)
-            : thread.CommunicationDestinationDeviceName;
+    static string DeviceLabel(OwnThread thread) => ExecutionHostLabel(thread);
 
     static string ExecutionHostLabel(OwnThread thread) =>
         string.IsNullOrWhiteSpace(thread.AgentExecutionHostDeviceName)
@@ -3167,7 +2999,7 @@ else
 
     string DeviceStatus(OwnThread thread)
     {
-        var deviceId = thread.CommunicationDestinationDeviceId ?? Mesh.MyDeviceId;
+        var deviceId = thread.AgentExecutionHostDeviceId ?? Mesh.MyDeviceId;
         var device = rosterDevices.FirstOrDefault(item =>
             string.Equals(item.DeviceId, deviceId, StringComparison.Ordinal));
         return $"{DeviceLabel(thread)} · {DeviceAvailability(device)}";

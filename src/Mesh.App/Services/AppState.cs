@@ -830,13 +830,10 @@ public sealed partial class AppState :
                         () => activeDb.SetOwnThreadActivity(thread.Id, thread.LastActivityAt.Value));
                 if (thread.IsPinned)
                     activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadPin(thread.Id, true));
-                if (thread.CommunicationDestinationDeviceId is not null)
-                    activeDb.ExecuteDurableWrite(() => activeDb.SetOwnThreadCommunicationDestination(
-                        thread.Id,
-                        thread.CommunicationDestinationDeviceId,
-                        thread.CommunicationDestinationDeviceName,
-                        thread.CommunicationDestinationDevicePlatform ?? DevicePlatforms.Unknown,
-                        thread.LastActivityAt ?? thread.CreatedAt));
+                thread.ConversationKind = ConversationKind.Assistant;
+                thread.CommunicationDestinationDeviceId = null;
+                thread.CommunicationDestinationDeviceName = null;
+                thread.CommunicationDestinationDevicePlatform = null;
                 if (thread.AgentExecutionHostDeviceId is not null
                     || thread.AgentExecutionHostDeviceName is not null
                     || thread.AgentExecutionHostDevicePlatform is not null
@@ -1238,12 +1235,10 @@ public sealed partial class AppState :
             CreatedAt = createdAt ?? DateTimeOffset.UtcNow,
             LastActivityAt = lastActivityAt,
             IsPinned = isPinned,
-            ConversationKind = communicationDestination is null
-                ? ConversationKind.Assistant
-                : ConversationKind.Communication,
-            CommunicationDestinationDeviceId = communicationDestination?.DeviceId,
-            CommunicationDestinationDeviceName = communicationDestination?.DeviceName,
-            CommunicationDestinationDevicePlatform = communicationDestination?.Platform,
+            ConversationKind = ConversationKind.Assistant,
+            CommunicationDestinationDeviceId = null,
+            CommunicationDestinationDeviceName = null,
+            CommunicationDestinationDevicePlatform = null,
             AgentExecutionHostDeviceId = executionDevice?.DeviceId,
             AgentExecutionHostDeviceName = executionDevice?.DeviceName,
             AgentExecutionHostDevicePlatform = executionDevice?.Platform

@@ -1162,11 +1162,13 @@ public sealed partial class MeshDb :
     {
         using var marker = conn.CreateCommand();
         marker.CommandText = "SELECT v FROM meta WHERE k = 'own_thread_plane_schema_version';";
-        if (string.Equals(marker.ExecuteScalar() as string, "2", StringComparison.Ordinal))
+        var version = marker.ExecuteScalar() as string;
+        if (string.Equals(version, "3", StringComparison.Ordinal))
             return;
 
         using var transaction = conn.BeginTransaction();
-        if (ColumnExists("own_threads", "execution_device_id"))
+        if (!string.Equals(version, "2", StringComparison.Ordinal)
+            && ColumnExists("own_threads", "execution_device_id"))
         {
             using var migrate = conn.CreateCommand();
             migrate.Transaction = transaction;
@@ -1187,11 +1189,23 @@ public sealed partial class MeshDb :
                 """;
             migrate.ExecuteNonQuery();
         }
+        using (var normalize = conn.CreateCommand())
+        {
+            normalize.Transaction = transaction;
+            normalize.CommandText = """
+                UPDATE own_threads SET
+                    conversation_kind = 0,
+                    communication_destination_device_id = NULL,
+                    communication_destination_device_name = NULL,
+                    communication_destination_device_platform = NULL;
+                """;
+            normalize.ExecuteNonQuery();
+        }
 
         using var complete = conn.CreateCommand();
         complete.Transaction = transaction;
         complete.CommandText = """
-            INSERT INTO meta(k, v) VALUES('own_thread_plane_schema_version', '2')
+            INSERT INTO meta(k, v) VALUES('own_thread_plane_schema_version', '3')
             ON CONFLICT(k) DO UPDATE SET v = excluded.v;
             UPDATE meta SET v = '2' WHERE k = 'schema_version';
             """;
@@ -2116,12 +2130,10 @@ public sealed partial class MeshDb :
                     CreatedAt = ParseAt(r.GetString(2)),
                     LastActivityAt = r.IsDBNull(3) ? null : ParseAt(r.GetString(3)),
                     IsPinned = !r.IsDBNull(4) && r.GetInt64(4) != 0,
-                    ConversationKind = r.IsDBNull(5)
-                        ? ConversationKind.Assistant
-                        : (ConversationKind)r.GetInt32(5),
-                    CommunicationDestinationDeviceId = r.IsDBNull(6) ? null : r.GetString(6),
-                    CommunicationDestinationDeviceName = r.IsDBNull(7) ? null : r.GetString(7),
-                    CommunicationDestinationDevicePlatform = r.IsDBNull(8) ? null : r.GetString(8),
+                    ConversationKind = ConversationKind.Assistant,
+                    CommunicationDestinationDeviceId = null,
+                    CommunicationDestinationDeviceName = null,
+                    CommunicationDestinationDevicePlatform = null,
                     AgentExecutionHostDeviceId = r.IsDBNull(9) ? null : r.GetString(9),
                     AgentExecutionHostDeviceName = r.IsDBNull(10) ? null : r.GetString(10),
                     AgentExecutionHostDevicePlatform = r.IsDBNull(11) ? null : r.GetString(11),
@@ -3396,16 +3408,13 @@ public sealed partial class MeshDb :
             ? lastActivityAt.Value.UtcDateTime.ToString("O")
             : DBNull.Value);
         cmd.Parameters.AddWithValue("$pinned", isPinned ? 1 : 0);
-        cmd.Parameters.AddWithValue("$conversationKind", (int)conversationKind);
+        cmd.Parameters.AddWithValue("$conversationKind", (int)ConversationKind.Assistant);
         cmd.Parameters.AddWithValue(
-            "$communicationDevice",
-            (object?)communicationDestinationDeviceId ?? DBNull.Value);
+            "$communicationDevice", DBNull.Value);
         cmd.Parameters.AddWithValue(
-            "$communicationName",
-            (object?)communicationDestinationDeviceName ?? DBNull.Value);
+            "$communicationName", DBNull.Value);
         cmd.Parameters.AddWithValue(
-            "$communicationPlatform",
-            (object?)communicationDestinationDevicePlatform ?? DBNull.Value);
+            "$communicationPlatform", DBNull.Value);
         cmd.Parameters.AddWithValue("$execDevice", (object?)executionDeviceId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execName", (object?)executionDeviceName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$execPlatform", (object?)executionDevicePlatform ?? DBNull.Value);
