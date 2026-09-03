@@ -50,6 +50,7 @@ public sealed partial class MeshDb
         long AuthGeneration,
         string LocalOriginDeviceId,
         string LocalLogEpoch,
+        ulong CaptureCursor,
         string BootstrapId,
         ulong BootstrapFromSeq,
         ulong BootstrapThroughSeq,
@@ -123,12 +124,47 @@ public sealed partial class MeshDb
             CREATE INDEX IF NOT EXISTS ix_replication_outbox_due
                 ON replication_outbox(target_account, state, event_id);
 
+            CREATE TABLE IF NOT EXISTS replication_pending_intents(
+                intent_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                causal_version TEXT NOT NULL,
+                target_accounts_json TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                encrypted_envelope TEXT NOT NULL,
+                roster_state TEXT NOT NULL,
+                durable_sequence INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_replication_pending_intents_created
+                ON replication_pending_intents(created_at, intent_id);
+
+            CREATE TABLE IF NOT EXISTS replication_local_intent_events(
+                intent_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL UNIQUE,
+                completed_at TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES replication_events(event_id));
+
             CREATE TABLE IF NOT EXISTS replication_cursors(
                 origin_device_id TEXT PRIMARY KEY,
                 log_epoch TEXT NOT NULL,
                 contiguous INTEGER NOT NULL,
                 ahead_bits BLOB NOT NULL,
                 updated_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS replication_inbound_quarantine(
+                event_id TEXT PRIMARY KEY,
+                origin_device_id TEXT NOT NULL,
+                log_epoch TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_replication_inbound_quarantine_origin
+                ON replication_inbound_quarantine(origin_device_id, log_epoch, seq);
 
             CREATE TABLE IF NOT EXISTS replication_receipts(
                 receiver_device_id TEXT NOT NULL,
@@ -179,6 +215,7 @@ public sealed partial class MeshDb
                 auth_generation INTEGER NOT NULL,
                 local_origin_device_id TEXT NOT NULL,
                 local_log_epoch TEXT NOT NULL,
+                capture_cursor INTEGER NOT NULL DEFAULT 0,
                 bootstrap_id TEXT NOT NULL,
                 bootstrap_from_seq INTEGER NOT NULL DEFAULT 0,
                 bootstrap_through_seq INTEGER NOT NULL,
@@ -196,9 +233,142 @@ public sealed partial class MeshDb
 
         AddColumnIfMissing("replication_outbox", "notification_worthy", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("replication_outbox", "notification_id", "TEXT");
+        if (AddColumnIfMissing(
+                "replication_pending_intents",
+                "durable_sequence",
+                "INTEGER NOT NULL DEFAULT 0"))
+        {
+            Exec("""
+                WITH ordered AS (
+                    SELECT intent_id, ROW_NUMBER() OVER (ORDER BY created_at, intent_id) AS sequence
+                    FROM replication_pending_intents)
+                UPDATE replication_pending_intents
+                SET durable_sequence = (
+                    SELECT sequence FROM ordered
+                    WHERE ordered.intent_id = replication_pending_intents.intent_id);
+                """);
+        }
         AddColumnIfMissing("replication_peer_bootstrap", "bootstrap_from_seq", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("replication_peer_bootstrap", "capture_cursor", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("replication_peer_bootstrap", "coverage_json", "TEXT NOT NULL DEFAULT '[]'");
         Exec("CREATE INDEX IF NOT EXISTS ix_replication_outbox_notification ON replication_outbox(target_account, notification_worthy, event_id);");
+        Exec("CREATE UNIQUE INDEX IF NOT EXISTS ix_replication_pending_intents_sequence ON replication_pending_intents(durable_sequence);");
+        CanonicalizeReplicationOutboxTargets();
+    }
+
+    private void CanonicalizeReplicationOutboxTargets()
+    {
+        var rows = new List<(
+            string EventId,
+            string Target,
+            string State,
+            string? OfferedAt,
+            string? LastAttemptAt,
+            int Attempts,
+            string? LastError,
+            bool NotificationWorthy,
+            string? NotificationId)>();
+        using (var read = conn.CreateCommand())
+        {
+            read.CommandText = """
+                SELECT event_id, target_account, state, offered_at, last_attempt_at, attempts,
+                       last_error, notification_worthy, notification_id
+                FROM replication_outbox;
+                """;
+            using var reader = read.ExecuteReader();
+            while (reader.Read())
+            {
+                rows.Add((
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    reader.GetInt32(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6),
+                    reader.GetInt32(7) != 0,
+                    reader.IsDBNull(8) ? null : reader.GetString(8)));
+            }
+        }
+
+        static int StateRank(string state) => state switch
+        {
+            OutboxStatePersisted => 3,
+            OutboxStateOffered => 2,
+            OutboxStatePending => 1,
+            _ => 0,
+        };
+
+        var normalized = rows
+            .Select(row => (Row: row, Canonical: ReplicationHandle.Norm(row.Target)))
+            .Where(item => item.Canonical.Length > 0)
+            .GroupBy(item => (item.Row.EventId, item.Canonical))
+            .Select(group =>
+            {
+                var members = group.Select(item => item.Row).ToArray();
+                var strongest = members
+                    .OrderByDescending(item => StateRank(item.State))
+                    .ThenBy(item => item.OfferedAt, StringComparer.Ordinal)
+                    .First();
+                return (
+                    group.Key.EventId,
+                    Target: group.Key.Canonical,
+                    strongest.State,
+                    OfferedAt: members
+                        .Where(item => item.OfferedAt is not null)
+                        .Select(item => item.OfferedAt)
+                        .Min(StringComparer.Ordinal),
+                    LastAttemptAt: members
+                        .Where(item => item.LastAttemptAt is not null)
+                        .Select(item => item.LastAttemptAt)
+                        .Max(StringComparer.Ordinal),
+                    Attempts: members.Max(item => item.Attempts),
+                    LastError: members
+                        .OrderByDescending(item => item.Attempts)
+                        .Select(item => item.LastError)
+                        .FirstOrDefault(value => value is not null),
+                    NotificationWorthy: members.Any(item => item.NotificationWorthy),
+                    NotificationId: members
+                        .Select(item => item.NotificationId)
+                        .FirstOrDefault(value => value is not null));
+            })
+            .ToArray();
+
+        var unchanged = rows.Count == normalized.Length
+            && rows.All(row => string.Equals(
+                row.Target, ReplicationHandle.Norm(row.Target), StringComparison.Ordinal));
+        if (unchanged) return;
+
+        using var tx = conn.BeginTransaction(deferred: false);
+        using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = tx;
+            delete.CommandText = "DELETE FROM replication_outbox;";
+            delete.ExecuteNonQuery();
+        }
+        foreach (var row in normalized)
+        {
+            using var insert = conn.CreateCommand();
+            insert.Transaction = tx;
+            insert.CommandText = """
+                INSERT INTO replication_outbox(
+                    event_id, target_account, state, offered_at, last_attempt_at, attempts,
+                    last_error, notification_worthy, notification_id)
+                VALUES($event, $target, $state, $offered, $attempted, $attempts,
+                       $error, $worthy, $notification);
+                """;
+            insert.Parameters.AddWithValue("$event", row.EventId);
+            insert.Parameters.AddWithValue("$target", row.Target);
+            insert.Parameters.AddWithValue("$state", row.State);
+            insert.Parameters.AddWithValue("$offered", (object?)row.OfferedAt ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$attempted", (object?)row.LastAttemptAt ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$attempts", row.Attempts);
+            insert.Parameters.AddWithValue("$error", (object?)row.LastError ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$worthy", row.NotificationWorthy ? 1 : 0);
+            insert.Parameters.AddWithValue("$notification", (object?)row.NotificationId ?? DBNull.Value);
+            insert.ExecuteNonQuery();
+        }
+        tx.Commit();
     }
 
     // -----------------------------------------------------------------------
@@ -467,6 +637,58 @@ public sealed partial class MeshDb
         if (!r.Read()) return null;
         var bits = (byte[])r.GetValue(2);
         return new ReplicationCursorEntry(r.GetString(0), (ulong)r.GetInt64(1), bits);
+    }
+
+    public sealed record ReplicationInboundQuarantine(
+        string EventId,
+        string OriginDeviceId,
+        string LogEpoch,
+        ulong Seq,
+        string Outcome,
+        int Attempts);
+
+    public void QuarantineInboundEvent(ReplicationEvent evt, MessageDecryptOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(evt);
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO replication_inbound_quarantine(
+                event_id, origin_device_id, log_epoch, seq, outcome,
+                attempts, first_seen_at, last_seen_at)
+            VALUES($event, $origin, $epoch, $seq, $outcome, 1, $now, $now)
+            ON CONFLICT(event_id) DO UPDATE SET
+                outcome = excluded.outcome,
+                attempts = replication_inbound_quarantine.attempts + 1,
+                last_seen_at = excluded.last_seen_at;
+            """;
+        cmd.Parameters.AddWithValue("$event", evt.EventId);
+        cmd.Parameters.AddWithValue("$origin", evt.OriginDeviceId);
+        cmd.Parameters.AddWithValue("$epoch", evt.LogEpoch);
+        cmd.Parameters.AddWithValue("$seq", (long)evt.Seq);
+        cmd.Parameters.AddWithValue("$outcome", outcome.ToString());
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    public ReplicationInboundQuarantine? GetInboundQuarantine(string eventId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT event_id, origin_device_id, log_epoch, seq, outcome, attempts
+            FROM replication_inbound_quarantine
+            WHERE event_id = $event;
+            """;
+        cmd.Parameters.AddWithValue("$event", eventId);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read()
+            ? new ReplicationInboundQuarantine(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                (ulong)reader.GetInt64(3),
+                reader.GetString(4),
+                reader.GetInt32(5))
+            : null;
     }
 
     /// <summary>
@@ -878,7 +1100,8 @@ public sealed partial class MeshDb
         string stateHash,
         string snapshotJson,
         int totalItems,
-        string coverageJson = "[]")
+        string coverageJson = "[]",
+        ulong captureCursor = 0)
     {
         ArgumentNullException.ThrowIfNull(target);
         ArgumentException.ThrowIfNullOrWhiteSpace(bootstrapId);
@@ -886,13 +1109,14 @@ public sealed partial class MeshDb
         ArgumentNullException.ThrowIfNull(snapshotJson);
         ArgumentNullException.ThrowIfNull(coverageJson);
         if (totalItems < 0) throw new ArgumentOutOfRangeException(nameof(totalItems));
+        if (captureCursor > long.MaxValue) throw new ArgumentOutOfRangeException(nameof(captureCursor));
 
         using var tx = conn.BeginTransaction(deferred: false);
         var existing = GetPeerBootstrapCore(target, tx);
         if (existing is not null
             && string.Equals(existing.LocalOriginDeviceId, target.LocalOriginDeviceId, StringComparison.Ordinal)
             && string.Equals(existing.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal)
-            && existing.BootstrapFromSeq > 0)
+            && (existing.BootstrapFromSeq > 0 || existing.EmittedItems == 0))
         {
             tx.Commit();
             return existing;
@@ -907,14 +1131,15 @@ public sealed partial class MeshDb
             cmd.CommandText = """
                 INSERT INTO replication_peer_bootstrap(
                     peer_handle, peer_device_id, peer_key_hash, auth_generation,
-                    local_origin_device_id, local_log_epoch, bootstrap_id,
+                    local_origin_device_id, local_log_epoch, capture_cursor, bootstrap_id,
                     bootstrap_from_seq, bootstrap_through_seq, state_hash, state, emitted_items, total_items,
                     coverage_json, snapshot_json, created_at, updated_at, completed_at)
-                VALUES($handle, $device, $keyHash, $generation, $origin, $epoch, $bootstrap,
+                VALUES($handle, $device, $keyHash, $generation, $origin, $epoch, $capture, $bootstrap,
                     0, 0, $stateHash, $state, 0, $total, $coverage, $snapshot, $created, $updated, $completed)
                 ON CONFLICT(peer_handle, peer_device_id, peer_key_hash, auth_generation) DO UPDATE SET
                     local_origin_device_id = excluded.local_origin_device_id,
                     local_log_epoch = excluded.local_log_epoch,
+                    capture_cursor = excluded.capture_cursor,
                     bootstrap_id = excluded.bootstrap_id,
                     bootstrap_from_seq = excluded.bootstrap_from_seq,
                     bootstrap_through_seq = 0,
@@ -934,6 +1159,7 @@ public sealed partial class MeshDb
             cmd.Parameters.AddWithValue("$generation", target.AuthGeneration);
             cmd.Parameters.AddWithValue("$origin", target.LocalOriginDeviceId);
             cmd.Parameters.AddWithValue("$epoch", target.LocalLogEpoch);
+            cmd.Parameters.AddWithValue("$capture", (long)captureCursor);
             cmd.Parameters.AddWithValue("$bootstrap", bootstrapId);
             cmd.Parameters.AddWithValue("$stateHash", stateHash);
             cmd.Parameters.AddWithValue("$state", initialState);
@@ -1068,7 +1294,7 @@ public sealed partial class MeshDb
         cmd.Transaction = tx;
         cmd.CommandText = """
             SELECT peer_handle, peer_device_id, peer_key_hash, auth_generation,
-                   local_origin_device_id, local_log_epoch, bootstrap_id,
+                   local_origin_device_id, local_log_epoch, capture_cursor, bootstrap_id,
                    bootstrap_from_seq, bootstrap_through_seq, state_hash, state, emitted_items, total_items,
                    coverage_json, snapshot_json, created_at, updated_at, completed_at
             FROM replication_peer_bootstrap
@@ -1085,11 +1311,11 @@ public sealed partial class MeshDb
         if (!reader.Read()) return null;
         return new ReplicationPeerBootstrap(
             reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetInt64(3),
-            reader.GetString(4), reader.GetString(5), reader.GetString(6), (ulong)reader.GetInt64(7),
-            (ulong)reader.GetInt64(8), reader.GetString(9), reader.GetString(10), reader.GetInt32(11),
-            reader.GetInt32(12), reader.GetString(13), reader.GetString(14), DateTimeOffset.Parse(reader.GetString(15)),
-            DateTimeOffset.Parse(reader.GetString(16)),
-            reader.IsDBNull(17) ? null : DateTimeOffset.Parse(reader.GetString(17)));
+            reader.GetString(4), reader.GetString(5), (ulong)reader.GetInt64(6), reader.GetString(7),
+            (ulong)reader.GetInt64(8), (ulong)reader.GetInt64(9), reader.GetString(10), reader.GetString(11),
+            reader.GetInt32(12), reader.GetInt32(13), reader.GetString(14), reader.GetString(15),
+            DateTimeOffset.Parse(reader.GetString(16)), DateTimeOffset.Parse(reader.GetString(17)),
+            reader.IsDBNull(18) ? null : DateTimeOffset.Parse(reader.GetString(18)));
     }
 
     private bool MarkPeerBootstrapPersistedCore(

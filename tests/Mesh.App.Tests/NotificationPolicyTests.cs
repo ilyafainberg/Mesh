@@ -112,6 +112,21 @@ public sealed class NotificationPolicyTests
     }
 
     [TestMethod]
+    public async Task OperationGate_DoesNotRunSqliteWorkInlineOnCaller()
+    {
+        var gate = new NotificationOperationGate();
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        var operation = gate.RunAsync(_ =>
+        {
+            Thread.Sleep(250);
+            return Task.CompletedTask;
+        });
+
+        Assert.IsTrue(elapsed.ElapsedMilliseconds < 100);
+        await operation;
+    }
+
+    [TestMethod]
     public void WakeDeduplicator_CoalescesStableIdsAndAcceptsAfterRetention()
     {
         var deduplicator = new NotificationWakeDeduplicator(TimeSpan.FromMinutes(5), capacity: 4);

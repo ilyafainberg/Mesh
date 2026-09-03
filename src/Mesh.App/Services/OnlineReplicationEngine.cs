@@ -41,10 +41,10 @@ public sealed record ReplicationBootstrapTarget(
         var keyHash = Convert.ToHexString(SHA256.HashData(keyBytes)).ToLowerInvariant();
         return new ReplicationBootstrapTarget(
             ReplicationHandle.Norm(peer.Handle),
-            peer.DeviceId,
+            ReplicationHandle.Device(peer.DeviceId),
             keyHash,
             peer.AuthGeneration,
-            localIdentity.DeviceId,
+            ReplicationHandle.Device(localIdentity.DeviceId),
             localIdentity.LogEpoch);
     }
 }
@@ -61,7 +61,9 @@ public sealed record ReplicationEngineActivity(
     int EventCount = 0,
     long ByteCount = 0,
     string? ErrorCode = null,
-    string? BootstrapId = null);
+    string? BootstrapId = null,
+    string? OriginDeviceId = null,
+    string? EventId = null);
 
 /// <summary>One authorised device of some account, as known from custody / relay metadata.</summary>
 public sealed record ReplicationDevice(
@@ -70,6 +72,35 @@ public sealed record ReplicationDevice(
     string PublicKeyB64,
     long AuthGeneration,
     bool Revoked);
+
+/// <summary>The fail-closed outcome of resolving recipients for a local immutable event.</summary>
+public enum ReplicationEmissionRosterState
+{
+    FreshComplete = 0,
+    Unavailable = 1,
+    RefreshFailed = 2,
+    Stale = 3,
+    GenerationChanged = 4,
+    NoSiblings = 5,
+}
+
+/// <summary>
+/// One authoritative, point-in-time recipient roster used for local event encryption. Callers may
+/// emit only for <see cref="ReplicationEmissionRosterState.FreshComplete"/> or
+/// <see cref="ReplicationEmissionRosterState.NoSiblings"/>.
+/// </summary>
+public sealed record ReplicationEmissionRosterSnapshot(
+    ReplicationEmissionRosterState State,
+    IReadOnlyList<ReplicationDevice> Devices,
+    IReadOnlyDictionary<string, long> AuthGenerations,
+    string? Reason = null,
+    IReadOnlyDictionary<string, string>? CustodyHeads = null,
+    long RosterVersion = 0,
+    DateTimeOffset? ValidAt = null)
+{
+    public bool CanEmit => State is ReplicationEmissionRosterState.FreshComplete
+        or ReplicationEmissionRosterState.NoSiblings;
+}
 
 /// <summary>
 /// Read-only view of the authoritative device roster the engine consumes from the relay
@@ -86,6 +117,27 @@ public interface IReplicationRoster
 
     /// <summary>The authoritative auth generation for a handle (highest valid custody generation).</summary>
     long AuthGeneration(string accountHandle);
+
+    /// <summary>
+    /// Awaits an authoritative complete snapshot for local event encryption. Implementations that
+    /// cannot prove freshness fail closed; a cache miss is never interpreted as no siblings.
+    /// </summary>
+    Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+        IReadOnlyCollection<string> accountHandles,
+        ReplicationIdentity localIdentity,
+        CancellationToken ct)
+        => Task.FromResult(new ReplicationEmissionRosterSnapshot(
+            ReplicationEmissionRosterState.Unavailable,
+            Array.Empty<ReplicationDevice>(),
+            new Dictionary<string, long>(StringComparer.Ordinal),
+            "authoritative roster refresh is unavailable"));
+
+    Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+        IReadOnlyCollection<string> accountHandles,
+        ReplicationIdentity localIdentity,
+        IReadOnlyDictionary<string, long> minimumObservedGenerations,
+        CancellationToken ct)
+        => GetEmissionSnapshotAsync(accountHandles, localIdentity, ct);
 }
 
 /// <summary>
@@ -118,8 +170,10 @@ public sealed record ReplicationCommittedDomainEvent(
     ReplicationPayloadCodec.DomainEnvelope Envelope);
 
 /// <summary>
-/// Domain projection seam. <see cref="Apply"/> is invoked inside the same transaction that appends
-/// an inbound event, so the projection commits or rolls back atomically with the log and cursor.
+/// Domain projection seam. <see cref="Prepare"/> runs before the durable-write gate is acquired and
+/// is the only hook permitted to read caller-owned state. <see cref="Apply"/> is invoked inside the
+/// same transaction that appends an inbound event, so the durable projection commits or rolls back
+/// atomically with the log and cursor; it must not acquire caller-owned state/operation gates.
 /// <see cref="AfterCommitAsync"/> is invoked once that transaction has committed, so an implementation
 /// can refresh its in-memory state and notify the UI without ever doing so for a change that later
 /// rolled back. Implemented by <c>AppState</c>; a recording fake is used in isolation tests.
@@ -127,9 +181,21 @@ public sealed record ReplicationCommittedDomainEvent(
 public interface IReplicationDomainApplier
 {
     /// <summary>
-    /// Applies the durable domain projection and returns true only when the event won causal
-    /// arbitration. A false result still commits the immutable event/cursor, but suppresses the
-    /// post-commit in-memory/UI mutation.
+    /// Captures any caller-owned state needed to localise an inbound envelope. This is called before
+    /// the durable-write gate is acquired. Returning null stores the immutable event and advances its
+    /// cursor without projecting domain state (for example, after an account switch).
+    /// </summary>
+    ReplicationPayloadCodec.DomainEnvelope? Prepare(
+        ReplicationEvent evt,
+        ReplicationPayloadCodec.DomainEnvelope envelope,
+        bool deviceIsDesktop)
+        => envelope;
+
+    /// <summary>
+    /// Applies the prepared durable domain projection and returns true only when the event won causal
+    /// arbitration. This runs under the durable-write gate and must not call into caller-owned state
+    /// gates. A false result still commits the immutable event/cursor, but suppresses post-commit
+    /// in-memory/UI mutation.
     /// </summary>
     bool Apply(
         SqliteConnection conn,
@@ -205,12 +271,15 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     private readonly ConcurrentDictionary<string, PriorityOperationGate> peerLocks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> peerSessionLocks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> peerReceiptLocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> peerInboundBatchLocks = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim projectionBoundary = new(1, 1);
     private readonly ConcurrentDictionary<string, PeerSession> sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> latestSessionInitTickets = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> haltedOrigins = new(StringComparer.Ordinal);
     private long nextSessionInitTicket;
     private readonly CancellationTokenSource lifetime = new();
+    private readonly SemaphoreSlim pendingIntentRepairGate = new(1, 1);
+    private readonly Task startupIntentRepair;
     private readonly object disposalGate = new();
     private Task? disposeTask;
     private TaskCompletionSource<bool>? peerOperationsDrained;
@@ -223,6 +292,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     private DateTimeOffset? lastProtocolActivity;
 
     private volatile string? lastError;
+    private static readonly AsyncLocal<LockOrderState?> LockOrder = new();
 
     public OnlineReplicationEngine(
         MeshDb db,
@@ -263,6 +333,17 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(requestRetryInterval));
         if (this.receiptRetryInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(receiptRetryInterval));
+
+        // Startup intent repair may target a newly rotated local device identity. Register that
+        // origin before repair starts so replay can allocate its first sequence deterministically.
+        journal.EnsureLocalOrigin();
+        if (roster is RelayReplicationRoster relayRoster
+            && db.HasPendingReplicationIntents())
+        {
+            foreach (var account in journal.PendingIntentAccounts())
+                relayRoster.Invalidate(account);
+        }
+        startupIntentRepair = RepairPendingIntentsOnStartupAsync();
     }
 
     /// <summary>The most recent replication error surfaced (fork, verification failure, ...).</summary>
@@ -334,15 +415,24 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 await TryOfferLocalOriginsAsync(session, pushClass, operationCt).ConfigureAwait(false);
         }, ct, prioritize: true);
 
-    internal async Task<IDisposable> EnterProjectionBoundaryAsync(CancellationToken ct)
+    internal async Task<T> WithProjectionBoundaryAsync<T>(
+        Func<CancellationToken, Task<T>> body,
+        CancellationToken ct)
     {
-        lock (disposalGate)
-        {
-            if (disposed) throw new ObjectDisposedException(nameof(OnlineReplicationEngine));
-        }
+        ArgumentNullException.ThrowIfNull(body);
+        AssertLockNotHeld(ReplicationLockKind.Peer, ReplicationLockKind.Projection);
+        using var trackedOperation = EnterTrackedOperation();
         using var operation = CancellationTokenSource.CreateLinkedTokenSource(ct, lifetime.Token);
         await projectionBoundary.WaitAsync(operation.Token).ConfigureAwait(false);
-        return new SemaphoreLease(projectionBoundary);
+        try
+        {
+            using var scope = TrackLock(ReplicationLockKind.Projection);
+            return await body(operation.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            projectionBoundary.Release();
+        }
     }
 
     internal void ReportBootstrapActivity(
@@ -362,7 +452,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
     /// <summary>Registers this device's local origin log (idempotent).</summary>
     public void EnsureLocalOrigin()
-        => db.EnsureLocalOrigin(identity.DeviceId, identity.LogEpoch, identity.AuthGeneration);
+        => db.ExecuteDurableWrite(
+            () => db.EnsureLocalOrigin(
+                identity.DeviceId, identity.LogEpoch, identity.AuthGeneration));
 
     // =======================================================================
     // Local origin: create a signed event, persist it and enqueue outbox refs.
@@ -386,11 +478,60 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(envelope);
         ArgumentNullException.ThrowIfNull(targetAccounts);
 
+        var emission = await CommitLocalAsync(
+            envelope, targetAccounts, domainWork, ct).ConfigureAwait(false);
+        var eventId = emission.EventId ?? emission.IntentId;
+
+        if (emission.EventId is not null)
+        {
+            var established = sessions.Values.Where(session => session.Established).ToArray();
+            await Task.WhenAll(established.Select(session =>
+                    OfferPeerAsync(session.PeerHandle, session.PeerDevice, pushClass, ct)))
+                .ConfigureAwait(false);
+        }
+
+        return eventId;
+    }
+
+    internal async Task<string> EmitLocalDurableAsync(
+        ReplicationPayloadCodec.DomainEnvelope envelope,
+        IReadOnlyCollection<string> targetAccounts,
+        CancellationToken ct = default,
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainWork = null)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        ArgumentNullException.ThrowIfNull(targetAccounts);
+        var emission = await CommitLocalAsync(
+            envelope, targetAccounts, domainWork, ct).ConfigureAwait(false);
+        return emission.EventId ?? emission.IntentId;
+    }
+
+    private async Task<ReplicationLocalEmission> CommitLocalAsync(
+        ReplicationPayloadCodec.DomainEnvelope envelope,
+        IReadOnlyCollection<string> targetAccounts,
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainWork,
+        CancellationToken ct)
+    {
+        using var trackedOperation = EnterTrackedOperation();
+        await startupIntentRepair.WaitAsync(ct).ConfigureAwait(false);
+        await pendingIntentRepairGate.WaitAsync(ct).ConfigureAwait(false);
+        ReplicationLocalEmission emission;
+        try
+        {
+            // Existing durable intents own all earlier origin positions. If authority is still
+            // unavailable, the journal records this mutation behind them rather than bypassing.
+            await journal.RetryPendingIntentsAsync(ct).ConfigureAwait(false);
+            emission = await journal.EmitLocalAsync(envelope, targetAccounts, domainWork, ct)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            pendingIntentRepairGate.Release();
+        }
+
         // Local-journal write: append the signed event, its outbox refs and the domain
         // projection atomically. This happens whether or not any session is established, so a
         // local change is always durably recorded before any transport is attempted.
-        var eventId = journal.EmitLocal(envelope, targetAccounts, domainWork);
-
 #if ANDROID
         var localSpan = db.GetServeableOrigins().FirstOrDefault(origin =>
             string.Equals(origin.OriginDeviceId, identity.DeviceId, StringComparison.Ordinal)
@@ -400,17 +541,84 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             $"[replication-local] emitted;origin={identity.DeviceId};available_through={localSpan?.AvailableThrough ?? 0};targets={targetAccounts.Count};sessions={sessions.Count}");
 #endif
 
-        if (targetAccounts.Count > 0)
+        if (emission.EventId is not null && targetAccounts.Count > 0)
             LocalWorkPending?.Invoke();
 
-        // Best-effort immediate offer to any peer with a live established session. Offline this
-        // simply finds no sessions and leaves the outbox pending for a later drain.
-        var established = sessions.Values.Where(session => session.Established).ToArray();
-        await Task.WhenAll(established.Select(session =>
-                OfferPeerAsync(session.PeerHandle, session.PeerDevice, pushClass, ct)))
-            .ConfigureAwait(false);
+        return emission;
+    }
 
-        return eventId;
+    public async Task<IReadOnlyList<string>> EmitLocalBatchAsync(
+        IReadOnlyList<ReplicationPayloadCodec.DomainEnvelope> envelopes,
+        IReadOnlyCollection<string> targetAccounts,
+        Action<SqliteConnection, SqliteTransaction, int>? domainWork = null,
+        CancellationToken ct = default,
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent, int>? eventWork = null)
+    {
+        ArgumentNullException.ThrowIfNull(envelopes);
+        ArgumentNullException.ThrowIfNull(targetAccounts);
+
+        await startupIntentRepair.WaitAsync(ct).ConfigureAwait(false);
+        await pendingIntentRepairGate.WaitAsync(ct).ConfigureAwait(false);
+        IReadOnlyList<string> eventIds;
+        try
+        {
+            await journal.RetryPendingIntentsAsync(ct).ConfigureAwait(false);
+            eventIds = await journal.EmitLocalBatchAsync(
+                    envelopes, targetAccounts, domainWork, eventWork, ct)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            pendingIntentRepairGate.Release();
+        }
+
+        var persisted = eventIds.Count > 0 && db.GetEvent(eventIds[0]) is not null;
+        if (persisted && targetAccounts.Count > 0)
+            LocalWorkPending?.Invoke();
+        if (persisted)
+        {
+            var established = sessions.Values.Where(session => session.Established).ToArray();
+            await Task.WhenAll(established.Select(session =>
+                    OfferPeerAsync(
+                        session.PeerHandle,
+                        session.PeerDevice,
+                        OnlinePushClasses.Normal,
+                        ct)))
+                .ConfigureAwait(false);
+        }
+        return eventIds;
+    }
+
+    private async Task RepairPendingIntentsOnStartupAsync()
+    {
+        try
+        {
+            await RetryPendingIntentsAsync(lifetime.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            Surface("intent", $"startup retry failed: {ex.GetType().Name}");
+        }
+    }
+
+    public async Task<int> RetryPendingIntentsAsync(CancellationToken ct = default)
+    {
+        await pendingIntentRepairGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var emitted = await journal.RetryPendingIntentsAsync(ct).ConfigureAwait(false);
+            if (emitted > 0)
+            {
+                ObserveActivity(new ReplicationEngineActivity("intent.retry", EventCount: emitted));
+                LocalWorkPending?.Invoke();
+            }
+            return emitted;
+        }
+        finally
+        {
+            pendingIntentRepairGate.Release();
+        }
     }
 
     // =======================================================================
@@ -429,8 +637,11 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     /// Presence transition to online: initiate a session (which drives the symmetric
     /// offer / request / batch exchange once acknowledged).
     /// </summary>
-    public Task OnPresenceOnlineAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
-        => StartSessionAsync(peerHandle, peerDevice, ct);
+    public async Task OnPresenceOnlineAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
+    {
+        await RetryPendingIntentsAsync(ct).ConfigureAwait(false);
+        await StartSessionAsync(peerHandle, peerDevice, ct).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Offers immediately when a peer session exists; otherwise asks the authenticated relay to emit
@@ -440,6 +651,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     public Task OnWakeAsync(string peerHandle, string peerDevice, CancellationToken ct = default)
         => WithPeerLock(peerDevice, async operationCt =>
         {
+            await RetryPendingIntentsAsync(operationCt).ConfigureAwait(false);
             if (sessions.TryGetValue(peerDevice, out var session) && session.Established)
             {
                 await TryOfferLocalOriginsAsync(session, OnlinePushClasses.Silent, operationCt).ConfigureAwait(false);
@@ -544,6 +756,21 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         {
             return WithOperationLock(
                 peerReceiptLocks,
+                delivery.FromDevice,
+                async operationCt =>
+                {
+                    _ = await DispatchAsync(delivery, frame, sessionInitTicket, operationCt).ConfigureAwait(false);
+                },
+                ct);
+        }
+
+        // Inbound projection owns a dedicated per-peer lane. It must not enter the general
+        // peer lane because projection takes projectionBoundary and bootstrap offers take the
+        // peer lane only after releasing that boundary.
+        if (frame?.Kind is E2EFrameKind.Batch or E2EFrameKind.ResyncSnapshot)
+        {
+            return WithOperationLock(
+                peerInboundBatchLocks,
                 delivery.FromDevice,
                 async operationCt =>
                 {
@@ -715,7 +942,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         if (!duplicate)
         {
             sessions[delivery.FromDevice] = session;
-            db.UpsertPeerState(delivery.FromHandle, delivery.FromDevice, init.SessionId, null);
+            db.ExecuteDurableWrite(
+                () => db.UpsertPeerState(
+                    delivery.FromHandle, delivery.FromDevice, init.SessionId, null));
             ObserveActivity(new ReplicationEngineActivity(
                 "session.established", delivery.FromHandle, delivery.FromDevice));
         }
@@ -767,7 +996,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         }
         session.Established = true;
         session.SessionId = ack.SessionId;
-        db.UpsertPeerState(delivery.FromHandle, delivery.FromDevice, ack.SessionId, null);
+        db.ExecuteDurableWrite(
+            () => db.UpsertPeerState(
+                delivery.FromHandle, delivery.FromDevice, ack.SessionId, null));
         ObserveActivity(new ReplicationEngineActivity(
             "session.established", delivery.FromHandle, delivery.FromDevice));
         return session.TryScheduleInitialOffers();
@@ -799,7 +1030,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             availableOrigins.Add(new MeshDb.ServeableOrigin(
                 identity.DeviceId,
                 identity.LogEpoch,
-                bootstrap.BootstrapFromSeq,
+                bootstrap.CaptureCursor + 1,
                 bootstrap.BootstrapThroughSeq));
         }
 
@@ -845,12 +1076,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                     && (bootstrap.BootstrapThroughSeq >= bootstrap.BootstrapFromSeq
                         || bootstrap.BootstrapThroughSeq + 1 == bootstrap.BootstrapFromSeq))
                 {
-                    availableFrom = bootstrap.BootstrapFromSeq;
+                    // The immutable projection covers exactly the local prefix through
+                    // CaptureCursor. Every later journal position, including events that raced
+                    // bootstrap allocation and the bootstrap chunks themselves, remains in the
+                    // offered catch-up range and is therefore applied exactly once by cursor.
+                    availableFrom = bootstrap.CaptureCursor + 1;
                     availableThrough = Math.Max(availableThrough, bootstrap.BootstrapThroughSeq);
                     var snapshotEvents = ReadSnapshotEvents(
                         identity.DeviceId,
                         identity.LogEpoch,
-                        bootstrap.BootstrapFromSeq,
+                        availableFrom,
                         bootstrap.BootstrapThroughSeq);
                     if (snapshotEvents is null)
                     {
@@ -873,7 +1108,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                         session.PeerDevice,
                         identity.DeviceId,
                         identity.LogEpoch,
-                        bootstrap.BootstrapFromSeq,
+                        availableFrom,
                         bootstrap.BootstrapThroughSeq,
                         OnlineReplicationProtocol.ComputeSnapshotStateHash(snapshotEvents),
                         identity.AuthGeneration,
@@ -968,7 +1203,8 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 Surface("auth", "Snapshot manifest signature failed verification.");
                 return;
             }
-            var baselineInstalled = db.TryInstallSnapshotBaseline(snapshot);
+            var baselineInstalled = db.ExecuteDurableWrite(
+                () => db.TryInstallSnapshotBaseline(snapshot));
             session.PendingSnapshots[offer.OriginDeviceId] = new PendingSnapshot(snapshot, baselineInstalled);
             if (baselineInstalled)
             {
@@ -1124,7 +1360,8 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             return false;
         }
 
-        var installed = db.TryInstallSnapshotCoverage(snapshot);
+        var installed = db.ExecuteDurableWrite(
+            () => db.TryInstallSnapshotCoverage(snapshot));
         session.PendingSnapshots.Remove(originDeviceId);
         ObserveActivity(new ReplicationEngineActivity(
             "snapshot.verified",
@@ -1158,7 +1395,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             OnlineReplicationProtocol.ComputeCursorHash(cursor),
             OnlineReplicationProtocol.ComputeSnapshotManifestHash(snapshot),
             identity.PrivateKeyB64);
-        db.StoreReceipt(receipt);
+        db.ExecuteDurableWrite(() => db.StoreReceipt(receipt));
         var sent = await SendControlAsync(
             session.PeerHandle,
             session.PeerDevice,
@@ -1282,28 +1519,30 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                     unresolvedAccounts, ct).ConfigureAwait(false);
         }
 
-        var projectionLease = await EnterProjectionBoundaryAsync(ct).ConfigureAwait(false);
-        try
+        var shouldReceipt = await WithProjectionBoundaryAsync(
+            async boundaryCt =>
         {
             var committedCount = 0;
             var committedEvents = new List<ReplicationCommittedDomainEvent>();
             foreach (var evt in batch.Events)
             {
+                using var inboundOperation = ManagedOperationDiagnostics.Begin(
+                    $"replication.inbound:{evt.EventId}:{evt.OriginDeviceId}:{evt.Seq}");
                 var originDevice = roster.ResolveDevice(evt.OriginAccount, evt.OriginDeviceId);
                 if (originDevice is null || originDevice.Revoked)
                 {
                     Surface("auth", $"Event from unknown/revoked origin device {evt.OriginDeviceId}.");
-                    return;
+                    return false;
                 }
                 if (evt.AuthGeneration > roster.AuthGeneration(evt.OriginAccount) && roster.AuthGeneration(evt.OriginAccount) >= 0)
                 {
                     Surface("auth", $"Event carried a future auth generation {evt.AuthGeneration}.");
-                    return;
+                    return false;
                 }
                 if (!OnlineReplicationProtocol.VerifyEvent(evt, originDevice.PublicKeyB64))
                 {
                     Surface("auth", $"Event {evt.EventId} failed signature verification.");
-                    return;
+                    return false;
                 }
 
                 var cursor = db.GetCursor(evt.OriginDeviceId) ?? OnlineReplicationProtocol.EmptyCursor();
@@ -1316,25 +1555,62 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                         continue; // Outside the reorder window; a follow-up request refetches.
                     case CursorApplyResult.RejectedEpochMismatch:
                         Halt(evt.OriginDeviceId, "epoch-mismatch", $"Epoch changed for {evt.OriginDeviceId}.");
-                        return;
+                        return false;
                     case CursorApplyResult.RejectedInvalid:
                         Surface("route", $"Event {evt.EventId} rejected by cursor.");
-                        return;
+                        return false;
                 }
 
                 ReplicationPayloadCodec.DomainEnvelope? committed = null;
                 try
                 {
-                    var append = db.ApplyInboundEvent(
-                        evt,
-                        updated,
-                        (conn, tx) => committed = ProjectDomain(conn, tx, evt));
+                    // Decrypt, validate and capture caller-owned state before entering MeshDb's
+                    // durable gate. ApplyPreparedDomain is therefore a DB-only callback and cannot
+                    // form durableWriteGate -> profile/state-gate lock order.
+                    var prepared = PrepareDomain(evt, out var decryptOutcome);
+                    if (decryptOutcome == MessageDecryptOutcome.MissingRecipientSlot)
+                    {
+                        var slots = ReplicationPayloadCodec.RecipientDeviceIds(evt.Ciphertext).Count;
+                        ObserveActivity(new ReplicationEngineActivity(
+                            "event.unaddressed",
+                            EventCount: 1,
+                            ErrorCode: $"recipient_slots={slots};reason=no-local-key-slot",
+                            OriginDeviceId: HashDiagnosticId(evt.OriginDeviceId),
+                            EventId: evt.EventId));
+                        Surface(
+                            "unaddressed-event",
+                            $"event={evt.EventId};account={HashDiagnosticId(evt.OriginAccount)};" +
+                            $"device={HashDiagnosticId(identity.DeviceId)};recipient_slots={slots};" +
+                            "reason=no-local-key-slot;cursor=advance-without-projection");
+                    }
+                    else if (decryptOutcome != MessageDecryptOutcome.Success)
+                    {
+                        await db.ExecuteDurableWriteAsync(
+                            () => db.QuarantineInboundEvent(evt, decryptOutcome),
+                            boundaryCt).ConfigureAwait(false);
+                        ObserveActivity(new ReplicationEngineActivity(
+                            "event.quarantined",
+                            EventCount: 1,
+                            ErrorCode: $"decrypt={decryptOutcome};cursor=held",
+                            OriginDeviceId: HashDiagnosticId(evt.OriginDeviceId),
+                            EventId: evt.EventId));
+                        Surface(
+                            "event-quarantine",
+                            $"event={evt.EventId};outcome={decryptOutcome};cursor=held;projection=held");
+                        return false;
+                    }
+                    var append = await db.ExecuteDurableWriteAsync(
+                        () => db.ApplyInboundEvent(
+                            evt,
+                            updated,
+                            (conn, tx) => committed = ApplyPreparedDomain(conn, tx, evt, prepared)),
+                        boundaryCt).ConfigureAwait(false);
                     if (append == MeshDb.ReplicationAppendResult.Inserted) committedCount++;
                 }
                 catch (MeshDb.ReplicationForkException fork)
                 {
                     Halt(evt.OriginDeviceId, "fork", fork.Message);
-                    return;
+                    return false;
                 }
                 catch (ReplicationProjectionException projection)
                 {
@@ -1343,7 +1619,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                     // is not stored and the cursor did not advance. Halt this origin so we never
                     // silently skip the event or advance past it (spec items 4 & 6: fail closed).
                     Halt(evt.OriginDeviceId, "projection", projection.Message);
-                    return;
+                    return false;
                 }
 
                 // The transaction committed. Defer in-memory refresh until every event in this wire
@@ -1357,38 +1633,56 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
 
             if (committedCount > 0)
             {
-                db.RecordPeerSync(session.PeerHandle, session.PeerDevice);
+                await db.ExecuteDurableWriteAsync(
+                    () => db.RecordPeerSync(session.PeerHandle, session.PeerDevice),
+                    boundaryCt).ConfigureAwait(false);
                 ObserveActivity(new ReplicationEngineActivity(
                     "batch.committed",
                     session.PeerHandle,
                     session.PeerDevice,
                     committedCount,
-                    Encoding.UTF8.GetByteCount(plaintext)));
+                    Encoding.UTF8.GetByteCount(plaintext),
+                    OriginDeviceId: batch.OriginDeviceId,
+                    EventId: batch.Events[^1].EventId));
             }
-            if (!TryFinalizePendingSnapshot(session, batch.OriginDeviceId)) return;
-        }
-        finally
-        {
-            projectionLease.Dispose();
-        }
+            return TryFinalizePendingSnapshot(session, batch.OriginDeviceId);
+        }, ct).ConfigureAwait(false);
+        if (!shouldReceipt) return;
         await SendReceiptAsync(session, delivery, batch, ct).ConfigureAwait(false);
     }
 
-    private ReplicationPayloadCodec.DomainEnvelope? ProjectDomain(SqliteConnection conn, SqliteTransaction tx, ReplicationEvent evt)
+    private ReplicationPayloadCodec.DomainEnvelope? PrepareDomain(
+        ReplicationEvent evt,
+        out MessageDecryptOutcome decryptOutcome)
     {
-        var (ok, plaintext) = ReplicationPayloadCodec.TryDecrypt(evt.Ciphertext, identity.PrivateKeyB64, identity.PublicKeyB64);
-        if (!ok || plaintext is null) return null; // Not addressed to this device: store the log, no projection.
-        var envelope = ReplicationPayloadCodec.DecodeEnvelope(plaintext)
+        var decrypt = ReplicationPayloadCodec.TryDecrypt(
+            evt.Ciphertext, identity.PrivateKeyB64, identity.PublicKeyB64);
+        decryptOutcome = decrypt.Outcome;
+        // An authenticated but unaddressed event still occupies the immutable origin position.
+        // Store it and advance the cursor so it is not requested forever, but never project it.
+        if (decryptOutcome != MessageDecryptOutcome.Success) return null;
+        var envelope = ReplicationPayloadCodec.DecodeEnvelope(decrypt.Plaintext!)
             ?? throw new ReplicationProjectionException(
                 "The authenticated event payload could not be decoded or mapped.");
         // Desktop-only entries still occupy positions in the shared origin log. Mobile stores the
         // authenticated event and advances its cursor, but never materialises device-local bytes.
         if (!deviceIsDesktop && ReplicationPayloadCodec.RequiresDesktop(envelope.Kind, envelope.Action))
             return null;
-        return applier.Apply(conn, tx, evt, envelope, deviceIsDesktop)
-            ? envelope
-            : null;
+        return applier.Prepare(evt, envelope, deviceIsDesktop);
     }
+
+    private static string HashDiagnosticId(string value)
+        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value ?? "")))
+            .ToLowerInvariant()[..16];
+
+    private ReplicationPayloadCodec.DomainEnvelope? ApplyPreparedDomain(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        ReplicationEvent evt,
+        ReplicationPayloadCodec.DomainEnvelope? prepared)
+        => prepared is not null && applier.Apply(conn, tx, evt, prepared, deviceIsDesktop)
+            ? prepared
+            : null;
 
     private async Task SendReceiptAsync(PeerSession session, OnlineRelayDelivery delivery, ReplicationBatch batch, CancellationToken ct)
     {
@@ -1399,7 +1693,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             OnlineReplicationProtocol.ComputeCursorHash(cursor),
             OnlineReplicationProtocol.ComputeBatchHash(batch),
             identity.PrivateKeyB64);
-        db.StoreReceipt(receipt);
+        db.ExecuteDurableWrite(() => db.StoreReceipt(receipt));
         var sent = await SendControlAsync(
             session.PeerHandle,
             session.PeerDevice,
@@ -1447,7 +1741,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             receiverDeviceId,
             bootstrap.LocalOriginDeviceId,
             bootstrap.LocalLogEpoch,
-            bootstrap.BootstrapFromSeq,
+            bootstrap.CaptureCursor + 1,
             bootstrap.BootstrapThroughSeq,
             OnlineReplicationProtocol.ComputeSnapshotStateHash(Array.Empty<ReplicationEvent>()),
             identity.AuthGeneration,
@@ -1487,7 +1781,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
                 Surface("auth", "Empty snapshot receipt did not acknowledge the active manifest.");
                 return;
             }
-            var advanced = db.MarkOutboxPersistedFromReceipt(receipt, peer.PublicKeyB64, delivery.FromHandle);
+            var advanced = db.ExecuteDurableWrite(
+                () => db.MarkOutboxPersistedFromReceipt(
+                    receipt, peer.PublicKeyB64, delivery.FromHandle));
             ObserveActivity(new ReplicationEngineActivity(
                 "receipt.received",
                 delivery.FromHandle,
@@ -1519,7 +1815,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
     {
         var watermark = ReplicationPayloadCodec.DeserializeControl<ReadWatermarkPayload>(plaintext);
         if (watermark is null) { Surface("route", "Malformed read watermark."); return; }
-        db.UpsertReadWatermark(watermark);
+        db.ExecuteDurableWrite(() => db.UpsertReadWatermark(watermark));
     }
 
     private void OnCustody(OnlineRelayDelivery delivery, string plaintext)
@@ -1534,7 +1830,7 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             Surface("custody", "Custody entry handle did not match the authenticated sender.");
             return;
         }
-        try { db.AppendCustodyEntry(entry); }
+        try { db.ExecuteDurableWrite(() => db.AppendCustodyEntry(entry)); }
         catch (MeshDb.ReplicationForkException fork) { Halt("custody:" + entry.Handle, "custody-fork", fork.Message); }
         catch (ArgumentException ex) { Surface("custody", ex.Message); }
     }
@@ -1807,7 +2103,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             ("event_count", activity.EventCount == 0 ? null : activity.EventCount),
             ("byte_count", activity.ByteCount == 0 ? null : activity.ByteCount),
             ("error_code", activity.ErrorCode),
-            ("bootstrap_id", activity.BootstrapId));
+            ("bootstrap_id", activity.BootstrapId),
+            ("origin_device_id", activity.OriginDeviceId),
+            ("event_id", activity.EventId));
     }
 
     private void Halt(string origin, string reason, string error)
@@ -1832,6 +2130,12 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         bool prioritize = false)
         => WithPriorityOperationLock(peerDevice, prioritize, body, ct);
 
+    internal Task WithPeerLockForDiagnosticsAsync(
+        string peerDevice,
+        Func<CancellationToken, Task> body,
+        CancellationToken ct = default)
+        => WithPeerLock(peerDevice, body, ct);
+
     private async Task WithPriorityOperationLock(
         string peerDevice,
         bool prioritize,
@@ -1850,7 +2154,9 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         try
         {
             using var operation = CancellationTokenSource.CreateLinkedTokenSource(ct, lifetime.Token);
+            AssertLockNotHeld(ReplicationLockKind.Projection, ReplicationLockKind.Peer);
             lease = await gate.EnterAsync(prioritize, operation.Token).ConfigureAwait(false);
+            using var scope = TrackLock(ReplicationLockKind.Peer);
             await body(operation.Token).ConfigureAwait(false);
         }
         finally
@@ -1901,6 +2207,16 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         drained?.TrySetResult(true);
     }
 
+    private IDisposable EnterTrackedOperation()
+    {
+        lock (disposalGate)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(OnlineReplicationEngine));
+            activePeerOperations++;
+        }
+        return new DelegateLease(ExitPeerOperation);
+    }
+
     public ValueTask DisposeAsync()
     {
         Task task;
@@ -1932,9 +2248,12 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
             lifetime.Cancel();
             lock (activityGate) activitySignal.TrySetCanceled();
             await drain.ConfigureAwait(false);
+            await startupIntentRepair.ConfigureAwait(false);
             foreach (var gate in peerLocks.Values) gate.Dispose();
             foreach (var gate in peerSessionLocks.Values) gate.Dispose();
             foreach (var gate in peerReceiptLocks.Values) gate.Dispose();
+            foreach (var gate in peerInboundBatchLocks.Values) gate.Dispose();
+            pendingIntentRepairGate.Dispose();
             lifetime.Dispose();
             completion.TrySetResult(true);
         }
@@ -1942,6 +2261,37 @@ public sealed class OnlineReplicationEngine : IAsyncDisposable
         {
             completion.TrySetException(ex);
         }
+    }
+
+    private enum ReplicationLockKind
+    {
+        Peer,
+        Projection
+    }
+
+    private sealed record LockOrderState(ReplicationLockKind Kind, LockOrderState? Parent);
+
+    private static IDisposable TrackLock(ReplicationLockKind kind)
+    {
+        var previous = LockOrder.Value;
+        LockOrder.Value = new LockOrderState(kind, previous);
+        return new DelegateLease(() => LockOrder.Value = previous);
+    }
+
+    private static void AssertLockNotHeld(ReplicationLockKind held, ReplicationLockKind requested)
+    {
+        for (var current = LockOrder.Value; current is not null; current = current.Parent)
+        {
+            if (current.Kind != held) continue;
+            throw new InvalidOperationException(
+                $"Replication lock-order violation: cannot acquire {requested} while holding {held}.");
+        }
+    }
+
+    private sealed class DelegateLease(Action release) : IDisposable
+    {
+        private Action? release = release;
+        public void Dispose() => Interlocked.Exchange(ref release, null)?.Invoke();
     }
 
     private sealed class PriorityOperationGate : IDisposable
@@ -2160,6 +2510,9 @@ internal static class ReplicationHandle
 {
     public static string Norm(string? handle)
         => (handle ?? "").Trim().TrimStart('@').ToLowerInvariant();
+
+    public static string Device(string? deviceId)
+        => (deviceId ?? "").Trim().ToLowerInvariant();
 }
 
 /// <summary>
@@ -2299,12 +2652,14 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
     private readonly Func<string, string?> localCustodyHead;
     private readonly Action<string> surface;
     private readonly Action onOwnAuthorityChanged;
+    private readonly TimeProvider clock;
 
     private readonly object gate = new();
+    private readonly SemaphoreSlim pollGate = new(1, 1);
     private readonly Dictionary<string, Entry> cache = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, DateTimeOffset> refreshAttempts = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, DateTimeOffset> authoritativeRefreshAttempts = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> refreshLocks = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RefreshFlight> refreshFlights = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> authorityEpochs = new(StringComparer.Ordinal);
+    private long rosterVersion;
 
     public RelayReplicationRoster(
         IReplicationMetadataSource source,
@@ -2313,7 +2668,8 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
         string ownCustodyHead,
         Func<string, string?> localCustodyHead,
         Action<string> surface,
-        Action onOwnAuthorityChanged)
+        Action onOwnAuthorityChanged,
+        TimeProvider? timeProvider = null)
     {
         this.source = source ?? throw new ArgumentNullException(nameof(source));
         this.ownHandle = ReplicationHandle.Norm(ownHandle);
@@ -2322,6 +2678,7 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
         this.localCustodyHead = localCustodyHead ?? (_ => null);
         this.surface = surface ?? (_ => { });
         this.onOwnAuthorityChanged = onOwnAuthorityChanged ?? (() => { });
+        clock = timeProvider ?? TimeProvider.System;
     }
 
     private sealed record Entry(
@@ -2330,11 +2687,22 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
         string CustodyHead,
         DateTimeOffset FetchedAt);
 
+    private sealed record RefreshResult(
+        bool Success,
+        bool Stale,
+        Exception? Error,
+        DateTimeOffset CompletedAt);
+
+    private sealed record RefreshFlight(
+        long AuthorityEpoch,
+        bool Authoritative,
+        Task<RefreshResult> Task);
+
     public IReadOnlyList<ReplicationDevice> AuthorizedDevices(string accountHandle)
     {
         var h = ReplicationHandle.Norm(accountHandle);
         lock (gate)
-            return cache.TryGetValue(h, out var e)
+            return TryGetFreshEntry(h, clock.GetUtcNow(), out var e)
                 ? e.Devices.Where(d => !d.Revoked).ToList()
                 : Array.Empty<ReplicationDevice>();
     }
@@ -2342,9 +2710,11 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
     public ReplicationDevice? ResolveDevice(string accountHandle, string deviceId)
     {
         var h = ReplicationHandle.Norm(accountHandle);
+        var normalizedDevice = ReplicationHandle.Device(deviceId);
         lock (gate)
-            return cache.TryGetValue(h, out var e)
-                ? e.Devices.FirstOrDefault(d => string.Equals(d.DeviceId, deviceId, StringComparison.Ordinal))
+            return TryGetFreshEntry(h, clock.GetUtcNow(), out var e)
+                ? e.Devices.FirstOrDefault(d => string.Equals(
+                    ReplicationHandle.Device(d.DeviceId), normalizedDevice, StringComparison.Ordinal))
                 : null;
     }
 
@@ -2352,7 +2722,216 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
     {
         var h = ReplicationHandle.Norm(accountHandle);
         lock (gate)
-            return cache.TryGetValue(h, out var e) ? e.AuthGeneration : -1;
+            return TryGetFreshEntry(h, clock.GetUtcNow(), out var e) ? e.AuthGeneration : -1;
+    }
+
+    private bool TryGetFreshEntry(string handle, DateTimeOffset now, out Entry entry)
+    {
+        if (cache.TryGetValue(handle, out entry!)
+            && now - entry.FetchedAt < CacheLifetime)
+            return true;
+        entry = null!;
+        return false;
+    }
+
+    public async Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+        IReadOnlyCollection<string> accountHandles,
+        ReplicationIdentity localIdentity,
+        CancellationToken ct)
+        => await GetEmissionSnapshotAsync(
+            accountHandles,
+            localIdentity,
+            new Dictionary<string, long>(StringComparer.Ordinal),
+            ct).ConfigureAwait(false);
+
+    public async Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+        IReadOnlyCollection<string> accountHandles,
+        ReplicationIdentity localIdentity,
+        IReadOnlyDictionary<string, long> minimumObservedGenerations,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(accountHandles);
+        ArgumentNullException.ThrowIfNull(localIdentity);
+        ArgumentNullException.ThrowIfNull(minimumObservedGenerations);
+        var handles = accountHandles
+            .Append(ownHandle)
+            .Select(ReplicationHandle.Norm)
+            .Where(handle => handle.Length > 0)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (handles.Length == 0)
+            return new ReplicationEmissionRosterSnapshot(
+                ReplicationEmissionRosterState.Unavailable,
+                Array.Empty<ReplicationDevice>(),
+                new Dictionary<string, long>(StringComparer.Ordinal),
+                "no account handles were supplied");
+
+        var requestedAt = clock.GetUtcNow();
+        long requestedRosterVersion;
+        lock (gate) requestedRosterVersion = rosterVersion;
+        foreach (var handle in handles)
+        {
+            var needsRefresh = true;
+            var forceAuthoritative = false;
+            lock (gate)
+            {
+                needsRefresh = !TryGetFreshEntry(handle, requestedAt, out var current);
+                if (!needsRefresh
+                    && TryGetMinimumGeneration(
+                        minimumObservedGenerations, handle, out var required)
+                    && current.AuthGeneration < required)
+                {
+                    needsRefresh = true;
+                    forceAuthoritative = true;
+                }
+            }
+            if (!needsRefresh) continue;
+
+            surface($"emission roster wait account={DiagnosticHash(handle)} state=refresh");
+            try
+            {
+                var refresh = await RefreshHandleAsync(
+                    handle, requestedAt, forceAuthoritative, ct).ConfigureAwait(false);
+                if (refresh.Stale)
+                    return StaleSnapshot(
+                        $"authority generation changed while refreshing {DiagnosticHash(handle)}");
+                if (!refresh.Success)
+                {
+                    var refreshState = refresh.Error is null
+                        ? ReplicationEmissionRosterState.Unavailable
+                        : ReplicationEmissionRosterState.RefreshFailed;
+                    surface(
+                        $"emission roster account={DiagnosticHash(handle)} state=" +
+                        $"{(refreshState == ReplicationEmissionRosterState.RefreshFailed ? "refresh-failed" : "unavailable")}" +
+                        (refresh.Error is null ? "" : $";error={refresh.Error.GetType().Name}"));
+                    return new ReplicationEmissionRosterSnapshot(
+                        refreshState,
+                        Array.Empty<ReplicationDevice>(),
+                        new Dictionary<string, long>(StringComparer.Ordinal),
+                        refreshState == ReplicationEmissionRosterState.RefreshFailed
+                            ? "directory refresh failed"
+                            : "directory entry is unavailable");
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                surface(
+                    $"emission roster account={DiagnosticHash(handle)} state=refresh-failed " +
+                    $"error={ex.GetType().Name}");
+                return new ReplicationEmissionRosterSnapshot(
+                    ReplicationEmissionRosterState.RefreshFailed,
+                    Array.Empty<ReplicationDevice>(),
+                    new Dictionary<string, long>(StringComparer.Ordinal),
+                    "directory refresh failed");
+            }
+        }
+
+        List<ReplicationDevice> devices;
+        Dictionary<string, long> generations;
+        Dictionary<string, string> custodyHeads;
+        lock (gate)
+        {
+            var now = clock.GetUtcNow();
+            var missing = handles.FirstOrDefault(handle => !TryGetFreshEntry(handle, now, out _));
+            if (missing is not null)
+            {
+                surface($"emission roster account={DiagnosticHash(missing)} state=unavailable");
+                return new ReplicationEmissionRosterSnapshot(
+                    ReplicationEmissionRosterState.Unavailable,
+                    Array.Empty<ReplicationDevice>(),
+                    new Dictionary<string, long>(StringComparer.Ordinal),
+                    "one or more authoritative directory entries are unavailable");
+            }
+
+            var entries = handles.ToDictionary(handle => handle, handle => cache[handle], StringComparer.Ordinal);
+            var belowMinimum = entries.FirstOrDefault(item =>
+                TryGetMinimumGeneration(
+                    minimumObservedGenerations, item.Key, out var required)
+                && item.Value.AuthGeneration < required);
+            if (!string.IsNullOrEmpty(belowMinimum.Key))
+                return StaleSnapshot(
+                    $"directory generation for {DiagnosticHash(belowMinimum.Key)} is below the caller minimum");
+            if (rosterVersion < requestedRosterVersion)
+                return StaleSnapshot("roster version regressed");
+            devices = entries.Values
+                .SelectMany(entry => entry.Devices)
+                .Where(device => !device.Revoked)
+                .GroupBy(device => ReplicationHandle.Device(device.DeviceId), StringComparer.Ordinal)
+                .Select(group => group.First())
+                .ToList();
+            generations = entries.ToDictionary(
+                item => item.Key, item => item.Value.AuthGeneration, StringComparer.Ordinal);
+            custodyHeads = entries.ToDictionary(
+                item => item.Key, item => item.Value.CustodyHead, StringComparer.Ordinal);
+        }
+
+        if (!generations.TryGetValue(ownHandle, out var ownGeneration)
+            || ownGeneration != localIdentity.AuthGeneration
+            || !custodyHeads.TryGetValue(ownHandle, out var freshOwnHead)
+            || !CustodyHeadsAgree(freshOwnHead, localIdentity.CustodyHead))
+        {
+            surface($"emission roster account={DiagnosticHash(ownHandle)} state=generation-changed");
+            return new ReplicationEmissionRosterSnapshot(
+                ReplicationEmissionRosterState.GenerationChanged,
+                devices,
+                generations,
+                "local signing authority no longer matches the directory",
+                custodyHeads);
+        }
+
+        var ownOnly = handles.All(handle => string.Equals(handle, ownHandle, StringComparison.Ordinal));
+        var hasSibling = devices.Any(device =>
+            string.Equals(ReplicationHandle.Norm(device.Handle), ownHandle, StringComparison.Ordinal)
+            && !string.Equals(
+                ReplicationHandle.Device(device.DeviceId),
+                ReplicationHandle.Device(localIdentity.DeviceId),
+                StringComparison.Ordinal));
+        var state = ownOnly && !hasSibling
+            ? ReplicationEmissionRosterState.NoSiblings
+            : ReplicationEmissionRosterState.FreshComplete;
+        surface(
+            $"emission roster account={DiagnosticHash(ownHandle)} state={state} " +
+            $"recipient_slots={devices.Count}");
+        return new ReplicationEmissionRosterSnapshot(
+            state,
+            devices,
+            generations,
+            CustodyHeads: custodyHeads,
+            RosterVersion: Volatile.Read(ref rosterVersion),
+            ValidAt: clock.GetUtcNow());
+
+        ReplicationEmissionRosterSnapshot StaleSnapshot(string reason)
+        {
+            surface($"emission roster state=stale reason={reason}");
+            return new ReplicationEmissionRosterSnapshot(
+                ReplicationEmissionRosterState.Stale,
+                Array.Empty<ReplicationDevice>(),
+                new Dictionary<string, long>(StringComparer.Ordinal),
+                reason,
+                RosterVersion: Volatile.Read(ref rosterVersion),
+                ValidAt: clock.GetUtcNow());
+        }
+    }
+
+    private static bool TryGetMinimumGeneration(
+        IReadOnlyDictionary<string, long> minimumObservedGenerations,
+        string normalizedHandle,
+        out long generation)
+    {
+        foreach (var item in minimumObservedGenerations)
+        {
+            if (string.Equals(
+                    ReplicationHandle.Norm(item.Key),
+                    normalizedHandle,
+                    StringComparison.Ordinal))
+            {
+                generation = item.Value;
+                return true;
+            }
+        }
+        generation = -1;
+        return false;
     }
 
     /// <summary>Drops any cached entry for a handle so the next refresh re-fetches it.</summary>
@@ -2362,8 +2941,9 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
         lock (gate)
         {
             cache.Remove(h);
-            refreshAttempts.Remove(h);
-            authoritativeRefreshAttempts.Remove(h);
+            refreshFlights.Remove(h);
+            authorityEpochs[h] = authorityEpochs.GetValueOrDefault(h) + 1;
+            rosterVersion++;
         }
     }
 
@@ -2373,8 +2953,10 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
         lock (gate)
         {
             cache.Clear();
-            refreshAttempts.Clear();
-            authoritativeRefreshAttempts.Clear();
+            refreshFlights.Clear();
+            foreach (var handle in authorityEpochs.Keys.ToArray())
+                authorityEpochs[handle]++;
+            rosterVersion++;
         }
     }
 
@@ -2396,75 +2978,135 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(handles);
-        var requestedAt = DateTimeOffset.UtcNow;
+        var requestedAt = clock.GetUtcNow();
         foreach (var handle in handles
                      .Select(ReplicationHandle.Norm)
                      .Where(candidate => candidate.Length > 0)
                      .Distinct(StringComparer.Ordinal))
         {
-            await RefreshHandleAsync(handle, requestedAt, authoritative, ct).ConfigureAwait(false);
+            var result = await RefreshHandleAsync(handle, requestedAt, authoritative, ct)
+                .ConfigureAwait(false);
+            // Refresh is a cache-warming operation. Snapshot resolution reports an unavailable
+            // cached failure explicitly; pollers must remain live through transient directory loss.
         }
     }
 
-    private async Task RefreshHandleAsync(
+    private async Task<RefreshResult> RefreshHandleAsync(
         string handle,
         DateTimeOffset requestedAt,
         bool authoritative,
         CancellationToken ct)
     {
-        var refreshLock = refreshLocks.GetOrAdd(handle, static _ => new SemaphoreSlim(1, 1));
-        await refreshLock.WaitAsync(ct).ConfigureAwait(false);
+        Task<RefreshResult> shared;
+        lock (gate)
+        {
+            var now = clock.GetUtcNow();
+            var epoch = authorityEpochs.GetValueOrDefault(handle);
+            if (refreshFlights.TryGetValue(handle, out var existing)
+                && existing.AuthorityEpoch == epoch
+                && (!existing.Task.IsCompleted
+                    || existing.Task.IsCompletedSuccessfully
+                    && !existing.Task.Result.Success
+                    && now - existing.Task.Result.CompletedAt < AuthoritativeRefreshCooldown))
+            {
+                shared = existing.Task;
+            }
+            else if (!authoritative
+                     && cache.TryGetValue(handle, out var current)
+                     && now - current.FetchedAt < CacheLifetime)
+            {
+                return new RefreshResult(true, false, null, now);
+            }
+            else
+            {
+                shared = FetchHandleSharedAsync(handle, epoch, CancellationToken.None);
+                refreshFlights[handle] = new RefreshFlight(epoch, authoritative, shared);
+            }
+        }
+
+        // A waiter may leave without cancelling the refresh needed by every other caller.
+        return await shared.WaitAsync(ct).ConfigureAwait(false);
+    }
+
+    private async Task<RefreshResult> FetchHandleSharedAsync(
+        string handle,
+        long authorityEpoch,
+        CancellationToken fetchToken)
+    {
         try
         {
-            ct.ThrowIfCancellationRequested();
-            var now = DateTimeOffset.UtcNow;
-            lock (gate)
-            {
-                if (!authoritative
-                    && cache.TryGetValue(handle, out var current)
-                    && now - current.FetchedAt < CacheLifetime)
-                    return;
-                if (refreshAttempts.TryGetValue(handle, out var attemptedAt)
-                    && attemptedAt >= requestedAt)
-                    return;
-                if (authoritative
-                    && authoritativeRefreshAttempts.TryGetValue(handle, out var authoritativeAt)
-                    && now - authoritativeAt < AuthoritativeRefreshCooldown)
-                    return;
-            }
-
-            var info = await source.FetchHandleAsync(handle, ct).ConfigureAwait(false);
-            var fetchedAt = DateTimeOffset.UtcNow;
+            var info = await source.FetchHandleAsync(handle, fetchToken).ConfigureAwait(false);
+            var fetchedAt = clock.GetUtcNow();
             if (info is null)
             {
-                lock (gate)
-                {
-                    refreshAttempts[handle] = fetchedAt;
-                    if (authoritative) authoritativeRefreshAttempts[handle] = fetchedAt;
-                }
                 surface($"directory entry for '{handle}' is unavailable");
-                return;
+                return new RefreshResult(
+                    false,
+                    false,
+                    null,
+                    fetchedAt);
             }
 
             var devices = (info.DevicePublicKeys ?? Array.Empty<string>())
                 .Where(pk => !string.IsNullOrWhiteSpace(pk))
                 .Select(pk => new ReplicationDevice(
-                    handle, DeviceProtocol.DeviceId(pk), pk, info.AuthGeneration, Revoked: false))
+                    handle,
+                    ReplicationHandle.Device(DeviceProtocol.DeviceId(pk)),
+                    pk,
+                    info.AuthGeneration,
+                    Revoked: false))
                 .ToList();
 
             lock (gate)
             {
-                cache[handle] = new Entry(devices, info.AuthGeneration, info.CustodyHead ?? "", fetchedAt);
-                refreshAttempts[handle] = fetchedAt;
-                if (authoritative) authoritativeRefreshAttempts[handle] = fetchedAt;
+                if (authorityEpochs.GetValueOrDefault(handle) != authorityEpoch)
+                    return new RefreshResult(false, true, null, fetchedAt);
+                cache[handle] = new Entry(
+                    devices, info.AuthGeneration, info.CustodyHead ?? "", fetchedAt);
+                rosterVersion++;
             }
 
             if (string.Equals(handle, ownHandle, StringComparison.Ordinal))
                 CrossCheckOwnAuthority(info);
+            return new RefreshResult(true, false, null, fetchedAt);
         }
-        finally
+        catch (OperationCanceledException) when (fetchToken.IsCancellationRequested)
         {
-            refreshLock.Release();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new RefreshResult(false, false, ex, clock.GetUtcNow());
+        }
+    }
+
+    internal Task RefreshOwnedAsync(
+        IReadOnlyList<string> handles,
+        bool authoritative,
+        CancellationToken ownerToken)
+        => RefreshOwnedCoreAsync(handles, authoritative, ownerToken);
+
+    private async Task RefreshOwnedCoreAsync(
+        IReadOnlyList<string> handles,
+        bool authoritative,
+        CancellationToken ownerToken)
+    {
+        ArgumentNullException.ThrowIfNull(handles);
+        foreach (var handle in handles
+                     .Select(ReplicationHandle.Norm)
+                     .Where(candidate => candidate.Length > 0)
+                     .Distinct(StringComparer.Ordinal))
+        {
+            long epoch;
+            lock (gate)
+            {
+                if (!authoritative
+                    && cache.TryGetValue(handle, out var current)
+                    && clock.GetUtcNow() - current.FetchedAt < CacheLifetime)
+                    continue;
+                epoch = authorityEpochs.GetValueOrDefault(handle);
+            }
+            _ = await FetchHandleSharedAsync(handle, epoch, ownerToken).ConfigureAwait(false);
         }
     }
 
@@ -2492,6 +3134,10 @@ public sealed class RelayReplicationRoster : IRefreshableReplicationRoster
         if (IsEmpty(local) && IsEmpty(relay)) return true;
         return string.Equals(local, relay, StringComparison.Ordinal);
     }
+
+    private static string DiagnosticHash(string value)
+        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value ?? "")))
+            .ToLowerInvariant()[..16];
 }
 
 /// <summary>
@@ -2511,6 +3157,8 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
     private static readonly TimeSpan PendingInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan IdleInterval = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan MaxPendingInterval = TimeSpan.FromSeconds(12);
+    internal static readonly TimeSpan PollFailureRetryBaseDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan MaxPollFailureRetryDelay = TimeSpan.FromSeconds(2);
     internal static readonly TimeSpan OfflineWakeInterval = TimeSpan.FromMinutes(1);
 
     private readonly OnlineReplicationEngine engine;
@@ -2523,16 +3171,27 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
     private readonly Action<string> surface;
     private readonly Func<ReplicationBootstrapTarget, CancellationToken, Task>? bootstrapPeer;
     private readonly Action<bool, bool>? pollCompleted;
+    private readonly Action<IReadOnlyCollection<string>>? rosterOnline;
+    private readonly Action<IReadOnlyCollection<string>>? accountRosterObserved;
 
     private readonly object gate = new();
     private readonly Random jitter = new();
+    private readonly CancellationTokenSource pollLifetime = new();
     private CancellationTokenSource? loopCts;
     private Task? loopTask;
-    private TaskCompletionSource<bool>? poke;
     private readonly Dictionary<string, DateTimeOffset> offlineWakes = new(StringComparer.Ordinal);
+    private Dictionary<string, string> onlineRosterIdentities = new(StringComparer.Ordinal);
+    private HashSet<string>? observedAccountRoster;
     private Task? disposeTask;
+    private PollFlight? pollFlight;
+    private long nextPollFlightId;
+    private long requestedPollGeneration;
+    private long completedPollGeneration;
+    private bool pendingPoll;
     private bool runningRequested;
     private int backoffStep;
+    private int pollFailureBackoffStep;
+    private bool pollLifetimeDisposed;
     private volatile bool onlineAuthorizedPeer;
     private volatile bool immediatelyDeliverableWork;
     private volatile bool pendingSynchronizationWork;
@@ -2549,7 +3208,9 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         string ownDevice,
         Action<string> surface,
         Func<ReplicationBootstrapTarget, CancellationToken, Task>? bootstrapPeer = null,
-        Action<bool, bool>? pollCompleted = null)
+        Action<bool, bool>? pollCompleted = null,
+        Action<IReadOnlyCollection<string>>? rosterOnline = null,
+        Action<IReadOnlyCollection<string>>? accountRosterObserved = null)
     {
         this.engine = engine ?? throw new ArgumentNullException(nameof(engine));
         this.roster = roster ?? throw new ArgumentNullException(nameof(roster));
@@ -2561,12 +3222,31 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         this.surface = surface ?? (_ => { });
         this.bootstrapPeer = bootstrapPeer;
         this.pollCompleted = pollCompleted;
+        this.rosterOnline = rosterOnline;
+        this.accountRosterObserved = accountRosterObserved;
     }
 
     public bool HasOnlineAuthorizedPeer => onlineAuthorizedPeer;
     public bool HasImmediatelyDeliverableWork => immediatelyDeliverableWork;
     public bool HasPendingSynchronizationWork => pendingSynchronizationWork;
     public string? LastOnlinePeerDevice => Volatile.Read(ref lastOnlinePeerDevice);
+    internal Action? BeforePollFlightFinalize { get; set; }
+    internal (long Requested, long Completed, bool Pending, bool Active) PollFlightState
+    {
+        get
+        {
+            lock (gate)
+                return (requestedPollGeneration, completedPollGeneration, pendingPoll, pollFlight is not null);
+        }
+    }
+    internal (bool LifetimeDisposed, bool LoopOwned, bool Active) PollResourceState
+    {
+        get
+        {
+            lock (gate)
+                return (pollLifetimeDisposed, loopCts is not null || loopTask is not null, pollFlight is not null);
+        }
+    }
 
     /// <summary>Starts (or restarts) the polling loop, polling immediately.</summary>
     public void Start()
@@ -2584,7 +3264,6 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         if (disposed || loopTask is { IsCompleted: false }) return;
         var cts = new CancellationTokenSource();
         loopCts = cts;
-        poke = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         backoffStep = 0;
         loopTask = Task.Run(() => RunOwnedLoopAsync(cts));
     }
@@ -2625,14 +3304,23 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         try { cts?.Cancel(); } catch (ObjectDisposedException) { }
     }
 
-    /// <summary>Requests an immediate poll on the next loop iteration.</summary>
+    /// <summary>Requests an immediate poll, coalescing with any active flight.</summary>
     public void Poke()
     {
-        lock (gate) poke?.TrySetResult(true);
+        PollFlight? created = null;
+        lock (gate)
+        {
+            if (disposed) return;
+            requestedPollGeneration++;
+            pendingPoll = true;
+            if (pollFlight is null)
+                pollFlight = created = CreatePollFlightUnderLock();
+        }
+        if (created is not null) StartPollFlight(created);
     }
 
     /// <summary>Runs one poll pass synchronously (used by tests and the immediate-on-connect path).</summary>
-    public Task<bool> PollOnceAsync(CancellationToken ct) => PollCoreAsync(ct);
+    public Task<bool> PollOnceAsync(CancellationToken ct) => PollSingleFlightAsync(ct);
 
     private async Task RunAsync(CancellationToken ct)
     {
@@ -2641,7 +3329,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
             bool pending;
             try
             {
-                pending = await PollCoreAsync(ct).ConfigureAwait(false);
+                pending = await PollSingleFlightAsync(ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex)
@@ -2654,6 +3342,154 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
             try { await WaitAsync(delay, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
         }
+    }
+
+    private Task<bool> PollSingleFlightAsync(CancellationToken ct)
+    {
+        PollFlight flight;
+        lock (gate)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(ReplicationPresencePoller));
+            if (pollFlight is { } active)
+                flight = active;
+            else
+                pollFlight = flight = CreatePollFlightUnderLock();
+        }
+        StartPollFlight(flight);
+        return flight.Completion.Task.WaitAsync(ct);
+    }
+
+    private PollFlight CreatePollFlightUnderLock(
+        bool readyToStart = true,
+        TimeSpan startDelay = default)
+    {
+        var owner = CancellationTokenSource.CreateLinkedTokenSource(pollLifetime.Token);
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        return new PollFlight(
+            ++nextPollFlightId,
+            requestedPollGeneration,
+            owner,
+            completion,
+            readyToStart,
+            startDelay);
+    }
+
+    private void StartPollFlight(PollFlight flight)
+    {
+        lock (gate)
+        {
+            if (flight.Started
+                || !flight.ReadyToStart
+                || disposed
+                || !ReferenceEquals(pollFlight, flight))
+                return;
+            flight.CoveredGeneration = requestedPollGeneration;
+            flight.Started = true;
+        }
+        _ = Task.Run(() => RunPollFlightAsync(flight));
+    }
+
+    private async Task RunPollFlightAsync(PollFlight flight)
+    {
+        bool result = false;
+        Exception? error = null;
+        try
+        {
+            result = await PollCoreAsync(flight.Owner.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        try
+        {
+            BeforePollFlightFinalize?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            error ??= ex;
+        }
+
+        PollFlight? successor = null;
+        TimeSpan successorDelay = TimeSpan.Zero;
+        lock (gate)
+        {
+            if (!ReferenceEquals(pollFlight, flight))
+                return;
+
+            if (error is null)
+            {
+                completedPollGeneration = Math.Max(
+                    completedPollGeneration,
+                    flight.CoveredGeneration);
+                pollFailureBackoffStep = 0;
+            }
+            pendingPoll = !disposed
+                && requestedPollGeneration > completedPollGeneration;
+            var needsSuccessor = pendingPoll;
+
+            // The promise becomes terminal while this flight still owns the active slot.
+            // RunContinuationsAsynchronously prevents a waiter from re-entering this lock.
+            if (error is OperationCanceledException canceled)
+                flight.Completion.TrySetCanceled(canceled.CancellationToken);
+            else if (error is not null)
+                flight.Completion.TrySetException(error);
+            else
+                flight.Completion.TrySetResult(result);
+
+            if (needsSuccessor)
+            {
+                if (error is not null)
+                    successorDelay = NextPollFailureRetryDelayUnderLock();
+                pollFlight = successor = CreatePollFlightUnderLock(
+                    readyToStart: false,
+                    startDelay: successorDelay);
+            }
+            else
+                pollFlight = null;
+        }
+
+        flight.Owner.Dispose();
+        if (successor is not null)
+        {
+            if (successorDelay > TimeSpan.Zero)
+                _ = ArmPollFlightAfterDelayAsync(successor);
+            else
+                ArmPollFlight(successor);
+        }
+    }
+
+    private TimeSpan NextPollFailureRetryDelayUnderLock()
+    {
+        var step = Math.Min(++pollFailureBackoffStep, 6);
+        var delay = TimeSpan.FromMilliseconds(
+            PollFailureRetryBaseDelay.TotalMilliseconds * Math.Pow(2, step - 1));
+        return delay > MaxPollFailureRetryDelay ? MaxPollFailureRetryDelay : delay;
+    }
+
+    private async Task ArmPollFlightAfterDelayAsync(PollFlight flight)
+    {
+        try
+        {
+            await Task.Delay(flight.StartDelay, pollLifetime.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (pollLifetime.IsCancellationRequested)
+        {
+            return;
+        }
+        ArmPollFlight(flight);
+    }
+
+    private void ArmPollFlight(PollFlight flight)
+    {
+        lock (gate)
+        {
+            if (ReferenceEquals(pollFlight, flight) && !disposed)
+                flight.ReadyToStart = true;
+        }
+        StartPollFlight(flight);
     }
 
     private async Task<bool> PollCoreAsync(CancellationToken ct)
@@ -2669,11 +3505,12 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         Volatile.Write(ref lastOnlinePeerDevice, null);
         if (candidates.Length == 0)
         {
+            onlineRosterIdentities = new(StringComparer.Ordinal);
             ReportPollCompleted(hasOnlinePeer: false, hasPendingWork: false);
             return false;
         }
 
-        await roster.RefreshAsync(candidates, ct).ConfigureAwait(false);
+        await roster.RefreshOwnedAsync(candidates, authoritative: false, ct).ConfigureAwait(false);
         var presence = await source.ResolvePresenceAsync(candidates, ct).ConfigureAwait(false);
         var stalePresenceHandles = new HashSet<string>(StringComparer.Ordinal);
         foreach (var handle in presence)
@@ -2692,8 +3529,9 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
             }
         }
         if (stalePresenceHandles.Count > 0)
-            await roster.RefreshAuthoritativeAsync(
-                stalePresenceHandles.ToArray(), ct).ConfigureAwait(false);
+            await roster.RefreshOwnedAsync(
+                stalePresenceHandles.ToArray(), authoritative: true, ct).ConfigureAwait(false);
+        ReportAccountRoster(presence);
 
         var dueHandles = new HashSet<string>(StringComparer.Ordinal);
         var pendingDevices = new Dictionary<string, bool>(StringComparer.Ordinal);
@@ -2732,6 +3570,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
 
         var onlineAuthorized = false;
         var onlinePending = false;
+        var onlineRosterDevices = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var handle in presence)
         {
             var handleName = ReplicationHandle.Norm(handle.Handle);
@@ -2748,6 +3587,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
                 if (resolved is null || resolved.Revoked) continue;
                 onlineAuthorized = true;
                 onlineAuthorizedPeer = true;
+                onlineRosterDevices[device] = AvailabilityIdentity(handleName, resolved);
                 var peerPending = pendingDevices.TryGetValue(device, out var pending) && pending;
                 onlinePending |= peerPending;
                 Volatile.Write(ref lastOnlinePeerDevice, device);
@@ -2806,9 +3646,69 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
 
         immediatelyDeliverableWork = onlinePending;
         pendingSynchronizationWork = dueHandles.Count > 0;
+        var availabilityTransitions = onlineRosterDevices
+            .Where(item => !onlineRosterIdentities.TryGetValue(item.Key, out var previous)
+                           || !string.Equals(previous, item.Value, StringComparison.Ordinal))
+            .Select(static item => item.Key)
+            .ToArray();
+        if (availabilityTransitions.Length > 0)
+        {
+            try
+            {
+                rosterOnline?.Invoke(availabilityTransitions);
+                onlineRosterIdentities = onlineRosterDevices;
+            }
+            catch (Exception ex)
+            {
+                surface($"roster-online callback failed: {ex.Message}");
+                onlineRosterIdentities = onlineRosterDevices
+                    .Where(item => !availabilityTransitions.Contains(item.Key, StringComparer.Ordinal))
+                    .ToDictionary(
+                        static item => item.Key,
+                        static item => item.Value,
+                        StringComparer.Ordinal);
+            }
+        }
+        else
+        {
+            onlineRosterIdentities = onlineRosterDevices;
+        }
         ReportPollCompleted(onlinePending, pendingSynchronizationWork);
         return onlineAuthorized || pendingSynchronizationWork;
     }
+
+    private void ReportAccountRoster(IReadOnlyList<RelayHandlePresence> presence)
+    {
+        if (accountRosterObserved is null || ownHandle.Length == 0) return;
+        var own = presence.FirstOrDefault(item =>
+            string.Equals(ReplicationHandle.Norm(item.Handle), ownHandle, StringComparison.Ordinal));
+        if (own is null) return;
+
+        var online = own.Online
+            ? (own.Devices ?? Array.Empty<string>())
+                .Where(static device => !string.IsNullOrWhiteSpace(device))
+                .ToHashSet(StringComparer.Ordinal)
+            : new HashSet<string>(StringComparer.Ordinal);
+        if (observedAccountRoster?.SetEquals(online) == true) return;
+
+        try
+        {
+            accountRosterObserved(online.ToArray());
+            observedAccountRoster = online;
+        }
+        catch (Exception ex)
+        {
+            surface($"account roster callback failed: {ex.Message}");
+        }
+    }
+
+    private static string AvailabilityIdentity(string handle, ReplicationDevice device)
+        => string.Join(
+            "\0",
+            handle,
+            device.DeviceId,
+            device.AuthGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Convert.ToHexString(SHA256.HashData(Convert.FromBase64String(device.PublicKeyB64))));
 
     private bool ShouldWakeOfflinePeer(string peerDeviceId, DateTimeOffset now)
     {
@@ -2850,19 +3750,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
     }
 
     private async Task WaitAsync(TimeSpan delay, CancellationToken ct)
-    {
-        Task pokeTask;
-        lock (gate)
-        {
-            poke ??= new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            pokeTask = poke.Task;
-        }
-        var completed = await Task.WhenAny(pokeTask, Task.Delay(delay, ct)).ConfigureAwait(false);
-        if (completed == pokeTask)
-        {
-            lock (gate) poke = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        }
-    }
+        => await Task.Delay(delay, ct).ConfigureAwait(false);
 
     public void Dispose()
         => DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -2871,6 +3759,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
     {
         Task task;
         Task? loop;
+        Task? flight;
         CancellationTokenSource? cts;
         TaskCompletionSource<bool> completion;
         lock (gate)
@@ -2878,33 +3767,124 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
             if (disposeTask is not null) return new ValueTask(disposeTask);
             disposed = true;
             runningRequested = false;
+            pendingPoll = false;
             cts = loopCts;
             loop = loopTask;
+            flight = pollFlight?.Completion.Task;
+            if (pollFlight is { Started: false } unstarted)
+            {
+                unstarted.Completion.TrySetCanceled();
+                pollFlight = null;
+                unstarted.Owner.Dispose();
+            }
             completion = new TaskCompletionSource<bool>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             task = completion.Task;
             disposeTask = task;
         }
 
-        _ = CompleteDisposeAsync(cts, loop, completion);
+        _ = CompleteDisposeAsync(cts, loop, flight, completion);
         return new ValueTask(task);
     }
 
-    private static async Task CompleteDisposeAsync(
+    private async Task CompleteDisposeAsync(
         CancellationTokenSource? cts,
         Task? loop,
+        Task? flight,
         TaskCompletionSource<bool> completion)
     {
+        var errors = new List<Exception>();
         try
         {
             try { cts?.Cancel(); }
             catch (ObjectDisposedException) { }
-            if (loop is not null) await loop.ConfigureAwait(false);
-            completion.TrySetResult(true);
+            catch (Exception ex) { errors.Add(ex); }
+            try { pollLifetime.Cancel(); }
+            catch (ObjectDisposedException) { }
+            catch (Exception ex) { errors.Add(ex); }
+            var drains = new[] { loop, flight }
+                .Where(static task => task is not null)
+                .Cast<Task>()
+                .Distinct()
+                .ToArray();
+            foreach (var drain in drains)
+            {
+                try
+                {
+                    await drain.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (pollLifetime.IsCancellationRequested)
+                {
+                    // Cancellation is the expected completion mode for capture/emission waits
+                    // owned by the poll flight during disconnect or session replacement.
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+            }
         }
         catch (Exception ex)
         {
-            completion.TrySetException(ex);
+            errors.Add(ex);
         }
+        finally
+        {
+            PollFlight? remainingFlight;
+            lock (gate)
+            {
+                pendingPoll = false;
+                remainingFlight = pollFlight;
+                pollFlight = null;
+                loopCts = null;
+                loopTask = null;
+                offlineWakes.Clear();
+                onlineRosterIdentities.Clear();
+                observedAccountRoster = null;
+                remainingFlight?.Completion.TrySetCanceled();
+            }
+
+            try { remainingFlight?.Owner.Dispose(); }
+            catch (Exception ex) { errors.Add(ex); }
+            try { cts?.Dispose(); }
+            catch (Exception ex) { errors.Add(ex); }
+            try
+            {
+                pollLifetime.Dispose();
+                lock (gate) pollLifetimeDisposed = true;
+            }
+            catch (Exception ex)
+            {
+                errors.Add(ex);
+            }
+        }
+
+        if (errors.Count == 0)
+            completion.TrySetResult(true);
+        else if (errors.Count == 1)
+            completion.TrySetException(errors[0]);
+        else
+        {
+            completion.TrySetException(new AggregateException(
+                "Replication presence poller disposal encountered multiple errors.",
+                errors));
+        }
+    }
+
+    private sealed class PollFlight(
+        long id,
+        long coveredGeneration,
+        CancellationTokenSource owner,
+        TaskCompletionSource<bool> completion,
+        bool readyToStart,
+        TimeSpan startDelay)
+    {
+        public long Id { get; } = id;
+        public long CoveredGeneration { get; set; } = coveredGeneration;
+        public CancellationTokenSource Owner { get; } = owner;
+        public TaskCompletionSource<bool> Completion { get; } = completion;
+        public bool ReadyToStart { get; set; } = readyToStart;
+        public TimeSpan StartDelay { get; } = startDelay;
+        public bool Started { get; set; }
     }
 }

@@ -58,6 +58,7 @@ public static class MauiProgram
 		builder.Services.AddHttpClient("model", c => c.Timeout = TimeSpan.FromMinutes(10));
 		builder.Services.AddHttpClient("connector");
 		builder.Services.AddHttpClient("relay");
+		builder.Services.AddSingleton(TimeProvider.System);
 		// The self-updater downloads a large (hundreds of MB) client zip, so give it a generous
 		// timeout and the User-Agent the GitHub API requires.
 		builder.Services.AddHttpClient("updater", c =>
@@ -74,6 +75,20 @@ public static class MauiProgram
 		builder.Services.AddSingleton<ISecretStore, SecretStore>();
 #endif
 		builder.Services.AddSingleton<IAppLifecycleState, AppLifecycleState>();
+		builder.Services.AddSingleton<UiOperationCoordinator>();
+		builder.Services.AddSingleton<ITopicSendIdentityStore>(_ =>
+			new KeyValueTopicSendIdentityStore(
+				key => Preferences.Default.Get(key, ""),
+				(key, value) => Preferences.Default.Set(key, value),
+				key => Preferences.Default.Remove(key)));
+		builder.Services.AddSingleton<ITopicSendReconciliationQuery>(services =>
+			new AppStateTopicSendReconciliationQuery(
+				services.GetRequiredService<AppState>()));
+		builder.Services.AddSingleton<TopicSendCoordinator>(services =>
+			new TopicSendCoordinator(
+				identityStore: services.GetRequiredService<ITopicSendIdentityStore>(),
+				reconciliationQuery: services.GetRequiredService<ITopicSendReconciliationQuery>()));
+		builder.Services.AddSingleton<ComposerRevisionGuard>();
 #if WINDOWS
 		builder.Services.AddSingleton<IAppControl, Mesh.App.Platforms.Windows.WindowsAppControl>();
 		builder.Services.AddSingleton<INotifier, Mesh.App.Platforms.Windows.WindowsNotifier>();
@@ -207,4 +222,5 @@ public static class MauiProgram
 		});
 		return app;
 	}
+
 }

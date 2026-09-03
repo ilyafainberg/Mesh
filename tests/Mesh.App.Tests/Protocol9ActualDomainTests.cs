@@ -263,7 +263,13 @@ public sealed class Protocol9ActualDomainTests : ReplicationTestBase
     // =======================================================================
 
     private static ReplicationPayloadCodec.DomainEnvelope TopicUpsert(
-        string id, string title, string causal = "v1", bool pinned = false)
+        string id,
+        string title,
+        string causal = "v1",
+        bool pinned = false,
+        string? executionDeviceId = null,
+        string? executionRunId = null,
+        string? executionPlatform = null)
         => new(ReplicationOpKinds.Topic, ReplicationPayloadCodec.DomainAction.Upsert, id, id, causal,
             Body(new
             {
@@ -271,13 +277,13 @@ public sealed class Protocol9ActualDomainTests : ReplicationTestBase
                 Title = title,
                 CreatedAt = DateTimeOffset.UtcNow,
                 SortOrder = 0,
-                ExecutionDeviceId = (string?)null,
-                ExecutionDeviceName = (string?)null,
-                ExecutionDevicePlatform = (string?)null,
+                ExecutionDeviceId = executionDeviceId,
+                ExecutionDeviceName = executionDeviceId is null ? null : "Execution host",
+                ExecutionDevicePlatform = executionPlatform,
                 LastActivityAt = (DateTimeOffset?)DateTimeOffset.UtcNow,
                 IsPinned = pinned,
-                ExecutionAt = (DateTimeOffset?)null,
-                ExecutionRunId = (string?)null
+                ExecutionAt = executionRunId is null ? null : (DateTimeOffset?)DateTimeOffset.UtcNow,
+                ExecutionRunId = executionRunId
             }));
 
     [TestMethod]
@@ -835,6 +841,50 @@ public sealed class Protocol9ActualDomainTests : ReplicationTestBase
     }
 
     [TestMethod]
+    public async Task Inbound_TopicRunAndMessagesReachSiblingAccountDevice()
+    {
+        var (a, b) = await PairAsync();
+        await a.Engine.EmitLocalAsync(
+            TopicUpsert(
+                "t-run",
+                "Replicated run",
+                executionDeviceId: "desktop-host",
+                executionRunId: "run-1",
+                executionPlatform: DevicePlatforms.Windows),
+            new[] { "alice" });
+        await a.Engine.EmitLocalAsync(
+            LineEnv(
+                "t-run",
+                Line("prompt-1", "account-wide prompt"),
+                "v2",
+                ReplicationOpKinds.Topic),
+            new[] { "alice" });
+        await a.Engine.EmitLocalAsync(
+            LineEnv(
+                "t-run",
+                Line("answer-1", "account-wide answer", "assistant"),
+                "v3",
+                ReplicationOpKinds.Topic),
+            new[] { "alice" });
+
+        await Fabric.DrainAsync();
+
+        Assert.AreEqual(
+            "desktop-host",
+            Text(b.Db, "SELECT execution_device_id FROM own_threads WHERE id = 't-run';"));
+        Assert.AreEqual(
+            "run-1",
+            Text(b.Db, "SELECT execution_run_id FROM own_threads WHERE id = 't-run';"));
+        Assert.AreEqual(1, OwnChatCount(b.Db, "t-run", "prompt-1"));
+        Assert.AreEqual(1, OwnChatCount(b.Db, "t-run", "answer-1"));
+        Assert.AreEqual(
+            "account-wide answer",
+            Text(
+                b.Db,
+                "SELECT text FROM own_chat WHERE thread_id = 't-run' AND line_id = 'answer-1';"));
+    }
+
+    [TestMethod]
     public async Task Inbound_Contact_WritesTheReceiversActualProfileBlob()
     {
         var (a, b) = await PairAsync();
@@ -1167,5 +1217,4 @@ public sealed class Protocol9ActualDomainTests : ReplicationTestBase
         Assert.AreEqual(5, EventCount(node.Db));
     }
 }
-
 

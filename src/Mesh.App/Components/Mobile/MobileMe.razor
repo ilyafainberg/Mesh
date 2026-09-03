@@ -8,12 +8,17 @@
 @inject AgentService Agent
 @inject MeshClient Mesh
 @inject ITopicExecutionRouter TopicRouter
+@inject UiOperationCoordinator UiOperations
+@inject TopicSendCoordinator TopicSends
+@inject ComposerRevisionGuard ComposerRevisions
 @inject LocalFileRegistry LocalFiles
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 @inject NotificationViewState NotificationViews
+@implements IAsyncDisposable
 @implements IDisposable
 
+<RendererDispatcherCapture DispatcherCaptured="CaptureObserverDispatcher" />
 <MobileOverlayScope Active="@(newDeviceMenuOpen || moveMenuOpen || pendingMove is not null)" />
 
 @if (Active is null)
@@ -116,7 +121,7 @@
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "Talk to this device" : $"Talk to {FriendlyName(device)}")</strong>
-                            <small>@(device.Online ? "Online" : "Offline")</small>
+                            <small>@DeviceAvailability(device)</small>
                         </span>
                     </button>
                 }
@@ -241,6 +246,7 @@ else
                                     <span>@QueueLabel(line)</span>
                                     <button type="button" class="queue-cancel" title="Cancel queued turn"
                                             aria-label="Cancel queued turn" @onclick="() => CancelQueued(line)"
+                                            disabled="@IsQueuedCancellationPending(line)"
                                             @onclick:stopPropagation="true">
                                         <i class="bi bi-x-lg"></i>
                                     </button>
@@ -438,7 +444,7 @@ else
                                 <i class="bi bi-paperclip"></i>
                                 <span class="attach-name">@a.Name</span>
                                 <span class="attach-size">@a.SizeLabel</span>
-                                <button class="chip-x" @onclick="() => attachments.Remove(a)" title="Remove" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
+                                <button class="chip-x" @onclick="() => RemoveAttachment(a)" title="Remove" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
                             </span>
                         }
                     </div>
@@ -485,18 +491,59 @@ else
                               placeholder="@ComposerPlaceholder" aria-label="@ComposerAriaLabel"></textarea>
                     @if (ShowStopAction)
                     {
-                        <button class="primary send-btn stop-btn" @onclick="StopActive" title="Stop current run" aria-label="Stop current run">
+                        <button class="primary send-btn stop-btn" @onclick="StopActive"
+                                disabled="@StopPending"
+                                title="@(StopPending ? "Cancellation pending" : "Stop current run")"
+                                aria-label="@(StopPending ? "Cancellation pending" : "Stop current run")">
                             <i class="bi bi-stop-fill"></i>
                         </button>
                     }
                     else
                     {
-                        <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend)" title="@SendTitle" aria-label="@SendTitle">
+                        <button class="primary send-btn" @onclick="Send" disabled="@(!CanSend || SendPending)" title="@SendTitle" aria-label="@SendTitle">
                             <i class="bi @(widgetMode || selectedWidget is not null ? "bi-magic" : "bi-send")"></i>
                         </button>
                     }
                 </div>
+                @if (TopicRestorePending)
+                {
+                    <div class="warn-banner" role="status"><i class="bi bi-arrow-repeat"></i> Restoring local topic state…</div>
+                }
+                @if (SendPending)
+                {
+                    <div class="warn-banner" role="status" aria-live="polite">
+                        <i class="bi bi-arrow-repeat spin"></i>
+                        @(ReconciliationPending
+                            ? "Checking the durable handoff status…"
+                            : "Preparing durable local handoff…")
+                        @if (ReconciliationPending)
+                        {
+                            <button class="link-btn" @onclick="ReconcilePendingSend" aria-label="Check status">Check status</button>
+                        }
+                    </div>
+                }
+                else if (ReconciliationPending)
+                {
+                    <div class="warn-banner" role="status" aria-live="polite">
+                        <i class="bi bi-shield-exclamation"></i>
+                        Durable handoff status is unavailable. No duplicate was submitted.
+                        <button class="link-btn" @onclick="ReconcilePendingSend" aria-label="Retry status">Retry status</button>
+                    </div>
+                }
                 @if (attachError is not null) { <p class="err-text">@attachError</p> }
+                @if (capacityBlockedSubmission is not null)
+                {
+                    <p class="err-text" role="alert" aria-live="assertive">
+                        Too many topic sends are being prepared right now. Your draft is unchanged.
+                        <button class="link-btn" @onclick="RetryCapacityBlockedSend">Retry send</button>
+                    </p>
+                }
+                @if (DraftError is not null)
+                {
+                    <p class="err-text" role="alert">
+                        @DraftError <button class="link-btn" @onclick="RetryDraft">Retry save</button>
+                    </p>
+                }
                 @if (Active is not null && !ActiveDeviceOnline)
                 {
                     <div class="warn-banner" role="status"><i class="bi bi-cloud-arrow-up"></i> @DeviceLabel(Active) is offline. New turns will wait securely until it reconnects.</div>
@@ -533,7 +580,7 @@ else
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "This device" : FriendlyName(device))</strong>
-                            <small>@(device.Online ? "Online" : "Offline")</small>
+                            <small>@DeviceAvailability(device)</small>
                         </span>
                     </button>
                 }
@@ -560,6 +607,9 @@ else
 <ReportDialog @ref="reportDialog" />
 
 @code {
+    internal static Action<string>? BeforeBeginTopicRunCheckpointHook { get; set; }
+    internal static Action<string>? DurableBeginCheckpointHook { get; set; }
+
     string inputValue = "";
     string input
     {
@@ -568,7 +618,16 @@ else
         {
             if (string.Equals(inputValue, value, StringComparison.Ordinal)) return;
             inputValue = value;
-            if (activeThreadValue is not null) State.SetTopicDraft(activeThreadValue, value);
+            if (activeThreadValue is not null)
+            {
+                inputRevision = ScheduleComposerSnapshot();
+                if (inputRevision > 0)
+                    ComposerRevisions.SetExact(activeThreadValue, inputRevision, value);
+            }
+            else
+            {
+                inputRevision++;
+            }
         }
     }
     ReportDialog? reportDialog;
@@ -578,6 +637,7 @@ else
     bool widgetMode;
     bool widgetPickerOpen;
     Widget? selectedWidget;
+    string? selectedWidgetId;
     bool widgetLoading;
     string? widgetLoadError;
     bool newDeviceMenuOpen;
@@ -599,9 +659,20 @@ else
         {
             if (string.Equals(activeThreadValue, value, StringComparison.Ordinal)) return;
             activeThreadValue = value;
+            navigationGeneration++;
             NotificationViews.SetVisibleEntities("mobile-topics", value is null ? Array.Empty<string>() : new[] { value });
             messageRenderCount = MessageRenderWindow.InitialCount;
-            inputValue = value is null ? "" : State.GetTopicDraft(value);
+            inputValue = "";
+            attachments.Clear();
+            widgetMode = false;
+            widgetPickerOpen = false;
+            selectedWidget = null;
+            selectedWidgetId = null;
+            widgetLoading = false;
+            widgetLoadError = null;
+            inputRevision = value is null
+                ? inputRevision + 1
+                : 0;
         }
     }
     string? pinHtml;
@@ -618,6 +689,19 @@ else
     string? lastScrolledThread;
     bool lastBusy;
     bool disposed;
+    Task? disposalTask;
+    long navigationGeneration;
+    long inputRevision;
+    int renderQueued;
+    string? restoreOperationKey;
+    readonly CancellationTokenSource callbackLifetime = new();
+    readonly LatestWinsRefreshCoordinator deviceRefreshes = new();
+    readonly string componentLifecycleId = Guid.NewGuid().ToString("n");
+    ITopicSendObserverDispatcher? observerDispatcher;
+    readonly Dictionary<string, ITopicSendObserverSubscription> sendObserverSubscriptions =
+        new(StringComparer.Ordinal);
+    readonly HashSet<string> cleanupRecoveryAttempts = new(StringComparer.Ordinal);
+    TopicSendSnapshot? capacityBlockedSubmission;
 
     // True when the thread currently being viewed is running a turn (drives the composer + thinking bubble).
     RemoteRunProjection? RemoteRun => Active is null ? null : RemoteRunPresentation.VisibleProjection(
@@ -636,6 +720,11 @@ else
             ? $"Use or change {selectedWidget.Name}…"
             : "Message your assistant…";
     string ComposerAriaLabel => "Message your assistant";
+    string? DraftError => activeThread is null ? null : State.GetTopicDraftError(activeThread);
+    void RetryDraft()
+    {
+        if (activeThread is not null) State.RetryTopicDraft(activeThread);
+    }
     bool ActiveDeviceOnline => Active is null || string.IsNullOrWhiteSpace(Active.ExecutionDeviceId)
         || IsDeviceOnline(Active.ExecutionDeviceId);
     bool ActiveUsesCurrentDevice => Active is null
@@ -645,7 +734,50 @@ else
         || attachments.Count > 0
         || selectedWidget is not null;
     bool ShowStopAction => TopicComposerPresentation.ShowStop(ActiveBusy, HasSendableDraft);
-    bool CanSend => (!ActiveUsesCurrentDevice || Agent.IsModelReady)
+    string? StopOperationKey
+    {
+        get
+        {
+            var thread = Active;
+            var runId = RemoteRun?.RunId ?? thread?.ExecutionRunId
+                ?? State.AgentRunFor(thread?.Id ?? "")?.RunId;
+            return thread is null || string.IsNullOrWhiteSpace(runId)
+                ? null
+                : StopKey(thread.Id, runId);
+        }
+    }
+    bool StopPending => StopOperationKey is { } key && UiOperations.IsRunning(key);
+    bool TopicRestorePending => restoreOperationKey is { } key
+        && UiOperations.IsRunning(key);
+    bool SendPending => CurrentSendSnapshot is { } snapshot
+        && TopicSends.IsRunning(snapshot.OperationId);
+    TopicSendSnapshot? CurrentSendSnapshot
+    {
+        get
+        {
+            if (Active is not { } thread) return null;
+            return TopicSends.TryGetSnapshot(
+                thread.Id,
+                ResolveTarget(thread).DeviceId,
+                inputRevision,
+                out var snapshot,
+                State.ActiveAccountId)
+                ? snapshot
+                : null;
+        }
+    }
+    bool ReconciliationPending => CurrentSendSnapshot is { } snapshot
+        && TopicSends.TryGetOutcome(snapshot.OperationId, out var outcome)
+        && outcome?.Kind == TopicSendOutcomeKind.Reconciling;
+    bool ActiveExecutionReady => ActiveUsesCurrentDevice
+        ? Agent.IsModelReady
+        : Active is not null
+          && DeviceChoices.Any(device =>
+              string.Equals(device.DeviceId, Active.ExecutionDeviceId, StringComparison.Ordinal)
+              && IsEligibleRemoteHost(device));
+    bool CanSend => !widgetLoading
+        && widgetLoadError is null
+        && ActiveExecutionReady
         && HasSendableDraft;
     string SendTitle => ActiveUsesCurrentDevice && !Agent.IsModelReady
         ? "Configure a model to use this device"
@@ -662,16 +794,12 @@ else
     QueuedTopicRunInfo? QueueInfo(ChatLine line) => State.QueuedTopicRunForLine(line);
     string QueueLabel(ChatLine line)
     {
+        if (IsQueuedCancellationPending(line)) return "cancellation pending";
         var device = Active is null ? "linked device" : DeviceLabel(Active);
-        return QueueInfo(line)?.Stage switch
-        {
-            TopicQueueStage.Relay => $"waiting for {device}",
-            TopicQueueStage.Device => $"queued on {device}",
-            TopicQueueStage.Cancelling => "cancelling",
-            TopicQueueStage.Expired => "expired",
-            TopicQueueStage.Failed => "failed",
-            _ => ActiveUsesCurrentDevice ? "queued on this device" : "sending"
-        };
+        return TopicQueuePresentation.Label(
+            QueueInfo(line)?.Stage ?? TopicQueueStage.Sending,
+            ActiveUsesCurrentDevice,
+            device);
     }
     string QueueIcon(ChatLine line) => QueueInfo(line)?.Stage switch
     {
@@ -681,14 +809,22 @@ else
         _ => "bi-hourglass-split"
     };
 
-    async Task CancelQueued(ChatLine line)
+    Task CancelQueued(ChatLine line)
     {
         var queued = QueueInfo(line);
-        if (queued is null) return;
-        if (!await TopicRouter.CancelQueuedAsync(
-                queued.ThreadId, queued.RunId, line.Id, CancellationToken.None))
-            attachError = "The queued turn could not be cancelled yet.";
+        if (queued is null) return Task.CompletedTask;
+        UiOperations.TryRun(
+            StopKey(queued.ThreadId, queued.RunId),
+            "ui.topic.cancel-queued",
+            ct => TopicRouter.CancelQueuedAsync(queued.ThreadId, queued.RunId, line.Id, ct),
+            outcome => ApplyCancellationOutcomeAsync(outcome, queued: true),
+            callbackLifetime.Token);
+        return Task.CompletedTask;
     }
+
+    bool IsQueuedCancellationPending(ChatLine line)
+        => QueueInfo(line) is { } queued
+           && UiOperations.IsRunning(StopKey(queued.ThreadId, queued.RunId));
     IReadOnlyList<ChatLine> OrderedVisibleLines => Active is null
         ? Array.Empty<ChatLine>()
         : TopicTranscriptOrdering.OrderForDisplay(Active.Lines.Where(line => !line.Internal));
@@ -753,10 +889,9 @@ else
         Mesh.MyDeviceId,
         string.IsNullOrWhiteSpace(State.Profile.DeviceName) ? "This device" : State.Profile.DeviceName,
         true,
-        PlatformCaps.DevicePlatform,
-        PlatformCaps.CanRunAgent && Agent.IsModelReady);
+        PlatformCaps.DevicePlatform);
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => new[] { CurrentDevice }
-        .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d)))
+        .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d) && IsEligibleRemoteHost(d)))
         .GroupBy(d => d.DeviceId, StringComparer.Ordinal)
         .Select(g => g.First())
         .ToList();
@@ -777,27 +912,27 @@ else
         State.Changed += Refresh;
         Mesh.ReplicationStateChanged += Refresh;
         Agent.EnsureAskUserResumeRegistered();
-        _ = State.RecoverPendingAskUserPromptsAsync();
+        ObserveComponentTask(State.RecoverPendingAskUserPromptsAsync(), "recover-ask-user");
         // Deep-link: /m/me?thread=id opens that topic (used by Search). Otherwise land on the LIST
         // view - on mobile we do NOT auto-open the most recent thread; the user picks one.
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
         var wanted = ParseQueryValue(uri.Query, "thread");
         if (!string.IsNullOrWhiteSpace(wanted) && State.Profile.OwnThreads.Any(t => t.Id == wanted))
+        {
             activeThread = wanted;
+            RestoreTopicState(wanted);
+        }
         else
             activeThread = null;
-        if (activeThread is not null) State.MarkThreadSeen(activeThread);
         Mesh.StateChanged += OnMeshStateChanged;
-        _ = LoadDevicesAsync();
+        Mesh.AccountDevicePresenceChanged += OnMeshStateChanged;
+        RequestDeviceRefresh();
     }
 
     void OnMeshStateChanged()
     {
-        _ = InvokeAsync(async () =>
-        {
-            await LoadDevicesAsync();
-            StateHasChanged();
-        });
+        RequestDeviceRefresh();
+        Refresh();
     }
 
     static string? ParseQueryValue(string queryString, string key)
@@ -812,7 +947,15 @@ else
         return null;
     }
 
-    void Refresh() => InvokeAsync(StateHasChanged);
+    void Refresh()
+    {
+        if (disposed || Interlocked.Exchange(ref renderQueued, 1) != 0) return;
+        ObserveComponentTask(InvokeAsync(() =>
+        {
+            Interlocked.Exchange(ref renderQueued, 0);
+            if (!disposed) StateHasChanged();
+        }), "state-refresh");
+    }
 
     readonly HashSet<string> askResolving = new(StringComparer.Ordinal);
 
@@ -916,6 +1059,7 @@ else
         {
             LocalFiles.Allow(s.Path);
             attachments.Add(new StagedFile(s.Name, s.Path, s.Size));
+            ScheduleComposerSnapshot();
         }
         else
         {
@@ -924,17 +1068,27 @@ else
         return InvokeAsync(StateHasChanged);
     }
 
-    async Task LoadDevicesAsync()
+    void RequestDeviceRefresh()
     {
-        try
-        {
-            eligibleDevices = await TopicRouter.ListEligibleDevicesAsync(CancellationToken.None);
-        }
-        catch
-        {
-            eligibleDevices = Array.Empty<global::Mesh.Shared.DeviceInfo>();
-        }
-        if (!disposed) await InvokeAsync(StateHasChanged);
+        deviceRefreshes.Request(
+            async cancellationToken =>
+            {
+                var devices = await TopicRouter.ListEligibleDevicesAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                if (disposed) return;
+                await InvokeAsync(() =>
+                {
+                    if (disposed) return;
+                    eligibleDevices = devices;
+                    StateHasChanged();
+                });
+            },
+            ex =>
+            {
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "topic-device-list-failed",
+                $"exception={ex.GetType().FullName}");
+            });
     }
 
     void ShowEarlierMessages()
@@ -949,7 +1103,182 @@ else
         actionsMenuOpen = false;
         confirmDelete = false;
         renaming = false;
-        State.MarkThreadSeen(id);
+        RestoreTopicState(id);
+    }
+
+    void RestoreTopicState(string threadId)
+    {
+        var generation = navigationGeneration;
+        var revision = inputRevision;
+        var operationKey =
+            $"topic.open:{componentLifecycleId}:{threadId}";
+        var requestId = $"{generation}:{revision}";
+        restoreOperationKey = operationKey;
+        UiOperations.RunLatest(
+            operationKey,
+            requestId,
+            componentLifecycleId,
+            "ui.topic.open",
+            ct =>
+            {
+                ct.ThrowIfCancellationRequested();
+                var draft = State.GetTopicDraftState(threadId);
+                ct.ThrowIfCancellationRequested();
+                State.MarkThreadSeen(threadId);
+                return Task.FromResult(draft);
+            },
+            outcome => ApplyTopicRestoreOutcomeAsync(
+                threadId, generation, revision, operationKey, outcome),
+            callbackLifetime.Token,
+            TimeSpan.FromSeconds(8));
+    }
+
+    Task ApplyTopicRestoreOutcomeAsync(
+        string threadId,
+        long generation,
+        long revision,
+        string operationKey,
+        UiOperationOutcome<MeshDb.ComposerDraft?> outcome)
+        => InvokeAsync(() =>
+        {
+            if (disposed
+                || generation != navigationGeneration
+                || !string.Equals(activeThread, threadId, StringComparison.Ordinal))
+                return;
+
+            if (string.Equals(restoreOperationKey, operationKey, StringComparison.Ordinal)
+                && !UiOperations.IsRunning(operationKey))
+                restoreOperationKey = null;
+
+            switch (outcome.Kind)
+            {
+                case UiOperationOutcomeKind.Succeeded:
+                    if (revision != inputRevision)
+                    {
+                        attachError = "Draft state changed while recovery was running; reconciling the latest revision.";
+                        AttachPendingSendObserver(threadId);
+                        RestoreTopicState(threadId);
+                    }
+                    else if (outcome.Result is { IsMalformed: true })
+                    {
+                        inputValue = outcome.Result.Text;
+                        inputRevision = 0;
+                        attachError = "This legacy draft has an invalid revision and must be edited before sending.";
+                        AttachPendingSendObserver(threadId);
+                    }
+                    else
+                    {
+                        var restored = outcome.Result;
+                        inputValue = restored?.Text ?? "";
+                        inputRevision = restored?.Revision ?? 0;
+                        RestoreComposerSnapshot(restored?.TopicSnapshot);
+                        if (inputRevision > 0)
+                            ComposerRevisions.SetExact(threadId, inputRevision, inputValue);
+                        attachError = null;
+                        AttachPendingSendObserver(threadId);
+                    }
+                    break;
+                case UiOperationOutcomeKind.TimedOut:
+                    attachError = "This topic opened, but local draft recovery is still pending.";
+                    ScheduleTopicRestoreRetry(threadId, generation);
+                    break;
+                case UiOperationOutcomeKind.Failed:
+                    attachError = "This topic opened, but its local draft could not be restored.";
+                    ScheduleTopicRestoreRetry(threadId, generation);
+                    break;
+                case UiOperationOutcomeKind.Cancelled:
+                    ScheduleTopicRestoreRetry(threadId, generation);
+                    break;
+            }
+            StateHasChanged();
+        });
+
+    void AttachPendingSendObserver(string threadId)
+    {
+        var thread = Active;
+        if (thread is null || !string.Equals(thread.Id, threadId, StringComparison.Ordinal))
+            return;
+        var targetDeviceId = ResolveTarget(thread).DeviceId;
+        if (!TopicSends.TryGetSnapshot(
+                threadId,
+                targetDeviceId,
+                inputRevision,
+                out var submission)
+            || submission is null)
+            return;
+
+        var submittedDraft = new ComposerRevisionSnapshot(
+            threadId,
+            submission.ComposerRevision,
+            inputValue);
+        AttachSendObserver(
+            submission,
+            outcome =>
+            {
+                var current = ComposerRevisions.GetOrCreate(threadId, "");
+                var clearedRevision = outcome.Kind == TopicSendOutcomeKind.Accepted
+                                      && current.Text.Length == 0
+                    ? current.Revision
+                    : 0;
+                return ApplySendOutcomeAsync(
+                    submission,
+                    submittedDraft,
+                    clearedRevision,
+                    outcome);
+            });
+        if (TopicSends.RequiresRecovery(submission.OperationId))
+            ObserveComponentTask(
+                TopicSends.RequestReconciliationAsync(
+                    submission,
+                    draftCleanup: CreateDraftCleanup(submittedDraft),
+                    cancellationToken: callbackLifetime.Token),
+                "reconcile-topic-send");
+    }
+
+    void AttachSendObserver(
+        TopicSendSnapshot submission,
+        Func<TopicSendOutcome, Task> observer)
+    {
+        if (sendObserverSubscriptions.ContainsKey(submission.OperationId)) return;
+        var dispatcher = observerDispatcher
+            ?? throw new InvalidOperationException(
+                "The renderer dispatcher must be captured before attaching a topic-send observer.");
+        var subscription = TopicSends.Observe(
+            submission.OperationId,
+            componentLifecycleId,
+            dispatcher,
+            observer,
+            callbackLifetime.Token);
+        if (subscription is not null)
+            sendObserverSubscriptions.Add(submission.OperationId, subscription);
+    }
+
+    void CaptureObserverDispatcher(ITopicSendObserverDispatcher dispatcher)
+        => observerDispatcher ??= dispatcher;
+
+    void ScheduleTopicRestoreRetry(string threadId, long generation)
+    {
+        ObserveComponentTask(
+            RetryTopicRestoreAsync(threadId, generation),
+            "retry-topic-restore");
+    }
+
+    async Task RetryTopicRestoreAsync(string threadId, long generation)
+    {
+        try
+        {
+            await Task.Delay(100, callbackLifetime.Token);
+            await InvokeAsync(() =>
+            {
+                if (!disposed
+                    && generation == navigationGeneration
+                    && string.Equals(activeThread, threadId, StringComparison.Ordinal))
+                    RestoreTopicState(threadId);
+            });
+        }
+        catch (OperationCanceledException) when (callbackLifetime.IsCancellationRequested)
+        {
+        }
     }
 
     void TogglePinFromSwipe(OwnThread thread)
@@ -957,19 +1286,19 @@ else
         State.SetOwnThreadPinned(thread.Id, !thread.IsPinned);
     }
 
-    async Task OpenNewDeviceMenu()
+    void OpenNewDeviceMenu()
     {
-        await LoadDevicesAsync();
         newDeviceMenuOpen = true;
         moveMenuOpen = false;
+        RequestDeviceRefresh();
     }
 
-    async Task OpenMoveMenu()
+    void OpenMoveMenu()
     {
-        await LoadDevicesAsync();
         moveMenuOpen = true;
         actionsMenuOpen = false;
         newDeviceMenuOpen = false;
+        RequestDeviceRefresh();
     }
 
     void CloseDeviceMenus()
@@ -1001,10 +1330,10 @@ else
         BeginRename();
     }
 
-    async Task OpenMoveMenuFromActions()
+    void OpenMoveMenuFromActions()
     {
         actionsMenuOpen = false;
-        await OpenMoveMenu();
+        OpenMoveMenu();
     }
 
     void OpenReportFromActions()
@@ -1024,11 +1353,11 @@ else
         if (e.Key == "Escape") CloseDeviceMenus();
     }
 
-    void NewThread(global::Mesh.Shared.DeviceInfo device)
+    async Task NewThread(global::Mesh.Shared.DeviceInfo device)
     {
-        if (!device.Online) return;
+        if (!CanRunHere(device)) return;
         var target = ToExecutionDevice(device);
-        var t = State.NewOwnThread("New chat", target);
+        var t = await State.NewOwnThreadAsync("New chat", target);
         activeThread = t.Id;
         confirmDelete = false;
         renaming = false;
@@ -1038,7 +1367,7 @@ else
 
     void ChooseMoveTarget(global::Mesh.Shared.DeviceInfo device)
     {
-        if (Active is null || !device.Online || IsActiveDevice(device)) return;
+        if (Active is null || !CanRunHere(device) || IsActiveDevice(device)) return;
         moveMenuOpen = false;
         if (ActiveBusy)
         {
@@ -1059,8 +1388,9 @@ else
 
     void MoveActiveTo(global::Mesh.Shared.DeviceInfo device)
     {
-        if (Active is null || !device.Online) return;
+        if (Active is null || !CanRunHere(device)) return;
         State.MoveOwnThreadToDevice(Active.Id, ToExecutionDevice(device));
+        ScheduleComposerSnapshot();
         CloseDeviceMenus();
     }
 
@@ -1105,7 +1435,9 @@ else
     {
         widgetPickerOpen = false;
         selectedWidget = null;
+        selectedWidgetId = null;
         widgetMode = true;
+        ScheduleComposerSnapshot();
     }
 
     async Task SelectWidget(Widget widget)
@@ -1113,7 +1445,9 @@ else
         widgetPickerOpen = false;
         widgetMode = false;
         selectedWidget = widget;
+        selectedWidgetId = widget.Id;
         widgetLoadError = null;
+        ScheduleComposerSnapshot();
         await HydrateSelectedWidgetAsync(widget.Id);
     }
 
@@ -1129,7 +1463,12 @@ else
             if (selectedWidget is not null && string.Equals(selectedWidget.Id, id, StringComparison.Ordinal))
             {
                 if (full is null) widgetLoadError = "Could not load this widget.";
-                else selectedWidget = full;
+                else
+                {
+                    selectedWidget = full;
+                    selectedWidgetId = full.Id;
+                    ScheduleComposerSnapshot();
+                }
             }
         }
         catch (Exception ex)
@@ -1148,8 +1487,42 @@ else
         widgetPickerOpen = false;
         widgetMode = false;
         selectedWidget = null;
+        selectedWidgetId = null;
         widgetLoading = false;
         widgetLoadError = null;
+        ScheduleComposerSnapshot();
+    }
+
+    void RemoveAttachment(StagedFile attachment)
+    {
+        if (attachments.Remove(attachment))
+            ScheduleComposerSnapshot();
+    }
+
+    long ScheduleComposerSnapshot()
+    {
+        var thread = Active;
+        if (activeThreadValue is null || thread is null) return 0;
+        var snapshot = CaptureComposerSnapshot(thread);
+        try
+        {
+            inputRevision = State.SetTopicDraftSnapshotRevision(
+                activeThreadValue,
+                snapshot);
+            attachError = null;
+        }
+        catch (Exception exception)
+        {
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "topic-draft-stage-failed",
+                $"thread={TopicSendSnapshot.StableId("thread", thread.Id)};"
+                + $"exception={exception.GetType().FullName}");
+            attachError = "The latest edit could not be staged durably. Retry before sending.";
+            return 0;
+        }
+        if (inputRevision > 0)
+            ComposerRevisions.SetExact(activeThreadValue, inputRevision, inputValue);
+        return inputRevision;
     }
 
     void OpenReport()
@@ -1165,15 +1538,26 @@ else
         try { await JS.InvokeVoidAsync("meshUI.resetComposer", composerEl); } catch { }
     }
 
-    bool ClearSubmittedDraft(string threadId, string submittedText)
+    bool ClearSubmittedDraftPresentation(
+        ComposerRevisionSnapshot submittedDraft,
+        long clearedRevision)
     {
-        if (!string.Equals(activeThread, threadId, StringComparison.Ordinal))
-        {
-            State.SetTopicDraft(threadId, "");
-            return false;
-        }
-        if (!string.Equals(input, submittedText, StringComparison.Ordinal)) return false;
-        input = "";
+        if (clearedRevision <= 0) return false;
+        var isVisible = string.Equals(
+            activeThread,
+            submittedDraft.EntityId,
+            StringComparison.Ordinal);
+        if (!isVisible || inputRevision != submittedDraft.Revision) return false;
+
+        inputValue = "";
+        inputRevision = clearedRevision;
+        attachments.Clear();
+        widgetMode = false;
+        widgetPickerOpen = false;
+        selectedWidget = null;
+        selectedWidgetId = null;
+        widgetLoading = false;
+        widgetLoadError = null;
         return true;
     }
 
@@ -1189,6 +1573,7 @@ else
             var staged = await PickedFileStager.StageAsync(file.FileName, file.ContentType, stream);
             LocalFiles.Allow(staged.Path);
             attachments.Add(new StagedFile(staged.Name, staged.Path, staged.Size));
+            ScheduleComposerSnapshot();
         }
         catch (Exception ex) { attachError = "Couldn't attach that file: " + ex.Message; }
     }
@@ -1202,130 +1587,458 @@ else
         return $"{size:0.#} {units[u]}";
     }
 
-    async Task StopActive()
+    Task StopActive()
     {
         var thread = Active;
         var runId = RemoteRun?.RunId ?? thread?.ExecutionRunId ?? State.AgentRunFor(thread?.Id ?? "")?.RunId;
-        if (thread is null || string.IsNullOrWhiteSpace(runId)) return;
-        try
-        {
-            var stopped = await TopicRouter.StopAsync(thread.Id, runId, CancellationToken.None);
-            // No live run to cancel (a stranded run id from a completed or lost remote run): reconcile
-            // locally so the phantom "thinking" indicator and Stop button clear immediately.
-            if (!stopped && RemoteRun is null && IsAssignedElsewhere(thread))
-                State.ClearRemoteRunProjection(thread.Id, runId);
-        }
-        catch (Exception ex)
-        {
-            attachError = $"Could not stop this run: {ex.Message}";
-        }
+        if (thread is null || string.IsNullOrWhiteSpace(runId)) return Task.CompletedTask;
+
+        var threadId = thread.Id;
+        attachError = null;
+        UiOperations.TryRun(
+            StopKey(threadId, runId),
+            "ui.topic.stop",
+            async ct =>
+            {
+                var stopped = await TopicRouter.StopAsync(threadId, runId, ct).ConfigureAwait(false);
+                if (stopped) return true;
+
+                var remote = State.GetRemoteRunProjection(threadId);
+                var runIsStillExpected =
+                    string.Equals(thread.ExecutionRunId, runId, StringComparison.Ordinal)
+                    || string.Equals(remote?.RunId, runId, StringComparison.Ordinal);
+                if (!runIsStillExpected) return true;
+
+                // A persisted run without a live projection is stranded. Reconcile it off-dispatcher;
+                // never claim cancellation if the durable state cannot be cleared.
+                if (remote is null && thread.ExecutionDeviceId is not null)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    State.ClearRemoteRunProjection(threadId, runId);
+                    return thread.ExecutionRunId is null;
+                }
+                return false;
+            },
+            outcome => ApplyCancellationOutcomeAsync(outcome, queued: false),
+            callbackLifetime.Token);
+        return Task.CompletedTask;
     }
+
+    Task ApplyCancellationOutcomeAsync(
+        UiOperationOutcome<bool> outcome,
+        bool queued)
+        => InvokeAsync(() =>
+        {
+            if (disposed) return;
+            attachError = outcome.Kind switch
+            {
+                UiOperationOutcomeKind.TimedOut => queued
+                    ? "Queued cancellation timed out; the turn remains queued until delivery is confirmed."
+                    : "Cancellation timed out; the run remains active until delivery is confirmed.",
+                UiOperationOutcomeKind.Failed => queued
+                    ? "The queued turn could not be cancelled yet."
+                    : "Could not request cancellation for this run.",
+                UiOperationOutcomeKind.Succeeded when outcome.Result != true => queued
+                    ? "The queued turn could not be cancelled yet."
+                    : "The run is still active; cancellation was not acknowledged.",
+                UiOperationOutcomeKind.Cancelled => queued
+                    ? "Queued cancellation was interrupted; the turn remains queued."
+                    : "Cancellation was interrupted; the run remains active.",
+                _ => null
+            };
+            StateHasChanged();
+        });
+
+    static string StopKey(string threadId, string runId)
+        => $"topic.stop:{threadId}:{runId}";
 
     async Task Send()
     {
         if (!CanSend) return;
 
-        var text = input;
-        var thread = Active ?? State.NewOwnThread("New chat", ToExecutionDevice(CurrentDevice));
-        activeThread = thread.Id;
-        input = text;
-        var chosenWidget = selectedWidget;
+        var thread = Active;
+        if (thread is null) return;
+        var requestedSnapshot = CaptureComposerSnapshot(thread);
+        var requestedRevision = inputRevision;
+        MeshDb.ComposerDraft persistedDraft;
+        try
+        {
+            persistedDraft = await State.PersistTopicDraftSnapshotAsync(
+                thread.Id,
+                requestedSnapshot,
+                requestedRevision,
+                callbackLifetime.Token);
+        }
+        catch (Exception exception)
+        {
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "topic-send-draft-flush-failed",
+                $"thread={TopicSendSnapshot.StableId("thread", thread.Id)};"
+                + $"revision={TopicSendSnapshot.StableId("revision", requestedRevision.ToString(System.Globalization.CultureInfo.InvariantCulture))};"
+                + $"exception={exception.GetType().FullName}");
+            attachError = "The latest draft could not be saved durably. Retry before sending.";
+            StateHasChanged();
+            return;
+        }
+        var durableSnapshot = persistedDraft.TopicSnapshot
+            ?? throw new InvalidOperationException("The durable topic snapshot is incomplete.");
+        var draftRevision = new ComposerRevisionSnapshot(
+            thread.Id,
+            persistedDraft.Revision,
+            durableSnapshot.Text);
+        if (inputRevision == requestedRevision)
+        {
+            inputRevision = persistedDraft.Revision;
+            ComposerRevisions.SetExact(
+                thread.Id,
+                persistedDraft.Revision,
+                durableSnapshot.Text);
+        }
+        var text = durableSnapshot.Text;
+        var chosenWidget = durableSnapshot.Widget is null
+            ? null
+            : RestoreWidget(durableSnapshot.Widget);
+        var files = durableSnapshot.Attachments
+            .Select(file => new StagedFile(file.Name, file.Path, file.Size))
+            .ToList();
+        var wasWidget = durableSnapshot.WidgetMode;
+        var target = ResolveTarget(thread);
+        if (!string.Equals(
+                target.DeviceId,
+                durableSnapshot.TargetDeviceId,
+                StringComparison.Ordinal))
+        {
+            attachError = "The topic target changed while the draft was being saved. Review and retry.";
+            StateHasChanged();
+            return;
+        }
+        var fingerprint = durableSnapshot.Fingerprint;
+        var submission = TopicSends.CreateSnapshot(
+            thread.Id,
+            target.DeviceId,
+            draftRevision.Revision,
+            fingerprint,
+            DateTimeOffset.UtcNow,
+            State.ActiveAccountId);
+        var triggerHandle = State.Profile.Handle;
+        var turnMode = State.Profile.PlanBeforeActing
+            ? global::Mesh.Shared.TopicTurnMode.Autonomous
+            : global::Mesh.Shared.TopicTurnMode.Single;
         var titleText = !string.IsNullOrWhiteSpace(text)
             ? text
             : chosenWidget is not null ? $"Use widget: {chosenWidget.Name}" : "";
-        if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(titleText))
-            State.RenameOwnThread(thread.Id, Titleize(titleText));
+        var appState = State;
+        var topicRouter = TopicRouter;
+        var composerRevisions = ComposerRevisions;
+        long clearedRevision = 0;
+        var draftCleanup = new TopicSendDraftCleanup(
+            outcome => PersistSubmittedDraftCleanupAsync(
+                draftRevision,
+                outcome,
+                appState,
+                composerRevisions,
+                revision => Interlocked.Exchange(ref clearedRevision, revision),
+                CancellationToken.None));
 
-        var files = attachments.ToList();
-        var wasWidget = widgetMode;
-        var target = ResolveTarget(thread);
-
-        if (string.IsNullOrWhiteSpace(thread.ExecutionDeviceId))
-            State.BindOwnThreadForSend(thread.Id, target);
-
-        IReadOnlyList<ChatAttachment> loadedAttachments;
-        try
+        if (submission.ComposerRevision != draftRevision.Revision
+            || !string.Equals(
+                submission.DraftFingerprint,
+                fingerprint,
+                StringComparison.Ordinal))
         {
-            loadedAttachments = await LoadAttachmentsAsync(files, CancellationToken.None);
-        }
-        catch (Exception ex)
-        {
-            attachError = $"Could not read the attachments: {ex.Message}";
+            var recoveryDraft = new ComposerRevisionSnapshot(
+                draftRevision.EntityId,
+                submission.ComposerRevision,
+                text);
+            AttachSendObserver(
+                submission,
+                outcome => ApplySendOutcomeAsync(
+                    submission,
+                    recoveryDraft,
+                    Interlocked.Read(ref clearedRevision),
+                    outcome));
+            ObserveComponentTask(
+                TopicSends.RequestReconciliationAsync(
+                    submission,
+                    draftCleanup: CreateDraftCleanup(recoveryDraft),
+                    cancellationToken: callbackLifetime.Token),
+                "reconcile-superseded-topic-send");
+            attachError = "A prior send identity is being reconciled before this revision can be submitted.";
+            StateHasChanged();
             return;
         }
 
-        var runId = Guid.NewGuid().ToString("n");
-        var prompt = BuildTurnPrompt(text, chosenWidget, wasWidget);
-        var trigger = new ChatLine
-        {
-            Id = Guid.NewGuid().ToString("n"),
-            Role = "user",
-            Text = prompt,
-            Attachments = loadedAttachments.ToList(),
-            At = DateTimeOffset.UtcNow
-        };
-        scrollToLatestRequested = true;
-        State.AddOwnChatLine(thread.Id, trigger);
-
-        // Hydrate a picker summary's body before it is sent so the widget context is never blank.
-        if (WidgetConsumerPolicy.RequiresBodyLoad(chosenWidget))
-        {
-            var full = await State.LoadFullWidgetAsync(chosenWidget!.Id);
-            if (full is not null) chosenWidget = full;
-        }
-
-        var widgetContext = BuildWidgetContext(chosenWidget, wasWidget);
-        var draft = new TopicTurnDraft(
-            runId,
-            thread.Id,
-            trigger.Id,
-            State.Profile.Handle,
-            prompt,
-            trigger.At,
-            State.Profile.PlanBeforeActing ? global::Mesh.Shared.TopicTurnMode.Autonomous : global::Mesh.Shared.TopicTurnMode.Single,
-            target.DeviceId,
-            chosenWidget?.Id,
-            widgetContext,
-            loadedAttachments);
-
-        var clearedVisibleDraft = ClearSubmittedDraft(thread.Id, text);
-        attachments.Clear();
-        widgetMode = false;
-        widgetPickerOpen = false;
-        selectedWidget = null;
-        widgetLoading = false;
-        widgetLoadError = null;
         attachError = null;
-        if (clearedVisibleDraft) _ = ResetComposer();
-
-        // Paint the persisted prompt before dispatch can classify it as queued or start streaming.
-        await InvokeAsync(StateHasChanged);
-
-        try
-        {
-            var result = await TopicRouter.SubmitAsync(draft, null, CancellationToken.None);
-            if (!result.Accepted)
-            {
-                attachError = result.Error ?? $"The topic turn was not accepted ({result.Code}).";
-                State.AddOwnChatLine(thread.Id, new ChatLine
+        capacityBlockedSubmission = null;
+        var submissionResult = TopicSends.Submit(
+                submission,
+                async (stableSubmission, handoffContext) =>
                 {
-                    Role = "assistant",
-                    Text = $"[{attachError}]",
-                    ReplyToLineId = trigger.Id
-                });
-            }
-        }
-        catch (Exception ex)
+                    if (string.Equals(thread.Title, "New chat", StringComparison.Ordinal)
+                        && !string.IsNullOrWhiteSpace(titleText))
+                        appState.RenameOwnThread(thread.Id, Titleize(titleText));
+
+                    var loadedAttachments = await LoadAttachmentsAsync(
+                        files,
+                        CancellationToken.None).ConfigureAwait(false);
+                    var prompt = BuildTurnPrompt(text, chosenWidget, wasWidget);
+                    var draft = new TopicTurnDraft(
+                        stableSubmission.RunId,
+                        stableSubmission.ThreadId,
+                        stableSubmission.LineId,
+                        triggerHandle,
+                        prompt,
+                        stableSubmission.SubmittedAt,
+                        turnMode,
+                        stableSubmission.TargetDeviceId,
+                        chosenWidget?.Id,
+                        BuildWidgetContext(chosenWidget, wasWidget),
+                        loadedAttachments,
+                        stableSubmission.OperationId);
+                    BeforeBeginTopicRunCheckpointHook?.Invoke(
+                        stableSubmission.OperationId);
+                    var result = await topicRouter.SubmitAsync(
+                        draft,
+                        null,
+                        CancellationToken.None,
+                        handoffContext).ConfigureAwait(false);
+                    if (!result.Accepted
+                        && !result.Durable
+                        && string.Equals(
+                            result.Code,
+                            "local_persistence_failed",
+                            StringComparison.Ordinal))
+                        throw new InvalidOperationException(
+                            result.Error ?? "The run could not be durably started.");
+                    if (result.Durable)
+                    {
+                        DurableBeginCheckpointHook?.Invoke(stableSubmission.OperationId);
+                        handoffContext.MarkDurableBoundaryEntered();
+                    }
+                    return new TopicSendHandoff(
+                        result.Accepted,
+                        result.Code,
+                        result.Error);
+                },
+                draftCleanup: draftCleanup);
+        if (submissionResult.Kind is TopicSendSubmissionKind.Started
+            or TopicSendSubmissionKind.AlreadyRunning
+            or TopicSendSubmissionKind.AlreadyCompleted
+            or TopicSendSubmissionKind.ReconciliationRequired)
         {
-            attachError = $"Could not send this topic turn: {ex.Message}";
-            State.AddOwnChatLine(thread.Id, new ChatLine
-            {
-                Role = "assistant",
-                Text = $"[{attachError}]",
-                ReplyToLineId = trigger.Id
-            });
+            AttachSendObserver(
+                submissionResult.Snapshot,
+                outcome => ApplySendOutcomeAsync(
+                    submissionResult.Snapshot,
+                    draftRevision,
+                    Interlocked.Read(ref clearedRevision),
+                    outcome));
+            if (submissionResult.Kind == TopicSendSubmissionKind.ReconciliationRequired)
+                ObserveComponentTask(
+                    TopicSends.RequestReconciliationAsync(
+                        submissionResult.Snapshot,
+                        draftCleanup: CreateDraftCleanup(draftRevision),
+                        cancellationToken: callbackLifetime.Token),
+                    "reconcile-topic-send");
         }
+        else if (submissionResult.Kind == TopicSendSubmissionKind.CapacityExceeded)
+        {
+            capacityBlockedSubmission = submissionResult.Snapshot;
+        }
+        else
+        {
+            attachError = submissionResult.Error
+                ?? "This topic turn could not be scheduled. Your draft is unchanged.";
+        }
+        StateHasChanged();
+
     }
+
+    Task RetryCapacityBlockedSend()
+    {
+        var blocked = capacityBlockedSubmission;
+        capacityBlockedSubmission = null;
+        if (blocked is not null
+            && Active is { } thread
+            && string.Equals(thread.Id, blocked.ThreadId, StringComparison.Ordinal)
+            && string.Equals(
+                ResolveTarget(thread).DeviceId,
+                blocked.TargetDeviceId,
+                StringComparison.Ordinal)
+            && inputRevision == blocked.ComposerRevision)
+            return Send();
+
+        attachError = "The draft changed before retry. Review it and send the latest version.";
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    Task ApplySendOutcomeAsync(
+        TopicSendSnapshot submission,
+        ComposerRevisionSnapshot submittedDraft,
+        long clearedRevision,
+        TopicSendOutcome outcome)
+    {
+        if (disposed) return Task.CompletedTask;
+
+        if (outcome.Kind == TopicSendOutcomeKind.Accepted)
+        {
+            scrollToLatestRequested = true;
+            if (clearedRevision <= 0)
+            {
+                var reconciled = ComposerRevisions.GetOrCreate(
+                    submittedDraft.EntityId, "");
+                if (reconciled.Revision > submittedDraft.Revision
+                    && reconciled.Text.Length == 0)
+                    clearedRevision = reconciled.Revision;
+            }
+            var clearedVisibleDraft = ClearSubmittedDraftPresentation(
+                submittedDraft,
+                clearedRevision);
+            attachError = null;
+            if (clearedVisibleDraft) ObserveComponentTask(
+                ResetComposer(),
+                "reset-composer");
+        }
+        else if (outcome.Kind == TopicSendOutcomeKind.Reconciling)
+        {
+            attachError = outcome.Handoff?.Error
+                ?? "The durable handoff status is still being checked.";
+            if (TopicSends.RequiresRecovery(submission.OperationId)
+                && cleanupRecoveryAttempts.Add(submission.OperationId))
+                ObserveComponentTask(
+                    TopicSends.RequestReconciliationAsync(
+                        submission,
+                        draftCleanup: CreateDraftCleanup(submittedDraft),
+                        cancellationToken: callbackLifetime.Token),
+                    "recover-topic-draft-cleanup");
+        }
+        else
+        {
+            if (outcome.Kind == TopicSendOutcomeKind.RetryableFailed)
+            {
+                var current = ComposerRevisions.GetOrCreate(
+                    submittedDraft.EntityId,
+                    inputValue);
+                if (current.Revision > submission.ComposerRevision)
+                    TopicSends.TryAbandonPreHandoff(
+                        submission.OperationId,
+                        current.Revision);
+            }
+            attachError = outcome.Kind == TopicSendOutcomeKind.Rejected
+                ? outcome.Handoff?.Error
+                  ?? $"The topic turn was not accepted ({outcome.Handoff?.Code ?? "rejected"})."
+                : $"Could not send this topic turn: {outcome.Exception?.Message ?? "unknown error"}";
+        }
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    TopicSendDraftCleanup CreateDraftCleanup(
+        ComposerRevisionSnapshot submittedDraft)
+        => new(outcome => PersistSubmittedDraftCleanupAsync(
+            submittedDraft,
+            outcome,
+            State,
+            ComposerRevisions,
+            null,
+            callbackLifetime.Token));
+
+    static async Task<TopicSendDraftCleanupResult> PersistSubmittedDraftCleanupAsync(
+        ComposerRevisionSnapshot submittedDraft,
+        TopicSendOutcome outcome,
+        AppState state,
+        ComposerRevisionGuard revisions,
+        Action<long>? cleared,
+        CancellationToken cancellationToken)
+    {
+        var result = await state.CompareAndClearTopicDraftAsync(
+                submittedDraft.EntityId,
+                submittedDraft.Revision,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (result == MeshDb.ComposerDraftClearResult.Superseded)
+            return TopicSendDraftCleanupResult.DraftClearSuperseded;
+
+        if (revisions.TryClear(submittedDraft, out var clearToken)
+            && clearToken is not null)
+            cleared?.Invoke(clearToken.ClearedRevision);
+        else
+            cleared?.Invoke(submittedDraft.Revision);
+        return TopicSendDraftCleanupResult.DraftClearPersisted;
+    }
+
+    Task ReconcilePendingSend()
+    {
+        var snapshot = CurrentSendSnapshot;
+        if (snapshot is null) return Task.CompletedTask;
+        var submitted = new ComposerRevisionSnapshot(
+            snapshot.ThreadId,
+            snapshot.ComposerRevision,
+            inputValue);
+        ObserveComponentTask(
+            TopicSends.RequestReconciliationAsync(
+                snapshot,
+                draftCleanup: CreateDraftCleanup(submitted),
+                cancellationToken: callbackLifetime.Token),
+            "reconcile-topic-send");
+        return Task.CompletedTask;
+    }
+
+    MeshDb.TopicComposerSnapshot CaptureComposerSnapshot(OwnThread thread)
+        => new(
+            inputValue,
+            attachments
+                .Select(file => MeshDb.ComposerDraftAttachment.Create(
+                    file.Name,
+                    file.Path,
+                    file.Size))
+                .ToArray(),
+            widgetMode,
+            selectedWidget?.Id ?? selectedWidgetId,
+            ResolveTarget(thread).DeviceId,
+            selectedWidget is null
+                ? null
+                : MeshDb.ComposerDraftWidget.Create(selectedWidget));
+
+    void RestoreComposerSnapshot(MeshDb.TopicComposerSnapshot? snapshot)
+    {
+        attachments.Clear();
+        widgetMode = snapshot?.WidgetMode ?? false;
+        widgetPickerOpen = false;
+        selectedWidget = snapshot?.Widget is not null
+            ? RestoreWidget(snapshot.Widget)
+            : snapshot?.WidgetId is null
+                ? null
+                : State.Profile.Widgets.FirstOrDefault(widget =>
+                    string.Equals(widget.Id, snapshot.WidgetId, StringComparison.Ordinal));
+        selectedWidgetId = snapshot?.WidgetId;
+        widgetLoading = false;
+        widgetLoadError = snapshot?.WidgetId is not null && selectedWidget is null
+            ? "The saved widget is no longer available."
+            : null;
+        if (snapshot is null) return;
+        foreach (var file in snapshot.Attachments)
+        {
+            attachments.Add(new StagedFile(file.Name, file.Path, file.Size));
+            if (File.Exists(file.Path)) LocalFiles.Allow(file.Path);
+        }
+        if (snapshot.Widget is null
+            && selectedWidget is not null
+            && WidgetConsumerPolicy.RequiresBodyLoad(selectedWidget))
+            ObserveComponentTask(
+                HydrateSelectedWidgetAsync(selectedWidget.Id),
+                "hydrate-restored-widget");
+    }
+
+    static Widget RestoreWidget(MeshDb.ComposerDraftWidget widget)
+        => new()
+        {
+            Id = widget.Id,
+            Name = widget.Name,
+            Prompt = widget.Prompt,
+            Html = widget.Html
+        };
 
     private static readonly Dictionary<string, string> AttachmentMimes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -1399,7 +2112,19 @@ else
     bool CanRunHere(global::Mesh.Shared.DeviceInfo device) =>
         IsCurrentDevice(device)
             ? Agent.IsModelReady
-            : device.Online && device.CanHostRemoteTurn;
+            : IsEligibleRemoteHost(device);
+
+    static bool IsEligibleRemoteHost(global::Mesh.Shared.DeviceInfo device) =>
+        device.Online && device.CanHostRemoteTurn;
+
+    string DeviceAvailability(global::Mesh.Shared.DeviceInfo device) =>
+        IsCurrentDevice(device)
+            ? Agent.IsModelReady
+                ? "Ready on this device"
+                : "Configure a model in Settings"
+            : IsEligibleRemoteHost(device)
+                ? "Online · Agent ready"
+                : "Unavailable";
 
     bool IsTopicBusy(OwnThread thread) => RemoteRunActivity.IsBusy(
         thread,
@@ -1424,8 +2149,11 @@ else
         if (string.IsNullOrWhiteSpace(deviceId)
             || string.Equals(deviceId, Mesh.MyDeviceId, StringComparison.Ordinal))
             return true;
-        return eligibleDevices.FirstOrDefault(d =>
-            string.Equals(d.DeviceId, deviceId, StringComparison.Ordinal))?.Online == true;
+        return Mesh.IsAccountDeviceOnline(deviceId)
+               || !Mesh.HasAccountDevicePresenceSnapshot
+               && eligibleDevices.Any(device =>
+                   string.Equals(device.DeviceId, deviceId, StringComparison.Ordinal)
+                   && device.Online);
     }
 
     bool IsActiveDevice(global::Mesh.Shared.DeviceInfo device) =>
@@ -1506,14 +2234,62 @@ else
         pinError = null;
     }
 
+    public ValueTask DisposeAsync()
+    {
+        disposalTask ??= DisposeCoreAsync();
+        return new(disposalTask);
+    }
+
     public void Dispose()
+        => _ = DisposeAsync();
+
+    async Task DisposeCoreAsync()
     {
         NotificationViews.Clear("mobile-topics");
         disposed = true;
-        _ = JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
+        var detachments = sendObserverSubscriptions.Values
+            .Select(subscription => subscription.DisposeAsync().AsTask())
+            .ToArray();
+        sendObserverSubscriptions.Clear();
+        callbackLifetime.Cancel();
+        await Task.WhenAll(detachments).ConfigureAwait(false);
+        callbackLifetime.Dispose();
+        deviceRefreshes.Dispose();
+        await ResetMobileThreadFlagAsync();
         State.Changed -= Refresh;
         Mesh.StateChanged -= OnMeshStateChanged;
+        Mesh.AccountDevicePresenceChanged -= OnMeshStateChanged;
         Mesh.ReplicationStateChanged -= Refresh;
         selfRef?.Dispose();
+    }
+
+    async Task ResetMobileThreadFlagAsync()
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("meshUI.setMobileThreadOpen", false);
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or ObjectDisposedException)
+        {
+        }
+    }
+
+    void ObserveComponentTask(Task task, string operation)
+    {
+        _ = ObserveComponentTaskCore(task, operation);
+    }
+
+    static async Task ObserveComponentTaskCore(Task task, string operation)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RuntimeDiagnostics.Current?.RecordEvent(
+                $"mobile-component-{operation}",
+                $"exception={ex.GetType().FullName}");
+        }
     }
 }

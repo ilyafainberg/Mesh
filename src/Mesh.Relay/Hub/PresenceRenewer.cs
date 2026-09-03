@@ -10,7 +10,8 @@ namespace Mesh.Relay.Hub;
 /// </summary>
 public sealed class PresenceRenewer(
     ConnectionRegistry registry,
-    IBackplane backplane) : BackgroundService
+    IBackplane backplane,
+    TimeProvider clock) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -18,7 +19,7 @@ public sealed class PresenceRenewer(
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken);
+                await Task.Delay(TimeSpan.FromSeconds(15), clock, stoppingToken);
                 foreach (var handle in registry.LocalHandles())
                     await backplane.SetPresenceAsync(handle, stoppingToken);
                 foreach (var (handle, deviceId) in registry.LocalDevices())

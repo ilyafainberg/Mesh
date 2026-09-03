@@ -1,5 +1,7 @@
+using System.Threading.Channels;
 using System.Text.Json;
 using Mesh.App.Domain;
+using Mesh.App.Services;
 using Mesh.Shared;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -8,6 +10,97 @@ namespace Mesh.App.Tests;
 [TestClass]
 public sealed class DeviceTopicTransportTests
 {
+    [TestMethod]
+    public async Task DeliveryRetryLoop_CoalescesWakeStormAndCapsBackoffRate()
+    {
+        var time = new ManualTimerTimeProvider();
+        var observed = Channel.CreateUnbounded<int>();
+        var keepRunning = 1;
+        var callCount = 0;
+        var loop = new TopicDeliveryRetryLoop(
+            time,
+            TimeSpan.FromMilliseconds(20),
+            _ =>
+            {
+                var count = Interlocked.Increment(ref callCount);
+                observed.Writer.TryWrite(count);
+                if (count == 4)
+                {
+                    Interlocked.Exchange(ref keepRunning, 0);
+                }
+                return Task.CompletedTask;
+            },
+            () => Volatile.Read(ref keepRunning) == 1,
+            TimeSpan.FromMilliseconds(50));
+
+        for (var index = 0; index < 100; index++)
+        {
+            loop.Schedule();
+            loop.Wake();
+        }
+
+        Assert.AreEqual(1, await observed.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+        await time.WaitForTimerCountAsync(2);
+        time.Advance(TimeSpan.FromMilliseconds(39));
+        Assert.AreEqual(1, loop.AttemptCount, "backoff must not fire before virtual time is due");
+        time.Advance(TimeSpan.FromMilliseconds(1));
+        Assert.AreEqual(2, await observed.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+        await time.WaitForTimerCountAsync(3);
+        time.Advance(TimeSpan.FromMilliseconds(50));
+        Assert.AreEqual(3, await observed.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+        await time.WaitForTimerCountAsync(4);
+        time.Advance(TimeSpan.FromMilliseconds(50));
+        Assert.AreEqual(4, await observed.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+        loop.Stop();
+
+        Assert.AreEqual(4, loop.AttemptCount);
+        Assert.AreEqual(1, loop.WorkerStartCount);
+        Console.WriteLine(
+            "DETERMINISTIC_RETRY attempts=1,2,3,4 firstBackoffMs=40 cappedBackoffMs=50 workerStarts=1");
+    }
+
+    [TestMethod]
+    public async Task DeliveryRetryLoop_RosterAndConnectionWakeStormUsesOneWorkerWithoutLosingWake()
+    {
+        var firstEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondCompleted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var keepRunning = 1;
+        var calls = 0;
+        var loop = new TopicDeliveryRetryLoop(
+            TimeProvider.System,
+            TimeSpan.FromHours(1),
+            async _ =>
+            {
+                var call = Interlocked.Increment(ref calls);
+                if (call == 1)
+                {
+                    firstEntered.TrySetResult();
+                    await releaseFirst.Task;
+                    return;
+                }
+                Interlocked.Exchange(ref keepRunning, 0);
+                secondCompleted.TrySetResult();
+            },
+            () => Volatile.Read(ref keepRunning) == 1);
+
+        loop.Wake();
+        await firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        for (var index = 0; index < 100; index++)
+            loop.Wake();
+        releaseFirst.TrySetResult();
+
+        await secondCompleted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        loop.Stop();
+
+        Assert.AreEqual(2, loop.AttemptCount);
+        Assert.AreEqual(2, calls);
+        Assert.AreEqual(1, loop.WorkerStartCount);
+    }
+
     [TestMethod]
     public void TopicEnvelope_PreservesExactDeviceRoutingAndCiphertext()
     {
@@ -113,5 +206,95 @@ public sealed class DeviceTopicTransportTests
             "application/octet-stream");
 
         Assert.IsFalse(TopicRunProtocol.TryParseChunk(TopicRunProtocol.ChunkBody(chunk), out _));
+    }
+
+    private sealed class ManualTimerTimeProvider : TimeProvider
+    {
+        private readonly object gate = new();
+        private readonly List<ManualTimer> timers = [];
+        private readonly Channel<int> timerCounts = Channel.CreateUnbounded<int>();
+        private long timestamp;
+        private int timerCount;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Volatile.Read(ref timestamp);
+
+        public override ITimer CreateTimer(
+            TimerCallback callback,
+            object? state,
+            TimeSpan dueTime,
+            TimeSpan period)
+        {
+            var timer = new ManualTimer(this, callback, state);
+            timer.Change(dueTime, period);
+            lock (gate) timers.Add(timer);
+            timerCounts.Writer.TryWrite(Interlocked.Increment(ref timerCount));
+            return timer;
+        }
+
+        public async Task WaitForTimerCountAsync(int expected)
+        {
+            while (Volatile.Read(ref timerCount) < expected)
+                await timerCounts.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        }
+
+        public void Advance(TimeSpan elapsed)
+        {
+            Interlocked.Add(ref timestamp, elapsed.Ticks);
+            while (true)
+            {
+                ManualTimer? due;
+                lock (gate)
+                    due = timers.FirstOrDefault(timer => timer.IsDue(timestamp));
+                if (due is null) return;
+                due.Fire(timestamp);
+            }
+        }
+
+        private sealed class ManualTimer(
+            ManualTimerTimeProvider owner,
+            TimerCallback callback,
+            object? state) : ITimer
+        {
+            private long dueAt = long.MaxValue;
+            private long periodTicks = Timeout.InfiniteTimeSpan.Ticks;
+            private int disposed;
+
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                if (Volatile.Read(ref disposed) != 0) return false;
+                lock (owner.gate)
+                {
+                    dueAt = dueTime == Timeout.InfiniteTimeSpan
+                        ? long.MaxValue
+                        : checked(owner.timestamp + Math.Max(0, dueTime.Ticks));
+                    periodTicks = period.Ticks;
+                }
+                return true;
+            }
+
+            public bool IsDue(long now)
+                => Volatile.Read(ref disposed) == 0 && dueAt <= now;
+
+            public void Fire(long now)
+            {
+                lock (owner.gate)
+                {
+                    if (!IsDue(now)) return;
+                    dueAt = periodTicks > 0
+                        ? checked(dueAt + periodTicks)
+                        : long.MaxValue;
+                }
+                callback(state);
+            }
+
+            public void Dispose() => Interlocked.Exchange(ref disposed, 1);
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+        }
     }
 }

@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
+using Mesh.Relay.LiveFaults;
 using Mesh.Relay.Observability;
 using Mesh.Relay.Push;
 using Mesh.Relay.RateLimiting;
@@ -970,6 +971,7 @@ public sealed class RelayOnlineSwitchboardTests
         public required MeshRouter Router { get; init; }
         public required RelayFrameDedup Dedup { get; init; }
         public required RelayMetrics Metrics { get; init; }
+        public required LiveFaultStore Faults { get; init; }
         public required IMessageRateLimiter RateLimiter { get; init; }
         public required PushDispatcher Push { get; init; }
         public RecordingPushSender? PushSender { get; init; }
@@ -986,7 +988,8 @@ public sealed class RelayOnlineSwitchboardTests
             var sink = new DeliverySink();
             var registry = new ConnectionRegistry();
             var metrics = new RelayMetrics();
-            var router = new MeshRouter(new RouterHubContext(sink), registry, backplane, metrics);
+            var faults = new LiveFaultStore(new LiveFaultOptions { Enabled = false });
+            var router = new MeshRouter(new RouterHubContext(sink), registry, backplane, metrics, faults);
             var pushSender = withPush ? new RecordingPushSender() : null;
             IEnumerable<IPushSender> senders = pushSender is null
                 ? Array.Empty<IPushSender>() : new IPushSender[] { pushSender };
@@ -999,6 +1002,7 @@ public sealed class RelayOnlineSwitchboardTests
                 Router = router,
                 Dedup = new RelayFrameDedup(),
                 Metrics = metrics,
+                Faults = faults,
                 RateLimiter = rateLimiter ?? new AllowAllRateLimiter(),
                 Push = push,
                 PushSender = pushSender,
@@ -1040,7 +1044,10 @@ public sealed class RelayOnlineSwitchboardTests
                 $"?handle={Uri.EscapeDataString(handle)}&deviceId={Uri.EscapeDataString(deviceId)}" +
                 $"&protocolVersion={protocolVersion}&authGeneration={authGeneration}&custodyHead={Uri.EscapeDataString(custodyHead)}";
             var context = new FakeCallerContext(connectionId, query);
-            var hub = new MeshHub(Registry, Router, Store, Backplane, RateLimiter, Dedup, Push, Metrics, NullLogger<MeshHub>.Instance)
+            var hub = new MeshHub(
+                Registry, Router, Store, Backplane, RateLimiter, Dedup, Push, Metrics,
+                TimeProvider.System, Faults, new LiveFaultHandshakeObserver(),
+                new LiveFaultTransportObserver(), NullLogger<MeshHub>.Instance)
             {
                 Context = context,
                 Clients = new CallerClients(Sink, connectionId)

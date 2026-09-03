@@ -1,8 +1,10 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json.Nodes;
 using Mesh.App.Services;
 using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
+using Mesh.Relay.LiveFaults;
 using Mesh.Relay.Observability;
 using Mesh.Relay.Push;
 using Mesh.Relay.RateLimiting;
@@ -31,6 +33,13 @@ namespace Mesh.App.Tests;
 [TestClass]
 public sealed class OnlineReplicationRuntimeTests
 {
+    private sealed class ManualTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        private DateTimeOffset now = utcNow;
+        public override DateTimeOffset GetUtcNow() => now;
+        public void Advance(TimeSpan duration) => now += duration;
+    }
+
     private static readonly byte[] DbKey = Enumerable.Range(1, 32).Select(i => (byte)i).ToArray();
 
     private string _root = null!;
@@ -269,11 +278,20 @@ public sealed class OnlineReplicationRuntimeTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<bool> Release { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool CancellationObserved { get; private set; }
 
         public async Task<HandleInfo?> FetchHandleAsync(string requestedHandle, CancellationToken ct)
         {
             Entered.TrySetResult(true);
-            await Release.Task.ConfigureAwait(false);
+            try
+            {
+                await Release.Task.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                CancellationObserved = true;
+                throw;
+            }
             return handle;
         }
 
@@ -293,6 +311,7 @@ public sealed class OnlineReplicationRuntimeTests
         public int ResolveCount;
         public TaskCompletionSource<bool>? FetchEntered;
         public TaskCompletionSource<bool>? FetchRelease;
+        public Exception? FetchError;
 
         public void SetHandle(string handle, HandleInfo info)
         {
@@ -319,6 +338,8 @@ public sealed class OnlineReplicationRuntimeTests
             var release = FetchRelease;
             if (release is not null)
                 await release.Task.WaitAsync(ct);
+            if (FetchError is not null)
+                throw FetchError;
 
             return result;
         }
@@ -367,6 +388,101 @@ public sealed class OnlineReplicationRuntimeTests
                 && string.Equals(d.DeviceId, deviceId, StringComparison.Ordinal));
 
         public long AuthGeneration(string handle) => Gen;
+
+        public Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+            IReadOnlyCollection<string> accountHandles,
+            ReplicationIdentity localIdentity,
+            CancellationToken ct)
+        {
+            var snapshot = accountHandles
+                .Append(localIdentity.Handle)
+                .Distinct(StringComparer.Ordinal)
+                .SelectMany(AuthorizedDevices)
+                .ToList();
+            var ownOnly = accountHandles.All(handle =>
+                string.Equals(handle, localIdentity.Handle, StringComparison.Ordinal));
+            var hasSibling = snapshot.Any(device =>
+                string.Equals(device.Handle, localIdentity.Handle, StringComparison.Ordinal)
+                && !string.Equals(device.DeviceId, localIdentity.DeviceId, StringComparison.Ordinal));
+            return Task.FromResult(new ReplicationEmissionRosterSnapshot(
+                ownOnly && !hasSibling
+                    ? ReplicationEmissionRosterState.NoSiblings
+                    : ReplicationEmissionRosterState.FreshComplete,
+                snapshot,
+                accountHandles.Append(localIdentity.Handle)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToDictionary(handle => handle, _ => Gen, StringComparer.Ordinal)));
+        }
+    }
+
+    private sealed class UnavailableEmissionRoster : IReplicationRoster
+        {
+            public IReadOnlyList<ReplicationDevice> AuthorizedDevices(string accountHandle)
+                => Array.Empty<ReplicationDevice>();
+
+            public ReplicationDevice? ResolveDevice(string accountHandle, string deviceId) => null;
+
+            public long AuthGeneration(string accountHandle) => -1;
+
+            public Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+                IReadOnlyCollection<string> accountHandles,
+                ReplicationIdentity localIdentity,
+                CancellationToken ct)
+                => Task.FromResult(new ReplicationEmissionRosterSnapshot(
+                    ReplicationEmissionRosterState.Unavailable,
+                    Array.Empty<ReplicationDevice>(),
+                    new Dictionary<string, long>(StringComparer.Ordinal),
+                    "test authority unavailable"));
+        }
+
+    private sealed class BlockingEmissionRoster(
+            IReadOnlyList<ReplicationDevice> devices) : IReplicationRoster
+        {
+            public TaskCompletionSource<bool> Entered { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public TaskCompletionSource<bool> Release { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public IReadOnlyList<ReplicationDevice> AuthorizedDevices(string accountHandle)
+                => devices.Where(device =>
+                    ReplicationHandle.Norm(device.Handle)
+                    == ReplicationHandle.Norm(accountHandle)).ToArray();
+
+            public ReplicationDevice? ResolveDevice(string accountHandle, string deviceId)
+                => AuthorizedDevices(accountHandle).FirstOrDefault(device =>
+                    ReplicationHandle.Device(device.DeviceId)
+                    == ReplicationHandle.Device(deviceId));
+
+            public long AuthGeneration(string accountHandle)
+                => AuthorizedDevices(accountHandle).Select(device => device.AuthGeneration)
+                    .DefaultIfEmpty(-1).Max();
+
+            public async Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+                IReadOnlyCollection<string> accountHandles,
+                ReplicationIdentity localIdentity,
+                CancellationToken ct)
+            {
+                Entered.TrySetResult(true);
+                await Release.Task.WaitAsync(ct);
+                var handles = accountHandles.Append(localIdentity.Handle)
+                    .Select(ReplicationHandle.Norm)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray();
+                var selected = devices.Where(device =>
+                    handles.Contains(ReplicationHandle.Norm(device.Handle), StringComparer.Ordinal))
+                    .ToArray();
+                return new ReplicationEmissionRosterSnapshot(
+                    ReplicationEmissionRosterState.FreshComplete,
+                    selected,
+                    handles.ToDictionary(
+                        handle => handle,
+                        handle => selected.Where(device =>
+                                ReplicationHandle.Norm(device.Handle) == handle)
+                            .Select(device => device.AuthGeneration)
+                            .DefaultIfEmpty(0).Max(),
+                        StringComparer.Ordinal),
+                    ValidAt: DateTimeOffset.UtcNow);
+            }
     }
 
     private sealed class BlockingResolveRoster : IReplicationRoster, IDisposable
@@ -471,7 +587,65 @@ public sealed class OnlineReplicationRuntimeTests
     }
 
     [TestMethod]
-    public async Task Poller_DisposeAsyncWaitsForInFlightPollBeforeCompleting()
+    public async Task Engine_DisposeWaitsForProjectionCaptureBeforeCompleting()
+    {
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var capture = engine.WithProjectionBoundaryAsync(
+            async _ =>
+            {
+                entered.TrySetResult(true);
+                await release.Task;
+                return true;
+            },
+            CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var dispose = engine.DisposeAsync().AsTask();
+        await Task.Delay(50);
+        Assert.IsFalse(dispose.IsCompleted, "disposal must drain snapshot capture");
+
+        release.TrySetResult(true);
+        await Task.WhenAll(capture, dispose).WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [TestMethod]
+    public async Task Engine_DisposeWaitsForActiveDurableEmissionBeforeDisposingRepairGate()
+    {
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+
+        var emission = Task.Run(() => engine.EmitLocalDurableAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "dispose-emission"),
+            new[] { "alice" },
+            domainWork: (_, _, _) =>
+            {
+                entered.TrySetResult(true);
+                release.Wait();
+            }));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var dispose = engine.DisposeAsync().AsTask();
+        await Task.Delay(50);
+        Assert.IsFalse(dispose.IsCompleted, "disposal must drain the durable journal transaction");
+
+        release.Set();
+        await Task.WhenAll(emission, dispose).WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [TestMethod]
+    public async Task Poller_DisposeAsyncCancelsAndDrainsBlockedRosterFetch()
     {
         var mine = KeyPair.New();
         var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
@@ -499,11 +673,8 @@ public sealed class OnlineReplicationRuntimeTests
         await source.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         var dispose = poller.DisposeAsync().AsTask();
-        await Task.Delay(50);
-        Assert.IsFalse(dispose.IsCompleted, "disposal must wait for the active poll iteration");
-
-        source.Release.TrySetResult(true);
         await dispose.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsTrue(source.CancellationObserved, "disposal must cancel the active roster HTTP await");
     }
 
     [TestMethod]
@@ -545,10 +716,721 @@ public sealed class OnlineReplicationRuntimeTests
 
     private RelayReplicationRoster NewRoster(
         FakeMetadataSource source, string ownHandle, List<string> surfaced, Action? onAuthorityChanged = null,
-        Func<string, string?>? localCustody = null, long ownAuthGen = 0, string ownCustody = "")
+        Func<string, string?>? localCustody = null, long ownAuthGen = 0, string ownCustody = "",
+        TimeProvider? timeProvider = null)
         => new(source, ownHandle, ownAuthGen, ownCustody,
             localCustody ?? (_ => ""), s => { lock (surfaced) surfaced.Add(s); },
-            onAuthorityChanged ?? (() => { }));
+            onAuthorityChanged ?? (() => { }), timeProvider);
+
+    [TestMethod]
+    public async Task Emission_ExpiredRosterWaitsForSingleFlightRefreshBeforeAllocatingEvent()
+    {
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64, sibling.PublicB64));
+        var roster = NewRoster(source, "alice", new List<string>(), timeProvider: clock);
+        await roster.RefreshAsync(new[] { "alice" }, default);
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var db = _dbs[^1];
+
+        clock.Advance(TimeSpan.FromSeconds(31));
+        source.FetchEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        source.FetchRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var emission = engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "result"),
+            new[] { "alice" },
+            domainWork: static (_, _, _) => { });
+
+        await source.FetchEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsFalse(emission.IsCompleted, "emission must await the in-flight authoritative refresh");
+        Assert.AreEqual(0, db.QueryEvents(myDevice, "epoch-1", 1, 64).Count);
+        Assert.AreEqual(0, db.GetPendingReplicationIntents().Count);
+
+        source.FetchRelease.TrySetResult(true);
+        var eventId = await emission.WaitAsync(TimeSpan.FromSeconds(2));
+        var evt = db.GetEvent(eventId)!;
+        CollectionAssert.AreEquivalent(
+            new[] { myDevice, siblingDevice },
+            ReplicationPayloadCodec.RecipientDeviceIds(evt.Ciphertext).ToArray());
+        Assert.AreEqual(MeshDb.OutboxStatePending, db.GetOutboxState(eventId, "alice"));
+    }
+
+    [TestMethod]
+    public async Task Emission_UnavailableRosterPersistsEncryptedIntentAndRetriesExactlyOnce()
+    {
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        var roster = NewRoster(source, "alice", new List<string>(), timeProvider: clock);
+        await roster.RefreshAsync(new[] { "alice" }, default);
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var db = _dbs[^1];
+
+        clock.Advance(TimeSpan.FromSeconds(31));
+        source.RemoveHandle("alice");
+        var intentId = await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "offline-result"),
+            new[] { "alice" },
+            domainWork: static (_, _, _) => { });
+
+        Assert.IsNull(db.GetEvent(intentId));
+        Assert.AreEqual(0, db.QueryEvents(myDevice, "epoch-1", 1, 64).Count);
+        var pending = db.GetPendingReplicationIntents().Single();
+        Assert.AreEqual(intentId, pending.IntentId);
+        Assert.IsFalse(
+            pending.EncryptedEnvelope.Contains("offline-result", StringComparison.Ordinal),
+            "pending intent must not duplicate plaintext");
+
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        clock.Advance(TimeSpan.FromMilliseconds(1));
+        var failedFetches = source.FetchCount;
+        Assert.AreEqual(
+            0,
+            await engine.RetryPendingIntentsAsync(),
+            "the cached directory failure must fail closed during its bounded cooldown");
+        Assert.AreEqual(
+            failedFetches,
+            source.FetchCount,
+            "a near retry must not create a directory fetch storm");
+        clock.Advance(TimeSpan.FromSeconds(3));
+        Assert.AreEqual(1, await engine.RetryPendingIntentsAsync());
+        Assert.AreEqual(0, await engine.RetryPendingIntentsAsync());
+        Assert.AreEqual(0, db.GetPendingReplicationIntents().Count);
+        var repaired = db.QueryEvents(myDevice, "epoch-1", 1, 64).Single();
+        Assert.IsNull(db.GetOutboxState(repaired.EventId, "alice"));
+    }
+
+    [TestMethod]
+    public async Task Emission_AuthoritativeNoSiblingsAllowsLocalOnlyEvent()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var db = _dbs[^1];
+
+        var eventId = await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "local-only"),
+            new[] { "alice" },
+            domainWork: static (_, _, _) => { });
+
+        Assert.IsNotNull(db.GetEvent(eventId));
+        Assert.IsNull(db.GetOutboxState(eventId, "alice"));
+        CollectionAssert.AreEqual(
+            new[] { myDevice },
+            ReplicationPayloadCodec.RecipientDeviceIds(db.GetEvent(eventId)!.Ciphertext).ToArray());
+    }
+
+    [TestMethod]
+    public async Task Emission_CaseVariantSelfDeviceIsNotASibling()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        var roster = NewRoster(source, "ALICE", new List<string>());
+        var identity = new ReplicationIdentity(
+            "@Alice",
+            myDevice.ToUpperInvariant(),
+            mine.PublicB64,
+            mine.PrivateB64,
+            "epoch-case",
+            0,
+            OnlineReplicationProtocol.ZeroHash);
+
+        var snapshot = await roster.GetEmissionSnapshotAsync(
+            new[] { "@ALICE" }, identity, default);
+
+        Assert.AreEqual(ReplicationEmissionRosterState.NoSiblings, snapshot.State);
+        Assert.IsNotNull(snapshot.ValidAt);
+    }
+
+    [TestMethod]
+    public async Task Roster_TwentyFailedCallersShareFailureCooldownAndInvalidationRefresh()
+    {
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var identity = new ReplicationIdentity(
+            "alice",
+            DeviceProtocol.DeviceId(mine.PublicB64),
+            mine.PublicB64,
+            mine.PrivateB64,
+            "epoch-failure",
+            0,
+            OnlineReplicationProtocol.ZeroHash);
+        var roster = NewRoster(source, "alice", new List<string>(), timeProvider: clock);
+
+        var failures = await Task.WhenAll(Enumerable.Range(0, 20).Select(_ =>
+            roster.GetEmissionSnapshotAsync(new[] { "alice" }, identity, default)));
+
+        Assert.AreEqual(1, source.FetchCount);
+        Assert.IsTrue(failures.All(result =>
+            result.State == ReplicationEmissionRosterState.Unavailable));
+        _ = await roster.GetEmissionSnapshotAsync(new[] { "alice" }, identity, default);
+        Assert.AreEqual(1, source.FetchCount, "failure must remain cached during cooldown");
+
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        roster.Invalidate("ALICE");
+        var recovered = await Task.WhenAll(Enumerable.Range(0, 20).Select(_ =>
+            roster.GetEmissionSnapshotAsync(new[] { "alice" }, identity, default)));
+
+        Assert.AreEqual(2, source.FetchCount);
+        Assert.IsTrue(recovered.All(result =>
+            result.State == ReplicationEmissionRosterState.NoSiblings));
+    }
+
+    [TestMethod]
+    public async Task Roster_RefreshFailureIsDistinctAndCanceledWaiterDoesNotCancelSharedFetch()
+    {
+        var source = new FakeMetadataSource
+        {
+            FetchEntered = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            FetchRelease = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            FetchError = new InvalidOperationException("secret-upstream-detail"),
+        };
+        var mine = KeyPair.New();
+        var identity = new ReplicationIdentity(
+            "alice",
+            DeviceProtocol.DeviceId(mine.PublicB64),
+            mine.PublicB64,
+            mine.PrivateB64,
+            "epoch-refresh-failure",
+            0,
+            OnlineReplicationProtocol.ZeroHash);
+        var roster = NewRoster(source, "alice", new List<string>());
+        using var canceled = new CancellationTokenSource();
+
+        var canceledWaiter = roster.GetEmissionSnapshotAsync(
+            new[] { "alice" }, identity, canceled.Token);
+        var remaining = Enumerable.Range(0, 19)
+            .Select(_ => roster.GetEmissionSnapshotAsync(
+                new[] { "alice" }, identity, CancellationToken.None))
+            .ToArray();
+        await source.FetchEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        canceled.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await canceledWaiter);
+        source.FetchRelease.TrySetResult(true);
+
+        var results = await Task.WhenAll(remaining).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.AreEqual(1, source.FetchCount);
+        Assert.IsTrue(results.All(result =>
+            result.State == ReplicationEmissionRosterState.RefreshFailed));
+        Assert.IsTrue(results.All(result =>
+            string.Equals(result.Reason, "directory refresh failed", StringComparison.Ordinal)));
+        Assert.IsTrue(results.All(result =>
+            !(result.Reason ?? "").Contains("secret-upstream-detail", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public async Task Roster_InvalidateDuringFetchReturnsStaleAndDoesNotPublishResult()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        source.FetchEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        source.FetchRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var identity = new ReplicationIdentity(
+            "alice",
+            DeviceProtocol.DeviceId(mine.PublicB64),
+            mine.PublicB64,
+            mine.PrivateB64,
+            "epoch-stale",
+            0,
+            OnlineReplicationProtocol.ZeroHash);
+        var roster = NewRoster(source, "alice", new List<string>());
+
+        var resolving = roster.GetEmissionSnapshotAsync(
+            new[] { "alice" }, identity, default);
+        await source.FetchEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        roster.Invalidate("alice");
+        source.FetchRelease.TrySetResult(true);
+        var snapshot = await resolving;
+
+        Assert.AreEqual(ReplicationEmissionRosterState.Stale, snapshot.State);
+        Assert.AreEqual(0, roster.AuthorizedDevices("alice").Count);
+    }
+
+    [TestMethod]
+    public async Task Roster_MinimumObservedGenerationForcesFreshFetchAndReturnsStale()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        var identity = new ReplicationIdentity(
+            "alice",
+            DeviceProtocol.DeviceId(mine.PublicB64),
+            mine.PublicB64,
+            mine.PrivateB64,
+            "epoch-minimum",
+            0,
+            OnlineReplicationProtocol.ZeroHash);
+        var roster = NewRoster(source, "alice", new List<string>());
+        _ = await roster.GetEmissionSnapshotAsync(new[] { "alice" }, identity, default);
+
+        var snapshot = await roster.GetEmissionSnapshotAsync(
+            new[] { "alice" },
+            identity,
+            new Dictionary<string, long>(StringComparer.Ordinal) { ["@ALICE"] = 1 },
+            default);
+
+        Assert.AreEqual(2, source.FetchCount, "the fresh-but-older cache must be bypassed");
+        Assert.AreEqual(ReplicationEmissionRosterState.Stale, snapshot.State);
+    }
+
+    [TestMethod]
+    public void Crypto_DecryptOutcomeDistinguishesMissingAuthenticationAndMalformed()
+    {
+        var mine = KeyPair.New();
+        var other = KeyPair.New();
+        var ciphertext = ReplicationPayloadCodec.Encrypt("secret", new[] { mine.PublicB64 });
+        Assert.AreEqual(
+            MessageDecryptOutcome.Success,
+            ReplicationPayloadCodec.TryDecrypt(
+                ciphertext, mine.PrivateB64, mine.PublicB64).Outcome);
+        Assert.AreEqual(
+            MessageDecryptOutcome.MissingRecipientSlot,
+            ReplicationPayloadCodec.TryDecrypt(
+                ciphertext, other.PrivateB64, other.PublicB64).Outcome);
+
+        var payload = JsonNode.Parse(ciphertext)!.AsObject();
+        var body = Convert.FromBase64String(payload["ct"]!.GetValue<string>());
+        body[0] ^= 1;
+        payload["ct"] = Convert.ToBase64String(body);
+        Assert.AreEqual(
+            MessageDecryptOutcome.AuthenticationFailed,
+            ReplicationPayloadCodec.TryDecrypt(
+                payload.ToJsonString(), mine.PrivateB64, mine.PublicB64).Outcome);
+        Assert.AreEqual(
+            MessageDecryptOutcome.Malformed,
+            ReplicationPayloadCodec.TryDecrypt(
+                "{\"alg\":\"ECIES-P256-AESGCM\"}",
+                mine.PrivateB64,
+                mine.PublicB64).Outcome);
+    }
+
+    [TestMethod]
+    public async Task Emission_TwentyConcurrentCallsShareOneExpiredRosterRefresh()
+    {
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64, sibling.PublicB64));
+        var roster = NewRoster(source, "alice", new List<string>(), timeProvider: clock);
+        await roster.RefreshAsync(new[] { "alice" }, default);
+        var baselineFetches = source.FetchCount;
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var db = _dbs[^1];
+
+        clock.Advance(TimeSpan.FromSeconds(31));
+        var emissions = Enumerable.Range(0, 20)
+            .Select(index => engine.EmitLocalAsync(
+                Env(
+                    ReplicationOpKinds.Message,
+                    ReplicationPayloadCodec.DomainAction.Upsert,
+                    "concurrent-" + index),
+                new[] { "alice" },
+                domainWork: static (_, _, _) => { }))
+            .ToArray();
+        var eventIds = await Task.WhenAll(emissions);
+
+        Assert.AreEqual(baselineFetches + 1, source.FetchCount);
+        Assert.AreEqual(20, eventIds.Distinct(StringComparer.Ordinal).Count());
+        Assert.AreEqual(20, db.QueryEvents(myDevice, "epoch-1", 1, 64).Count);
+        Assert.IsTrue(db.QueryEvents(myDevice, "epoch-1", 1, 64).All(evt =>
+            ReplicationPayloadCodec.RecipientDeviceIds(evt.Ciphertext).Count == 2));
+        Assert.IsTrue(eventIds.All(eventId =>
+            db.GetOutboxState(eventId, "alice") == MeshDb.OutboxStatePending));
+    }
+
+    [TestMethod]
+    public async Task Emission_PendingIntentRepairsOnceOnEngineRestart()
+    {
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        var roster = NewRoster(source, "alice", new List<string>(), timeProvider: clock);
+        await roster.RefreshAsync(new[] { "alice" }, default);
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var db = _dbs[^1];
+
+        clock.Advance(TimeSpan.FromSeconds(31));
+        source.RemoveHandle("alice");
+        _ = await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "restart-result"),
+            new[] { "alice" },
+            domainWork: static (_, _, _) => { });
+        Assert.AreEqual(1, db.GetPendingReplicationIntents().Count);
+
+        await engine.DisposeAsync();
+        _engines.Remove(engine);
+        db.Dispose();
+        _dbs.Remove(db);
+
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64));
+        clock.Advance(TimeSpan.FromMilliseconds(1));
+        var reopened = MeshDb.Open(Path.Combine(_root, myDevice + ".meshdb"), DbKey);
+        _dbs.Add(reopened);
+        var identity = new ReplicationIdentity(
+            "alice", myDevice, mine.PublicB64, mine.PrivateB64,
+            "epoch-1", 0, OnlineReplicationProtocol.ZeroHash);
+        var restarted = new OnlineReplicationEngine(
+            reopened,
+            identity,
+            new RecordingTransport(),
+            roster,
+            new CapturingApplier(),
+            sendTimeout: TimeSpan.FromSeconds(2),
+            maxSendAttempts: 1);
+        _engines.Add(restarted);
+        restarted.EnsureLocalOrigin();
+
+        await WaitUntilAsync(
+            () => reopened.QueryEvents(myDevice, "epoch-1", 1, 64).Count == 1,
+            TimeSpan.FromSeconds(2));
+        Assert.AreEqual(0, reopened.GetPendingReplicationIntents().Count);
+        Assert.AreEqual(1, reopened.QueryEvents(myDevice, "epoch-1", 1, 64).Count);
+    }
+
+    [TestMethod]
+    public async Task Emission_PendingIntentSurvivesLocalAndRemoteKeyRotation()
+    {
+        var oldKeys = KeyPair.New();
+        var oldDevice = DeviceProtocol.DeviceId(oldKeys.PublicB64);
+        var first = NewEngine(
+            "alice",
+            oldDevice,
+            new UnavailableEmissionRoster(),
+            new RecordingTransport(),
+            oldKeys);
+        var db = _dbs[^1];
+        _ = await first.EmitLocalAsync(
+            Env(
+                ReplicationOpKinds.Message,
+                ReplicationPayloadCodec.DomainAction.Upsert,
+                "rotation-safe-intent"),
+            new[] { "bob" },
+            domainWork: static (_, _, _) => { });
+        var pending = db.GetPendingReplicationIntents().Single();
+        Assert.IsTrue(
+            pending.EncryptedEnvelope.StartsWith("local-v1:", StringComparison.Ordinal));
+        Assert.IsFalse(
+            pending.EncryptedEnvelope.Contains("rotation-safe-intent", StringComparison.Ordinal));
+
+        await first.DisposeAsync();
+        _engines.Remove(first);
+        db.Dispose();
+        _dbs.Remove(db);
+        SqliteConnection.ClearAllPools();
+        DowngradePendingIntentSchemaToLegacy(
+            Path.Combine(_root, oldDevice + ".meshdb"),
+            DbKey,
+            "rotation-safe-intent");
+
+        var newKeys = KeyPair.New();
+        var remoteKeys = KeyPair.New();
+        var newDevice = DeviceProtocol.DeviceId(newKeys.PublicB64);
+        var remoteDevice = DeviceProtocol.DeviceId(remoteKeys.PublicB64);
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", newDevice, newKeys.PublicB64, 1, false));
+        roster.Add(new ReplicationDevice("bob", remoteDevice, remoteKeys.PublicB64, 1, false));
+        var reopened = MeshDb.Open(Path.Combine(_root, oldDevice + ".meshdb"), DbKey);
+        _dbs.Add(reopened);
+        var restarted = new OnlineReplicationEngine(
+            reopened,
+            new ReplicationIdentity(
+                "alice",
+                newDevice,
+                newKeys.PublicB64,
+                newKeys.PrivateB64,
+                "epoch-rotated",
+                1,
+                OnlineReplicationProtocol.ZeroHash),
+            new RecordingTransport(),
+            roster,
+            new CapturingApplier(),
+            sendTimeout: TimeSpan.FromSeconds(2),
+            maxSendAttempts: 1);
+        _engines.Add(restarted);
+
+        await WaitUntilAsync(
+            () => reopened.QueryEvents(newDevice, "epoch-rotated", 1, 64).Count == 1,
+            TimeSpan.FromSeconds(2));
+        var repaired = reopened.QueryEvents(newDevice, "epoch-rotated", 1, 64).Single();
+        var decrypt = ReplicationPayloadCodec.TryDecrypt(
+            repaired.Ciphertext,
+            remoteKeys.PrivateB64,
+            remoteKeys.PublicB64);
+        Assert.AreEqual(MessageDecryptOutcome.Success, decrypt.Outcome);
+        Assert.AreEqual(
+            "rotation-safe-intent",
+            ReplicationPayloadCodec.DecodeEnvelope(decrypt.Plaintext!)!.EntityId);
+        Assert.AreEqual(0, reopened.GetPendingReplicationIntents().Count);
+    }
+
+    private static void DowngradePendingIntentSchemaToLegacy(
+        string databasePath,
+        byte[] databaseKey,
+        string plaintextMarker)
+    {
+        using var connection = new SqliteConnection($"Data Source={databasePath}");
+        connection.Open();
+        using (var key = connection.CreateCommand())
+        {
+            key.CommandText =
+                $"PRAGMA key = \"x'{Convert.ToHexString(databaseKey)}'\";";
+            key.ExecuteNonQuery();
+        }
+        using (var downgrade = connection.CreateCommand())
+        {
+            downgrade.CommandText = """
+                DROP INDEX IF EXISTS ix_replication_pending_intents_sequence;
+                ALTER TABLE replication_pending_intents DROP COLUMN durable_sequence;
+                """;
+            downgrade.ExecuteNonQuery();
+        }
+        using var inspect = connection.CreateCommand();
+        inspect.CommandText = """
+            SELECT encrypted_envelope,
+                   EXISTS(
+                       SELECT 1 FROM pragma_table_info('replication_pending_intents')
+                       WHERE name = 'durable_sequence')
+            FROM replication_pending_intents;
+            """;
+        using var reader = inspect.ExecuteReader();
+        Assert.IsTrue(reader.Read());
+        var protectedEnvelope = reader.GetString(0);
+        Assert.IsTrue(protectedEnvelope.StartsWith("local-v1:", StringComparison.Ordinal));
+        Assert.IsFalse(protectedEnvelope.Contains(plaintextMarker, StringComparison.Ordinal));
+        Assert.AreEqual(0L, reader.GetInt64(1));
+        Assert.IsFalse(reader.Read());
+    }
+
+    [TestMethod]
+    public async Task Emission_StartupBarrierPreservesThreePendingThenConcurrentNewOrder()
+    {
+        var mine = KeyPair.New();
+        var remote = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var remoteDevice = DeviceProtocol.DeviceId(remote.PublicB64);
+        var first = NewEngine(
+            "alice",
+            myDevice,
+            new UnavailableEmissionRoster(),
+            new RecordingTransport(),
+            mine);
+        var db = _dbs[^1];
+        for (var index = 1; index <= 3; index++)
+        {
+            _ = await first.EmitLocalAsync(
+                Env(
+                    ReplicationOpKinds.Message,
+                    ReplicationPayloadCodec.DomainAction.Upsert,
+                    "ordered-" + index),
+                new[] { "bob" },
+                domainWork: static (_, _, _) => { });
+        }
+        Assert.AreEqual(3, db.GetPendingReplicationIntents().Count);
+        await first.DisposeAsync();
+        _engines.Remove(first);
+        db.Dispose();
+        _dbs.Remove(db);
+
+        var blocking = new BlockingEmissionRoster(new[]
+        {
+            new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false),
+            new ReplicationDevice("bob", remoteDevice, remote.PublicB64, 0, false),
+        });
+        var reopened = MeshDb.Open(Path.Combine(_root, myDevice + ".meshdb"), DbKey);
+        _dbs.Add(reopened);
+        var restarted = new OnlineReplicationEngine(
+            reopened,
+            new ReplicationIdentity(
+                "alice",
+                myDevice,
+                mine.PublicB64,
+                mine.PrivateB64,
+                "epoch-1",
+                0,
+                OnlineReplicationProtocol.ZeroHash),
+            new RecordingTransport(),
+            blocking,
+            new CapturingApplier(),
+            sendTimeout: TimeSpan.FromSeconds(2),
+            maxSendAttempts: 1);
+        _engines.Add(restarted);
+        await blocking.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var fourth = restarted.EmitLocalAsync(
+            Env(
+                ReplicationOpKinds.Message,
+                ReplicationPayloadCodec.DomainAction.Upsert,
+                "ordered-4"),
+            new[] { "bob" },
+            domainWork: static (_, _, _) => { });
+        Assert.IsFalse(fourth.IsCompleted, "new emission must await startup repair");
+        blocking.Release.TrySetResult(true);
+        _ = await fourth.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var events = reopened.QueryEvents(myDevice, "epoch-1", 1, 64);
+        CollectionAssert.AreEqual(
+            new[] { "ordered-1", "ordered-2", "ordered-3", "ordered-4" },
+            events.Select(evt =>
+            {
+                var decrypt = ReplicationPayloadCodec.TryDecrypt(
+                    evt.Ciphertext, mine.PrivateB64, mine.PublicB64);
+                Assert.AreEqual(MessageDecryptOutcome.Success, decrypt.Outcome);
+                return ReplicationPayloadCodec.DecodeEnvelope(decrypt.Plaintext!)!.EntityId;
+            }).ToArray());
+        Assert.AreEqual(0, reopened.GetPendingReplicationIntents().Count);
+        Assert.IsTrue(events.All(evt =>
+            reopened.GetOutboxState(evt.EventId, "bob") == MeshDb.OutboxStatePending));
+    }
+
+    [TestMethod]
+    public async Task Emission_UnavailableBatchQueuesAtomicallyAheadOfLaterSingleAcrossRestart()
+    {
+        var mine = KeyPair.New();
+        var remote = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var remoteDevice = DeviceProtocol.DeviceId(remote.PublicB64);
+        var first = NewEngine(
+            "alice",
+            myDevice,
+            new UnavailableEmissionRoster(),
+            new RecordingTransport(),
+            mine);
+        var db = _dbs[^1];
+        var batch = new[]
+        {
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "batch-1"),
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "batch-2"),
+        };
+
+        var pendingBatchIds = await first.EmitLocalBatchAsync(
+            batch, new[] { "bob" }, domainWork: static (_, _, _) => { });
+        _ = await first.EmitLocalAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "after-batch"),
+            new[] { "bob" },
+            domainWork: static (_, _, _) => { });
+        Assert.AreEqual(2, pendingBatchIds.Count);
+        Assert.AreEqual(2, db.GetPendingReplicationIntents().Count);
+        Assert.AreEqual(0, db.QueryEvents(myDevice, "epoch-1", 1, 10).Count);
+
+        await first.DisposeAsync();
+        _engines.Remove(first);
+        db.Dispose();
+        _dbs.Remove(db);
+        SqliteConnection.ClearAllPools();
+
+        var roster = new StubRoster();
+        roster.Add(new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        roster.Add(new ReplicationDevice("bob", remoteDevice, remote.PublicB64, 0, false));
+        var reopened = MeshDb.Open(Path.Combine(_root, myDevice + ".meshdb"), DbKey);
+        _dbs.Add(reopened);
+        var restarted = new OnlineReplicationEngine(
+            reopened,
+            new ReplicationIdentity(
+                "alice", myDevice, mine.PublicB64, mine.PrivateB64,
+                "epoch-1", 0, OnlineReplicationProtocol.ZeroHash),
+            new RecordingTransport(),
+            roster,
+            new CapturingApplier(),
+            sendTimeout: TimeSpan.FromSeconds(2),
+            maxSendAttempts: 1);
+        _engines.Add(restarted);
+
+        await WaitUntilAsync(
+            () => reopened.QueryEvents(myDevice, "epoch-1", 1, 10).Count == 3,
+            TimeSpan.FromSeconds(2));
+        var entities = reopened.QueryEvents(myDevice, "epoch-1", 1, 10)
+            .Select(evt =>
+            {
+                var decrypted = ReplicationPayloadCodec.TryDecrypt(
+                    evt.Ciphertext, mine.PrivateB64, mine.PublicB64);
+                Assert.AreEqual(MessageDecryptOutcome.Success, decrypted.Outcome);
+                return ReplicationPayloadCodec.DecodeEnvelope(decrypted.Plaintext!)!.EntityId;
+            })
+            .ToArray();
+        CollectionAssert.AreEqual(
+            new[] { "batch-1", "batch-2", "after-batch" },
+            entities);
+        Assert.AreEqual(0, reopened.GetPendingReplicationIntents().Count);
+    }
+
+    [TestMethod]
+    public async Task Emission_GenerationChangeFailsClosedUntilRearmedWithoutRevokedSlot()
+    {
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var revokedSibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir(
+            "alice", 0, OnlineReplicationProtocol.ZeroHash, mine.PublicB64, revokedSibling.PublicB64));
+        var roster = NewRoster(source, "alice", new List<string>(), timeProvider: clock);
+        await roster.RefreshAsync(new[] { "alice" }, default);
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var db = _dbs[^1];
+
+        clock.Advance(TimeSpan.FromSeconds(31));
+        source.SetHandle("alice", Dir("alice", 1, "head-1", mine.PublicB64));
+        var intentId = await engine.EmitLocalAsync(
+            Env(ReplicationOpKinds.Message, ReplicationPayloadCodec.DomainAction.Upsert, "post-revoke"),
+            new[] { "alice" },
+            domainWork: static (_, _, _) => { });
+        Assert.IsNull(db.GetEvent(intentId));
+        Assert.AreEqual(
+            ReplicationEmissionRosterState.GenerationChanged.ToString(),
+            db.GetPendingReplicationIntents().Single().RosterState);
+
+        await engine.DisposeAsync();
+        _engines.Remove(engine);
+        var freshIdentity = new ReplicationIdentity(
+            "alice", myDevice, mine.PublicB64, mine.PrivateB64, "epoch-1", 1, "head-1");
+        var rearmed = new OnlineReplicationEngine(
+            db,
+            freshIdentity,
+            new RecordingTransport(),
+            roster,
+            new CapturingApplier(),
+            sendTimeout: TimeSpan.FromSeconds(2),
+            maxSendAttempts: 1);
+        _engines.Add(rearmed);
+        await WaitUntilAsync(
+            () => db.QueryEvents(myDevice, "epoch-1", 1, 64).Count == 1,
+            TimeSpan.FromSeconds(2));
+
+        var repaired = db.QueryEvents(myDevice, "epoch-1", 1, 64).Single();
+        CollectionAssert.AreEqual(
+            new[] { myDevice },
+            ReplicationPayloadCodec.RecipientDeviceIds(repaired.Ciphertext).ToArray());
+        Assert.IsNull(db.GetOutboxState(repaired.EventId, "alice"));
+    }
 
     [TestMethod]
     public async Task Roster_AuthorizedDevices_DerivedFromDirectoryKeys()
@@ -610,6 +1492,91 @@ public sealed class OnlineReplicationRuntimeTests
         await roster.RefreshAsync(new[] { "alice" }, default);
 
         Assert.AreEqual(1, source.FetchCount, "second refresh within the cache lifetime must not re-fetch");
+    }
+
+    [TestMethod]
+    public async Task Roster_Refresh_UsesInjectedTimeProviderForThirtySecondExpiry()
+    {
+        var source = new FakeMetadataSource();
+        var first = KeyPair.New();
+        var second = KeyPair.New();
+        source.SetHandle("alice", Dir("alice", 0, "", first.PublicB64));
+        var clock = new ManualTimeProvider(DateTimeOffset.Parse("2026-08-22T18:00:00Z"));
+        var roster = NewRoster(source, "alice", new List<string>(), timeProvider: clock);
+
+        await roster.RefreshAsync(new[] { "alice" }, default);
+        source.SetHandle("alice", Dir("alice", 0, "", first.PublicB64, second.PublicB64));
+        clock.Advance(TimeSpan.FromSeconds(29));
+        await roster.RefreshAsync(new[] { "alice" }, default);
+        Assert.AreEqual(1, source.FetchCount);
+
+        clock.Advance(TimeSpan.FromSeconds(2));
+        await roster.RefreshAsync(new[] { "alice" }, default);
+
+        Assert.AreEqual(2, source.FetchCount);
+        Assert.IsNotNull(roster.ResolveDevice("alice", DeviceProtocol.DeviceId(second.PublicB64)));
+    }
+
+    [TestMethod]
+    public async Task RouteIsolation_RosterExpiryFreshAuthorityNonceAndRestoreAreDeterministic()
+    {
+        var sourceKey = KeyPair.New();
+        var targetKey = KeyPair.New();
+        var sourceDevice = DeviceProtocol.DeviceId(sourceKey.PublicB64);
+        var targetDevice = DeviceProtocol.DeviceId(targetKey.PublicB64);
+        var source = new FakeMetadataSource();
+        source.SetHandle("alice", Dir("alice", 0, "", sourceKey.PublicB64, targetKey.PublicB64));
+        var clock = new ManualTimeProvider(DateTimeOffset.Parse("2026-08-22T18:00:00Z"));
+        var authorityChanged = false;
+        var roster = NewRoster(
+            source,
+            "alice",
+            new List<string>(),
+            onAuthorityChanged: () => authorityChanged = true,
+            ownAuthGen: 0,
+            timeProvider: clock);
+        await roster.RefreshAsync(new[] { "alice" }, default);
+
+        var faults = new LiveFaultStore(
+            new LiveFaultOptions { Enabled = true, MaxTtlSeconds = 300, MaxUses = 100 },
+            clock);
+        faults.Activate(new LiveFaultActivationRequest(
+            "route-isolation",
+            LiveFaultMode.DropBeforeForwarding,
+            LiveFaultDirection.Outbound,
+            "alice",
+            targetDevice,
+            120,
+            MaxUses: 100,
+            SourceDevice: sourceDevice,
+            TargetAccount: "alice",
+            Kind: LiveFaultStore.OnlineFrameKind));
+        Assert.AreEqual(
+            LiveFaultMode.DropBeforeForwarding,
+            faults.TryApply(
+                LiveFaultDirection.Outbound, "alice", sourceDevice, "alice", targetDevice,
+                LiveFaultStore.OnlineFrameKind, "outage-frame")!.Mode);
+
+        source.SetHandle("alice", Dir("alice", 1, "head-1", sourceKey.PublicB64, targetKey.PublicB64));
+        clock.Advance(TimeSpan.FromSeconds(31));
+        await roster.RefreshAsync(new[] { "alice" }, default);
+
+        Assert.AreEqual(2, source.FetchCount);
+        Assert.AreEqual(1, roster.AuthGeneration("alice"));
+        Assert.IsTrue(authorityChanged);
+        var nonce = MeshCrypto.NewNonce();
+        var canonical = ReplicationConnectChallenge.Canonical(
+            nonce, "alice", targetDevice, MeshProtocol.Version, 1, "head-1");
+        using var signer = ECDsa.Create();
+        signer.ImportPkcs8PrivateKey(Convert.FromBase64String(targetKey.PrivateB64), out _);
+        var signature = Convert.ToBase64String(
+            signer.SignData(Encoding.UTF8.GetBytes(canonical), HashAlgorithmName.SHA256));
+        Assert.IsTrue(MeshCrypto.Verify(targetKey.PublicB64, canonical, signature));
+
+        Assert.IsTrue(faults.Deactivate("route-isolation"));
+        Assert.IsNull(faults.TryApply(
+            LiveFaultDirection.Outbound, "alice", sourceDevice, "alice", targetDevice,
+            LiveFaultStore.OnlineFrameKind, "restored-frame"));
     }
 
     [TestMethod]
@@ -910,6 +1877,121 @@ public sealed class OnlineReplicationRuntimeTests
     }
 
     [TestMethod]
+    public async Task Poller_RosterWake_ReportsOnlyMeaningfulPerDeviceTransitions()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var target = KeyPair.New();
+        var unrelated = KeyPair.New();
+        var rotatedTarget = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var targetDevice = DeviceProtocol.DeviceId(target.PublicB64);
+        var unrelatedDevice = DeviceProtocol.DeviceId(unrelated.PublicB64);
+        var rotatedTargetDevice = DeviceProtocol.DeviceId(rotatedTarget.PublicB64);
+        source.SetHandle("bob", Dir("bob", 1, "authority-a", target.PublicB64));
+        source.SetHandle("charlie", Dir("charlie", 1, "authority-c", unrelated.PublicB64));
+        source.SetPresence("bob", false, targetDevice);
+        source.SetPresence("charlie", false, unrelatedDevice);
+
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var wakes = new List<string[]>();
+        var poller = new ReplicationPresencePoller(
+            engine,
+            roster,
+            source,
+            () => new[] { "bob", "charlie" },
+            _ => true,
+            "alice",
+            myDevice,
+            _ => { },
+            rosterOnline: devices => wakes.Add(devices.OrderBy(id => id, StringComparer.Ordinal).ToArray()));
+        _disposables.Add(poller);
+
+        await poller.PollOnceAsync(default);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(0, wakes.Count, "unchanged offline polls must not wake retry backoff");
+
+        source.SetPresence("charlie", true, unrelatedDevice);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(1, wakes.Count);
+        CollectionAssert.AreEqual(new[] { unrelatedDevice }, wakes[0],
+            "an unrelated transition must identify only the unrelated device");
+
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => poller.PollOnceAsync(default)));
+        Assert.AreEqual(1, wakes.Count, "concurrent unchanged polls must not duplicate a wake");
+
+        source.SetPresence("bob", true, targetDevice);
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => poller.PollOnceAsync(default)));
+        Assert.AreEqual(2, wakes.Count, "the exact target transition must coalesce to one wake");
+        CollectionAssert.AreEqual(new[] { targetDevice }, wakes[1]);
+
+        source.SetHandle("bob", Dir("bob", 2, "authority-b", rotatedTarget.PublicB64));
+        source.SetPresence("bob", true, rotatedTargetDevice);
+        roster.Invalidate("bob");
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => poller.PollOnceAsync(default)));
+        Assert.AreEqual(3, wakes.Count, "an authority/device epoch change must coalesce to one wake");
+        CollectionAssert.AreEqual(new[] { rotatedTargetDevice }, wakes[2]);
+
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(3, wakes.Count, "an unchanged authority epoch must not reset retry backoff");
+        Console.WriteLine(
+            $"WAKE_TARGETS count={wakes.Count} targets=" +
+            $"{string.Join("|", wakes.Select(batch => string.Join(",", batch)))} " +
+            "unchangedOfflineWakes=0 concurrentDuplicateWakes=0");
+    }
+
+    [TestMethod]
+    public async Task Poller_AccountRoster_ReportsOnlineOfflineReconnectAndCoalescesReplays()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var mobile = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var mobileDevice = DeviceProtocol.DeviceId(mobile.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, mobile.PublicB64));
+        source.SetPresence("alice", true, myDevice);
+
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var observed = new List<string[]>();
+        var poller = new ReplicationPresencePoller(
+            engine,
+            roster,
+            source,
+            () => new[] { "alice" },
+            _ => false,
+            "alice",
+            myDevice,
+            _ => { },
+            accountRosterObserved: devices => observed.Add(
+                devices.OrderBy(device => device, StringComparer.Ordinal).ToArray()));
+        _disposables.Add(poller);
+
+        await poller.PollOnceAsync(default);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(1, observed.Count, "a replayed roster must not duplicate notifications");
+        CollectionAssert.AreEqual(new[] { myDevice }, observed[0]);
+
+        source.SetPresence("alice", true, myDevice, mobileDevice);
+        await poller.PollOnceAsync(default);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(2, observed.Count);
+        CollectionAssert.AreEqual(
+            new[] { mobileDevice, myDevice }.OrderBy(device => device, StringComparer.Ordinal).ToArray(),
+            observed[1]);
+
+        source.SetPresence("alice", true, myDevice);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(3, observed.Count, "disconnect must remove the expired device");
+        CollectionAssert.AreEqual(new[] { myDevice }, observed[2]);
+
+        source.SetPresence("alice", true, myDevice, mobileDevice);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(4, observed.Count, "reconnect must be observable after an offline transition");
+    }
+
+    [TestMethod]
     public async Task Poller_OnlineNewSibling_BypassesFreshStaleRoster()
     {
         var source = new FakeMetadataSource();
@@ -1021,6 +2103,865 @@ public sealed class OnlineReplicationRuntimeTests
         Assert.IsNotNull(bootstrapTarget);
         Assert.AreEqual(siblingDevice, bootstrapTarget.PeerDeviceId);
         Assert.AreEqual("alice", bootstrapTarget.PeerHandle);
+    }
+
+    [TestMethod]
+    public async Task Poller_TwentyConcurrentManualPollsAndPokeCoalesceOneFollowupFlight()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var sibling = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var siblingDevice = DeviceProtocol.DeviceId(sibling.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, sibling.PublicB64));
+        source.SetPresence("alice", true, myDevice, siblingDevice);
+
+        var sessionRoster = new FabricRoster();
+        sessionRoster.Add("alice", new ReplicationDevice("alice", myDevice, mine.PublicB64, 0, false));
+        sessionRoster.Add("alice", new ReplicationDevice("alice", siblingDevice, sibling.PublicB64, 0, false));
+        var fabric = new ReplicationFabric();
+        var engine = NewEngine("alice", myDevice, sessionRoster, fabric.TransportFor("alice", myDevice), mine);
+        var siblingEngine = NewEngine(
+            "alice",
+            siblingDevice,
+            sessionRoster,
+            fabric.TransportFor("alice", siblingDevice),
+            sibling);
+        fabric.Register("alice", myDevice, engine);
+        fabric.Register("alice", siblingDevice, siblingEngine);
+        await engine.StartSessionAsync("alice", siblingDevice);
+        await fabric.DrainAsync();
+        Assert.IsTrue(engine.IsSessionEstablished(siblingDevice));
+
+        var entered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var bootstrapCount = 0;
+        var presenceRoster = NewRoster(source, "alice", new List<string>());
+        var poller = new ReplicationPresencePoller(
+            engine,
+            presenceRoster,
+            source,
+            () => new[] { "alice" },
+            _ => false,
+            "alice",
+            myDevice,
+            _ => { },
+            async (_, ct) =>
+            {
+                Interlocked.Increment(ref bootstrapCount);
+                entered.TrySetResult(true);
+                await release.Task.WaitAsync(ct);
+            });
+        _disposables.Add(poller);
+
+        var first = poller.PollOnceAsync(default);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var joined = Enumerable.Range(0, 19)
+            .Select(_ => poller.PollOnceAsync(default))
+            .ToArray();
+        poller.Poke();
+        await Task.Delay(25);
+        Assert.AreEqual(1, Volatile.Read(ref bootstrapCount));
+
+        release.TrySetResult(true);
+        await Task.WhenAll(joined.Prepend(first)).WaitAsync(TimeSpan.FromSeconds(10));
+        await WaitUntilAsync(
+            () => !poller.PollFlightState.Active,
+            TimeSpan.FromSeconds(10));
+        Assert.AreEqual(2, bootstrapCount, "a poke newer than the active pass must cause one follow-up");
+    }
+
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(64)]
+    public async Task Poller_PokesAfterFinalCheckBeforeClear_CoalesceOneFollowup(int pokeCount)
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        var hookCalls = 0;
+        using var finalCheckEntered = new ManualResetEventSlim();
+        using var allowClear = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                Interlocked.Increment(ref polls);
+                return Array.Empty<string>();
+            });
+        poller.BeforePollFlightFinalize = () =>
+        {
+            if (Interlocked.Increment(ref hookCalls) != 1) return;
+            finalCheckEntered.Set();
+            allowClear.Wait(TimeSpan.FromSeconds(5));
+        };
+
+        var first = poller.PollOnceAsync(default);
+        Assert.IsTrue(finalCheckEntered.Wait(TimeSpan.FromSeconds(2)));
+        var pokes = Enumerable.Range(0, pokeCount)
+            .Select(_ => Task.Run(poller.Poke))
+            .ToArray();
+        await Task.WhenAll(pokes).WaitAsync(TimeSpan.FromSeconds(2));
+
+        allowClear.Set();
+        await first.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(
+            () => !poller.PollFlightState.Active,
+            TimeSpan.FromSeconds(2));
+
+        var state = poller.PollFlightState;
+        Assert.AreEqual(2, polls, "the entire poke burst must produce exactly one follow-up poll");
+        Assert.AreEqual(pokeCount, state.Requested);
+        Assert.AreEqual(state.Requested, state.Completed, "the follow-up must cover the newest generation");
+        Assert.IsFalse(state.Pending);
+        Assert.IsFalse(state.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_ConcurrentCallersAndPokeBurst_NeverOverlapOrAmplify()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        var active = 0;
+        var maxActive = 0;
+        using var firstPollEntered = new ManualResetEventSlim();
+        using var allowFirstPoll = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                var current = Interlocked.Increment(ref active);
+                var observedMax = Volatile.Read(ref maxActive);
+                while (current > observedMax)
+                {
+                    var previous = Interlocked.CompareExchange(ref maxActive, current, observedMax);
+                    if (previous == observedMax) break;
+                    observedMax = previous;
+                }
+                try
+                {
+                    if (Interlocked.Increment(ref polls) == 1)
+                    {
+                        firstPollEntered.Set();
+                        allowFirstPoll.Wait(TimeSpan.FromSeconds(5));
+                    }
+                    return Array.Empty<string>();
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref active);
+                }
+            });
+
+        var callers = Enumerable.Range(0, 32)
+            .Select(_ => poller.PollOnceAsync(default))
+            .ToArray();
+        Assert.IsTrue(firstPollEntered.Wait(TimeSpan.FromSeconds(2)));
+        var pokes = Enumerable.Range(0, 128)
+            .Select(_ => Task.Run(poller.Poke))
+            .ToArray();
+        await Task.WhenAll(pokes).WaitAsync(TimeSpan.FromSeconds(2));
+        allowFirstPoll.Set();
+        await Task.WhenAll(callers).WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(
+            () => !poller.PollFlightState.Active,
+            TimeSpan.FromSeconds(2));
+
+        var state = poller.PollFlightState;
+        Assert.AreEqual(1, maxActive, "poll cores must never overlap");
+        Assert.AreEqual(2, polls, "all callers and the poke burst must coalesce to one flight plus one follow-up");
+        Assert.AreEqual(128L, state.Requested);
+        Assert.AreEqual(state.Requested, state.Completed);
+        Assert.IsFalse(state.Pending);
+        Assert.IsFalse(state.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_PokeSimultaneousWithFinalClear_IsNeverLost_OneThousandIterations()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        var armed = 0;
+        ManualResetEventSlim? finalCheckEntered = null;
+        ManualResetEventSlim? allowClear = null;
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                Interlocked.Increment(ref polls);
+                return Array.Empty<string>();
+            });
+        poller.BeforePollFlightFinalize = () =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) != 1) return;
+            finalCheckEntered!.Set();
+            allowClear!.Wait(TimeSpan.FromSeconds(5));
+        };
+
+        for (var iteration = 1; iteration <= 1_000; iteration++)
+        {
+            using var entered = new ManualResetEventSlim();
+            using var release = new ManualResetEventSlim();
+            finalCheckEntered = entered;
+            allowClear = release;
+            Volatile.Write(ref armed, 1);
+
+            var flight = poller.PollOnceAsync(default);
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(2)), $"iteration {iteration} missed the final-check barrier");
+            await Task.Run(poller.Poke).WaitAsync(TimeSpan.FromSeconds(2));
+            release.Set();
+            await flight.WaitAsync(TimeSpan.FromSeconds(2));
+            await WaitUntilAsync(
+                () =>
+                {
+                    var current = poller.PollFlightState;
+                    return !current.Active && current.Completed == current.Requested;
+                },
+                TimeSpan.FromSeconds(2));
+
+            var state = poller.PollFlightState;
+            Assert.AreEqual(iteration, state.Requested, $"iteration {iteration} lost its poke");
+            Assert.AreEqual(state.Requested, state.Completed, $"iteration {iteration} was not covered");
+            Assert.IsFalse(state.Pending);
+            Assert.IsFalse(state.Active);
+            Assert.AreEqual(iteration * 2, Volatile.Read(ref polls),
+                $"iteration {iteration} amplified or omitted its single follow-up");
+        }
+    }
+
+    [TestMethod]
+    public async Task Poller_FailedPollWithPoke_InstallsSuccessorBeforeOldWaiterResumes()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        using var failedPollEntered = new ManualResetEventSlim();
+        using var allowFailure = new ManualResetEventSlim();
+        using var successorEntered = new ManualResetEventSlim();
+        using var allowSuccessor = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                var poll = Interlocked.Increment(ref polls);
+                if (poll == 1)
+                {
+                    failedPollEntered.Set();
+                    allowFailure.Wait(TimeSpan.FromSeconds(5));
+                    throw new InvalidOperationException("injected poll failure");
+                }
+                successorEntered.Set();
+                allowSuccessor.Wait(TimeSpan.FromSeconds(5));
+                return Array.Empty<string>();
+            });
+
+        var failed = poller.PollOnceAsync(default);
+        Assert.IsTrue(failedPollEntered.Wait(TimeSpan.FromSeconds(2)));
+        poller.Poke();
+        allowFailure.Set();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => failed);
+
+        var failedState = poller.PollFlightState;
+        Assert.AreEqual(1L, failedState.Requested);
+        Assert.AreEqual(0L, failedState.Completed, "a failed poll must not observe its generation");
+        Assert.IsTrue(failedState.Pending);
+        Assert.IsTrue(failedState.Active, "pending work must already own the successor slot");
+
+        Assert.IsTrue(successorEntered.Wait(TimeSpan.FromSeconds(2)));
+        var successor = poller.PollOnceAsync(default);
+        allowSuccessor.Set();
+        await successor.WaitAsync(TimeSpan.FromSeconds(2));
+        var recoveredState = poller.PollFlightState;
+        Assert.AreEqual(2, polls);
+        Assert.AreEqual(recoveredState.Requested, recoveredState.Completed);
+        Assert.IsFalse(recoveredState.Pending);
+        Assert.IsFalse(recoveredState.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_FailedLatestPoke_DelaysAndRunsOneSuccessor()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        using var firstEntered = new ManualResetEventSlim();
+        using var allowFailure = new ManualResetEventSlim();
+        using var successorEntered = new ManualResetEventSlim();
+        using var allowSuccessor = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                if (Interlocked.Increment(ref polls) == 1)
+                {
+                    firstEntered.Set();
+                    allowFailure.Wait(TimeSpan.FromSeconds(5));
+                    throw new InvalidOperationException("latest poke failed");
+                }
+                successorEntered.Set();
+                allowSuccessor.Wait(TimeSpan.FromSeconds(5));
+                return Array.Empty<string>();
+            });
+
+        poller.Poke();
+        var failed = poller.PollOnceAsync(default);
+        Assert.IsTrue(firstEntered.Wait(TimeSpan.FromSeconds(2)));
+        allowFailure.Set();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => failed);
+
+        var failedState = poller.PollFlightState;
+        Assert.AreEqual(1L, failedState.Requested);
+        Assert.AreEqual(0L, failedState.Completed);
+        Assert.IsTrue(failedState.Pending);
+        Assert.IsTrue(failedState.Active);
+        await Task.Delay(ReplicationPresencePoller.PollFailureRetryBaseDelay / 2);
+        Assert.AreEqual(1, polls, "a failed demanded generation must not tight-loop");
+
+        Assert.IsTrue(successorEntered.Wait(TimeSpan.FromSeconds(2)));
+        var successor = poller.PollOnceAsync(default);
+        allowSuccessor.Set();
+        await successor.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var recoveredState = poller.PollFlightState;
+        Assert.AreEqual(2, polls);
+        Assert.AreEqual(recoveredState.Requested, recoveredState.Completed);
+        Assert.IsFalse(recoveredState.Pending);
+        Assert.IsFalse(recoveredState.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_RepeatedFailures_BackOffAndRunOneAtATime()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        var active = 0;
+        var maxActive = 0;
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                var current = Interlocked.Increment(ref active);
+                var observedMax = Volatile.Read(ref maxActive);
+                while (current > observedMax)
+                {
+                    var previous = Interlocked.CompareExchange(ref maxActive, current, observedMax);
+                    if (previous == observedMax) break;
+                    observedMax = previous;
+                }
+                try
+                {
+                    var poll = Interlocked.Increment(ref polls);
+                    if (poll <= 3)
+                        throw new InvalidOperationException($"failure {poll}");
+                    return Array.Empty<string>();
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref active);
+                }
+            });
+
+        poller.Poke();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => poller.PollOnceAsync(default));
+        await WaitUntilAsync(() => Volatile.Read(ref polls) >= 2, TimeSpan.FromSeconds(2));
+        await Task.Delay(ReplicationPresencePoller.PollFailureRetryBaseDelay);
+        Assert.AreEqual(2, Volatile.Read(ref polls), "the second retry must use a longer cooldown");
+        await WaitUntilAsync(() => Volatile.Read(ref polls) >= 3, TimeSpan.FromSeconds(2));
+        await Task.Delay(ReplicationPresencePoller.PollFailureRetryBaseDelay * 2);
+        Assert.AreEqual(3, Volatile.Read(ref polls), "the third retry must continue bounded backoff");
+        await WaitUntilAsync(
+            () =>
+            {
+                var state = poller.PollFlightState;
+                return Volatile.Read(ref polls) == 4 && !state.Active && !state.Pending;
+            },
+            TimeSpan.FromSeconds(3));
+
+        Assert.AreEqual(1, maxActive);
+        Assert.AreEqual(1L, poller.PollFlightState.Completed);
+    }
+
+    [TestMethod]
+    public async Task Poller_CanceledPollWithPoke_InstallsSuccessorBeforeOldWaiterResumes()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        using var canceledFinalizeEntered = new ManualResetEventSlim();
+        using var allowCanceledFinalize = new ManualResetEventSlim();
+        using var successorEntered = new ManualResetEventSlim();
+        using var allowSuccessor = new ManualResetEventSlim();
+        var hookCalls = 0;
+        var canceledToken = new CancellationToken(canceled: true);
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                if (Interlocked.Increment(ref polls) == 1)
+                    throw new OperationCanceledException(canceledToken);
+                successorEntered.Set();
+                allowSuccessor.Wait(TimeSpan.FromSeconds(5));
+                return Array.Empty<string>();
+            });
+        poller.BeforePollFlightFinalize = () =>
+        {
+            if (Interlocked.Increment(ref hookCalls) != 1) return;
+            canceledFinalizeEntered.Set();
+            allowCanceledFinalize.Wait(TimeSpan.FromSeconds(5));
+        };
+
+        var canceled = poller.PollOnceAsync(default);
+        Assert.IsTrue(canceledFinalizeEntered.Wait(TimeSpan.FromSeconds(2)));
+        poller.Poke();
+        allowCanceledFinalize.Set();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => canceled);
+
+        var canceledState = poller.PollFlightState;
+        Assert.AreEqual(1L, canceledState.Requested);
+        Assert.AreEqual(0L, canceledState.Completed);
+        Assert.IsTrue(canceledState.Pending);
+        Assert.IsTrue(canceledState.Active, "pending work must atomically replace the canceled flight");
+
+        Assert.IsTrue(successorEntered.Wait(TimeSpan.FromSeconds(2)));
+        var successor = poller.PollOnceAsync(default);
+        allowSuccessor.Set();
+        await successor.WaitAsync(TimeSpan.FromSeconds(2));
+        var recoveredState = poller.PollFlightState;
+        Assert.AreEqual(2, polls);
+        Assert.AreEqual(recoveredState.Requested, recoveredState.Completed);
+        Assert.IsFalse(recoveredState.Pending);
+        Assert.IsFalse(recoveredState.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_ExplicitlyCanceledLatestPoke_RetainsDemandAndRunsSuccessor()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        using var firstEntered = new ManualResetEventSlim();
+        using var allowCancellation = new ManualResetEventSlim();
+        using var successorEntered = new ManualResetEventSlim();
+        var canceledToken = new CancellationToken(canceled: true);
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                if (Interlocked.Increment(ref polls) == 1)
+                {
+                    firstEntered.Set();
+                    allowCancellation.Wait(TimeSpan.FromSeconds(5));
+                    throw new OperationCanceledException(canceledToken);
+                }
+                successorEntered.Set();
+                return Array.Empty<string>();
+            });
+
+        poller.Poke();
+        var canceled = poller.PollOnceAsync(default);
+        Assert.IsTrue(firstEntered.Wait(TimeSpan.FromSeconds(2)));
+        allowCancellation.Set();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => canceled);
+        Assert.IsTrue(poller.PollFlightState.Pending);
+        Assert.IsTrue(poller.PollFlightState.Active);
+
+        Assert.IsTrue(successorEntered.Wait(TimeSpan.FromSeconds(2)));
+        await WaitUntilAsync(
+            () => !poller.PollFlightState.Active,
+            TimeSpan.FromSeconds(2));
+        Assert.AreEqual(2, polls);
+        Assert.AreEqual(1L, poller.PollFlightState.Completed);
+        Assert.IsFalse(poller.PollFlightState.Pending);
+    }
+
+    [TestMethod]
+    public async Task Poller_PokesDuringFailureBackoff_CoalesceIntoInstalledSuccessor()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        using var successorEntered = new ManualResetEventSlim();
+        using var allowSuccessor = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                if (Interlocked.Increment(ref polls) == 1)
+                    throw new InvalidOperationException("initial failure");
+                successorEntered.Set();
+                allowSuccessor.Wait(TimeSpan.FromSeconds(5));
+                return Array.Empty<string>();
+            });
+
+        poller.Poke();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => poller.PollOnceAsync(default));
+        var pokes = Enumerable.Range(0, 100)
+            .Select(_ => Task.Run(poller.Poke))
+            .ToArray();
+        await Task.WhenAll(pokes).WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Delay(ReplicationPresencePoller.PollFailureRetryBaseDelay / 2);
+        Assert.AreEqual(1, polls);
+
+        Assert.IsTrue(successorEntered.Wait(TimeSpan.FromSeconds(2)));
+        var successor = poller.PollOnceAsync(default);
+        allowSuccessor.Set();
+        await successor.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var state = poller.PollFlightState;
+        Assert.AreEqual(2, polls);
+        Assert.AreEqual(101L, state.Requested);
+        Assert.AreEqual(state.Requested, state.Completed);
+        Assert.IsFalse(state.Pending);
+        Assert.IsFalse(state.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_CanceledWaiterWithPoke_DoesNotCancelGenerationCoverage()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64));
+        source.SetPresence("alice", false);
+        source.FetchEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        source.FetchRelease = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                Interlocked.Increment(ref polls);
+                return new[] { "alice" };
+            });
+        using var waiterCancellation = new CancellationTokenSource();
+
+        var waiter = poller.PollOnceAsync(waiterCancellation.Token);
+        await source.FetchEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        poller.Poke();
+        waiterCancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => waiter);
+
+        source.FetchRelease.TrySetResult(true);
+        await WaitUntilAsync(
+            () =>
+            {
+                var state = poller.PollFlightState;
+                return !state.Active && !state.Pending && state.Completed == state.Requested;
+            },
+            TimeSpan.FromSeconds(2));
+        Assert.AreEqual(2, polls, "waiter cancellation must not suppress or amplify the poke follow-up");
+        Assert.AreEqual(1L, poller.PollFlightState.Completed);
+    }
+
+    [TestMethod]
+    public async Task Poller_DisposeWithPendingPoke_ClearsPendingAndDrainsWithoutSuccessor()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64));
+        source.FetchEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        source.FetchRelease = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                Interlocked.Increment(ref polls);
+                return new[] { "alice" };
+            });
+
+        var flight = poller.PollOnceAsync(default);
+        await source.FetchEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        poller.Poke();
+        await poller.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => flight);
+
+        var state = poller.PollFlightState;
+        Assert.AreEqual(1, polls);
+        Assert.AreEqual(1L, state.Requested);
+        Assert.AreEqual(0L, state.Completed);
+        Assert.IsFalse(state.Pending);
+        Assert.IsFalse(state.Active);
+        poller.Poke();
+        Assert.AreEqual(state, poller.PollFlightState, "a disposed poller must ignore later pokes");
+    }
+
+    [TestMethod]
+    public async Task Poller_DisposeDuringNonCancellationFault_CleansResourcesAndSurfacesError()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        using var pollEntered = new ManualResetEventSlim();
+        using var allowFault = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                pollEntered.Set();
+                allowFault.Wait(TimeSpan.FromSeconds(5));
+                throw new InvalidOperationException("fault during disposal");
+            });
+
+        poller.Poke();
+        var sharedFlight = poller.PollOnceAsync(default);
+        Assert.IsTrue(pollEntered.Wait(TimeSpan.FromSeconds(2)));
+        var disposal = poller.DisposeAsync().AsTask();
+        allowFault.Set();
+
+        var disposeError = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => disposal);
+        Assert.AreEqual("fault during disposal", disposeError.Message);
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => sharedFlight);
+
+        var state = poller.PollFlightState;
+        var resources = poller.PollResourceState;
+        Assert.IsFalse(state.Pending);
+        Assert.IsFalse(state.Active);
+        Assert.IsTrue(resources.LifetimeDisposed);
+        Assert.IsFalse(resources.LoopOwned);
+        Assert.IsFalse(resources.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_DisposeAtFinalizationBarrier_WaitsUntilOldCompletionIsSignaled()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        using var finalizeEntered = new ManualResetEventSlim();
+        using var allowFinalize = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () => Array.Empty<string>());
+        poller.BeforePollFlightFinalize = () =>
+        {
+            finalizeEntered.Set();
+            allowFinalize.Wait(TimeSpan.FromSeconds(5));
+        };
+
+        var old = poller.PollOnceAsync(default);
+        Assert.IsTrue(finalizeEntered.Wait(TimeSpan.FromSeconds(2)));
+        var disposal = poller.DisposeAsync().AsTask();
+        await Task.Delay(25);
+
+        Assert.IsFalse(old.IsCompleted, "the old promise must remain incomplete at the finalization barrier");
+        Assert.IsFalse(disposal.IsCompleted, "disposal must observe and drain the active old flight");
+        Assert.IsTrue(poller.PollFlightState.Active);
+
+        allowFinalize.Set();
+        await Task.WhenAll(old, disposal).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsFalse(poller.PollFlightState.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_FinalizationBarrier_ThousandPokesInstallOneSuccessorAndDisposeDrainsIt()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var polls = 0;
+        var active = 0;
+        var maxActive = 0;
+        var hookCalls = 0;
+        using var oldFinalizeEntered = new ManualResetEventSlim();
+        using var allowOldFinalize = new ManualResetEventSlim();
+        using var successorEntered = new ManualResetEventSlim();
+        using var allowSuccessor = new ManualResetEventSlim();
+        var poller = NewPoller(
+            engine,
+            roster,
+            source,
+            "alice",
+            myDevice,
+            () =>
+            {
+                var current = Interlocked.Increment(ref active);
+                var observedMax = Volatile.Read(ref maxActive);
+                while (current > observedMax)
+                {
+                    var previous = Interlocked.CompareExchange(ref maxActive, current, observedMax);
+                    if (previous == observedMax) break;
+                    observedMax = previous;
+                }
+                var poll = Interlocked.Increment(ref polls);
+                try
+                {
+                    if (poll == 2)
+                    {
+                        successorEntered.Set();
+                        allowSuccessor.Wait(TimeSpan.FromSeconds(5));
+                    }
+                    return Array.Empty<string>();
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref active);
+                }
+            });
+        poller.BeforePollFlightFinalize = () =>
+        {
+            if (Interlocked.Increment(ref hookCalls) != 1) return;
+            oldFinalizeEntered.Set();
+            allowOldFinalize.Wait(TimeSpan.FromSeconds(5));
+        };
+
+        var old = poller.PollOnceAsync(default);
+        Assert.IsTrue(oldFinalizeEntered.Wait(TimeSpan.FromSeconds(2)));
+        var pokes = Enumerable.Range(0, 1_000)
+            .Select(_ => Task.Run(poller.Poke))
+            .ToArray();
+        await Task.WhenAll(pokes).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsFalse(old.IsCompleted, "the active slot must not become observable as idle before signaling");
+
+        allowOldFinalize.Set();
+        await old.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsTrue(successorEntered.Wait(TimeSpan.FromSeconds(2)));
+        var successor = poller.PollOnceAsync(default);
+        var disposal = poller.DisposeAsync().AsTask();
+        await Task.Delay(25);
+        Assert.IsFalse(disposal.IsCompleted, "disposal must drain the installed successor");
+
+        allowSuccessor.Set();
+        await Task.WhenAll(successor, disposal).WaitAsync(TimeSpan.FromSeconds(2));
+        var state = poller.PollFlightState;
+        Assert.AreEqual(2, polls, "the poke burst must install exactly one successor");
+        Assert.AreEqual(1, maxActive, "successor network work must not overlap the old poll");
+        Assert.AreEqual(1_000L, state.Requested);
+        Assert.AreEqual(state.Requested, state.Completed, "no poke generation may be lost");
+        Assert.IsFalse(state.Pending);
+        Assert.IsFalse(state.Active);
+    }
+
+    [TestMethod]
+    public async Task Poller_FirstWaiterCancellationDoesNotCancelSharedFlight()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64));
+        source.SetPresence("alice", false);
+        source.FetchEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        source.FetchRelease = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var poller = NewPoller(engine, roster, source, "alice", myDevice, () => new[] { "alice" });
+        using var firstWaiter = new CancellationTokenSource();
+
+        var first = poller.PollOnceAsync(firstWaiter.Token);
+        await source.FetchEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var second = poller.PollOnceAsync(CancellationToken.None);
+        firstWaiter.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => first);
+        Assert.IsFalse(second.IsCompleted, "the second waiter must remain joined to the shared flight");
+
+        source.FetchRelease.TrySetResult(true);
+        Assert.IsFalse(await second.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.AreEqual(1, source.FetchCount);
     }
 
     [TestMethod]
@@ -1158,6 +3099,7 @@ public sealed class OnlineReplicationRuntimeTests
         var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
         var bob1Device = DeviceProtocol.DeviceId(bob1.PublicB64);
         var bob2Device = DeviceProtocol.DeviceId(bob2.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64));
         source.SetHandle("bob", Dir("bob", 0, "", bob1.PublicB64, bob2.PublicB64));
         source.SetPresence("bob", false);
 
@@ -1996,32 +3938,17 @@ public sealed class OnlineReplicationRuntimeTests
             blockerRequest)));
         await roster.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
-        var envelope = Env(
-            ReplicationOpKinds.Message,
-            ReplicationPayloadCodec.DomainAction.Upsert,
-            "fair-batch");
-        var eventCiphertext = ReplicationPayloadCodec.Encrypt(
-            ReplicationPayloadCodec.EncodeEnvelope(envelope), new[] { mine.PublicB64 });
-        var evt = OnlineReplicationProtocol.CreateEvent(
+        var queuedRequest = new ReplicationRequest(
             peerDevice,
             "epoch-1",
-            1,
-            "alice",
-            0,
-            envelope.Kind,
-            envelope.EntityId,
-            envelope.ConversationId,
-            envelope.CausalVersion,
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            eventCiphertext,
-            peer.PrivateB64);
-        var batch = engine.HandleDeliveryAsync(BuildControlDelivery(
+            new[] { new ReplicationRange(2, 2) });
+        var normal = engine.HandleDeliveryAsync(BuildControlDelivery(
             peerDevice,
             myDevice,
             mine.PublicB64,
             sessionId,
-            E2EFrameKind.Batch,
-            new ReplicationBatch(peerDevice, "epoch-1", new[] { evt })));
+            E2EFrameKind.Request,
+            queuedRequest));
         var offers = Enumerable.Range(0, 8)
             .Select(_ => engine.HandleDeliveryAsync(BuildControlDelivery(
                 peerDevice,
@@ -2033,25 +3960,26 @@ public sealed class OnlineReplicationRuntimeTests
             .ToArray();
 
         var protocolFrames = 0;
-        var framesAtCommit = new TaskCompletionSource<int>(
+        var requestsReceived = 0;
+        var framesAtNormal = new TaskCompletionSource<int>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         engine.Activity += activity =>
         {
             if (activity.Name == "protocol.frame_received")
                 Interlocked.Increment(ref protocolFrames);
-            else if (activity.Name == "batch.committed")
-                framesAtCommit.TrySetResult(Volatile.Read(ref protocolFrames));
+            else if (activity.Name == "request.received"
+                     && Interlocked.Increment(ref requestsReceived) == 2)
+                framesAtNormal.TrySetResult(Volatile.Read(ref protocolFrames));
         };
 
         roster.Release.TrySetResult(true);
-        var observedFrames = await framesAtCommit.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var observedFrames = await framesAtNormal.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.AreEqual(
             2,
             observedFrames,
-            "after one priority offer, an already-queued batch must run before newer offers");
-        CollectionAssert.Contains(applier.EntityIds, "fair-batch");
-        await Task.WhenAll(offers.Append(batch).Append(blocker)).WaitAsync(TimeSpan.FromSeconds(2));
+            "after one priority offer, an already-queued normal operation must run before newer offers");
+        await Task.WhenAll(offers.Append(normal).Append(blocker)).WaitAsync(TimeSpan.FromSeconds(2));
     }
 
     [TestMethod]
@@ -2625,6 +4553,38 @@ public sealed class OnlineReplicationRuntimeTests
     }
 
     [TestMethod]
+    public void Emission_JournalEntryPointsAreInternalAndProductionHasNoDirectBypass()
+    {
+        var publicMethods = typeof(ReplicationJournal)
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Select(method => method.Name)
+            .ToArray();
+        CollectionAssert.DoesNotContain(publicMethods, "EmitLocal");
+        CollectionAssert.DoesNotContain(publicMethods, "EmitLocalAsync");
+        CollectionAssert.DoesNotContain(publicMethods, "EmitLocalBatch");
+        CollectionAssert.DoesNotContain(publicMethods, "EmitLocalBatchAsync");
+
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "Mesh.slnx")))
+            root = root.Parent;
+        Assert.IsNotNull(root, "repository root was not found");
+        var services = Path.Combine(root.FullName, "src", "Mesh.App", "Services");
+        var bypasses = Directory.EnumerateFiles(services, "*.cs", SearchOption.AllDirectories)
+            .Where(path => !path.EndsWith("ReplicationJournal.cs", StringComparison.Ordinal)
+                           && !path.EndsWith("OnlineReplicationEngine.cs", StringComparison.Ordinal)
+                           && !path.EndsWith("AppState.OnlineReplication.cs", StringComparison.Ordinal))
+            .Where(path =>
+            {
+                var source = File.ReadAllText(path);
+                return source.Contains("EnsureLocalJournal().Emit", StringComparison.Ordinal)
+                       || source.Contains(".Journal.EmitLocal", StringComparison.Ordinal);
+            })
+            .Select(Path.GetFileName)
+            .ToArray();
+        CollectionAssert.AreEqual(Array.Empty<string>(), bypasses);
+    }
+
+    [TestMethod]
     public void RuntimeTypes_ExposeNoPublicConfigureReplicationSeam()
     {
         foreach (var t in new[]
@@ -2656,8 +4616,13 @@ public sealed class OnlineReplicationRuntimeTests
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddSingleton<IRelayStore>(store);
         builder.Services.AddSingleton<IBackplane>(backplane);
+        builder.Services.AddSingleton(TimeProvider.System);
         builder.Services.AddSingleton<ConnectionRegistry>();
         builder.Services.AddSingleton<MeshRouter>();
+        builder.Services.AddSingleton(new Mesh.Relay.LiveFaults.LiveFaultStore(
+            new Mesh.Relay.LiveFaults.LiveFaultOptions { Enabled = false }));
+        builder.Services.AddSingleton<Mesh.Relay.LiveFaults.LiveFaultHandshakeObserver>();
+        builder.Services.AddSingleton<Mesh.Relay.LiveFaults.LiveFaultTransportObserver>();
         builder.Services.AddSingleton<RelayFrameDedup>();
         builder.Services.AddSingleton(new RelayMetrics());
         builder.Services.AddSingleton<PushDispatcher>();

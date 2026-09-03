@@ -273,11 +273,21 @@ public static class Protocol9DomainTables
                 title = $title,
                 sort_order = $sort,
                 is_pinned = $pinned,
-                execution_device_id = $device,
-                execution_device_name = $deviceName,
-                execution_device_platform = $platform,
-                execution_at = $execAt,
-                execution_run_id = $runId,
+                execution_device_id = CASE
+                    WHEN execution_run_id IS NOT NULL AND $runId IS NULL
+                    THEN execution_device_id ELSE $device END,
+                execution_device_name = CASE
+                    WHEN execution_run_id IS NOT NULL AND $runId IS NULL
+                    THEN execution_device_name ELSE $deviceName END,
+                execution_device_platform = CASE
+                    WHEN execution_run_id IS NOT NULL AND $runId IS NULL
+                    THEN execution_device_platform ELSE $platform END,
+                execution_at = CASE
+                    WHEN execution_run_id IS NOT NULL AND $runId IS NULL
+                    THEN execution_at ELSE $execAt END,
+                execution_run_id = CASE
+                    WHEN execution_run_id IS NOT NULL AND $runId IS NULL
+                    THEN execution_run_id ELSE $runId END,
                 last_activity_at = CASE
                     WHEN $activity IS NOT NULL
                          AND (last_activity_at IS NULL OR julianday($activity) > julianday(last_activity_at))

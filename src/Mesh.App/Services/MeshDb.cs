@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Security.Cryptography;
+using System.Runtime.CompilerServices;
 using Microsoft.Data.Sqlite;
 using Mesh.App.Domain;
 using Mesh.Shared;
@@ -17,8 +18,94 @@ namespace Mesh.App.Services;
 /// The profile blob deliberately excludes conversations and own-chat, those live in the
 /// <c>chat_lines</c> / <c>own_chat</c> tables and are hydrated back onto the profile on load.
 /// </summary>
-public sealed partial class MeshDb : IDisposable
+public sealed partial class MeshDb :
+    IDisposable,
+    ITopicDurabilityStore,
+    ITopicRequestOutboxStore,
+    ITopicCorrelationMaintenanceStore
 {
+    public sealed record ComposerDraftAttachment(
+        string Id,
+        string Name,
+        string Path,
+        long Size)
+    {
+        public static ComposerDraftAttachment Create(string name, string path, long size)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(name);
+            ArgumentException.ThrowIfNullOrWhiteSpace(path);
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            var normalizedPath = System.IO.Path.GetFullPath(path);
+            var identity = string.Join(
+                "\0",
+                name,
+                normalizedPath,
+                size.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            return new(
+                TopicSendSnapshot.StableId("composer-attachment", identity),
+                name,
+                normalizedPath,
+                size);
+        }
+    }
+
+    public sealed record ComposerDraftWidget(
+        string Id,
+        string Name,
+        string Prompt,
+        string Html)
+    {
+        public static ComposerDraftWidget Create(Widget widget)
+        {
+            ArgumentNullException.ThrowIfNull(widget);
+            ArgumentException.ThrowIfNullOrWhiteSpace(widget.Id);
+            return new(widget.Id, widget.Name, widget.Prompt, widget.Html);
+        }
+    }
+
+    public sealed record TopicComposerSnapshot(
+        string Text,
+        IReadOnlyList<ComposerDraftAttachment> Attachments,
+        bool WidgetMode,
+        string? WidgetId,
+        string TargetDeviceId,
+        ComposerDraftWidget? Widget = null)
+    {
+        public static TopicComposerSnapshot TextOnly(string text)
+            => new(text, Array.Empty<ComposerDraftAttachment>(), false, null, "");
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        public string Fingerprint => ComputeTopicComposerFingerprint(this);
+    }
+
+    public sealed record ComposerDraft(
+        string Text,
+        long Revision,
+        bool IsMalformed = false,
+        TopicComposerSnapshot? TopicSnapshot = null);
+
+    public enum ComposerDraftClearResult
+    {
+        Cleared,
+        Superseded,
+        Missing
+    }
+
+    internal enum ComposerDraftTransactionCheckpoint
+    {
+        CleanupObserved,
+        BeforeNewerSnapshotWrite,
+        BeforeDraftWrite
+    }
+
+    internal interface IComposerDraftTransactionObserver
+    {
+        void Checkpoint(
+            ComposerDraftTransactionCheckpoint checkpoint,
+            string threadId,
+            long expectedRevision);
+    }
+
     internal sealed record SyncVersionWrite(string EntityKey, string Version);
     internal sealed record SyncTombstoneWrite(string Kind, string EntityId, string Version);
     internal sealed record SyncCircleRenameWrite(
@@ -27,7 +114,29 @@ public sealed partial class MeshDb : IDisposable
     public sealed record TopicOutboxItem(
         string RunId, string ThreadId, string TriggerLineId, string TargetDeviceId,
         TopicRunRequestPayload Request, IReadOnlyList<ChatAttachment> Attachments,
-        string State, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string? LastError = null);
+        string State, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string? LastError = null,
+        string? RemoteStage = null, int RemoteStageOrdinal = 0,
+        int TransportAttemptOrdinal = 0)
+    {
+        // Protocol 9 deliberately uses the stable run identity as the request envelope identity.
+        public string EnvelopeId => RunId;
+    }
+
+    public sealed record TopicRunTriggerItem(
+        string TriggerId,
+        string RunId,
+        TopicRunBeginMode Mode,
+        string ThreadId,
+        string TriggerLineId,
+        string TargetDeviceId,
+        string PayloadHash,
+        DateTimeOffset CreatedAt,
+        DateTimeOffset? TerminalAt);
+
+    public sealed record TopicTransportAttempt(
+        string TriggerId,
+        string RunId,
+        int Ordinal);
 
     public sealed record InboundTopicRunItem(
         string RunId, string SourceDeviceId, TopicRunRequestPayload Request,
@@ -52,7 +161,38 @@ public sealed partial class MeshDb : IDisposable
         DateTimeOffset RejectedAt);
     public sealed record DeviceEnvelopeOutboxItem(
         string EnvelopeId, string TargetDeviceId, string Kind, string Plaintext,
-        string? PushHint, DateTimeOffset CreatedAt);
+        string? PushHint, DateTimeOffset CreatedAt,
+        string State = TopicOutboxStates.Pending,
+        DateTimeOffset? LastAttemptAt = null,
+        string? LastError = null,
+        int RecoveryCount = 0,
+        DateTimeOffset? RecoveryStartedAt = null);
+
+    public sealed record ReceivedTopicControlItem(
+        string EnvelopeId,
+        string SourceDeviceId,
+        string RunId,
+        string ThreadId,
+        string ControlKind,
+        string UpdateJson,
+        DateTimeOffset ReceivedAt);
+
+    public sealed record TopicRunCorrelationItem(
+        string RunId,
+        string ThreadId,
+        string TargetDeviceId,
+        string? TriggerLineId,
+        DateTimeOffset CreatedAt,
+        DateTimeOffset? TerminalAt,
+        DateTimeOffset? TerminalEventAt = null);
+
+    public sealed record LocalTopicRunItem(
+        string RunId,
+        string ThreadId,
+        string TriggerLineId,
+        string TargetDeviceId,
+        DateTimeOffset CreatedAt,
+        DateTimeOffset? TerminalAt);
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private const string ConversationDraftKind = "conversation";
@@ -60,11 +200,42 @@ public sealed partial class MeshDb : IDisposable
     private const string LastDesktopTopicMetaKey = "ui.desktop.last_topic";
     private const string LastDesktopConversationMetaKey = "ui.desktop.last_conversation";
     private static bool nativeInit;
+    private string? lastDesktopTopicId;
+    private string? lastDesktopConversationKey;
 
     private readonly string connectionString;
+    private readonly string legacyPendingComposerPath;
+    private readonly IComposerDraftTransactionObserver? composerDraftObserver;
     private readonly byte[] key;
+    private readonly TimeProvider timeProvider;
     private readonly ThreadLocal<SqliteConnection> connections;
+    // Lock order for all durable mutations is:
+    //   caller state/operation gate (optional)
+    //   -> localOriginJournalGate (journal writes only) -> durableWriteGate -> SQLite transaction.
+    // Journal writes acquire the local-origin journal lock BEFORE the durable-write gate so a
+    // caller already holding the journal lock (e.g. the bootstrap-snapshot boundary) can perform a
+    // journal write without inverting against a concurrent local emit, which would otherwise take
+    // the durable-write gate first and then block on the journal lock.
+    // MeshDb never calls back into a caller state/operation gate while holding durableWriteGate.
+    // Inbound replication captures caller state before this gate, performs only DB projection while
+    // holding it, then performs live-state/UI projection after release. Reverse acquisition
+    // (durableWriteGate -> caller state gate) is forbidden.
+    private readonly SemaphoreSlim durableWriteGate = new(1, 1);
+    private sealed record DurableWriteOwner(string Operation, int ManagedThreadId, long AcquiredAt);
+    private DurableWriteOwner? durableWriteOwner;
+    [ThreadStatic]
+    private static HashSet<MeshDb>? durableWriteOwners;
     private int disposed;
+    internal const int DurableWriteAttemptLimit = 2;
+    private const int SqliteBusyTimeoutMilliseconds = 250;
+    private long coordinatedWriteCount;
+    private int activeCoordinatedWriters;
+    private int maxConcurrentCoordinatedWriters;
+    private int durableWriteWaiterCount;
+
+    internal long CoordinatedWriteCount => Interlocked.Read(ref coordinatedWriteCount);
+    internal int MaxConcurrentCoordinatedWriters => Volatile.Read(ref maxConcurrentCoordinatedWriters);
+    internal int DurableWriteWaiterCount => Volatile.Read(ref durableWriteWaiterCount);
 
     private SqliteConnection conn
     {
@@ -75,22 +246,60 @@ public sealed partial class MeshDb : IDisposable
         }
     }
 
-    private MeshDb(string path, byte[] key)
+    private MeshDb(
+        string path,
+        byte[] key,
+        TimeProvider timeProvider,
+        IComposerDraftTransactionObserver? composerDraftObserver)
     {
-        connectionString = new SqliteConnectionStringBuilder { DataSource = path }.ToString();
+        connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            DefaultTimeout = 1
+        }.ToString();
+        legacyPendingComposerPath = $"{path}.composer-pending";
         this.key = key.ToArray();
+        this.timeProvider = timeProvider;
+        this.composerDraftObserver = composerDraftObserver;
         connections = new ThreadLocal<SqliteConnection>(CreateConnection, trackAllValues: true);
     }
 
     /// <summary>Opens (creating if needed) an encrypted database at <paramref name="path"/> with the given key.</summary>
-    public static MeshDb Open(string path, byte[] key)
+    public static MeshDb Open(string path, byte[] key, TimeProvider? timeProvider = null)
+        => OpenCore(path, key, timeProvider, null);
+
+    internal static MeshDb OpenForTesting(
+        string path,
+        byte[] key,
+        IComposerDraftTransactionObserver composerDraftObserver,
+        TimeProvider? timeProvider = null)
+        => OpenCore(path, key, timeProvider, composerDraftObserver);
+
+    private static MeshDb OpenCore(
+        string path,
+        byte[] key,
+        TimeProvider? timeProvider,
+        IComposerDraftTransactionObserver? composerDraftObserver)
     {
         EnsureNativeInit();
         StorageProtection.TryEnsureBackgroundReadable(Path.GetDirectoryName(path) ?? path);
-        var db = new MeshDb(path, key);
+        var db = new MeshDb(
+            path,
+            key,
+            timeProvider ?? TimeProvider.System,
+            composerDraftObserver);
         _ = db.conn;
         StorageProtection.TryEnsureBackgroundReadable(path);
-        db.CreateSchema();
+        db.ExecuteDurableWrite(() =>
+        {
+            using var command = db.conn.CreateCommand();
+            command.CommandText = "PRAGMA journal_mode = WAL;";
+            command.ExecuteNonQuery();
+            db.CreateSchema();
+        });
+        db.ReplayPendingTopicSnapshots();
+        db.lastDesktopTopicId = db.GetMetaValue(LastDesktopTopicMetaKey);
+        db.lastDesktopConversationKey = db.GetMetaValue(LastDesktopConversationMetaKey);
         return db;
     }
 
@@ -99,21 +308,180 @@ public sealed partial class MeshDb : IDisposable
         var connection = new SqliteConnection(connectionString);
         connection.Open();
         ApplyKey(connection, key);
+        connection.CreateFunction<string?, bool>(
+            "topic_valid_id",
+            TopicRunProtocol.IsValidIdentifier,
+            isDeterministic: true);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            PRAGMA busy_timeout = 10000;
-            PRAGMA journal_mode = WAL;
+        cmd.CommandText = $"""
+            PRAGMA busy_timeout = {SqliteBusyTimeoutMilliseconds};
             PRAGMA synchronous = NORMAL;
             """;
         cmd.ExecuteNonQuery();
         return connection;
     }
 
+    internal T ExecuteDurableWrite<T>(
+        Func<T> write,
+        CancellationToken cancellationToken = default,
+        [CallerMemberName] string caller = "")
+    {
+        ArgumentNullException.ThrowIfNull(write);
+        if (durableWriteOwners?.Contains(this) == true)
+            return write();
+        if (!durableWriteGate.Wait(0))
+        {
+            Interlocked.Increment(ref durableWriteWaiterCount);
+            try
+            {
+                using (ManagedOperationDiagnostics.Wait(
+                           "meshdb.durable-write-gate",
+                           () =>
+                           {
+                               var owner = Volatile.Read(ref durableWriteOwner);
+                               return owner is null
+                                   ? "none"
+                                   : $"{owner.Operation}:thread-{owner.ManagedThreadId}:held-"
+                                     + $"{Environment.TickCount64 - owner.AcquiredAt}ms";
+                           }))
+                {
+                    durableWriteGate.Wait(cancellationToken);
+                }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref durableWriteWaiterCount);
+            }
+        }
+        Volatile.Write(
+            ref durableWriteOwner,
+            new DurableWriteOwner(
+                ManagedOperationDiagnostics.CurrentOperation == "untracked"
+                    ? caller
+                    : ManagedOperationDiagnostics.CurrentOperation,
+                Environment.CurrentManagedThreadId,
+                Environment.TickCount64));
+        var activeWriters = Interlocked.Increment(ref activeCoordinatedWriters);
+        UpdateMaximum(ref maxConcurrentCoordinatedWriters, activeWriters);
+        Interlocked.Increment(ref coordinatedWriteCount);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+            (durableWriteOwners ??= []).Add(this);
+            for (var attempt = 1; ; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    return write();
+                }
+                catch (SqliteException ex) when (
+                    ex.SqliteErrorCode is 5 or 6
+                    && attempt < DurableWriteAttemptLimit)
+                {
+                    var delay = Math.Min(25 << (attempt - 1), 400);
+                    RuntimeDiagnostics.Current?.RecordEvent(
+                        "sqlite-writer",
+                        $"busy-retry;attempt={attempt};error={ex.SqliteErrorCode}");
+                    if (cancellationToken.WaitHandle.WaitOne(delay))
+                        cancellationToken.ThrowIfCancellationRequested();
+                }
+                catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+                {
+                    RuntimeDiagnostics.Current?.RecordException("sqlite-writer-exhausted", ex);
+                    throw;
+                }
+            }
+        }
+        finally
+        {
+            durableWriteOwners!.Remove(this);
+            Interlocked.Decrement(ref activeCoordinatedWriters);
+            Volatile.Write(ref durableWriteOwner, null);
+            durableWriteGate.Release();
+        }
+    }
+
+    internal void ExecuteDurableWrite(
+        Action write,
+        CancellationToken cancellationToken = default,
+        [CallerMemberName] string caller = "")
+        => ExecuteDurableWrite(
+            () =>
+            {
+                write();
+                return true;
+            },
+            cancellationToken,
+            caller);
+
+    internal Task<T> ExecuteDurableWriteAsync<T>(
+        Func<T> write,
+        CancellationToken cancellationToken = default,
+        [CallerMemberName] string caller = "")
+        => Task.Run(
+            () => ExecuteDurableWrite(write, cancellationToken, caller),
+            cancellationToken);
+
+    internal Task ExecuteDurableWriteAsync(
+        Action write,
+        CancellationToken cancellationToken = default,
+        [CallerMemberName] string caller = "")
+        => Task.Run(
+            () => ExecuteDurableWrite(write, cancellationToken, caller),
+            cancellationToken);
+
+    internal T ExecuteJournalWrite<T>(
+        Func<T> write,
+        CancellationToken cancellationToken = default)
+    {
+        // Take the local-origin journal lock as the OUTER lock, before the durable-write gate, so a
+        // caller already holding the journal lock (for example the bootstrap-snapshot boundary) can
+        // perform a journal write without deadlocking against a concurrent EmitLocal that would
+        // otherwise acquire the durable-write gate first and then block on the journal lock.
+        // Monitor re-entry makes the nested acquisition inside AllocateAndAppendLocalEvent(s) a
+        // no-op on the same thread, and holding it across durable-write busy retries keeps local
+        // sequence allocation serialized.
+        using var journalLock = EnterLocalOriginJournalLock();
+        return ExecuteDurableWrite(write, cancellationToken);
+    }
+
+    internal Task<T> ExecuteJournalWriteAsync<T>(
+        Func<T> write,
+        CancellationToken cancellationToken = default)
+        => Task.Run(
+            () => ExecuteJournalWrite(write, cancellationToken),
+            cancellationToken);
+
+    internal Task ExecuteJournalWriteAsync(
+        Action write,
+        CancellationToken cancellationToken = default)
+        => Task.Run(
+            () => ExecuteJournalWrite(
+                () =>
+                {
+                    write();
+                    return true;
+                },
+                cancellationToken),
+            cancellationToken);
+
     private static void EnsureNativeInit()
     {
         if (nativeInit) return;
         SQLitePCL.Batteries_V2.Init();
         nativeInit = true;
+    }
+
+    private static void UpdateMaximum(ref int maximum, int candidate)
+    {
+        var current = Volatile.Read(ref maximum);
+        while (candidate > current)
+        {
+            var observed = Interlocked.CompareExchange(ref maximum, candidate, current);
+            if (observed == current) return;
+            current = observed;
+        }
     }
 
     private static void ApplyKey(SqliteConnection conn, byte[] key)
@@ -165,8 +533,40 @@ public sealed partial class MeshDb : IDisposable
                 state TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                last_error TEXT);
+                last_error TEXT,
+                remote_stage TEXT,
+                remote_stage_ordinal INTEGER NOT NULL DEFAULT 0,
+                transport_attempt_ordinal INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS ix_topic_outbox_state ON topic_outbox(state, created_at);
+            CREATE TABLE IF NOT EXISTS topic_run_correlations(
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                target_device_id TEXT NOT NULL,
+                trigger_line_id TEXT,
+                created_at TEXT NOT NULL,
+                terminal_at TEXT,
+                terminal_event_at TEXT);
+            CREATE INDEX IF NOT EXISTS ix_topic_run_correlations_terminal
+                ON topic_run_correlations(terminal_at);
+            CREATE TABLE IF NOT EXISTS topic_local_runs(
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                trigger_line_id TEXT NOT NULL,
+                target_device_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                terminal_at TEXT);
+            CREATE TABLE IF NOT EXISTS topic_run_triggers(
+                trigger_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE,
+                mode TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                trigger_line_id TEXT NOT NULL,
+                target_device_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                terminal_at TEXT);
+            CREATE INDEX IF NOT EXISTS ix_topic_run_triggers_terminal
+                ON topic_run_triggers(terminal_at);
             CREATE TABLE IF NOT EXISTS inbound_topic_runs(
                 run_id TEXT PRIMARY KEY,
                 source_device_id TEXT NOT NULL,
@@ -201,12 +601,34 @@ public sealed partial class MeshDb : IDisposable
                 kind TEXT NOT NULL,
                 plaintext TEXT NOT NULL,
                 push_hint TEXT,
-                created_at TEXT NOT NULL);
+                created_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                last_attempt_at TEXT,
+                last_error TEXT,
+                recovery_count INTEGER NOT NULL DEFAULT 0,
+                recovery_started_at TEXT);
+            CREATE TABLE IF NOT EXISTS received_topic_controls(
+                envelope_id TEXT PRIMARY KEY,
+                source_device_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                control_kind TEXT NOT NULL,
+                update_json TEXT NOT NULL,
+                received_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_received_topic_controls_run
+                ON received_topic_controls(run_id, received_at);
             CREATE TABLE IF NOT EXISTS composer_drafts(
                 kind TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
                 text TEXT NOT NULL,
+                revision INTEGER,
+                snapshot_json TEXT,
                 PRIMARY KEY(kind, entity_id));
+            CREATE TABLE IF NOT EXISTS pending_topic_drafts(
+                entity_id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS memories(
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -239,13 +661,16 @@ public sealed partial class MeshDb : IDisposable
                 previous_name TEXT NOT NULL,
                 delete_version TEXT NOT NULL,
                 PRIMARY KEY(entity_id, previous_entity_id));
-            INSERT OR IGNORE INTO meta(k, v) VALUES('schema_version', '1');");
+            INSERT OR IGNORE INTO meta(k, v) VALUES('schema_version', '1');
+            INSERT OR IGNORE INTO meta(k, v) VALUES('topic_trigger_epoch', '1');");
 
         // Idempotent migration for databases created before line_id/status existed.
         AddColumnIfMissing("chat_lines", "line_id", "TEXT");
         AddColumnIfMissing("chat_lines", "status", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("own_chat", "line_id", "TEXT");
         AddColumnIfMissing("own_chat", "status", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing("composer_drafts", "revision", "INTEGER");
+        AddColumnIfMissing("composer_drafts", "snapshot_json", "TEXT");
         Exec("CREATE INDEX IF NOT EXISTS ix_own_chat_lineid ON own_chat(line_id);");
         Exec("""
             UPDATE chat_lines
@@ -291,6 +716,24 @@ public sealed partial class MeshDb : IDisposable
         AddColumnIfMissing("own_threads", "execution_run_id", "TEXT");
         AddColumnIfMissing("inbound_topic_runs", "terminal_update_json", "TEXT");
         AddColumnIfMissing("inbound_topic_runs", "queue_sequence", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("topic_outbox", "remote_stage", "TEXT");
+        AddColumnIfMissing(
+            "topic_outbox", "remote_stage_ordinal", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing(
+            "topic_outbox", "transport_attempt_ordinal", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("topic_run_correlations", "trigger_line_id", "TEXT");
+        AddColumnIfMissing(
+            "topic_run_correlations",
+            "trigger_identity_state",
+            "TEXT NOT NULL DEFAULT 'strict'");
+        AddColumnIfMissing("topic_run_correlations", "terminal_event_at", "TEXT");
+        AddColumnIfMissing(
+            "device_envelope_outbox", "state", "TEXT NOT NULL DEFAULT 'pending'");
+        AddColumnIfMissing("device_envelope_outbox", "last_attempt_at", "TEXT");
+        AddColumnIfMissing("device_envelope_outbox", "last_error", "TEXT");
+        AddColumnIfMissing(
+            "device_envelope_outbox", "recovery_count", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("device_envelope_outbox", "recovery_started_at", "TEXT");
         Exec("""
             UPDATE inbound_topic_runs AS current
             SET queue_sequence = (
@@ -299,9 +742,37 @@ public sealed partial class MeshDb : IDisposable
                 WHERE prior.accepted_at < current.accepted_at
                    OR (prior.accepted_at = current.accepted_at AND prior.run_id <= current.run_id))
             WHERE queue_sequence = 0;
+            UPDATE topic_outbox
+            SET remote_stage = CASE state
+                    WHEN 'device_accepted' THEN 'accepted'
+                    WHEN 'device_queued' THEN 'queued'
+                    WHEN 'running' THEN 'executing'
+                    ELSE remote_stage
+                END,
+                remote_stage_ordinal = CASE state
+                    WHEN 'device_accepted' THEN 10
+                    WHEN 'device_queued' THEN 20
+                    WHEN 'running' THEN 40
+                    ELSE remote_stage_ordinal
+                END
+            WHERE remote_stage_ordinal = 0;
             CREATE INDEX IF NOT EXISTS ix_inbound_topic_runs_queue
                 ON inbound_topic_runs(queue_sequence, run_id);
             """);
+        MigrateTopicRunCorrelationTriggerIdentity();
+        using (var migrateTerminalObservation = conn.CreateCommand())
+        {
+            migrateTerminalObservation.CommandText = """
+                UPDATE topic_run_correlations
+                SET terminal_event_at = terminal_at,
+                    terminal_at = $observed
+                WHERE terminal_at IS NOT NULL
+                  AND terminal_event_at IS NULL;
+                """;
+            migrateTerminalObservation.Parameters.AddWithValue(
+                "$observed", timeProvider.GetUtcNow().ToString("O"));
+            migrateTerminalObservation.ExecuteNonQuery();
+        }
         MigrateOwnThreadActivity();
         AddColumnIfMissing("conversations", "last_activity_at", "TEXT");
         AddColumnIfMissing("conversations", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
@@ -311,9 +782,358 @@ public sealed partial class MeshDb : IDisposable
         CreateOnlineReplicationSchema();
         CreateNotificationSchema();
         CreateDeferredTopicUpdateSchema();
+        MigrateTopicRunTriggerLedger();
     }
 
-    private void AddColumnIfMissing(string table, string column, string decl)
+    private void MigrateTopicRunCorrelationTriggerIdentity()
+    {
+        using (var marker = conn.CreateCommand())
+        {
+            marker.CommandText =
+                "SELECT v FROM meta WHERE k = 'topic_run_trigger_schema_version';";
+            if (string.Equals(marker.ExecuteScalar() as string, "3", StringComparison.Ordinal))
+            {
+                using var incomplete = conn.CreateCommand();
+                incomplete.CommandText = """
+                    SELECT EXISTS(
+                        SELECT 1 FROM topic_run_correlations
+                        WHERE trigger_identity_state = 'strict'
+                          AND NOT topic_valid_id(trigger_line_id));
+                    """;
+                if (Convert.ToInt64(incomplete.ExecuteScalar()) == 0)
+                    return;
+            }
+        }
+
+        using var transaction = conn.BeginTransaction(deferred: false);
+        ExecuteMigrationCommand(transaction, """
+            UPDATE topic_run_correlations
+            SET trigger_line_id = NULL,
+                trigger_identity_state = 'legacy-active-null'
+            WHERE trigger_identity_state = 'strict'
+              AND NOT topic_valid_id(trigger_line_id);
+            """);
+        var preexistingNull = ScalarCount(
+            transaction,
+            "SELECT COUNT(*) FROM topic_run_correlations WHERE trigger_line_id IS NULL;");
+
+        ExecuteMigrationCommand(transaction, """
+            INSERT INTO topic_run_correlations(
+                run_id, thread_id, target_device_id, trigger_line_id, created_at, terminal_at,
+                terminal_event_at, trigger_identity_state)
+            SELECT outbox.run_id, outbox.thread_id, outbox.target_device_id,
+                   NULL, outbox.created_at, NULL, NULL, 'legacy-active-null'
+            FROM topic_outbox AS outbox
+            WHERE NOT EXISTS(
+                SELECT 1 FROM topic_run_correlations AS correlation
+                WHERE correlation.run_id = outbox.run_id);
+
+            WITH ranked_controls AS (
+                SELECT control.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY control.run_id
+                           ORDER BY
+                               CASE WHEN control.control_kind = 'topic.terminal' THEN 0 ELSE 1 END,
+                               control.received_at DESC,
+                               control.envelope_id DESC) AS candidate_rank
+                FROM received_topic_controls AS control
+                WHERE control.control_kind = 'topic.terminal')
+            INSERT INTO topic_run_correlations(
+                run_id, thread_id, target_device_id, trigger_line_id, created_at, terminal_at,
+                terminal_event_at, trigger_identity_state)
+            SELECT control.run_id, control.thread_id, control.source_device_id,
+                   NULL, control.received_at, control.received_at, control.received_at,
+                   'legacy-active-null'
+            FROM ranked_controls AS control
+            WHERE control.candidate_rank = 1
+              AND NOT EXISTS(
+                  SELECT 1 FROM topic_run_correlations AS correlation
+                  WHERE correlation.run_id = control.run_id);
+            """);
+
+        var derived = 0;
+        // Every candidate is protocol-valid before ranking. Any disagreement across durable
+        // sources remains unresolved; semantic priority only chooses among identical candidates.
+        ExecuteMigrationCommand(transaction, """
+            DROP TABLE IF EXISTS temp.topic_trigger_migration_candidates;
+            CREATE TEMP TABLE topic_trigger_migration_candidates(
+                run_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                target_device_id TEXT NOT NULL,
+                trigger_line_id TEXT NOT NULL,
+                semantic_priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                sequence_key TEXT NOT NULL);
+
+            INSERT INTO topic_trigger_migration_candidates
+            SELECT correlation.run_id, correlation.thread_id, correlation.target_device_id,
+                   correlation.trigger_line_id, 5, correlation.created_at, correlation.run_id
+            FROM topic_run_correlations AS correlation
+            WHERE topic_valid_id(correlation.trigger_line_id);
+
+            INSERT INTO topic_trigger_migration_candidates
+            SELECT correlation.run_id, correlation.thread_id, correlation.target_device_id,
+                   outbox.trigger_line_id, 10, outbox.created_at, outbox.run_id
+            FROM topic_run_correlations AS correlation
+            JOIN topic_outbox AS outbox
+              ON outbox.run_id = correlation.run_id
+             AND outbox.thread_id = correlation.thread_id
+             AND outbox.target_device_id = correlation.target_device_id
+            WHERE topic_valid_id(outbox.trigger_line_id);
+
+            INSERT INTO topic_trigger_migration_candidates
+            SELECT correlation.run_id, correlation.thread_id, correlation.target_device_id,
+                   trigger.trigger_line_id, 20, trigger.created_at, trigger.trigger_id
+            FROM topic_run_correlations AS correlation
+            JOIN topic_run_triggers AS trigger
+              ON trigger.run_id = correlation.run_id
+             AND trigger.thread_id = correlation.thread_id
+             AND trigger.target_device_id = correlation.target_device_id
+            WHERE topic_valid_id(trigger.trigger_line_id);
+
+            INSERT INTO topic_trigger_migration_candidates
+            SELECT correlation.run_id, correlation.thread_id, correlation.target_device_id,
+                   COALESCE(
+                       json_extract(inbound.request_json, '$.triggerLineId'),
+                       json_extract(inbound.request_json, '$.TriggerLineId')),
+                   30, inbound.accepted_at, inbound.run_id
+            FROM topic_run_correlations AS correlation
+            JOIN inbound_topic_runs AS inbound
+              ON inbound.run_id = correlation.run_id
+             AND inbound.source_device_id = correlation.target_device_id
+             AND COALESCE(
+                 json_extract(inbound.request_json, '$.threadId'),
+                 json_extract(inbound.request_json, '$.ThreadId')) = correlation.thread_id
+            WHERE topic_valid_id(COALESCE(
+                json_extract(inbound.request_json, '$.triggerLineId'),
+                json_extract(inbound.request_json, '$.TriggerLineId')));
+
+            INSERT INTO topic_trigger_migration_candidates
+            SELECT correlation.run_id, correlation.thread_id, correlation.target_device_id,
+                   COALESCE(
+                       json_extract(control.update_json, '$.triggerLineId'),
+                       json_extract(control.update_json, '$.TriggerLineId')),
+                   40, control.received_at,
+                   printf('%02d:', CASE WHEN control.control_kind = 'topic.terminal' THEN 0 ELSE 1 END)
+                       || control.envelope_id
+            FROM topic_run_correlations AS correlation
+            JOIN received_topic_controls AS control
+              ON control.run_id = correlation.run_id
+             AND control.thread_id = correlation.thread_id
+             AND control.source_device_id = correlation.target_device_id
+            WHERE topic_valid_id(COALESCE(
+                json_extract(control.update_json, '$.triggerLineId'),
+                json_extract(control.update_json, '$.TriggerLineId')));
+
+            INSERT INTO topic_trigger_migration_candidates
+            SELECT correlation.run_id, correlation.thread_id, correlation.target_device_id,
+                   local.trigger_line_id, 50, local.created_at, local.run_id
+            FROM topic_run_correlations AS correlation
+            JOIN topic_local_runs AS local
+              ON local.run_id = correlation.run_id
+             AND local.thread_id = correlation.thread_id
+             AND local.target_device_id = correlation.target_device_id
+            WHERE topic_valid_id(local.trigger_line_id);
+
+            INSERT INTO topic_trigger_migration_candidates
+            SELECT correlation.run_id, correlation.thread_id, correlation.target_device_id,
+                   line.line_id, 60, line.at, printf('%020d', line.id)
+            FROM topic_run_correlations AS correlation
+            JOIN own_threads AS thread
+              ON thread.id = correlation.thread_id
+             AND thread.execution_run_id = correlation.run_id
+            JOIN own_chat AS line ON line.thread_id = thread.id
+            WHERE line.role = 'user'
+              AND topic_valid_id(line.line_id)
+              AND (thread.execution_at IS NULL
+                   OR julianday(line.at) <= julianday(thread.execution_at));
+            """);
+
+        ExecuteMigrationCommand(transaction, """
+            UPDATE topic_run_correlations AS correlation
+            SET trigger_line_id = NULL,
+                trigger_identity_state = 'legacy-conflict'
+            WHERE EXISTS(
+                  SELECT 1
+                  FROM topic_trigger_migration_candidates AS candidate
+                  WHERE candidate.run_id = correlation.run_id
+                    AND candidate.thread_id = correlation.thread_id
+                    AND candidate.target_device_id = correlation.target_device_id
+                  GROUP BY candidate.run_id
+                  HAVING COUNT(DISTINCT candidate.trigger_line_id) > 1);
+            """);
+        derived += ExecuteMigrationCommand(transaction, """
+            UPDATE topic_run_correlations AS correlation
+            SET trigger_line_id = (
+                    SELECT candidate.trigger_line_id
+                    FROM topic_trigger_migration_candidates AS candidate
+                    WHERE candidate.run_id = correlation.run_id
+                      AND candidate.thread_id = correlation.thread_id
+                      AND candidate.target_device_id = correlation.target_device_id
+                    ORDER BY candidate.semantic_priority,
+                             candidate.created_at DESC,
+                             candidate.sequence_key DESC,
+                             candidate.trigger_line_id
+                    LIMIT 1),
+                trigger_identity_state = 'strict'
+            WHERE correlation.trigger_line_id IS NULL
+              AND correlation.trigger_identity_state <> 'legacy-conflict'
+              AND EXISTS(
+                  SELECT 1
+                  FROM topic_trigger_migration_candidates AS candidate
+                  WHERE candidate.run_id = correlation.run_id
+                    AND candidate.thread_id = correlation.thread_id
+                    AND candidate.target_device_id = correlation.target_device_id
+                    AND candidate.semantic_priority = (
+                        SELECT MIN(authoritative.semantic_priority)
+                        FROM topic_trigger_migration_candidates AS authoritative
+                        WHERE authoritative.run_id = correlation.run_id
+                          AND authoritative.thread_id = correlation.thread_id
+                          AND authoritative.target_device_id = correlation.target_device_id)
+                  GROUP BY candidate.run_id
+                  HAVING COUNT(DISTINCT candidate.trigger_line_id) = 1);
+            """);
+
+        ExecuteMigrationCommand(transaction, """
+            UPDATE topic_run_correlations AS correlation
+            SET terminal_at = COALESCE(terminal_at, (
+                    SELECT control.received_at
+                    FROM received_topic_controls AS control
+                    WHERE control.run_id = correlation.run_id
+                      AND control.thread_id = correlation.thread_id
+                      AND control.source_device_id = correlation.target_device_id
+                      AND control.control_kind = 'topic.terminal'
+                    ORDER BY control.received_at DESC, control.envelope_id
+                    LIMIT 1)),
+                terminal_event_at = COALESCE(terminal_event_at, (
+                    SELECT control.received_at
+                    FROM received_topic_controls AS control
+                    WHERE control.run_id = correlation.run_id
+                      AND control.thread_id = correlation.thread_id
+                      AND control.source_device_id = correlation.target_device_id
+                      AND control.control_kind = 'topic.terminal'
+                    ORDER BY control.received_at DESC, control.envelope_id
+                    LIMIT 1))
+            WHERE EXISTS(
+                SELECT 1 FROM received_topic_controls AS control
+                WHERE control.run_id = correlation.run_id
+                  AND control.thread_id = correlation.thread_id
+                  AND control.source_device_id = correlation.target_device_id
+                  AND control.control_kind = 'topic.terminal');
+
+            UPDATE topic_run_correlations AS correlation
+            SET trigger_identity_state = CASE
+                WHEN correlation.terminal_at IS NOT NULL
+                     OR NOT (
+                         EXISTS(
+                             SELECT 1 FROM topic_outbox AS outbox
+                             WHERE outbox.run_id = correlation.run_id
+                               AND outbox.thread_id = correlation.thread_id
+                               AND outbox.target_device_id = correlation.target_device_id
+                               AND outbox.state NOT IN ('expired', 'dead_letter', 'failed'))
+                         OR EXISTS(
+                             SELECT 1 FROM topic_local_runs AS local
+                             WHERE local.run_id = correlation.run_id
+                               AND local.thread_id = correlation.thread_id
+                               AND local.target_device_id = correlation.target_device_id
+                               AND local.terminal_at IS NULL)
+                         OR EXISTS(
+                             SELECT 1 FROM own_threads AS thread
+                             WHERE thread.id = correlation.thread_id
+                               AND thread.execution_run_id = correlation.run_id
+                               AND thread.execution_device_id = correlation.target_device_id))
+                    THEN 'legacy-tombstone'
+                ELSE 'legacy-active-null'
+                END
+            WHERE correlation.trigger_line_id IS NULL
+              AND correlation.trigger_identity_state <> 'legacy-conflict';
+            """);
+
+        var activeNull = ScalarCount(
+            transaction,
+            """
+            SELECT COUNT(*) FROM topic_run_correlations
+            WHERE trigger_line_id IS NULL AND trigger_identity_state = 'legacy-active-null';
+            """);
+        var tombstones = ScalarCount(
+            transaction,
+            """
+            SELECT COUNT(*) FROM topic_run_correlations
+            WHERE trigger_line_id IS NULL AND trigger_identity_state = 'legacy-tombstone';
+            """);
+        var conflicts = ScalarCount(
+            transaction,
+            """
+            SELECT COUNT(*) FROM topic_run_correlations
+            WHERE trigger_line_id IS NULL AND trigger_identity_state = 'legacy-conflict';
+            """);
+        var unresolvedHashes = new List<string>();
+        var conflictHashes = new List<string>();
+        using (var unresolved = conn.CreateCommand())
+        {
+            unresolved.Transaction = transaction;
+            unresolved.CommandText = """
+                SELECT run_id, trigger_identity_state FROM topic_run_correlations
+                WHERE trigger_line_id IS NULL
+                ORDER BY run_id;
+                """;
+            using var reader = unresolved.ExecuteReader();
+            while (reader.Read())
+            {
+                unresolvedHashes.Add(HashMigrationIdentifier(reader.GetString(0)));
+                if (string.Equals(reader.GetString(1), "legacy-conflict", StringComparison.Ordinal))
+                    conflictHashes.Add(HashMigrationIdentifier(reader.GetString(0)));
+            }
+        }
+
+        var diagnostics = JsonSerializer.Serialize(new
+        {
+            version = 3,
+            migratedAt = timeProvider.GetUtcNow().ToString("O"),
+            preexistingNull,
+            derived,
+            legacyActiveNull = activeNull,
+            legacyTombstone = tombstones,
+            legacyConflicts = conflicts,
+            unresolvedRunHashes = unresolvedHashes,
+            conflictRunHashes = conflictHashes
+        }, JsonOpts);
+        using (var meta = conn.CreateCommand())
+        {
+            meta.Transaction = transaction;
+            meta.CommandText = """
+                INSERT INTO meta(k, v) VALUES('topic_run_trigger_schema_version', '3')
+                ON CONFLICT(k) DO UPDATE SET v = excluded.v;
+                INSERT INTO meta(k, v) VALUES('topic_run_trigger_migration_diagnostics', $diagnostics)
+                ON CONFLICT(k) DO UPDATE SET v = excluded.v;
+                """;
+            meta.Parameters.AddWithValue("$diagnostics", diagnostics);
+            meta.ExecuteNonQuery();
+        }
+        transaction.Commit();
+    }
+
+    private int ExecuteMigrationCommand(SqliteTransaction transaction, string sql)
+    {
+        using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        return command.ExecuteNonQuery();
+    }
+
+    private long ScalarCount(SqliteTransaction transaction, string sql)
+    {
+        using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        return Convert.ToInt64(command.ExecuteScalar());
+    }
+
+    private static string HashMigrationIdentifier(string value)
+        => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value)))
+            .ToLowerInvariant();
+
+    private bool AddColumnIfMissing(string table, string column, string decl)
     {
         bool exists = false;
         using (var cmd = conn.CreateCommand())
@@ -323,7 +1143,9 @@ public sealed partial class MeshDb : IDisposable
             while (r.Read())
                 if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase)) { exists = true; break; }
         }
-        if (!exists) Exec($"ALTER TABLE {table} ADD COLUMN {column} {decl};");
+        if (exists) return false;
+        Exec($"ALTER TABLE {table} ADD COLUMN {column} {decl};");
+        return true;
     }
 
     /// <summary>True when this database has never had a profile written to it.</summary>
@@ -337,45 +1159,678 @@ public sealed partial class MeshDb : IDisposable
     // ---- composer drafts ---------------------------------------------------
 
     public string GetConversationDraft(string handle)
-        => GetComposerDraft(ConversationDraftKind, handle);
+        => GetConversationDraftState(handle)?.Text ?? "";
+
+    public ComposerDraft? GetConversationDraftState(string handle)
+        => GetComposerDraftState(ConversationDraftKind, handle);
 
     public void SetConversationDraft(string handle, string text)
-        => SetComposerDraft(ConversationDraftKind, handle, text);
+        => ExecuteDurableWrite(() => SetComposerDraft(
+            ConversationDraftKind, handle, text, ComposerDraftRevision.New(), null));
+
+    internal Task SetConversationDraftAsync(
+        string handle,
+        string text,
+        CancellationToken cancellationToken = default)
+        => ExecuteDurableWriteAsync(
+            () => SetComposerDraft(
+                ConversationDraftKind, handle, text, ComposerDraftRevision.New(), null),
+            cancellationToken);
+
+    internal Task<ComposerDraftMutationResult> TrySetConversationDraftAsync(
+        string handle,
+        string text,
+        long revision,
+        Func<bool> shouldPersist,
+        CancellationToken cancellationToken = default)
+        => ExecuteDurableWriteAsync(
+            () =>
+            {
+                if (!shouldPersist())
+                    return ComposerDraftMutationResult.Superseded;
+                return SetComposerDraft(
+                    ConversationDraftKind, handle, text, revision, null);
+            },
+            cancellationToken);
 
     public string GetTopicDraft(string threadId)
-        => GetComposerDraft(TopicDraftKind, threadId);
+        => GetTopicDraftState(threadId)?.Text ?? "";
+
+    public ComposerDraft? GetTopicDraftState(string threadId)
+        => GetComposerDraftState(TopicDraftKind, threadId);
 
     public void SetTopicDraft(string threadId, string text)
-        => SetComposerDraft(TopicDraftKind, threadId, text);
+    {
+        var revision = ComposerDraftRevision.New();
+        var snapshot = TopicComposerSnapshot.TextOnly(text);
+        StagePendingTopicSnapshot(threadId, snapshot, revision);
+        ExecuteDurableWrite(() => CommitTopicSnapshot(threadId, snapshot, revision));
+    }
 
-    private string GetComposerDraft(string kind, string entityId)
+    internal Task SetTopicDraftAsync(
+        string threadId,
+        string text,
+        CancellationToken cancellationToken = default)
+    {
+        var revision = ComposerDraftRevision.New();
+        var snapshot = TopicComposerSnapshot.TextOnly(text);
+        StagePendingTopicSnapshot(threadId, snapshot, revision);
+        return ExecuteDurableWriteAsync(
+            () => CommitTopicSnapshot(threadId, snapshot, revision),
+            cancellationToken);
+    }
+
+    internal Task<ComposerDraftMutationResult> TrySetTopicDraftAsync(
+        string threadId,
+        TopicComposerSnapshot snapshot,
+        long revision,
+        Func<bool> shouldPersist,
+        CancellationToken cancellationToken = default)
+        => ExecuteDurableWriteAsync(
+            () =>
+            {
+                if (!shouldPersist())
+                    return ComposerDraftMutationResult.Superseded;
+                composerDraftObserver?.Checkpoint(
+                    ComposerDraftTransactionCheckpoint.BeforeDraftWrite,
+                    threadId,
+                    revision);
+                return CommitTopicSnapshot(threadId, snapshot, revision);
+            },
+            cancellationToken);
+
+    internal void StagePendingTopicSnapshot(
+        string threadId,
+        TopicComposerSnapshot snapshot,
+        long revision)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(threadId);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        if (revision <= 0) throw new ArgumentOutOfRangeException(nameof(revision));
+        if (!ValidTopicComposerSnapshot(snapshot, snapshot.Text))
+            throw new ArgumentException(
+                "The topic composer snapshot is incomplete or inconsistent.",
+                nameof(snapshot));
+        snapshot = NormalizeTopicComposerSnapshot(snapshot);
+        ExecuteDurableWrite(() =>
+        {
+            using var transaction = conn.BeginTransaction();
+            using var command = conn.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO pending_topic_drafts(entity_id, text, revision, snapshot_json)
+                VALUES($id, $text, $revision, $snapshot)
+                ON CONFLICT(entity_id) DO UPDATE
+                SET text = excluded.text,
+                    revision = excluded.revision,
+                    snapshot_json = excluded.snapshot_json
+                WHERE pending_topic_drafts.revision < excluded.revision;
+                """;
+            command.Parameters.AddWithValue("$id", threadId);
+            command.Parameters.AddWithValue("$text", snapshot.Text);
+            command.Parameters.AddWithValue("$revision", revision);
+            command.Parameters.AddWithValue(
+                "$snapshot",
+                JsonSerializer.Serialize(snapshot, JsonOpts));
+            command.ExecuteNonQuery();
+            transaction.Commit();
+        });
+    }
+
+    internal void ClearPendingTopicSnapshot(string threadId, long persistedRevision)
+    {
+        ExecuteDurableWrite(() =>
+        {
+            using var transaction = conn.BeginTransaction();
+            DeletePendingTopicSnapshots(threadId, persistedRevision, transaction);
+            transaction.Commit();
+        });
+    }
+
+    private void DeletePendingTopicSnapshots(
+        string threadId,
+        long persistedRevision,
+        SqliteTransaction transaction)
+    {
+        using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DELETE FROM pending_topic_drafts
+            WHERE entity_id = $id AND revision <= $revision;
+            """;
+        command.Parameters.AddWithValue("$id", threadId);
+        command.Parameters.AddWithValue("$revision", persistedRevision);
+        command.ExecuteNonQuery();
+    }
+
+    private ComposerDraftMutationResult CommitTopicSnapshot(
+        string threadId,
+        TopicComposerSnapshot snapshot,
+        long revision)
+    {
+        using var transaction = conn.BeginTransaction();
+        var persisted = SetComposerDraft(
+            TopicDraftKind,
+            threadId,
+            snapshot.Text,
+            revision,
+            snapshot,
+            transaction);
+        DeletePendingTopicSnapshots(threadId, revision, transaction);
+        transaction.Commit();
+        return persisted;
+    }
+
+    internal Task<ComposerDraftClearResult> ResolveTopicDraftCleanupAsync(
+        string threadId,
+        long expectedRevision,
+        ComposerDraft? currentCandidate,
+        CancellationToken cancellationToken = default)
+        => ExecuteDurableWriteAsync(
+            () => ResolveTopicDraftCleanup(
+                threadId,
+                expectedRevision,
+                currentCandidate),
+            cancellationToken);
+
+    internal ComposerDraftClearResult ResolveTopicDraftCleanup(
+        string threadId,
+        long expectedRevision,
+        ComposerDraft? currentCandidate)
+    {
+        if (expectedRevision <= 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        using var transaction = conn.BeginTransaction();
+        var stored = ReadComposerDraftState(threadId, transaction);
+        var pending = ReadPendingTopicSnapshot(threadId, transaction);
+        composerDraftObserver?.Checkpoint(
+            ComposerDraftTransactionCheckpoint.CleanupObserved,
+            threadId,
+            expectedRevision);
+
+        var newer = HighestCompleteSnapshot(expectedRevision, currentCandidate, pending);
+        if (newer is not null)
+        {
+            composerDraftObserver?.Checkpoint(
+                ComposerDraftTransactionCheckpoint.BeforeNewerSnapshotWrite,
+                threadId,
+                expectedRevision);
+            _ = SetComposerDraft(
+                TopicDraftKind,
+                threadId,
+                newer.Text,
+                newer.Revision,
+                newer.TopicSnapshot,
+                transaction);
+            DeletePendingTopicSnapshots(threadId, newer.Revision, transaction);
+            stored = newer;
+        }
+
+        ComposerDraftClearResult result;
+        if (stored is null)
+        {
+            result = ComposerDraftClearResult.Missing;
+        }
+        else if (stored.Revision != expectedRevision)
+        {
+            result = ComposerDraftClearResult.Superseded;
+        }
+        else
+        {
+            using var clear = conn.CreateCommand();
+            clear.Transaction = transaction;
+            clear.CommandText = """
+                DELETE FROM composer_drafts
+                WHERE kind = $kind AND entity_id = $id
+                  AND typeof(revision) = 'integer' AND revision = $revision;
+                """;
+            clear.Parameters.AddWithValue("$kind", TopicDraftKind);
+            clear.Parameters.AddWithValue("$id", threadId);
+            clear.Parameters.AddWithValue("$revision", expectedRevision);
+            if (clear.ExecuteNonQuery() != 1)
+                throw new InvalidOperationException(
+                    "The submitted topic draft changed during atomic cleanup.");
+            DeletePendingTopicSnapshots(threadId, expectedRevision, transaction);
+            result = ComposerDraftClearResult.Cleared;
+        }
+
+        transaction.Commit();
+        return result;
+    }
+
+    private ComposerDraft? ReadComposerDraftState(
+        string threadId,
+        SqliteTransaction transaction)
+    {
+        using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT text, revision, typeof(revision), snapshot_json
+            FROM composer_drafts
+            WHERE kind = $kind AND entity_id = $id;
+            """;
+        command.Parameters.AddWithValue("$kind", TopicDraftKind);
+        command.Parameters.AddWithValue("$id", threadId);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read()) return null;
+        var text = reader.GetString(0);
+        if (reader.IsDBNull(1)
+            || !string.Equals(reader.GetString(2), "integer", StringComparison.Ordinal)
+            || reader.GetInt64(1) <= 0)
+            return new ComposerDraft(text, 0, IsMalformed: true);
+        var revision = reader.GetInt64(1);
+        if (reader.IsDBNull(3))
+            return new ComposerDraft(
+                text,
+                revision,
+                TopicSnapshot: TopicComposerSnapshot.TextOnly(text));
+        try
+        {
+            var snapshot = JsonSerializer.Deserialize<TopicComposerSnapshot>(
+                reader.GetString(3),
+                JsonOpts);
+            return snapshot is not null && ValidTopicComposerSnapshot(snapshot, text)
+                ? new ComposerDraft(
+                    text,
+                    revision,
+                    TopicSnapshot: NormalizeTopicComposerSnapshot(snapshot))
+                : new ComposerDraft(text, 0, IsMalformed: true);
+        }
+        catch (Exception exception) when (
+            exception is JsonException
+            or ArgumentException
+            or NotSupportedException
+            or PathTooLongException)
+        {
+            return new ComposerDraft(text, 0, IsMalformed: true);
+        }
+    }
+
+    private static ComposerDraft? HighestCompleteSnapshot(
+        long expectedRevision,
+        ComposerDraft? currentCandidate,
+        ComposerDraft? pending)
+        => new[] { currentCandidate, pending }
+            .Where(candidate => candidate is
+            {
+                IsMalformed: false,
+                TopicSnapshot: not null
+            } && candidate.Revision > expectedRevision)
+            .OrderByDescending(candidate => candidate!.Revision)
+            .FirstOrDefault();
+
+    private ComposerDraft? ReadPendingTopicSnapshot(
+        string threadId,
+        SqliteTransaction transaction)
+    {
+        using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT text, revision, snapshot_json
+            FROM pending_topic_drafts
+            WHERE entity_id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", threadId);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read()) return null;
+        var text = reader.GetString(0);
+        var revision = reader.GetInt64(1);
+        var snapshot = JsonSerializer.Deserialize<TopicComposerSnapshot>(
+                           reader.GetString(2),
+                           JsonOpts)
+                       ?? throw new InvalidDataException(
+                           "A pending topic snapshot is missing its payload.");
+        if (revision <= 0 || !ValidTopicComposerSnapshot(snapshot, text))
+            throw new InvalidDataException("A pending topic snapshot is malformed.");
+        return new ComposerDraft(
+            text,
+            revision,
+            TopicSnapshot: NormalizeTopicComposerSnapshot(snapshot));
+    }
+
+    public Task<ComposerDraftClearResult> CompareAndClearTopicDraftAsync(
+        string threadId,
+        long expectedRevision,
+        CancellationToken cancellationToken = default)
+        => ResolveTopicDraftCleanupAsync(
+            threadId,
+            expectedRevision,
+            null,
+            cancellationToken);
+
+    private void ImportLegacyPendingTopicSnapshots()
+    {
+        if (!File.Exists(legacyPendingComposerPath)) return;
+        using var legacy = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = legacyPendingComposerPath,
+            DefaultTimeout = 1
+        }.ToString());
+        legacy.Open();
+        ApplyKey(legacy, key);
+        using var exists = legacy.CreateCommand();
+        exists.CommandText = """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'pending_topic_snapshots';
+            """;
+        if (exists.ExecuteScalar() is null) return;
+        using var read = legacy.CreateCommand();
+        read.CommandText = """
+            SELECT entity_id, text, revision, snapshot_json
+            FROM pending_topic_snapshots
+            ORDER BY revision;
+            """;
+        using var reader = read.ExecuteReader();
+        while (reader.Read())
+        {
+            var entityId = reader.GetString(0);
+            var text = reader.GetString(1);
+            var revision = reader.GetInt64(2);
+            var snapshot = JsonSerializer.Deserialize<TopicComposerSnapshot>(
+                               reader.GetString(3),
+                               JsonOpts)
+                           ?? throw new InvalidDataException(
+                               "A legacy pending topic snapshot is missing its payload.");
+            if (!ValidTopicComposerSnapshot(snapshot, text))
+                throw new InvalidDataException(
+                    "A legacy pending topic snapshot is malformed.");
+            StagePendingTopicSnapshot(entityId, snapshot, revision);
+        }
+        legacy.Close();
+        TryDeleteLegacyPendingDatabase();
+    }
+
+    private void TryDeleteLegacyPendingDatabase()
+    {
+        foreach (var suffix in new[] { "", "-wal", "-shm" })
+        {
+            try { File.Delete(legacyPendingComposerPath + suffix); }
+            catch { }
+        }
+    }
+
+    private void ReplayPendingTopicSnapshots()
+    {
+        ImportLegacyPendingTopicSnapshots();
+        ExecuteDurableWrite(() =>
+        {
+            using var transaction = conn.BeginTransaction();
+            using var read = conn.CreateCommand();
+            read.Transaction = transaction;
+            read.CommandText = """
+                SELECT entity_id, text, revision, snapshot_json
+                FROM pending_topic_drafts
+                ORDER BY revision;
+                """;
+            using var reader = read.ExecuteReader();
+            var staged =
+                new List<(string EntityId, string Text, long Revision, TopicComposerSnapshot Snapshot)>();
+            while (reader.Read())
+            {
+                var entityId = reader.GetString(0);
+                var text = reader.GetString(1);
+                var revision = reader.GetInt64(2);
+                var snapshot = JsonSerializer.Deserialize<TopicComposerSnapshot>(
+                                   reader.GetString(3),
+                                   JsonOpts)
+                               ?? throw new InvalidDataException(
+                                   "A pending topic snapshot is missing its payload.");
+                if (revision <= 0 || !ValidTopicComposerSnapshot(snapshot, text))
+                    throw new InvalidDataException(
+                        "A pending topic snapshot is malformed.");
+                staged.Add((
+                    entityId,
+                    text,
+                    revision,
+                    NormalizeTopicComposerSnapshot(snapshot)));
+            }
+            reader.Close();
+            foreach (var item in staged)
+            {
+                _ = SetComposerDraft(
+                    TopicDraftKind,
+                    item.EntityId,
+                    item.Text,
+                    item.Revision,
+                    item.Snapshot,
+                    transaction);
+                DeletePendingTopicSnapshots(item.EntityId, item.Revision, transaction);
+            }
+            transaction.Commit();
+        });
+    }
+
+    private ComposerDraft? GetComposerDraftState(string kind, string entityId)
+    {
+        using (var read = conn.CreateCommand())
+        {
+            read.CommandText = """
+                SELECT text, revision, typeof(revision), snapshot_json
+                FROM composer_drafts
+                WHERE kind = $kind AND entity_id = $id;
+                """;
+            read.Parameters.AddWithValue("$kind", kind);
+            read.Parameters.AddWithValue("$id", entityId);
+            using var reader = read.ExecuteReader();
+            if (!reader.Read())
+                return null;
+
+            var text = reader.GetString(0);
+            var revisionType = reader.GetString(2);
+            if (!reader.IsDBNull(1)
+                && string.Equals(revisionType, "integer", StringComparison.Ordinal)
+                && reader.GetInt64(1) > 0)
+            {
+                var revision = reader.GetInt64(1);
+                if (!string.Equals(kind, TopicDraftKind, StringComparison.Ordinal))
+                    return new ComposerDraft(text, revision);
+                if (reader.IsDBNull(3))
+                    return new ComposerDraft(
+                        text,
+                        revision,
+                        TopicSnapshot: TopicComposerSnapshot.TextOnly(text));
+                try
+                {
+                    var snapshot = JsonSerializer.Deserialize<TopicComposerSnapshot>(
+                        reader.GetString(3),
+                        JsonOpts);
+                    if (snapshot is null || !ValidTopicComposerSnapshot(snapshot, text))
+                        return new ComposerDraft(text, 0, IsMalformed: true);
+                    return new ComposerDraft(
+                        text,
+                        revision,
+                        TopicSnapshot: NormalizeTopicComposerSnapshot(snapshot));
+                }
+                catch (Exception exception) when (
+                    exception is JsonException
+                    or ArgumentException
+                    or NotSupportedException
+                    or PathTooLongException)
+                {
+                    return new ComposerDraft(text, 0, IsMalformed: true);
+                }
+            }
+
+            if (!reader.IsDBNull(1))
+                return new ComposerDraft(text, 0, IsMalformed: true);
+        }
+
+        return ExecuteDurableWrite(() =>
+        {
+            using var transaction = conn.BeginTransaction();
+            var migratedRevision = ComposerDraftRevision.New();
+            using var migrate = conn.CreateCommand();
+            migrate.Transaction = transaction;
+            migrate.CommandText = """
+                UPDATE composer_drafts
+                SET revision = $revision
+                WHERE kind = $kind AND entity_id = $id AND revision IS NULL;
+                """;
+            migrate.Parameters.AddWithValue("$revision", migratedRevision);
+            migrate.Parameters.AddWithValue("$kind", kind);
+            migrate.Parameters.AddWithValue("$id", entityId);
+            if (migrate.ExecuteNonQuery() != 1)
+                throw new InvalidOperationException("Legacy composer draft migration lost its revision fence.");
+            transaction.Commit();
+            var migratedText = GetComposerDraftText(kind, entityId);
+            return new ComposerDraft(
+                migratedText,
+                migratedRevision,
+                TopicSnapshot: string.Equals(
+                    kind,
+                    TopicDraftKind,
+                    StringComparison.Ordinal)
+                    ? TopicComposerSnapshot.TextOnly(migratedText)
+                    : null);
+        });
+    }
+
+    private string GetComposerDraftText(string kind, string entityId)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT text FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
+        cmd.CommandText = """
+            SELECT text FROM composer_drafts
+            WHERE kind = $kind AND entity_id = $id;
+            """;
         cmd.Parameters.AddWithValue("$kind", kind);
         cmd.Parameters.AddWithValue("$id", entityId);
         return cmd.ExecuteScalar() as string ?? "";
     }
 
-    private void SetComposerDraft(string kind, string entityId, string text)
+    private ComposerDraftMutationResult SetComposerDraft(
+        string kind,
+        string entityId,
+        string text,
+        long revision,
+        TopicComposerSnapshot? topicSnapshot,
+        SqliteTransaction? transaction = null)
     {
+        if (revision <= 0) throw new ArgumentOutOfRangeException(nameof(revision));
+        string? snapshotJson = null;
+        if (string.Equals(kind, TopicDraftKind, StringComparison.Ordinal))
+        {
+            topicSnapshot ??= TopicComposerSnapshot.TextOnly(text);
+            if (!ValidTopicComposerSnapshot(topicSnapshot, text))
+                throw new ArgumentException(
+                    "The topic composer snapshot is incomplete or inconsistent.",
+                    nameof(topicSnapshot));
+            topicSnapshot = NormalizeTopicComposerSnapshot(topicSnapshot);
+            snapshotJson = JsonSerializer.Serialize(topicSnapshot, JsonOpts);
+        }
         using var cmd = conn.CreateCommand();
-        if (text.Length == 0)
-        {
-            cmd.CommandText = "DELETE FROM composer_drafts WHERE kind = $kind AND entity_id = $id;";
-        }
-        else
-        {
-            cmd.CommandText = """
-                INSERT INTO composer_drafts(kind, entity_id, text) VALUES($kind, $id, $text)
-                ON CONFLICT(kind, entity_id) DO UPDATE SET text = excluded.text;
-                """;
-            cmd.Parameters.AddWithValue("$text", text);
-        }
+        cmd.Transaction = transaction;
+        cmd.CommandText = """
+            INSERT INTO composer_drafts(kind, entity_id, text, revision, snapshot_json)
+            VALUES($kind, $id, $text, $revision, $snapshot)
+            ON CONFLICT(kind, entity_id) DO UPDATE
+            SET text = excluded.text,
+                revision = excluded.revision,
+                snapshot_json = excluded.snapshot_json
+            WHERE typeof(composer_drafts.revision) <> 'integer'
+               OR composer_drafts.revision IS NULL
+               OR composer_drafts.revision < excluded.revision;
+            """;
+        cmd.Parameters.AddWithValue("$text", text);
+        cmd.Parameters.AddWithValue("$revision", revision);
+        cmd.Parameters.AddWithValue("$snapshot", (object?)snapshotJson ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$kind", kind);
         cmd.Parameters.AddWithValue("$id", entityId);
-        cmd.ExecuteNonQuery();
+        if (cmd.ExecuteNonQuery() == 1)
+            return ComposerDraftMutationResult.Persisted;
+
+        using var existing = conn.CreateCommand();
+        existing.Transaction = transaction;
+        existing.CommandText = """
+            SELECT text, revision, typeof(revision), snapshot_json
+            FROM composer_drafts
+            WHERE kind = $kind AND entity_id = $id;
+            """;
+        existing.Parameters.AddWithValue("$kind", kind);
+        existing.Parameters.AddWithValue("$id", entityId);
+        using var reader = existing.ExecuteReader();
+        if (!reader.Read()
+            || reader.IsDBNull(1)
+            || !string.Equals(reader.GetString(2), "integer", StringComparison.Ordinal)
+            || reader.GetInt64(1) != revision
+            || !string.Equals(reader.GetString(0), text, StringComparison.Ordinal))
+            return ComposerDraftMutationResult.Superseded;
+
+        if (!string.Equals(kind, TopicDraftKind, StringComparison.Ordinal))
+            return ComposerDraftMutationResult.AlreadyPersisted;
+
+        var storedSnapshot = reader.IsDBNull(3)
+            ? TopicComposerSnapshot.TextOnly(text)
+            : JsonSerializer.Deserialize<TopicComposerSnapshot>(
+                reader.GetString(3),
+                JsonOpts);
+        return storedSnapshot is not null
+               && ValidTopicComposerSnapshot(storedSnapshot, text)
+               && TopicComposerSnapshotsEqual(storedSnapshot, topicSnapshot!)
+            ? ComposerDraftMutationResult.AlreadyPersisted
+            : ComposerDraftMutationResult.Superseded;
     }
+
+    internal static bool TopicComposerSnapshotsEqual(
+        TopicComposerSnapshot left,
+        TopicComposerSnapshot right)
+        => string.Equals(
+            JsonSerializer.Serialize(
+                NormalizeTopicComposerSnapshot(left),
+                JsonOpts),
+            JsonSerializer.Serialize(
+                NormalizeTopicComposerSnapshot(right),
+                JsonOpts),
+            StringComparison.Ordinal);
+
+    private static string ComputeTopicComposerFingerprint(TopicComposerSnapshot snapshot)
+    {
+        var json = JsonSerializer.Serialize(
+            NormalizeTopicComposerSnapshot(snapshot),
+            JsonOpts);
+        return Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(json)));
+    }
+
+    private static bool ValidTopicComposerSnapshot(
+        TopicComposerSnapshot snapshot,
+        string expectedText)
+        => snapshot.Text is not null
+           && string.Equals(snapshot.Text, expectedText, StringComparison.Ordinal)
+           && snapshot.Attachments is not null
+           && snapshot.Attachments.All(attachment =>
+               attachment is not null
+               && !string.IsNullOrWhiteSpace(attachment.Id)
+               && !string.IsNullOrWhiteSpace(attachment.Name)
+               && !string.IsNullOrWhiteSpace(attachment.Path)
+              && attachment.Size >= 0)
+           && !(snapshot.WidgetMode && !string.IsNullOrWhiteSpace(snapshot.WidgetId))
+           && !(snapshot.WidgetMode && snapshot.Widget is not null)
+           && (snapshot.Widget is null
+               || !string.IsNullOrWhiteSpace(snapshot.Widget.Id)
+               && snapshot.Widget.Name is not null
+               && snapshot.Widget.Prompt is not null
+               && snapshot.Widget.Html is not null
+               && string.Equals(
+                   snapshot.WidgetId,
+                   snapshot.Widget.Id,
+                   StringComparison.Ordinal))
+           && snapshot.TargetDeviceId is not null;
+
+    private static TopicComposerSnapshot NormalizeTopicComposerSnapshot(
+        TopicComposerSnapshot snapshot)
+        => snapshot with
+        {
+            Attachments = snapshot.Attachments
+                .Select(attachment => attachment with
+                {
+                    Path = System.IO.Path.GetFullPath(attachment.Path)
+                })
+                .ToArray(),
+            WidgetId = string.IsNullOrWhiteSpace(snapshot.WidgetId)
+                ? null
+                : snapshot.WidgetId,
+            TargetDeviceId = snapshot.TargetDeviceId ?? ""
+        };
+
 
     private void DeleteComposerDraft(SqliteTransaction transaction, string kind, string entityId)
     {
@@ -390,16 +1845,28 @@ public sealed partial class MeshDb : IDisposable
     // ---- local UI state ----------------------------------------------------
 
     public string? GetLastDesktopTopicId()
-        => GetMetaValue(LastDesktopTopicMetaKey);
+        => Volatile.Read(ref lastDesktopTopicId);
 
     public void SetLastDesktopTopicId(string? threadId)
-        => SetMetaValue(LastDesktopTopicMetaKey, threadId);
+    {
+        SetMetaValue(LastDesktopTopicMetaKey, threadId);
+        Volatile.Write(ref lastDesktopTopicId, threadId);
+    }
+
+    internal void StageLastDesktopTopicId(string? threadId)
+        => Volatile.Write(ref lastDesktopTopicId, threadId);
 
     public string? GetLastDesktopConversationKey()
-        => GetMetaValue(LastDesktopConversationMetaKey);
+        => Volatile.Read(ref lastDesktopConversationKey);
 
     public void SetLastDesktopConversationKey(string? conversationKey)
-        => SetMetaValue(LastDesktopConversationMetaKey, conversationKey);
+    {
+        SetMetaValue(LastDesktopConversationMetaKey, conversationKey);
+        Volatile.Write(ref lastDesktopConversationKey, conversationKey);
+    }
+
+    internal void StageLastDesktopConversationKey(string? conversationKey)
+        => Volatile.Write(ref lastDesktopConversationKey, conversationKey);
 
     private string? GetMetaValue(string key)
     {
@@ -2071,6 +3538,7 @@ public sealed partial class MeshDb : IDisposable
     public bool CompleteOwnThreadRunAndDeleteTopicOutbox(
         string id,
         string runId,
+        string? triggerLineId,
         string? deviceId,
         string? deviceName,
         string? devicePlatform,
@@ -2078,6 +3546,42 @@ public sealed partial class MeshDb : IDisposable
         DateTimeOffset activityAt)
     {
         using var transaction = conn.BeginTransaction();
+        using (var correlation = conn.CreateCommand())
+        {
+            correlation.Transaction = transaction;
+            var hasDurableIdentity = TopicRunProtocol.IsValidIdentifier(triggerLineId);
+            correlation.CommandText = hasDurableIdentity
+                ? """
+                  SELECT EXISTS(
+                      SELECT 1
+                      FROM topic_run_correlations
+                      WHERE run_id = $run
+                        AND thread_id = $thread
+                        AND trigger_line_id = $trigger);
+                  """
+                : """
+                  SELECT NOT EXISTS(
+                      SELECT 1 FROM topic_run_correlations WHERE thread_id = $thread)
+                     AND NOT EXISTS(
+                      SELECT 1 FROM topic_outbox WHERE thread_id = $thread);
+                  """;
+            correlation.Parameters.AddWithValue("$run", runId);
+            correlation.Parameters.AddWithValue("$thread", id);
+            correlation.Parameters.AddWithValue(
+                "$trigger", hasDurableIdentity ? triggerLineId! : DBNull.Value);
+            if (Convert.ToInt64(correlation.ExecuteScalar()) != 1)
+                return false;
+        }
+        using (var current = conn.CreateCommand())
+        {
+            current.Transaction = transaction;
+            current.CommandText = "SELECT execution_run_id FROM own_threads WHERE id = $id;";
+            current.Parameters.AddWithValue("$id", id);
+            var activeRun = current.ExecuteScalar();
+            if (activeRun is string active
+                && !string.Equals(active, runId, StringComparison.Ordinal))
+                return false;
+        }
         using var update = conn.CreateCommand();
         update.Transaction = transaction;
         update.CommandText = """
@@ -2092,7 +3596,8 @@ public sealed partial class MeshDb : IDisposable
                          OR julianday($activity) > julianday(last_activity_at)
                     THEN $activity ELSE last_activity_at
                 END
-            WHERE id = $id AND execution_run_id = $run;
+            WHERE id = $id
+              AND (execution_run_id = $run OR execution_run_id IS NULL);
             """;
         update.Parameters.AddWithValue("$did", (object?)deviceId ?? DBNull.Value);
         update.Parameters.AddWithValue("$dname", (object?)deviceName ?? DBNull.Value);
@@ -2110,6 +3615,8 @@ public sealed partial class MeshDb : IDisposable
         delete.CommandText = "DELETE FROM topic_outbox WHERE run_id = $run;";
         delete.Parameters.AddWithValue("$run", runId);
         delete.ExecuteNonQuery();
+        MarkTopicRunCorrelationTerminal(
+            transaction, runId, timeProvider.GetUtcNow(), activityAt);
         transaction.Commit();
         return true;
     }
@@ -2306,6 +3813,7 @@ public sealed partial class MeshDb : IDisposable
             connection.Dispose();
         }
         connections.Dispose();
+        durableWriteGate.Dispose();
         CryptographicOperations.ZeroMemory(key);
     }
 }

@@ -1195,6 +1195,23 @@ public static class TopicComposerPresentation
 /// </summary>
 public enum TopicQueueStage { Sending, Relay, Device, Cancelling, Expired, Failed }
 
+public static class TopicQueuePresentation
+{
+    public static string Label(
+        TopicQueueStage stage,
+        bool usesCurrentDevice,
+        string device)
+        => stage switch
+        {
+            TopicQueueStage.Relay => $"sent · waiting for {device}",
+            TopicQueueStage.Device => $"accepted by {device}",
+            TopicQueueStage.Cancelling => "cancelling",
+            TopicQueueStage.Expired => "expired",
+            TopicQueueStage.Failed => "failed",
+            _ => usesCurrentDevice ? "queued on this device" : "sending from this device"
+        };
+}
+
 public sealed record QueuedTopicRunInfo(
     string ThreadId,
     string RunId,
@@ -1206,6 +1223,7 @@ public sealed class QueuedTopicRunState
 {
     private sealed record Entry(string LineId, bool Waiting, TopicQueueStage Stage);
 
+    private readonly object gate = new();
     private readonly Dictionary<string, Dictionary<string, Entry>> runsByThread =
         new(StringComparer.Ordinal);
 
@@ -1218,81 +1236,122 @@ public sealed class QueuedTopicRunState
         ValidateId(threadId, nameof(threadId));
         ValidateId(runId, nameof(runId));
         ValidateId(lineId, nameof(lineId));
-        if (!runsByThread.TryGetValue(threadId, out var runs))
-            runsByThread[threadId] = runs = new Dictionary<string, Entry>(StringComparer.Ordinal);
-        if (runs.TryGetValue(runId, out var current))
+        lock (gate)
         {
-            if (!string.Equals(current.LineId, lineId, StringComparison.Ordinal))
-                throw new InvalidOperationException("A queued run cannot change its trigger line.");
-            if (current.Waiting && current.Stage == stage) return false;
-            runs[runId] = current with { Waiting = true, Stage = stage };
+            if (!runsByThread.TryGetValue(threadId, out var runs))
+                runsByThread[threadId] = runs = new Dictionary<string, Entry>(StringComparer.Ordinal);
+            if (runs.TryGetValue(runId, out var current))
+            {
+                if (!string.Equals(current.LineId, lineId, StringComparison.Ordinal))
+                    throw new InvalidOperationException("A queued run cannot change its trigger line.");
+                if (current.Waiting && current.Stage == stage) return false;
+                runs[runId] = current with { Waiting = true, Stage = stage };
+                return true;
+            }
+            runs[runId] = new Entry(lineId, Waiting: true, stage);
             return true;
         }
-        runs[runId] = new Entry(lineId, Waiting: true, stage);
-        return true;
     }
 
     public bool SetStage(string threadId, string runId, TopicQueueStage stage)
     {
-        if (!runsByThread.TryGetValue(threadId, out var runs)
-            || !runs.TryGetValue(runId, out var current)
-            || current.Stage == stage)
-            return false;
-        runs[runId] = current with { Stage = stage };
-        return true;
+        lock (gate)
+        {
+            if (!runsByThread.TryGetValue(threadId, out var runs)
+                || !runs.TryGetValue(runId, out var current)
+                || current.Stage == stage)
+                return false;
+            runs[runId] = current with { Stage = stage };
+            return true;
+        }
     }
 
     public bool MarkStarted(string threadId, string runId)
     {
-        if (!runsByThread.TryGetValue(threadId, out var runs)
-            || !runs.TryGetValue(runId, out var current)
-            || !current.Waiting)
-            return false;
-        runs[runId] = current with { Waiting = false };
-        return true;
+        lock (gate)
+        {
+            if (!runsByThread.TryGetValue(threadId, out var runs)
+                || !runs.TryGetValue(runId, out var current)
+                || !current.Waiting)
+                return false;
+            runs[runId] = current with { Waiting = false };
+            return true;
+        }
     }
 
     public bool Complete(string threadId, string runId)
     {
-        if (!runsByThread.TryGetValue(threadId, out var runs) || !runs.Remove(runId))
-            return false;
-        if (runs.Count == 0) runsByThread.Remove(threadId);
-        return true;
+        lock (gate)
+        {
+            if (!runsByThread.TryGetValue(threadId, out var runs) || !runs.Remove(runId))
+                return false;
+            if (runs.Count == 0) runsByThread.Remove(threadId);
+            return true;
+        }
     }
 
     public bool IsKnownRun(string threadId, string runId)
-        => runsByThread.TryGetValue(threadId, out var runs) && runs.ContainsKey(runId);
+    {
+        lock (gate)
+            return runsByThread.TryGetValue(threadId, out var runs) && runs.ContainsKey(runId);
+    }
+
+    public bool Matches(string threadId, string runId, string? lineId)
+    {
+        if (!TopicRunProtocol.IsValidIdentifier(lineId)) return false;
+        lock (gate)
+            return runsByThread.TryGetValue(threadId, out var runs)
+                   && runs.TryGetValue(runId, out var entry)
+                   && string.Equals(entry.LineId, lineId, StringComparison.Ordinal);
+    }
 
     public QueuedTopicRunInfo? FindByLine(string threadId, string lineId)
     {
-        if (!runsByThread.TryGetValue(threadId, out var runs)) return null;
-        foreach (var (runId, entry) in runs)
-            if (string.Equals(entry.LineId, lineId, StringComparison.Ordinal))
-                return new QueuedTopicRunInfo(
-                    threadId, runId, entry.LineId, entry.Stage, entry.Waiting);
-        return null;
+        lock (gate)
+        {
+            if (!runsByThread.TryGetValue(threadId, out var runs)) return null;
+            foreach (var (runId, entry) in runs)
+                if (string.Equals(entry.LineId, lineId, StringComparison.Ordinal))
+                    return new QueuedTopicRunInfo(
+                        threadId, runId, entry.LineId, entry.Stage, entry.Waiting);
+            return null;
+        }
     }
 
     public QueuedTopicRunInfo? FindByLine(string lineId)
     {
-        foreach (var threadId in runsByThread.Keys)
+        lock (gate)
         {
-            var match = FindByLine(threadId, lineId);
-            if (match is not null) return match;
+            foreach (var threadId in runsByThread.Keys)
+            {
+                var match = FindByLine(threadId, lineId);
+                if (match is not null) return match;
+            }
+            return null;
         }
-        return null;
     }
 
     public bool IsLineWaiting(string lineId) => FindByLine(lineId)?.Waiting == true;
 
     public int WaitingCount(string threadId)
-        => runsByThread.TryGetValue(threadId, out var runs)
-            ? runs.Values.Count(entry => entry.Waiting)
-            : 0;
+    {
+        lock (gate)
+            return runsByThread.TryGetValue(threadId, out var runs)
+                ? runs.Values.Count(entry => entry.Waiting)
+                : 0;
+    }
 
-    public bool ClearThread(string threadId) => runsByThread.Remove(threadId);
+    public bool ClearThread(string threadId)
+    {
+        lock (gate)
+            return runsByThread.Remove(threadId);
+    }
 
-    public void Clear() => runsByThread.Clear();
+    public void Clear()
+    {
+        lock (gate)
+            runsByThread.Clear();
+    }
 
     private static void ValidateId(string value, string parameterName)
     {
@@ -1331,11 +1390,17 @@ public static class RemoteRunReconciliation
         RemoteRunProjection? projection,
         DateTimeOffset answerAt)
     {
-        if (TopicRunProtocol.IsValidIdentifier(replyToLineId)
-            && queuedRun is not null
-            && string.Equals(queuedRun.ThreadId, threadId, StringComparison.Ordinal)
-            && string.Equals(queuedRun.LineId, replyToLineId, StringComparison.Ordinal))
-            return queuedRun.RunId;
+        if (TopicRunProtocol.IsValidIdentifier(replyToLineId))
+        {
+            if (queuedRun is not null
+                && string.Equals(queuedRun.ThreadId, threadId, StringComparison.Ordinal)
+                && string.Equals(queuedRun.LineId, replyToLineId, StringComparison.Ordinal))
+                return queuedRun.RunId;
+
+            // A correlated answer must never fall through to the timestamp heuristic. The caller
+            // resolves its durable run/trigger identity first; an unresolved identity is fenced.
+            return null;
+        }
 
         return projection is not null
                && string.Equals(projection.ThreadId, threadId, StringComparison.Ordinal)

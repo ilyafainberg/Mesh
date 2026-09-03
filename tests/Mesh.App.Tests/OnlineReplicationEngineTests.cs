@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json.Nodes;
 using Mesh.App.Services;
 using Mesh.Shared;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -303,6 +304,85 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         Assert.AreEqual(1, b.Applier.Count, "an exact duplicate must never re-project the domain");
         Assert.IsNotNull(b.Db.GetEvent(ev1.EventId));
         Assert.AreEqual(1UL, b.Db.GetCursor("sd1")!.Contiguous);
+    }
+
+    [TestMethod]
+    public async Task Receive_UnaddressedOwnAccountEventAdvancesCursorWithoutProjectionAndDiagnoses()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("alice", "a2");
+        var src = AddOrigin("alice", "a3");
+        var unrelated = KeyPair.New();
+        var activity = new List<ReplicationEngineActivity>();
+        b.Engine.Activity += item =>
+        {
+            lock (activity) activity.Add(item);
+        };
+        await EstablishAsync(a, b);
+
+        var evt = MakeEvent(
+            src,
+            "alice",
+            "a3",
+            1,
+            Msg("unaddressed"),
+            new[] { unrelated.PublicB64 });
+        await DeliverBatchAsync(a, b, Batch("a3", new[] { evt }));
+
+        Assert.IsNotNull(b.Db.GetEvent(evt.EventId));
+        Assert.AreEqual(1UL, b.Db.GetCursor("a3")!.Contiguous);
+        Assert.AreEqual(0, b.Applier.Count, "an unaddressed event must never materialise");
+        lock (activity)
+            Assert.IsTrue(activity.Any(item =>
+                item.Name == "event.unaddressed"
+                && item.EventId == evt.EventId
+                && item.ErrorCode?.Contains("recipient_slots=1", StringComparison.Ordinal) == true));
+    }
+
+    [TestMethod]
+    public async Task Receive_AuthenticationFailureQuarantinesWithoutCursorAdvanceOrProjection()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        var src = AddOrigin("src", "sd-auth");
+        await EstablishAsync(a, b);
+
+        var valid = MakeEvent(
+            src,
+            "src",
+            "sd-auth",
+            1,
+            Msg("authenticated"),
+            new[] { b.Keys.PublicB64 });
+        var payload = JsonNode.Parse(valid.Ciphertext)!.AsObject();
+        var cipherBytes = Convert.FromBase64String(payload["ct"]!.GetValue<string>());
+        cipherBytes[0] ^= 0x80;
+        payload["ct"] = Convert.ToBase64String(cipherBytes);
+        var tamperedCiphertext = payload.ToJsonString();
+        var tampered = OnlineReplicationProtocol.CreateEvent(
+            valid.OriginDeviceId,
+            valid.LogEpoch,
+            valid.Seq,
+            valid.OriginAccount,
+            valid.AuthGeneration,
+            valid.Kind,
+            valid.EntityId,
+            valid.ConversationId,
+            valid.CausalVersion,
+            valid.CreatedAtUnixMs,
+            tamperedCiphertext,
+            src.PrivateB64);
+
+        await DeliverBatchAsync(a, b, Batch("sd-auth", new[] { tampered }));
+
+        Assert.IsNull(b.Db.GetEvent(tampered.EventId));
+        Assert.IsNull(b.Db.GetCursor("sd-auth"));
+        Assert.AreEqual(0, b.Applier.Count);
+        var quarantine = b.Db.GetInboundQuarantine(tampered.EventId);
+        Assert.IsNotNull(quarantine);
+        Assert.AreEqual(
+            MessageDecryptOutcome.AuthenticationFailed.ToString(),
+            quarantine.Outcome);
     }
 
     [TestMethod]
@@ -909,7 +989,8 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
             bootstrapId,
             OnlineReplicationProtocol.HashText("snapshot-state"),
             "snapshot-state",
-            snapshot.Count);
+            snapshot.Count,
+            captureCursor: 130);
         ulong firstSnapshotSeq = 0;
         var snapshotIds = a.Engine.Journal.EmitLocalBatch(
             snapshot,
@@ -950,6 +1031,84 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         Assert.IsTrue(snapshotIds.All(id => b.Db.GetEvent(id) is not null));
         Assert.IsNotNull(a.Db.GetEvent(reverseId), "reverse-direction work must converge during bootstrap");
         Assert.AreEqual(MeshDb.BootstrapStatePersisted, a.Db.GetPeerBootstrap(targetB)!.State);
+    }
+
+    [TestMethod]
+    public async Task Snapshot_CursorBarrierEventsReachSiblingExactlyOnceInJournalOrder()
+    {
+        var a = NewNode("alice", "a1", deferSiblingOffersUntilBootstrap: true);
+        var b = NewNode("alice", "a2", deferSiblingOffersUntilBootstrap: true);
+
+        var beforeCapture = Msg("before-capture");
+        var historicalId = await a.Engine.EmitLocalAsync(beforeCapture, new[] { a.Handle });
+        const ulong captureCursor = 1;
+        var afterCursorId = await a.Engine.EmitLocalAsync(
+            Msg("after-cursor-before-boundary-release"), new[] { a.Handle });
+        var afterReleaseId = await a.Engine.EmitLocalAsync(
+            Msg("after-release-before-sequence-allocation"), new[] { a.Handle });
+
+        var peerB = Roster.ResolveDevice(b.Handle, b.Device)!;
+        var targetB = ReplicationBootstrapTarget.Create(peerB, a.Engine.LocalIdentity);
+        const string bootstrapId = "cursor-barrier-snapshot";
+        a.Db.CreateOrResumePeerBootstrap(
+            targetB,
+            bootstrapId,
+            OnlineReplicationProtocol.HashText("cursor-barrier-state"),
+            "cursor-barrier-state",
+            totalItems: 2,
+            captureCursor: captureCursor);
+
+        ulong bootstrapFrom = 0;
+        var firstSnapshotIds = a.Engine.Journal.EmitLocalBatch(
+            new[] { beforeCapture },
+            new[] { a.Handle },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, _) =>
+            {
+                bootstrapFrom = evt.Seq;
+                a.Db.UpdatePeerBootstrapProgress(
+                    targetB, bootstrapId, 1, 2, bootstrapFrom, evt.Seq, tx);
+            });
+        var duringChunksId = await a.Engine.EmitLocalAsync(
+            Msg("during-chunk-emission"), new[] { a.Handle });
+        var finalSnapshotIds = a.Engine.Journal.EmitLocalBatch(
+            new[] { Msg("snapshot-second-item") },
+            new[] { a.Handle },
+            domainWork: static (_, _, _) => { },
+            eventWork: (_, tx, evt, _) =>
+                a.Db.UpdatePeerBootstrapProgress(
+                    targetB, bootstrapId, 2, 2, bootstrapFrom, evt.Seq, tx));
+        var afterMarkerId = await a.Engine.EmitLocalAsync(
+            Msg("after-marker"), new[] { a.Handle });
+
+        await ConnectAsync(a, b);
+
+        Assert.AreEqual(7UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        Assert.IsNull(b.Db.GetEvent(historicalId), "the captured prefix is represented by the snapshot");
+        foreach (var eventId in new[]
+                 {
+                     afterCursorId,
+                     afterReleaseId,
+                     firstSnapshotIds[0],
+                     duringChunksId,
+                     finalSnapshotIds[0],
+                     afterMarkerId
+                 })
+            Assert.IsNotNull(b.Db.GetEvent(eventId), $"{eventId} must reach the sibling");
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                "after-cursor-before-boundary-release",
+                "after-release-before-sequence-allocation",
+                "before-capture",
+                "during-chunk-emission",
+                "snapshot-second-item",
+                "after-marker"
+            },
+            b.Applier.Applied.Select(item => item.Env.EntityId).ToArray());
+        Assert.AreEqual(
+            MeshDb.BootstrapStatePersisted,
+            a.Db.GetPeerBootstrap(targetB)!.State);
     }
 
     [TestMethod]
@@ -1016,7 +1175,8 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
             "empty-snapshot",
             OnlineReplicationProtocol.HashText("[]"),
             "[]",
-            totalItems: 0);
+            totalItems: 0,
+            captureCursor: 100);
         a.Db.CompleteEmptyPeerBootstrap(
             targetB,
             marker.BootstrapId,
@@ -1177,7 +1337,8 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
             coverageJson: ReplicationPayloadCodec.SerializeControl(new List<ReplicationSnapshotCoverage>
             {
                 new("z3", "epoch-1", 50)
-            }));
+            }),
+            captureCursor: 10);
         a.Db.CompleteEmptyPeerBootstrap(
             targetB,
             marker.BootstrapId,
@@ -1306,6 +1467,47 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
     }
 
     [TestMethod]
+    public async Task Request_LiveFaultSuccessDropRetriesAndPersistsExactlyOnce()
+    {
+        var sourceDevice = DeviceProtocol.DeviceId(KeyPair.New().PublicB64);
+        var targetDevice = DeviceProtocol.DeviceId(KeyPair.New().PublicB64);
+        var a = NewNode("alice", sourceDevice);
+        var b = NewNode(
+            "bob",
+            targetDevice,
+            requestRetryInterval: TimeSpan.FromMilliseconds(25));
+        await EstablishAsync(a, b);
+        var faults = new Mesh.Relay.LiveFaults.LiveFaultStore(
+            new Mesh.Relay.LiveFaults.LiveFaultOptions { Enabled = true });
+        Fabric.LiveFaults = faults;
+        faults.Activate(new Mesh.Relay.LiveFaults.LiveFaultActivationRequest(
+            "m08-engine-success-drop",
+            Mesh.Relay.LiveFaults.LiveFaultMode.SuccessDropBeforeDestination,
+            Mesh.Relay.LiveFaults.LiveFaultDirection.Outbound,
+            a.Handle,
+            b.Device,
+            60,
+            SourceDevice: a.Device,
+            TargetAccount: b.Handle,
+            Kind: Mesh.Relay.LiveFaults.LiveFaultStore.OnlineFrameKind));
+
+        var eventId = await a.Engine.EmitLocalAsync(Msg("live-fault-lost-batch"), new[] { b.Handle });
+        await Fabric.DrainAsync();
+        Assert.IsNull(b.Db.GetEvent(eventId));
+        Assert.AreEqual(1, faults.Get("m08-engine-success-drop")!.UseCount);
+
+        await Task.Delay(75);
+        await a.Engine.OfferPeerAsync(b.Handle, b.Device);
+        await Fabric.DrainAsync();
+        await a.Engine.OfferPeerAsync(b.Handle, b.Device);
+        await Fabric.DrainAsync();
+
+        Assert.IsNotNull(b.Db.GetEvent(eventId));
+        Assert.AreEqual(1UL, b.Db.GetCursor(a.Device)!.Contiguous);
+        Assert.AreEqual(1, b.Applier.Count);
+    }
+
+    [TestMethod]
     public async Task ProjectionBoundary_BlocksInboundCommitUntilSnapshotCaptureReleases()
     {
         var a = NewNode("alice", "a1");
@@ -1313,14 +1515,93 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
         await EstablishAsync(a, b);
         var evt = MakeEventForNode(a, 1, Msg("blocked-commit"), b.Keys.PublicB64);
 
-        var boundary = await b.Engine.EnterProjectionBoundaryAsync(CancellationToken.None);
+        var boundaryEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseBoundary = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var boundary = b.Engine.WithProjectionBoundaryAsync(
+            async _ =>
+            {
+                boundaryEntered.TrySetResult(true);
+                await releaseBoundary.Task;
+                return true;
+            },
+            CancellationToken.None);
+        await boundaryEntered.Task;
         var delivery = DeliverBatchAsync(a, b, Batch(a.Device, new[] { evt }));
         await Task.Delay(25);
         Assert.IsFalse(delivery.IsCompleted, "inbound projection crossed the snapshot boundary");
-        boundary.Dispose();
-        await delivery;
+        releaseBoundary.TrySetResult(true);
+        await Task.WhenAll(boundary, delivery);
 
         Assert.IsNotNull(b.Db.GetEvent(evt.EventId));
+    }
+
+    [TestMethod]
+    public async Task InboundBatch_DoesNotWaitForHeldPeerLockBeforeProjection()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        await EstablishAsync(a, b);
+        var evt = MakeEventForNode(a, 1, Msg("peer-lock-independent"), b.Keys.PublicB64);
+        var peerLockEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePeerLock = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var heldPeerLock = b.Engine.WithPeerLockForDiagnosticsAsync(
+            a.Device,
+            async _ =>
+            {
+                peerLockEntered.TrySetResult(true);
+                await releasePeerLock.Task;
+            });
+        await peerLockEntered.Task;
+
+        var inbound = DeliverBatchAsync(a, b, Batch(a.Device, new[] { evt }));
+        await inbound.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.IsNotNull(b.Db.GetEvent(evt.EventId));
+        releasePeerLock.TrySetResult(true);
+        await heldPeerLock;
+    }
+
+    [TestMethod]
+    public async Task ProjectionBoundary_RejectsPeerLockAcquisition()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        await EstablishAsync(a, b);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => b.Engine.WithProjectionBoundaryAsync(
+                async boundaryCt =>
+                {
+                    await b.Engine.OfferPeerAsync(a.Handle, a.Device, boundaryCt);
+                    return true;
+                },
+                CancellationToken.None));
+
+        StringAssert.Contains(error.Message, "lock-order violation");
+    }
+
+    [TestMethod]
+    public async Task PeerLock_RejectsProjectionBoundaryAcquisition()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        await EstablishAsync(a, b);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => b.Engine.WithPeerLockForDiagnosticsAsync(
+                a.Device,
+                async peerCt =>
+                {
+                    await b.Engine.WithProjectionBoundaryAsync(
+                        _ => Task.FromResult(true),
+                        peerCt);
+                }));
+
+        StringAssert.Contains(error.Message, "lock-order violation");
     }
 
     [TestMethod]
@@ -1413,6 +1694,104 @@ public sealed class OnlineReplicationEngineTests : ReplicationTestBase
 
         Assert.AreEqual(40UL, b.Db.GetCursor("sd1")!.Contiguous);
         Assert.AreEqual(40, b.Applier.Count, "duplicates under concurrency are still applied once");
+    }
+
+    [TestMethod]
+    public async Task Concurrency_InboundApplyCannotFormDurableToProfileGateCycle()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        var src = AddOrigin("src", "sd1");
+        await EstablishAsync(a, b);
+
+        var profileGate = new object();
+        var durableApplyEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var profileSideOwnsGate = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var prepared = new List<string>();
+        var projected = new List<string>();
+
+        b.Applier.OnPrepare = (evt, envelope, _) =>
+        {
+            lock (profileGate) prepared.Add(evt.EventId);
+            return envelope;
+        };
+        b.Applier.OnApply = (_, _, evt, _) =>
+        {
+            if (evt.Seq == 1)
+            {
+                durableApplyEntered.TrySetResult(true);
+                profileSideOwnsGate.Task.GetAwaiter().GetResult();
+                Assert.IsTrue(
+                    SpinWait.SpinUntil(
+                        () => b.Db.DurableWriteWaiterCount == 1,
+                        TimeSpan.FromSeconds(5)),
+                    "profile-side durable work did not reach the contended gate");
+            }
+        };
+        b.Applier.OnAfterCommit = (evt, _) =>
+        {
+            lock (profileGate) projected.Add(evt.EventId);
+        };
+
+        var events = Enumerable.Range(1, 2)
+            .Select(sequence => MakeEvent(
+                src,
+                "src",
+                "sd1",
+                (ulong)sequence,
+                Msg($"m{sequence}"),
+                new[] { b.Keys.PublicB64 }))
+            .ToArray();
+
+        // This models RegisterExpectedRemoteRun/Send-style work: caller state is owned before
+        // durable persistence. It starts only after inbound Apply owns the durable gate, which was
+        // the exact old ABBA schedule. Apply no longer calls profile state, so it can finish and
+        // release durableWriteGate; the profile-side write then completes before post-commit state.
+        var profileToDurable = Task.Run(async () =>
+        {
+            await durableApplyEntered.Task.ConfigureAwait(false);
+            lock (profileGate)
+            {
+                profileSideOwnsGate.TrySetResult(true);
+                b.Db.ExecuteDurableWrite(() => b.Db.SetTopicDraft("topic-abba", "completed"));
+            }
+        });
+        var inbound = DeliverBatchAsync(a, b, Batch("sd1", events));
+
+        await Task.WhenAll(inbound, profileToDurable).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual("completed", b.Db.GetTopicDraft("topic-abba"));
+        Assert.AreEqual(2UL, b.Db.GetCursor("sd1")!.Contiguous);
+        CollectionAssert.AreEqual(events.Select(evt => evt.EventId).ToArray(), prepared);
+        CollectionAssert.AreEqual(events.Select(evt => evt.EventId).ToArray(), projected);
+        CollectionAssert.AreEqual(
+            events.Select(evt => evt.EventId).ToArray(),
+            b.Applier.Applied.Select(item => item.Evt.EventId).ToArray());
+    }
+
+    [TestMethod]
+    public async Task Concurrency_PostCommitProjectionFailurePropagatesAfterDurableExactlyOnceApply()
+    {
+        var a = NewNode("alice", "a1");
+        var b = NewNode("bob", "b1");
+        var src = AddOrigin("src", "sd1");
+        await EstablishAsync(a, b);
+        var evt = MakeEvent(src, "src", "sd1", 1, Msg("m1"), new[] { b.Keys.PublicB64 });
+        var failure = new InvalidOperationException("post-commit projection failed");
+        b.Applier.OnAfterCommitAsync = (_, _) => Task.FromException(failure);
+
+        var thrown = await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+            () => DeliverBatchAsync(a, b, Batch("sd1", new[] { evt })));
+
+        Assert.AreSame(failure, thrown);
+        Assert.IsNotNull(b.Db.GetEvent(evt.EventId), "durable commit must not be lost");
+        Assert.AreEqual(1UL, b.Db.GetCursor("sd1")!.Contiguous);
+        Assert.AreEqual(1, b.Applier.Count, "the durable projection runs exactly once");
+        Assert.IsNull(
+            b.Db.GetReceipt("b1", "sd1", "epoch-1"),
+            "a failed post-commit projection must not silently acknowledge success");
     }
 
     [TestMethod]

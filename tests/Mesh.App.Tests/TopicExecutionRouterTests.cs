@@ -13,6 +13,9 @@ namespace Mesh.App.Services
         public MeshProfile Profile { get; } = new();
         public int RegisteredRemoteRuns { get; private set; }
         public int ClearedRemoteRuns { get; private set; }
+        public int BeginCount { get; private set; }
+        public int RemoteOutboxCount { get; private set; }
+        public TopicRunBeginMode? LastBeginMode { get; private set; }
         public bool Busy { get; private set; }
         public bool RemoteRunUpdatePersistenceSucceeds { get; set; } = true;
         public QueuedTopicRunState QueuedRuns { get; } = new();
@@ -22,6 +25,74 @@ namespace Mesh.App.Services
             => Profile.OwnThreads.First(thread => thread.Id == threadId).Title;
 
         public Task FlushPersistenceAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public TopicRunBeginResult BeginTopicRun(TopicRunBeginCommand command)
+        {
+            if (!RemoteRunUpdatePersistenceSucceeds)
+                return new TopicRunBeginResult(false, false, "persistence_failed");
+            BeginCount++;
+            LastBeginMode = command.Mode;
+            var thread = Profile.OwnThreads.Single(item => item.Id == command.Draft.ThreadId);
+            thread.ExecutionDeviceId = command.Target.DeviceId;
+            thread.ExecutionDeviceName = command.Target.DeviceName;
+            thread.ExecutionDevicePlatform = command.Target.Platform;
+            var existing = thread.Lines.FirstOrDefault(line =>
+                line.Id == command.Draft.TriggerLineId);
+            if (existing is null)
+                AddOwnChatLine(command.Draft.ThreadId, new ChatLine
+                {
+                    Id = command.Draft.TriggerLineId,
+                    Role = "user",
+                    Text = command.Draft.Prompt,
+                    SenderHandle = command.Draft.TriggerHandle,
+                    At = command.Draft.TriggerAt,
+                    Attachments = command.Draft.Attachments?.ToList() ?? []
+                });
+            RegisterExpectedRemoteRun(
+                command.Draft.ThreadId,
+                command.Draft.RunId,
+                command.Target,
+                command.Draft.TriggerAt);
+            TrackQueuedTopicRun(
+                command.Draft.ThreadId,
+                command.Draft.RunId,
+                command.Draft.TriggerLineId);
+            MeshDb.TopicOutboxItem? outbox = null;
+            if (command.Mode == TopicRunBeginMode.Remote)
+            {
+                RemoteOutboxCount++;
+                var now = command.InitialProjection.Timestamp;
+                outbox = new MeshDb.TopicOutboxItem(
+                    command.Draft.RunId,
+                    command.Draft.ThreadId,
+                    command.Draft.TriggerLineId,
+                    command.Target.DeviceId,
+                    command.Request!,
+                    command.Attachments ?? [],
+                    TopicOutboxStates.Pending,
+                    now,
+                    now,
+                    RemoteStage: "sender_queued");
+            }
+            return new TopicRunBeginResult(
+                true,
+                true,
+                "created",
+                outbox,
+                AuthoritativeRunId: command.Draft.RunId,
+                TriggerId: TopicRunTriggerIdentity.For(
+                    command.Draft.ThreadId, command.Draft.TriggerLineId),
+                AuthoritativeDraft: command.Draft,
+                ProjectionApplied: true);
+        }
+
+        public void CompleteLocalTopicRun(string runId, DateTimeOffset terminalAt) { }
+
+        internal static string BeginDiagnostic(
+            TopicRunBeginCommand command,
+            string result,
+            bool transportEntered)
+            => $"result={result};transport_entered={transportEntered}";
 
 
         public void AddOwnChatLine(string threadId, ChatLine line)
@@ -50,7 +121,8 @@ namespace Mesh.App.Services
         public void ClearRemoteRunProjection(
             string threadId,
             string? runId = null,
-            DateTimeOffset? clearedAt = null)
+            DateTimeOffset? clearedAt = null,
+            TopicRunUpdatePayload? terminalUpdate = null)
         {
             Profile.OwnThreads.Single(item => item.Id == threadId).ExecutionRunId = null;
             ClearedRemoteRuns++;
@@ -222,6 +294,223 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task MobileSelf_WithConfiguredProvider_IsLocalDespiteRemoteHostFalse()
+        {
+            var state = StateWithThread();
+            var currentId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+            var mobileSelf = new DeviceInfo(
+                currentId,
+                "This phone",
+                true,
+                DevicePlatforms.IOS,
+                RemoteAgentEnabled: false,
+                AgentHostEnabled: false);
+            var runner = new RecordingRunner();
+            var transport = new RecordingTransport { Devices = [mobileSelf] };
+            var router = new TopicExecutionRouter(
+                state, runner, transport, () => DevicePlatforms.IOS);
+            var draft = Draft() with { TargetDeviceId = currentId };
+
+            var result = await router.SubmitAsync(draft, null, CancellationToken.None);
+            await runner.Called.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            var choices = await router.ListEligibleDevicesAsync(CancellationToken.None);
+
+            Assert.IsTrue(result.Accepted);
+            Assert.IsFalse(mobileSelf.CanHostRemoteTurn);
+            Assert.AreEqual(TopicRunBeginMode.Local, state.LastBeginMode);
+            Assert.AreEqual(1, state.BeginCount);
+            Assert.AreEqual(0, state.RemoteOutboxCount);
+            Assert.AreEqual(1, runner.Calls);
+            Assert.AreEqual(0, transport.Dispatches);
+            Assert.AreEqual(1, state.Profile.OwnThreads[0].Lines.Count);
+            Assert.AreEqual(currentId, choices[0].DeviceId);
+            Assert.AreEqual(DevicePlatforms.IOS, choices[0].Platform);
+            Assert.IsFalse(choices[0].CanHostRemoteTurn);
+        }
+
+        [TestMethod]
+        public async Task DesktopSelf_RemoteHostingDisabled_StillRunsLocally()
+        {
+            var state = StateWithThread();
+            var currentId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+            var runner = new RecordingRunner();
+            var router = new TopicExecutionRouter(
+                state,
+                runner,
+                new RecordingTransport
+                {
+                    Devices =
+                    [
+                        new DeviceInfo(
+                            currentId,
+                            "This desktop",
+                            true,
+                            DevicePlatforms.Windows,
+                            RemoteAgentEnabled: false,
+                            AgentHostEnabled: false)
+                    ]
+                },
+                () => DevicePlatforms.Windows);
+
+            var result = await router.SubmitAsync(
+                Draft() with { TargetDeviceId = currentId },
+                null,
+                CancellationToken.None);
+            await runner.Called.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            Assert.IsTrue(result.Accepted);
+            Assert.AreEqual(TopicRunBeginMode.Local, state.LastBeginMode);
+            Assert.AreEqual(1, runner.Calls);
+            Assert.AreEqual(0, state.RemoteOutboxCount);
+        }
+
+        [TestMethod]
+        public async Task ExplicitCurrentDeviceIdentity_BypassesRemoteRosterFailure()
+        {
+            var state = StateWithThread();
+            var currentId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+            var runner = new RecordingRunner();
+            var transport = new RecordingTransport
+            {
+                ListException = new HttpRequestException("roster unavailable")
+            };
+            var router = new TopicExecutionRouter(
+                state, runner, transport, () => DevicePlatforms.Android);
+
+            var result = await router.SubmitAsync(
+                Draft() with { TargetDeviceId = currentId },
+                null,
+                CancellationToken.None);
+            await runner.Called.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            Assert.IsTrue(result.Accepted);
+            Assert.AreEqual(TopicRunBeginMode.Local, state.LastBeginMode);
+            Assert.AreEqual(0, transport.ListCalls);
+            Assert.AreEqual(0, transport.Dispatches);
+        }
+
+        [TestMethod]
+        public async Task MobileOrigin_CanRunOnOnlineAgentDesktop()
+            => await AssertRemoteDesktopRouteAsync(DevicePlatforms.IOS);
+
+        [TestMethod]
+        public async Task DesktopOrigin_CanRunOnOnlineAgentDesktop()
+            => await AssertRemoteDesktopRouteAsync(DevicePlatforms.Windows);
+
+        [TestMethod]
+        public async Task RemoteTargets_ExcludeMobileOfflineAndNonAgentDesktops()
+        {
+            var state = StateWithThread();
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo(
+                        "phone",
+                        "Phone",
+                        true,
+                        DevicePlatforms.Android,
+                        RemoteAgentEnabled: true,
+                        AgentHostEnabled: true),
+                    RemoteDesktop("offline", "Offline desktop", online: false),
+                    new DeviceInfo(
+                        "no-host",
+                        "No host",
+                        true,
+                        DevicePlatforms.Windows,
+                        RemoteAgentEnabled: true,
+                        AgentHostEnabled: false),
+                    new DeviceInfo(
+                        "old",
+                        "Old protocol",
+                        true,
+                        DevicePlatforms.Windows,
+                        RemoteAgentEnabled: true,
+                        AgentHostEnabled: true,
+                        ProtocolVersion: MeshProtocol.Version - 1),
+                    RemoteDesktop("eligible", "Eligible desktop")
+                ]
+            };
+            var router = new TopicExecutionRouter(
+                state, new RecordingRunner(), transport, () => DevicePlatforms.IOS);
+
+            var targets = await router.ListEligibleDevicesAsync(CancellationToken.None);
+
+            CollectionAssert.AreEqual(
+                new[] { DeviceProtocol.DeviceId(state.Profile.PublicKey), "eligible" },
+                targets.Select(device => device.DeviceId).ToArray());
+        }
+
+        [TestMethod]
+        public async Task ExplicitMobileRemoteTarget_IsRejectedWithoutPersistenceOrDispatch()
+        {
+            var state = StateWithThread();
+            var runner = new RecordingRunner();
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    new DeviceInfo(
+                        "phone",
+                        "Phone",
+                        true,
+                        DevicePlatforms.IOS,
+                        RemoteAgentEnabled: true,
+                        AgentHostEnabled: true)
+                ]
+            };
+            var router = new TopicExecutionRouter(
+                state, runner, transport, () => DevicePlatforms.Windows);
+
+            var result = await router.SubmitAsync(
+                Draft() with { TargetDeviceId = "phone" },
+                null,
+                CancellationToken.None);
+
+            Assert.IsFalse(result.Accepted);
+            Assert.AreEqual("device_not_eligible", result.Code);
+            Assert.AreEqual(0, state.BeginCount);
+            Assert.AreEqual(0, state.Profile.OwnThreads[0].Lines.Count);
+            Assert.AreEqual(0, runner.Calls);
+            Assert.AreEqual(0, transport.Dispatches);
+        }
+
+        [TestMethod]
+        public async Task OfflineAndNonAgentDesktopTargets_AreRejectedBeforePersistence()
+        {
+            var unavailable = new[]
+            {
+                RemoteDesktop("offline", "Offline desktop", online: false),
+                new DeviceInfo(
+                    "no-agent",
+                    "No agent",
+                    true,
+                    DevicePlatforms.Windows,
+                    RemoteAgentEnabled: false,
+                    AgentHostEnabled: true)
+            };
+
+            foreach (var device in unavailable)
+            {
+                var state = StateWithThread();
+                var transport = new RecordingTransport { Devices = [device] };
+                var router = new TopicExecutionRouter(
+                    state, new RecordingRunner(), transport, () => DevicePlatforms.IOS);
+
+                var result = await router.SubmitAsync(
+                    Draft() with { TargetDeviceId = device.DeviceId },
+                    null,
+                    CancellationToken.None);
+
+                Assert.IsFalse(result.Accepted, device.DeviceId);
+                Assert.AreEqual("device_not_eligible", result.Code, device.DeviceId);
+                Assert.AreEqual(0, state.BeginCount, device.DeviceId);
+                Assert.AreEqual(0, state.Profile.OwnThreads[0].Lines.Count, device.DeviceId);
+                Assert.AreEqual(0, transport.Dispatches, device.DeviceId);
+            }
+        }
+
+        [TestMethod]
         public async Task RemoteSubmission_ReusesOptimisticTriggerLine()
         {
             var state = StateWithThread();
@@ -230,7 +519,7 @@ namespace Mesh.App.Tests
             {
                 Devices =
                 [
-                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                    RemoteDesktop("target", "Workstation")
                 ]
             };
             var router = new TopicExecutionRouter(state, runner, transport);
@@ -252,6 +541,29 @@ namespace Mesh.App.Tests
         }
 
         [TestMethod]
+        public async Task RepeatedRemoteSubmission_DispatchesOneDurableRequest()
+        {
+            var state = StateWithThread();
+            var transport = new RecordingTransport
+            {
+                Devices =
+                [
+                    RemoteDesktop("target", "Workstation")
+                ]
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "target" };
+
+            var first = await router.SubmitAsync(draft, null, CancellationToken.None);
+            var retry = await router.SubmitAsync(draft, null, CancellationToken.None);
+
+            Assert.IsTrue(first.Accepted);
+            Assert.IsTrue(retry.Accepted);
+            Assert.AreEqual(1, transport.Dispatches);
+            Assert.AreEqual(1, state.Profile.OwnThreads[0].Lines.Count);
+        }
+
+        [TestMethod]
         public async Task RemoteSubmission_DoesNotDispatchWhenQueuedStateCannotPersist()
         {
             var state = StateWithThread();
@@ -260,7 +572,7 @@ namespace Mesh.App.Tests
             {
                 Devices =
                 [
-                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)
+                    RemoteDesktop("target", "Workstation")
                 ]
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
@@ -269,7 +581,7 @@ namespace Mesh.App.Tests
             var result = await router.SubmitAsync(draft, null, CancellationToken.None);
 
             Assert.IsFalse(result.Accepted);
-            Assert.AreEqual("dispatch_failed", result.Code);
+            Assert.AreEqual("local_persistence_failed", result.Code);
             Assert.AreEqual(0, transport.Dispatches);
         }
 
@@ -282,8 +594,8 @@ namespace Mesh.App.Tests
             {
                 Devices =
                 [
-                    new DeviceInfo("offline", "Offline", false, DevicePlatforms.Windows, true),
-                    new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true),
+                    RemoteDesktop("offline", "Offline", online: false),
+                    RemoteDesktop("target", "Workstation"),
                     new DeviceInfo("not-ready", "Tablet", true, DevicePlatforms.Android, false)
                 ]
             };
@@ -309,14 +621,91 @@ namespace Mesh.App.Tests
                 transport.Request.Attachments[0].Id,
                 transport.Request.AttachmentIds![0]);
             Assert.AreEqual(3L, transport.Request.Attachments[0].Length);
-            Assert.AreEqual(3, listed.Count);
-            Assert.AreEqual("offline", listed[1].DeviceId);
-            Assert.AreEqual("target", listed[2].DeviceId);
+            Assert.AreEqual(2, listed.Count);
+            Assert.AreEqual("target", listed[1].DeviceId);
             Assert.AreEqual(0, state.Profile.OwnThreads[0].Lines[0].Attachments.Count);
+            Assert.AreEqual(
+                TopicQueueStage.Relay,
+                state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage,
+                "relay acceptance must no longer look like a local-only send");
         }
 
         [TestMethod]
-        public async Task RemoteSubmission_ToOfflineBoundDeviceIsQueued()
+        public void TransportStatus_DistinguishesLocalRelayAndDeviceAcceptance()
+        {
+            Assert.IsTrue(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.Pending));
+            Assert.IsTrue(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.RelayQueued));
+            Assert.IsFalse(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.DeviceAccepted));
+            Assert.IsFalse(TopicOutboxStates.NeedsRemoteAcceptance(TopicOutboxStates.DeviceQueued));
+            Assert.IsTrue(TopicExecutionStatus.IsRelayAccepted("accepted"));
+            Assert.IsFalse(TopicExecutionStatus.IsRelayAccepted(TopicExecutionStatus.LocalQueued));
+
+            var now = DateTimeOffset.UtcNow;
+            Assert.IsTrue(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.Pending, now, now));
+            Assert.IsFalse(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.RelayQueued, now, now));
+            Assert.IsTrue(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.RelayQueued,
+                now,
+                now + TopicTransportPolicy.RemoteAcceptanceRetryInterval));
+            Assert.IsFalse(TopicTransportPolicy.ShouldAttemptRequestDelivery(
+                TopicOutboxStates.DeviceQueued, now, now.AddMinutes(1)));
+
+            var request = new TopicRunRequestPayload(
+                "run-acceptance",
+                "thread-acceptance",
+                "line-acceptance",
+                "owner",
+                "prompt",
+                now,
+                "target",
+                TopicTurnMode.Single);
+            var accepted = TopicAcceptancePolicy.Create(request, now);
+            Assert.AreEqual(TopicRunPhase.Queued, accepted.Phase);
+            Assert.AreEqual("Accepted", accepted.Status);
+            Assert.AreEqual(request.TriggerLineId, accepted.TriggerLineId);
+            Assert.AreEqual(now, accepted.Timestamp);
+
+            var executionQueued = accepted with
+            {
+                Status = TopicControlProtocol.ExecutionQueuedStatus
+            };
+            Assert.IsTrue(TopicControlProtocol.IsAcceptance(accepted));
+            Assert.IsFalse(TopicControlProtocol.IsExecutionQueued(accepted));
+            Assert.IsTrue(TopicControlProtocol.IsExecutionQueued(executionQueued));
+            Assert.IsTrue(TopicControlProtocol.RequiresPersistenceReceipt(accepted));
+            Assert.IsFalse(
+                TopicControlProtocol.RequiresPersistenceReceipt(executionQueued));
+            Assert.AreEqual(
+                "topic.accepted", TopicControlProtocol.ControlPurpose(accepted));
+            Assert.AreEqual(
+                "topic.execution-queued",
+                TopicControlProtocol.ControlPurpose(executionQueued));
+
+            var acceptanceReceipt = TopicControlProtocol.CreateReceipt(accepted, now);
+            Assert.IsTrue(TopicControlProtocol.IsReceipt(acceptanceReceipt));
+            Assert.AreEqual(
+                TopicControlProtocol.AcceptanceReceiptStatus,
+                acceptanceReceipt.Status);
+            Assert.AreEqual(
+                "topic.accepted",
+                TopicControlProtocol.AcknowledgedPurpose(acceptanceReceipt));
+
+            var terminal = accepted with
+            {
+                Phase = TopicRunPhase.Failed,
+                Status = "Failed"
+            };
+            var terminalReceipt = TopicControlProtocol.CreateReceipt(terminal, now);
+            Assert.IsTrue(TopicControlProtocol.IsReceipt(terminalReceipt));
+            Assert.AreEqual(
+                "topic.terminal",
+                TopicControlProtocol.AcknowledgedPurpose(terminalReceipt));
+        }
+
+        [TestMethod]
+        public async Task RemoteSubmission_ToOfflineBoundDeviceIsUnavailableAndNeverQueued()
         {
             var state = StateWithThread();
             var thread = state.Profile.OwnThreads[0];
@@ -325,7 +714,7 @@ namespace Mesh.App.Tests
             thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                Devices = [RemoteDesktop("offline", "Laptop", online: false)],
                 ResultCode = TopicExecutionStatus.LocalQueued
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
@@ -333,11 +722,12 @@ namespace Mesh.App.Tests
 
             var result = await router.SubmitAsync(draft, null, CancellationToken.None);
 
-            Assert.IsTrue(result.Accepted);
-            Assert.AreEqual(TopicExecutionStatus.LocalQueued, result.Code);
-            Assert.AreEqual(1, transport.Dispatches);
-            Assert.IsTrue(state.IsLineQueued(draft.TriggerLineId));
-            Assert.AreEqual(TopicQueueStage.Sending, state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
+            Assert.IsFalse(result.Accepted);
+            Assert.AreEqual("device_not_eligible", result.Code);
+            Assert.AreEqual(0, state.BeginCount);
+            Assert.AreEqual(0, transport.Dispatches);
+            Assert.IsFalse(state.IsLineQueued(draft.TriggerLineId));
+            Assert.AreEqual(0, thread.Lines.Count);
         }
         [TestMethod]
         public async Task CancellingQueuedSubmission_KeepsPromptUntilTerminalUpdate()
@@ -349,7 +739,7 @@ namespace Mesh.App.Tests
             thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                Devices = [RemoteDesktop("offline", "Laptop")],
                 ResultCode = TopicExecutionStatus.LocalQueued
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
@@ -378,7 +768,7 @@ namespace Mesh.App.Tests
             thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("offline", "Laptop", false, DevicePlatforms.Windows, true)],
+                Devices = [RemoteDesktop("offline", "Laptop")],
                 ResultCode = TopicExecutionStatus.LocalQueued,
                 CancellationAccepted = false
             };
@@ -395,6 +785,38 @@ namespace Mesh.App.Tests
                 TopicQueueStage.Sending,
                 state.QueuedRuns.FindByLine(draft.TriggerLineId)!.Stage);
         }
+
+        [TestMethod]
+        public async Task RunningCancellation_PublicBoundaryNeverBlocksCallingThread()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.ExecutionDeviceId = "offline";
+            thread.ExecutionDeviceName = "Laptop";
+            thread.ExecutionDevicePlatform = DevicePlatforms.Windows;
+            using var release = new ManualResetEventSlim();
+            var transport = new RecordingTransport
+            {
+                Devices = [RemoteDesktop("offline", "Laptop")],
+                ResultCode = TopicExecutionStatus.LocalQueued,
+                CancellationRelease = release
+            };
+            var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
+            var draft = Draft() with { TargetDeviceId = "offline" };
+            Assert.IsTrue((await router.SubmitAsync(draft, null, CancellationToken.None)).Accepted);
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var cancellation = router.StopAsync(
+                draft.ThreadId, draft.RunId, CancellationToken.None);
+            stopwatch.Stop();
+
+            Assert.IsTrue(stopwatch.ElapsedMilliseconds < 250);
+            await transport.CancellationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.IsFalse(cancellation.IsCompleted);
+            release.Set();
+            Assert.IsTrue(await cancellation.WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+
         [TestMethod]
         public async Task EligibleDeviceRefreshes_AreSerializedSoThePickerGetsTheNewestResult()
         {
@@ -412,7 +834,7 @@ namespace Mesh.App.Tests
             await transport.SecondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
             transport.SecondResult.SetResult(
             [
-                new DeviceInfo("desktop", "Desktop", true, DevicePlatforms.Windows, true)
+                RemoteDesktop("desktop", "Desktop")
             ]);
             var pickerDevices = await pickerLoad;
 
@@ -430,7 +852,7 @@ namespace Mesh.App.Tests
             thread.ExecutionRunId = "active-run";
             var transport = new RecordingTransport
             {
-                Devices = [new DeviceInfo("target", "Workstation", true, DevicePlatforms.Windows, true)]
+                Devices = [RemoteDesktop("target", "Workstation")]
             };
             var router = new TopicExecutionRouter(state, new RecordingRunner(), transport);
             var progress = new RecordingProgress();
@@ -608,6 +1030,114 @@ namespace Mesh.App.Tests
             Assert.AreEqual(new string('y', 120), answer);
         }
 
+        [TestMethod]
+        public async Task Runner_PostCompletionFault_DoesNotStrandDrainAndPreservesFifo()
+        {
+            var state = StateWithThread();
+            var thread = state.Profile.OwnThreads[0];
+            thread.Lines.AddRange(
+            [
+                new ChatLine { Id = "line-q1", Role = "user", Text = "q1" },
+                new ChatLine { Id = "line-q2", Role = "user", Text = "q2" },
+                new ChatLine { Id = "line-q3", Role = "user", Text = "q3" }
+            ]);
+            var order = new List<string>();
+            var agent = new AgentService
+            {
+                Continue = (_, runId, _) =>
+                {
+                    lock (order) order.Add(runId);
+                    return Task.FromResult("");
+                }
+            };
+            var runner = new TopicTurnRunner(agent, state);
+            var at = new DateTimeOffset(2026, 8, 22, 11, 0, 0, TimeSpan.Zero);
+            var q1 = new TopicTurnDraft(
+                "run-q1", thread.Id, "line-q1", "owner", "q1", at,
+                TopicTurnMode.Single);
+            var q2 = new TopicTurnDraft(
+                "run-q2", thread.Id, "line-q2", "owner", "q2", at.AddSeconds(1),
+                TopicTurnMode.Single);
+            var q3 = new TopicTurnDraft(
+                "run-q3", thread.Id, "line-q3", "owner", "q3", at.AddSeconds(2),
+                TopicTurnMode.Single);
+
+            var first = runner.ExecuteAsync(
+                q1, new ThrowOnTerminalProgress(), CancellationToken.None);
+            var second = runner.ExecuteAsync(
+                q2, new RecordingProgress(), CancellationToken.None);
+            var third = runner.ExecuteAsync(
+                q3, new RecordingProgress(), CancellationToken.None);
+
+            var completions = await Task.WhenAll(first, second, third)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            CollectionAssert.AreEqual(
+                new[] { "run-q1", "run-q2", "run-q3" }, order);
+            Assert.AreEqual(TopicRunPhase.Failed, completions[0].Phase);
+            Assert.AreEqual(TopicRunPhase.Completed, completions[1].Phase);
+            Assert.AreEqual(TopicRunPhase.Completed, completions[2].Phase);
+            Assert.IsFalse(state.IsLineQueued(q2.TriggerLineId));
+            Assert.IsFalse(state.IsLineQueued(q3.TriggerLineId));
+
+            var q4 = q3 with
+            {
+                RunId = "run-q4",
+                TriggerLineId = "line-q4",
+                Prompt = "q4",
+                TriggerAt = at.AddSeconds(3)
+            };
+            thread.Lines.Add(new ChatLine
+            {
+                Id = q4.TriggerLineId,
+                Role = "user",
+                Text = q4.Prompt
+            });
+            var fourth = await runner.ExecuteAsync(
+                q4, new RecordingProgress(), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.AreEqual(TopicRunPhase.Completed, fourth.Phase);
+        }
+
+        private static async Task AssertRemoteDesktopRouteAsync(string originPlatform)
+        {
+            var state = StateWithThread();
+            var runner = new RecordingRunner();
+            var transport = new RecordingTransport
+            {
+                Devices = [RemoteDesktop("target", "Workstation")]
+            };
+            var router = new TopicExecutionRouter(
+                state, runner, transport, () => originPlatform);
+
+            var result = await router.SubmitAsync(
+                Draft() with { TargetDeviceId = "target" },
+                null,
+                CancellationToken.None);
+
+            Assert.IsTrue(result.Accepted);
+            Assert.AreEqual(TopicRunBeginMode.Remote, state.LastBeginMode);
+            Assert.AreEqual(1, state.BeginCount);
+            Assert.AreEqual(1, state.RemoteOutboxCount);
+            Assert.AreEqual(0, runner.Calls);
+            Assert.AreEqual(1, transport.Dispatches);
+            Assert.AreEqual("target", transport.Request?.TargetDeviceId);
+            Assert.AreEqual(1, state.Profile.OwnThreads[0].Lines.Count);
+        }
+
+        private static DeviceInfo RemoteDesktop(
+            string id,
+            string name,
+            bool online = true)
+            => new(
+                id,
+                name,
+                online,
+                DevicePlatforms.Windows,
+                RemoteAgentEnabled: true,
+                AgentHostEnabled: true,
+                ProtocolVersion: MeshProtocol.Version);
+
         private static Mesh.App.Services.AppState StateWithThread()
         {
             var state = new Mesh.App.Services.AppState();
@@ -657,9 +1187,14 @@ namespace Mesh.App.Tests
             public IReadOnlyList<DeviceInfo> Devices { get; set; } = [];
             public int Dispatches { get; private set; }
             public int Cancellations { get; private set; }
+            public TaskCompletionSource CancellationStarted { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public ManualResetEventSlim? CancellationRelease { get; set; }
             public TopicRunRequestPayload? Request { get; private set; }
             public string ResultCode { get; set; } = "accepted";
             public bool CancellationAccepted { get; set; } = true;
+            public Exception? ListException { get; set; }
+            public int ListCalls { get; private set; }
 
             public Task<TopicDispatchResult> DispatchAsync(
                 string targetDeviceId,
@@ -678,12 +1213,19 @@ namespace Mesh.App.Tests
                 CancellationToken cancellationToken)
             {
                 Cancellations++;
+                CancellationStarted.TrySetResult();
+                CancellationRelease?.Wait(cancellationToken);
                 return Task.FromResult(CancellationAccepted);
             }
 
             public Task<IReadOnlyList<DeviceInfo>> ListEligibleDevicesAsync(
                 CancellationToken cancellationToken)
-                => Task.FromResult(Devices);
+            {
+                ListCalls++;
+                return ListException is null
+                    ? Task.FromResult(Devices)
+                    : Task.FromException<IReadOnlyList<DeviceInfo>>(ListException);
+            }
         }
 
         private sealed class SequencedDeviceTransport : IDeviceTopicTransport
@@ -731,6 +1273,17 @@ namespace Mesh.App.Tests
             {
                 lock (Updates) Updates.Add(value);
                 if (value.Phase == TopicRunPhase.Queued) Queued.TrySetResult();
+            }
+        }
+
+        private sealed class ThrowOnTerminalProgress : IProgress<TopicRunUpdatePayload>
+        {
+            public void Report(TopicRunUpdatePayload value)
+            {
+                if (value.Phase is TopicRunPhase.Completed
+                    or TopicRunPhase.Failed
+                    or TopicRunPhase.Cancelled)
+                    throw new InvalidOperationException("post-completion projection failed");
             }
         }
     }

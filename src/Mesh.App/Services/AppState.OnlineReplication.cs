@@ -32,12 +32,6 @@ public sealed partial class AppState
     }
 
     /// <summary>
-    /// The database the attached engine was started against. A post-commit callback whose database
-    /// is no longer the active one belongs to a switched-away or closed account and is ignored.
-    /// </summary>
-    private MeshDb? replicationEngineDb;
-
-    /// <summary>
     /// Raised immediately before the active account's database is closed (account switch or delete),
     /// so a listener (the online-replication runtime) can tear down peer sessions and the roster cache
     /// while the old database is still open. Fires on the caller's thread before disposal.
@@ -80,7 +74,7 @@ public sealed partial class AppState
         if (db is null) return null;
 
         var engine = new OnlineReplicationEngine(
-            db, identity, transport, roster, CreateReplicationApplier(),
+            db, identity, transport, roster, new AppStateReplicationApplier(this, db),
             deviceIsDesktop: !PlatformCaps.IsMobile,
             deferSiblingOffersUntilBootstrap: true);
         engine.StateChanged += change =>
@@ -88,7 +82,6 @@ public sealed partial class AppState
                 "replication",
                 $"reason={change.Reason}; error={change.Error}");
         replicationEngine = engine;
-        replicationEngineDb = db;
         return engine;
     }
 
@@ -101,7 +94,6 @@ public sealed partial class AppState
     {
         var engine = replicationEngine;
         replicationEngine = null;
-        replicationEngineDb = null;
         return engine;
     }
 
@@ -144,7 +136,8 @@ public sealed partial class AppState
             // The local origin log epoch is allocated once and is immutable thereafter (first epoch
             // wins). Registering is idempotent; the stored epoch is authoritative for emission.
             var candidate = Guid.NewGuid().ToString("n");
-            db.EnsureLocalOrigin(deviceId, candidate, relayAuthGeneration);
+            db.ExecuteDurableWrite(
+                () => db.EnsureLocalOrigin(deviceId, candidate, relayAuthGeneration));
             logEpoch = db.GetServeableOrigins()
                 .FirstOrDefault(o => string.Equals(o.OriginDeviceId, deviceId, StringComparison.Ordinal))
                 ?.LogEpoch ?? candidate;
@@ -194,7 +187,10 @@ public sealed partial class AppState
 
     /// <summary>Builds the domain applier the engine drives.</summary>
     public IReplicationDomainApplier CreateReplicationApplier()
-        => new AppStateReplicationApplier(this);
+    {
+        lock (profileSyncGate)
+            return new AppStateReplicationApplier(this, activeDb);
+    }
 
     /// <summary>
     /// Emits a local-origin replication event for a durable domain change. This NEVER silently
@@ -207,7 +203,7 @@ public sealed partial class AppState
     /// <see cref="ReplicationIdentityMissingException"/> so the local domain operation fails
     /// instead of falsely reporting replicated success.
     /// </summary>
-    public async Task<string?> ReplicateLocalAsync(
+    public Task<string?> ReplicateLocalAsync(
         string kind,
         ReplicationPayloadCodec.DomainAction action,
         string entityId,
@@ -219,40 +215,88 @@ public sealed partial class AppState
         CancellationToken ct = default,
         Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainWork = null,
         NotificationIntent? notificationIntent = null)
+        => ReplicateLocalCoreAsync(
+            kind, action, entityId, conversationId, causalVersion, bodyJson,
+            targetAccounts, pushClass, offerPeers: true, ct, domainWork, notificationIntent);
+
+    private async Task<string?> ReplicateLocalCoreAsync(
+        string kind,
+        ReplicationPayloadCodec.DomainAction action,
+        string entityId,
+        string? conversationId,
+        string causalVersion,
+        string bodyJson,
+        IReadOnlyCollection<string> targetAccounts,
+        string pushClass,
+        bool offerPeers,
+        CancellationToken ct,
+        Action<SqliteConnection, SqliteTransaction, ReplicationEvent>? domainWork,
+        NotificationIntent? notificationIntent)
     {
         var envelope = new ReplicationPayloadCodec.DomainEnvelope(
             kind, action, entityId, conversationId, causalVersion, bodyJson, notificationIntent);
 
         var engine = replicationEngine;
         if (engine is not null)
-            return await engine.EmitLocalAsync(
-                envelope,
-                targetAccounts,
-                pushClass,
-                ct,
-                domainWork).ConfigureAwait(false);
+            return offerPeers
+                ? await engine.EmitLocalAsync(
+                    envelope, targetAccounts, pushClass, ct, domainWork).ConfigureAwait(false)
+                : await engine.EmitLocalDurableAsync(
+                    envelope, targetAccounts, ct, domainWork).ConfigureAwait(false);
 
         // Offline / no session: write the immutable event + outbox directly to the open account
-        // database. The engine will drain the pending outbox once a session is later established.
-        var journal = EnsureLocalJournal();
-        return journal.EmitLocal(envelope, targetAccounts, domainWork);
+        // database only when an authoritative roster is available. Otherwise it commits a
+        // local-key-encrypted repair intent; the next armed engine repairs it before emission.
+        await localEmissionOrderGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var journal = EnsureLocalJournal();
+            await journal.RetryPendingIntentsAsync(ct).ConfigureAwait(false);
+            var emission = await journal.EmitLocalAsync(envelope, targetAccounts, domainWork, ct)
+                .ConfigureAwait(false);
+            return emission.EventId ?? emission.IntentId;
+        }
+        finally
+        {
+            localEmissionOrderGate.Release();
+        }
     }
 
     private ReplicationJournal? localJournal;
     private MeshDb? localJournalDb;
+    private readonly SemaphoreSlim localEmissionOrderGate = new(1, 1);
 
     /// <summary>
     /// Emits several local-origin events as ONE journal transaction (chunked transfers). Every
     /// event, its outbox references, the contiguous sequence allocation and the supplied domain
     /// work commit together, so a partial transfer is never observable.
     /// </summary>
-    public Task<IReadOnlyList<string>> ReplicateLocalBatchAsync(
+    public async Task<IReadOnlyList<string>> ReplicateLocalBatchAsync(
         IReadOnlyList<ReplicationPayloadCodec.DomainEnvelope> envelopes,
         IReadOnlyCollection<string> targetAccounts,
         Action<SqliteConnection, SqliteTransaction, int>? domainWork = null,
         CancellationToken ct = default)
-        => Task.Run<IReadOnlyList<string>>(
-            () => EnsureLocalJournal().EmitLocalBatch(envelopes, targetAccounts, domainWork), ct);
+    {
+        var engine = replicationEngine;
+        if (engine is not null)
+            return await engine.EmitLocalBatchAsync(
+                    envelopes, targetAccounts, domainWork, ct)
+                .ConfigureAwait(false);
+
+        await localEmissionOrderGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var journal = EnsureLocalJournal();
+            await journal.RetryPendingIntentsAsync(ct).ConfigureAwait(false);
+            return await journal.EmitLocalBatchAsync(
+                    envelopes, targetAccounts, domainWork, eventWork: null, ct)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            localEmissionOrderGate.Release();
+        }
+    }
 
     /// <summary>
     /// Replicates one local attachment to the owner's other devices as deterministic bounded
@@ -296,7 +340,7 @@ public sealed partial class AppState
         var targets = TargetsForOwnerState();
         if (targets.Count == 0)
         {
-            await Task.Run(() => db.SaveReplicatedAttachment(
+            await db.ExecuteDurableWriteAsync(() => db.SaveReplicatedAttachment(
                 attachmentId, runId, name, mimeType, hash, bytes, createdAt), ct).ConfigureAwait(false);
             return 0;
         }
@@ -332,7 +376,8 @@ public sealed partial class AppState
                 || string.IsNullOrWhiteSpace(publicKey)
                 || string.IsNullOrWhiteSpace(privateKey))
                 return null;
-            return db.InitializeGenesisCustody(handle, publicKey, privateKey);
+            return db.ExecuteDurableWrite(
+                () => db.InitializeGenesisCustody(handle, publicKey, privateKey));
         }
     }
 
@@ -369,7 +414,8 @@ public sealed partial class AppState
         var head = db.GetCustodyHead(handle);
         if (head is null)
         {
-            db.InitializeGenesisCustody(handle, publicKey, privateKey);
+            db.ExecuteDurableWrite(
+                () => db.InitializeGenesisCustody(handle, publicKey, privateKey));
             head = db.GetCustodyHead(handle)
                 ?? throw new ReplicationIdentityMissingException(
                     "The account has no local custody authority; re-onboard the account.");
@@ -377,7 +423,8 @@ public sealed partial class AppState
 
         // The local origin log epoch is allocated once and immutable thereafter (first epoch wins).
         var candidate = Guid.NewGuid().ToString("n");
-        db.EnsureLocalOrigin(deviceId, candidate, head.Generation);
+        db.ExecuteDurableWrite(
+            () => db.EnsureLocalOrigin(deviceId, candidate, head.Generation));
         var logEpoch = db.GetServeableOrigins()
             .FirstOrDefault(o => string.Equals(o.OriginDeviceId, deviceId, StringComparison.Ordinal))
             ?.LogEpoch ?? candidate;
@@ -433,7 +480,7 @@ public sealed partial class AppState
         {
             var db = activeDb
                 ?? throw new OnlineReplicationError("No account database is open for custody import.");
-            db.AppendCustodyEntry(authority);
+            db.ExecuteDurableWrite(() => db.AppendCustodyEntry(authority));
         }
     }
 
@@ -461,103 +508,83 @@ public sealed partial class AppState
 
             const int chunkSize = 50;
             var marker = db.GetPeerBootstrap(target);
-            var needsFreshSnapshot = marker is null
+            if (marker is null
                 || !string.Equals(marker.LocalOriginDeviceId, target.LocalOriginDeviceId, StringComparison.Ordinal)
-                || !string.Equals(marker.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal)
-                || marker.BootstrapFromSeq == 0;
-
-            if (needsFreshSnapshot)
+                || !string.Equals(marker.LocalLogEpoch, target.LocalLogEpoch, StringComparison.Ordinal))
             {
-                using var projectionBoundary = await engine.EnterProjectionBoundaryAsync(ct).ConfigureAwait(false);
-                lock (profileSyncGate)
-                {
-                    if (!ReferenceEquals(db, activeDb)
-                        || !ReferenceEquals(engine, replicationEngine)
-                        || !engine.IsSessionEstablished(target.PeerDeviceId)
-                        || !string.Equals(Norm(target.PeerHandle), Norm(Profile.Handle), StringComparison.Ordinal))
-                        return;
-
-                    using var journalLock = db.EnterLocalOriginJournalLock();
-                    var snapshot = CaptureOwnerBootstrapSnapshot(target.PeerHandle);
-                    var snapshotJson = JsonSerializer.Serialize(snapshot, ReplicationJson);
-                    var coverageJson = JsonSerializer.Serialize(
-                        db.GetSnapshotCoverage(target.LocalOriginDeviceId),
-                        ReplicationJson);
-                    var stateHash = Convert.ToHexString(
-                        SHA256.HashData(Encoding.UTF8.GetBytes(snapshotJson))).ToLowerInvariant();
-                    marker = db.CreateOrResumePeerBootstrap(
-                        target,
-                        Guid.NewGuid().ToString("n"),
-                        stateHash,
-                        snapshotJson,
-                        snapshot.Count,
-                        coverageJson);
-
-                    if (snapshot.Count > 0 && marker.State != MeshDb.BootstrapStatePersisted)
+                marker = await engine.WithProjectionBoundaryAsync(
+                    boundaryCt =>
                     {
-                        var firstChunk = snapshot.Take(chunkSize).ToList();
-                        EmitBootstrapChunk(
-                            engine,
-                            db,
-                            target,
-                            marker,
-                            firstChunk,
-                            firstChunk.Count,
-                            snapshot.Count);
-                        marker = db.GetPeerBootstrap(target)
-                            ?? throw new InvalidOperationException("The bootstrap marker disappeared after its first chunk committed.");
-                    }
-                    else if (snapshot.Count == 0)
-                    {
-                        marker = db.CompleteEmptyPeerBootstrap(
-                            target,
-                            marker.BootstrapId,
-                            db.GetLocalOriginNextSeq(target.LocalOriginDeviceId, target.LocalLogEpoch));
-                    }
-                }
+                        boundaryCt.ThrowIfCancellationRequested();
+                        lock (profileSyncGate)
+                        {
+                            if (!ReferenceEquals(db, activeDb)
+                                || !ReferenceEquals(engine, replicationEngine)
+                                || !engine.IsSessionEstablished(target.PeerDeviceId)
+                                || !string.Equals(
+                                    Norm(target.PeerHandle),
+                                    Norm(Profile.Handle),
+                                    StringComparison.Ordinal))
+                                return Task.FromResult<MeshDb.ReplicationPeerBootstrap?>(null);
+
+                            using var journalLease = db.EnterLocalOriginJournalLock();
+                            var snapshot = CaptureOwnerBootstrapSnapshot(target.PeerHandle).ToArray();
+                            var coverage = db.GetSnapshotCoverage(target.LocalOriginDeviceId).ToArray();
+                            var captureCursor = db.GetLocalOriginNextSeq(
+                                target.LocalOriginDeviceId,
+                                target.LocalLogEpoch) - 1;
+                            var snapshotJson = JsonSerializer.Serialize(snapshot, ReplicationJson);
+                            var coverageJson = JsonSerializer.Serialize(coverage, ReplicationJson);
+                            var stateHash = Convert.ToHexString(
+                                SHA256.HashData(Encoding.UTF8.GetBytes(snapshotJson))).ToLowerInvariant();
+                            var saved = db.ExecuteJournalWrite(() =>
+                            {
+                                var durable = db.CreateOrResumePeerBootstrap(
+                                    target,
+                                    Guid.NewGuid().ToString("n"),
+                                    stateHash,
+                                    snapshotJson,
+                                    snapshot.Length,
+                                    coverageJson,
+                                    captureCursor);
+                                return snapshot.Length == 0
+                                    ? db.CompleteEmptyPeerBootstrap(
+                                        target,
+                                        durable.BootstrapId,
+                                        captureCursor + 1)
+                                    : durable;
+                            }, boundaryCt);
+                            return Task.FromResult<MeshDb.ReplicationPeerBootstrap?>(saved);
+                        }
+                    },
+                    ct).ConfigureAwait(false);
             }
 
             if (marker is null) return;
-            engine.ReportBootstrapActivity("bootstrap.started", target, marker.BootstrapId);
-            if (marker.State == MeshDb.BootstrapStatePersisted)
-            {
-                engine.ReportBootstrapActivity("bootstrap.persisted", target, marker.BootstrapId, marker.TotalItems);
-                return;
-            }
-
-            var actualStateHash = Convert.ToHexString(
-                SHA256.HashData(Encoding.UTF8.GetBytes(marker.SnapshotJson))).ToLowerInvariant();
-            if (!string.Equals(actualStateHash, marker.StateHash, StringComparison.Ordinal))
-                throw new InvalidOperationException("The saved bootstrap snapshot failed its integrity check.");
-            var items = JsonSerializer.Deserialize<List<ReplicationPayloadCodec.DomainEnvelope>>(
-                            marker.SnapshotJson,
-                            ReplicationJson)
-                        ?? throw new InvalidOperationException("The saved bootstrap snapshot is invalid.");
-            if (items.Count != marker.TotalItems)
-                throw new InvalidOperationException("The saved bootstrap snapshot count is inconsistent.");
-            if (marker.EmittedItems < 0 || marker.EmittedItems > items.Count)
-                throw new InvalidOperationException("The saved bootstrap progress is inconsistent.");
-            if (marker.EmittedItems > 0 && marker.BootstrapFromSeq == 0)
-                throw new InvalidOperationException("The saved bootstrap is missing its first emitted sequence.");
-
-            if (items.Count == 0)
-            {
-                engine.ReportBootstrapActivity("bootstrap.emitted", target, marker.BootstrapId);
-                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
-                return;
-            }
-
-            if (needsFreshSnapshot && marker.EmittedItems > 0)
+            var plan = CreateOwnerBootstrapPlan(target, marker);
+            engine.ReportBootstrapActivity("bootstrap.started", target, plan.BootstrapId);
+            if (plan.State == MeshDb.BootstrapStatePersisted)
             {
                 engine.ReportBootstrapActivity(
-                    "bootstrap.progress",
+                    "bootstrap.persisted",
                     target,
-                    marker.BootstrapId,
-                    marker.EmittedItems);
-                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
+                    plan.BootstrapId,
+                    plan.Items.Count);
+                return;
             }
 
-            for (var offset = marker.EmittedItems; offset < items.Count; offset += chunkSize)
+            if (plan.Items.Count == 0)
+            {
+                engine.ReportBootstrapActivity("bootstrap.emitted", target, plan.BootstrapId);
+                if (engine.IsSessionEstablished(target.PeerDeviceId))
+                    await engine.OfferPeerAsync(
+                        target.PeerHandle,
+                        target.PeerDeviceId,
+                        ct).ConfigureAwait(false);
+                return;
+            }
+
+            for (var offset = plan.Cursor; offset < plan.Items.Count; offset += chunkSize)
             {
                 ct.ThrowIfCancellationRequested();
                 lock (profileSyncGate)
@@ -565,33 +592,45 @@ public sealed partial class AppState
                     if (!ReferenceEquals(db, activeDb) || !ReferenceEquals(engine, replicationEngine))
                         throw new OperationCanceledException("The active replication account changed.", ct);
                 }
+                if (!engine.IsSessionEstablished(target.PeerDeviceId)) return;
+                ValidateOwnerBootstrapPlan(db, target, plan, offset);
 
-                var chunk = items.Skip(offset).Take(chunkSize).ToList();
-                var emittedThrough = offset + chunk.Count;
-                await Task.Run(() => EmitBootstrapChunk(
-                    engine,
-                    db,
-                    target,
-                    marker,
-                    chunk,
-                    emittedThrough,
-                    items.Count), ct).ConfigureAwait(false);
+                var chunk = plan.Items.Skip(offset).Take(chunkSize).ToArray();
+                var emittedThrough = offset + chunk.Length;
+                await EmitBootstrapChunkAsync(
+                        engine,
+                        db,
+                        target,
+                        marker with { BootstrapFromSeq = plan.BootstrapFromSeq },
+                        chunk,
+                        emittedThrough,
+                        plan.Items.Count,
+                        ct)
+                    .ConfigureAwait(false);
 
                 engine.ReportBootstrapActivity(
                     "bootstrap.progress",
                     target,
-                    marker.BootstrapId,
+                    plan.BootstrapId,
                     emittedThrough);
-                await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
+                if (engine.IsSessionEstablished(target.PeerDeviceId))
+                    await engine.OfferPeerAsync(
+                        target.PeerHandle,
+                        target.PeerDeviceId,
+                        ct).ConfigureAwait(false);
                 await Task.Yield();
             }
 
             engine.ReportBootstrapActivity(
                 "bootstrap.emitted",
                 target,
-                marker.BootstrapId,
-                items.Count);
-            await engine.OfferPeerAsync(target.PeerHandle, target.PeerDeviceId, ct).ConfigureAwait(false);
+                plan.BootstrapId,
+                plan.Items.Count);
+            if (engine.IsSessionEstablished(target.PeerDeviceId))
+                await engine.OfferPeerAsync(
+                    target.PeerHandle,
+                    target.PeerDeviceId,
+                    ct).ConfigureAwait(false);
         }
         finally
         {
@@ -599,34 +638,99 @@ public sealed partial class AppState
         }
     }
 
-    private static void EmitBootstrapChunk(
+    private sealed record OwnerBootstrapPlan(
+        string BootstrapId,
+        long Generation,
+        string LocalOriginDeviceId,
+        string LocalLogEpoch,
+        ulong CaptureCursor,
+        ulong BootstrapFromSeq,
+        int Cursor,
+        string StateHash,
+        string State,
+        IReadOnlyList<ReplicationPayloadCodec.DomainEnvelope> Items);
+
+    private static OwnerBootstrapPlan CreateOwnerBootstrapPlan(
+        ReplicationBootstrapTarget target,
+        MeshDb.ReplicationPeerBootstrap marker)
+    {
+        var actualStateHash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(marker.SnapshotJson))).ToLowerInvariant();
+        if (!string.Equals(actualStateHash, marker.StateHash, StringComparison.Ordinal))
+            throw new InvalidOperationException("The saved bootstrap snapshot failed its integrity check.");
+        var items = JsonSerializer.Deserialize<List<ReplicationPayloadCodec.DomainEnvelope>>(
+                        marker.SnapshotJson,
+                        ReplicationJson)
+                    ?? throw new InvalidOperationException("The saved bootstrap snapshot is invalid.");
+        if (items.Count != marker.TotalItems)
+            throw new InvalidOperationException("The saved bootstrap snapshot count is inconsistent.");
+        if (marker.EmittedItems < 0 || marker.EmittedItems > items.Count)
+            throw new InvalidOperationException("The saved bootstrap progress is inconsistent.");
+        if (marker.EmittedItems > 0 && marker.BootstrapFromSeq == 0)
+            throw new InvalidOperationException("The saved bootstrap is missing its first emitted sequence.");
+
+        return new OwnerBootstrapPlan(
+            marker.BootstrapId,
+            target.AuthGeneration,
+            marker.LocalOriginDeviceId,
+            marker.LocalLogEpoch,
+            marker.CaptureCursor,
+            marker.BootstrapFromSeq,
+            marker.EmittedItems,
+            marker.StateHash,
+            marker.State,
+            Array.AsReadOnly(items.ToArray()));
+    }
+
+    private static void ValidateOwnerBootstrapPlan(
+        MeshDb db,
+        ReplicationBootstrapTarget target,
+        OwnerBootstrapPlan plan,
+        int expectedCursor)
+    {
+        var current = db.GetPeerBootstrap(target)
+            ?? throw new InvalidOperationException("The bootstrap marker disappeared during emission.");
+        if (current.AuthGeneration != plan.Generation
+            || !string.Equals(current.BootstrapId, plan.BootstrapId, StringComparison.Ordinal)
+            || !string.Equals(current.LocalOriginDeviceId, plan.LocalOriginDeviceId, StringComparison.Ordinal)
+            || !string.Equals(current.LocalLogEpoch, plan.LocalLogEpoch, StringComparison.Ordinal)
+            || current.CaptureCursor != plan.CaptureCursor
+            || !string.Equals(current.StateHash, plan.StateHash, StringComparison.Ordinal)
+            || current.EmittedItems != expectedCursor)
+            throw new InvalidOperationException("The bootstrap generation or cursor changed during emission.");
+    }
+
+    private static async Task EmitBootstrapChunkAsync(
         OnlineReplicationEngine engine,
         MeshDb db,
         ReplicationBootstrapTarget target,
         MeshDb.ReplicationPeerBootstrap marker,
         IReadOnlyList<ReplicationPayloadCodec.DomainEnvelope> chunk,
         int emittedThrough,
-        int totalItems)
+        int totalItems,
+        CancellationToken ct)
     {
         var bootstrapFrom = marker.BootstrapFromSeq;
-        engine.Journal.EmitLocalBatch(
-            chunk,
-            new[] { target.PeerHandle },
-            domainWork: static (_, _, _) => { },
-            eventWork: (_, tx, evt, index) =>
-            {
-                if (index == 0 && bootstrapFrom == 0)
-                    bootstrapFrom = evt.Seq;
-                if (index == chunk.Count - 1)
-                    db.UpdatePeerBootstrapProgress(
-                        target,
-                        marker.BootstrapId,
-                        emittedThrough,
-                        totalItems,
-                        bootstrapFrom,
-                        evt.Seq,
-                        tx);
-            });
+        await engine.EmitLocalBatchAsync(
+                chunk,
+                new[] { target.PeerHandle },
+                domainWork: static (_, _, _) => { },
+                ct,
+                eventWork: (_, tx, evt, index) =>
+                {
+                    if (index == 0 && bootstrapFrom == 0)
+                        bootstrapFrom = evt.Seq;
+                    if (index == chunk.Count - 1)
+                        db.UpdatePeerBootstrapProgress(
+                            target,
+                            marker.BootstrapId,
+                            emittedThrough,
+                            totalItems,
+                            bootstrapFrom,
+                            evt.Seq,
+                            tx);
+                })
+            .ConfigureAwait(false);
     }
     private List<ReplicationPayloadCodec.DomainEnvelope> CaptureOwnerBootstrapSnapshot(string accountHandle)
     {
@@ -677,7 +781,8 @@ public sealed partial class AppState
                 thread.LastActivityAt,
                 thread.IsPinned,
                 thread.ExecutionAt,
-                thread.ExecutionRunId
+                thread.ExecutionRunId,
+                ExecutionTriggerLineId = ExecutionTriggerLineId(thread)
             }, ReplicationJson);
             items.Add(new ReplicationPayloadCodec.DomainEnvelope(
                 ReplicationOpKinds.Topic,
@@ -968,19 +1073,6 @@ public sealed partial class AppState
             {
                 changed = ReplicationProfileMaterializer.Apply(Profile, envelope);
                 if (changed
-                    && envelope.Kind == ReplicationOpKinds.Topic
-                    && envelope.Action == ReplicationPayloadCodec.DomainAction.AppendLine)
-                {
-                    var line = JsonSerializer.Deserialize<ChatLine>(envelope.BodyJson, ReplicationJson);
-                    var thread = Profile.OwnThreads.FirstOrDefault(item =>
-                        string.Equals(item.Id, envelope.EntityId, StringComparison.Ordinal));
-                    if (line is { Role: "assistant" } && thread is not null)
-                        changed |= ReconcileTopicRunWithAnswer(
-                            thread,
-                            line.ReplyToLineId,
-                            line.At == default ? DateTimeOffset.UtcNow : line.At);
-                }
-                if (changed
                     && envelope.Kind == ReplicationOpKinds.Message
                     && envelope.Action == ReplicationPayloadCodec.DomainAction.AppendLine
                     && !string.Equals(Norm(evt.OriginAccount), Norm(Profile.Handle), StringComparison.Ordinal))
@@ -1022,6 +1114,14 @@ public sealed partial class AppState
                     sourceDb,
                     item.Event,
                     item.Envelope).ConfigureAwait(false);
+            var reconciled = ReconcileCommittedTopicAnswersAfterBatch(sourceDb, committed);
+            if (reconciled > 0)
+            {
+                RuntimeDiagnostics.Current?.RecordEvent(
+                    "topic-batch-reconciliation",
+                    $"runs={reconciled};result=converged");
+                NotifyChanged();
+            }
         }
         finally
         {
@@ -1031,6 +1131,60 @@ public sealed partial class AppState
                 if (previous is null) Changed?.Invoke();
                 else previous.Pending = true;
             }
+        }
+    }
+
+    private int ReconcileCommittedTopicAnswersAfterBatch(
+        MeshDb? sourceDb,
+        IReadOnlyList<ReplicationCommittedDomainEvent> committed)
+    {
+        lock (profileSyncGate)
+        {
+            if (sourceDb is null || !ReferenceEquals(sourceDb, activeDb)) return 0;
+            var affectedThreads = committed
+                .Where(item =>
+                    item.Envelope.Kind == ReplicationOpKinds.Topic
+                    && item.Envelope.Action is
+                        ReplicationPayloadCodec.DomainAction.AppendLine
+                        or ReplicationPayloadCodec.DomainAction.Upsert)
+                .Select(item => item.Envelope.EntityId)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var reconciled = 0;
+            foreach (var threadId in affectedThreads)
+            {
+                var thread = Profile.OwnThreads.FirstOrDefault(item =>
+                    string.Equals(item.Id, threadId, StringComparison.Ordinal));
+                if (thread is null) continue;
+                if (TopicRunProtocol.IsValidIdentifier(thread.ExecutionRunId))
+                {
+                    var correlation = sourceDb.ExecuteDurableWrite(
+                        () => sourceDb.GetTopicRunCorrelation(thread.ExecutionRunId!));
+                    if (correlation is
+                        {
+                            TerminalAt: not null,
+                            TriggerLineId: not null
+                        }
+                        && string.Equals(
+                            correlation.ThreadId, thread.Id, StringComparison.Ordinal)
+                        && ReconcileTopicRunWithAnswer(
+                            thread,
+                            correlation.TriggerLineId,
+                            correlation.TerminalEventAt ?? correlation.TerminalAt.Value))
+                        reconciled++;
+                }
+                foreach (var answer in thread.Lines.Where(line =>
+                             !line.Internal
+                             && string.Equals(line.Role, "assistant", StringComparison.Ordinal)))
+                {
+                    if (ReconcileTopicRunWithAnswer(
+                            thread,
+                            answer.ReplyToLineId,
+                            answer.At == default ? timeProvider.GetUtcNow() : answer.At))
+                        reconciled++;
+                }
+            }
+            return reconciled;
         }
     }
 
@@ -1065,38 +1219,57 @@ public sealed partial class AppState
     }
 
     /// <summary>
-    /// Materialises an inbound replicated envelope onto the ACTUAL domain tables inside the same
-    /// transaction that appends the event and advances the cursor. Throwing rolls the whole apply
-    /// back so the cursor never advances past an event this device could not project.
+    /// Captures the account-specific inbound envelope before the durable-write gate is acquired.
+    /// Returning null after an account switch keeps a stale engine from projecting into either
+    /// account while still allowing its immutable log entry to be stored by its bound database.
     /// </summary>
-    private bool ProjectInbound(
+    private ReplicationPayloadCodec.DomainEnvelope? PrepareInbound(
+        MeshDb? sourceDb,
+        ReplicationEvent evt,
+        ReplicationPayloadCodec.DomainEnvelope envelope)
+    {
+        lock (profileSyncGate)
+        {
+            if (sourceDb is null || !ReferenceEquals(sourceDb, activeDb)) return null;
+            return ReplicationInboundProjection.ForLocalAccount(evt, envelope, Profile.Handle);
+        }
+    }
+
+    /// <summary>
+    /// Materialises a prepared inbound envelope onto the actual domain tables inside the same
+    /// transaction that appends the event and advances the cursor. This DB-only callback runs under
+    /// the durable-write gate and must never acquire <c>profileSyncGate</c>.
+    /// </summary>
+    private static bool ProjectInbound(
         SqliteConnection conn,
         SqliteTransaction tx,
         ReplicationEvent evt,
         ReplicationPayloadCodec.DomainEnvelope envelope,
         bool deviceIsDesktop)
-    {
-        lock (profileSyncGate)
-            envelope = ReplicationInboundProjection.ForLocalAccount(evt, envelope, Profile.Handle);
-        return ReplicationDomainMaterializer.Apply(conn, tx, evt, envelope, deviceIsDesktop);
-    }
+        => ReplicationDomainMaterializer.Apply(conn, tx, evt, envelope, deviceIsDesktop);
 
-    private sealed class AppStateReplicationApplier(AppState owner) : IReplicationDomainApplier
+    private sealed class AppStateReplicationApplier(AppState owner, MeshDb? sourceDb) : IReplicationDomainApplier
     {
+        public ReplicationPayloadCodec.DomainEnvelope? Prepare(
+            ReplicationEvent evt,
+            ReplicationPayloadCodec.DomainEnvelope envelope,
+            bool deviceIsDesktop)
+            => owner.PrepareInbound(sourceDb, evt, envelope);
+
         public bool Apply(
             SqliteConnection conn,
             SqliteTransaction tx,
             ReplicationEvent evt,
             ReplicationPayloadCodec.DomainEnvelope envelope,
             bool deviceIsDesktop)
-            => owner.ProjectInbound(conn, tx, evt, envelope, deviceIsDesktop);
+            => ProjectInbound(conn, tx, evt, envelope, deviceIsDesktop);
 
         public Task AfterCommitAsync(
             ReplicationEvent evt,
             ReplicationPayloadCodec.DomainEnvelope envelope,
             bool deviceIsDesktop)
             => owner.ApplyReplicatedStateAfterCommitAsync(
-                owner.replicationEngineDb,
+                sourceDb,
                 evt,
                 envelope);
 
@@ -1104,7 +1277,7 @@ public sealed partial class AppState
             IReadOnlyList<ReplicationCommittedDomainEvent> committed,
             bool deviceIsDesktop)
             => owner.ApplyReplicatedStateBatchAfterCommitAsync(
-                owner.replicationEngineDb,
+                sourceDb,
                 committed);
     }
 }
@@ -1160,4 +1333,14 @@ internal sealed class LocalCustodyRoster(MeshDb db) : IReplicationRoster
         var head = db.GetCustodyHead(accountHandle ?? "");
         return head?.Generation ?? -1;
     }
+
+    public Task<ReplicationEmissionRosterSnapshot> GetEmissionSnapshotAsync(
+        IReadOnlyCollection<string> accountHandles,
+        ReplicationIdentity localIdentity,
+        CancellationToken ct)
+        => Task.FromResult(new ReplicationEmissionRosterSnapshot(
+            ReplicationEmissionRosterState.Unavailable,
+            Array.Empty<ReplicationDevice>(),
+            new Dictionary<string, long>(StringComparer.Ordinal),
+            "relay-authoritative roster unavailable while offline"));
 }

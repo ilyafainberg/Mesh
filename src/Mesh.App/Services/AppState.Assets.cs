@@ -134,13 +134,17 @@ public sealed partial class AppState : IAsyncDisposable
     public async Task FlushPersistenceAsync(CancellationToken ct = default)
     {
         var coordinator = persistence;
-        if (coordinator is null) return;
-        lock (writeQueueGate)
+        if (coordinator is not null)
         {
-            if (writeQueue.Count > 0)
-                coordinator.Schedule(0);
+            lock (writeQueueGate)
+            {
+                if (writeQueue.Count > 0)
+                    coordinator.Schedule(0);
+            }
+            await coordinator.FlushAsync(ct).ConfigureAwait(false);
         }
-        await coordinator.FlushAsync(ct).ConfigureAwait(false);
+        if (draftPersistence is not null)
+            await draftPersistence.FlushAsync(ct).ConfigureAwait(false);
     }
 
     private void FlushBlocking()
@@ -198,7 +202,9 @@ public sealed partial class AppState : IAsyncDisposable
 
             if (work.BlobJson is not null)
             {
-                work.Db.SaveProfileJson(work.BlobJson);
+                await work.Db.ExecuteDurableWriteAsync(
+                    () => work.Db.SaveProfileJson(work.BlobJson),
+                    ct).ConfigureAwait(false);
             }
         }
 
@@ -255,7 +261,7 @@ public sealed partial class AppState : IAsyncDisposable
             var deleteBody = JsonSerializer.Serialize(
                 new { kind = asset.Kind.ToString(), id = asset.Id, sourceDeviceId = asset.SourceDeviceId },
                 ReplicationJson);
-            await ReplicateLocalAsync(
+            await ReplicatePersistenceLocalAsync(
                 ReplicationOpKinds.Asset, ReplicationPayloadCodec.DomainAction.AssetDelete,
                 entityId, null, NewReplicationVersion(), deleteBody, asset.Targets, ct: ct).ConfigureAwait(false);
             assetContentCache.Remove(key);
@@ -292,7 +298,7 @@ public sealed partial class AppState : IAsyncDisposable
                 LocalOnly: false),
             ReplicationJson);
 
-        await ReplicateLocalAsync(
+        await ReplicatePersistenceLocalAsync(
             ReplicationOpKinds.Asset, ReplicationPayloadCodec.DomainAction.AssetUpsert,
             entityId, null, NewReplicationVersion(), bodyJson, asset.Targets, ct: ct).ConfigureAwait(false);
 
@@ -315,11 +321,26 @@ public sealed partial class AppState : IAsyncDisposable
         // database is gone, so the descriptor is dropped rather than written to a swapped-in one.
         if (!ReferenceEquals(work.Db, activeDb)) return;
 
-        await ReplicateLocalAsync(
+        await ReplicatePersistenceLocalAsync(
             work.Kind, work.Action, work.EntityId, work.ConversationId,
             work.CausalVersion, work.BodyJson, work.Targets, ct: ct,
             notificationIntent: work.NotificationIntent).ConfigureAwait(false);
     }
+
+    private Task<string?> ReplicatePersistenceLocalAsync(
+        string kind,
+        ReplicationPayloadCodec.DomainAction action,
+        string entityId,
+        string? conversationId,
+        string causalVersion,
+        string bodyJson,
+        IReadOnlyCollection<string> targetAccounts,
+        CancellationToken ct = default,
+        NotificationIntent? notificationIntent = null)
+        => ReplicateLocalCoreAsync(
+            kind, action, entityId, conversationId, causalVersion, bodyJson,
+            targetAccounts, OnlinePushClasses.Normal, offerPeers: false, ct,
+            domainWork: null, notificationIntent);
 
     private void RecordError(Exception ex)
     {
@@ -581,10 +602,13 @@ public sealed partial class AppState : IAsyncDisposable
         var hadLegacy = Profile.Skills.Count > 0 || Profile.Knowledge.Count > 0 || Profile.Widgets.Count > 0;
         try
         {
-            foreach (var (kind, id, record, content) in EnumerateAssets(Profile, deviceId, localOnly))
-                if (db.GetFullAsset(kind, id) is null)
-                    db.UpsertAsset(record, content);
-            if (hadLegacy) db.SaveProfile(Profile);
+            db.ExecuteDurableWrite(() =>
+            {
+                foreach (var (kind, id, record, content) in EnumerateAssets(Profile, deviceId, localOnly))
+                    if (db.GetFullAsset(kind, id) is null)
+                        db.UpsertAsset(record, content);
+                if (hadLegacy) db.SaveProfile(Profile);
+            });
             HydrateFromAssets(db);
         }
         catch (Exception ex)
@@ -849,6 +873,15 @@ public sealed partial class AppState : IAsyncDisposable
             if (persistence is not null)
             {
                 try { await persistence.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    RecordError(ex);
+                    failure ??= ex;
+                }
+            }
+            if (draftPersistence is not null)
+            {
+                try { await draftPersistence.DisposeAsync().ConfigureAwait(false); }
                 catch (Exception ex)
                 {
                     RecordError(ex);

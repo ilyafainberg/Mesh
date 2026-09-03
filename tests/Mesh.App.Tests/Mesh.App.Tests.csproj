@@ -58,6 +58,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\AssetPagePolicy.cs" Link="AssetPagePolicy.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AskUserStore.cs" Link="AskUserStore.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProfilePersistenceCoordinator.cs" Link="ProfilePersistenceCoordinator.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ComposerDraftPersistenceCoordinator.cs" Link="ComposerDraftPersistenceCoordinator.cs" />
     <Compile Include="..\..\src\Mesh.App\Domain\InteractionModels.cs" Link="Domain\InteractionModels.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AskUserInteractionCoordinator.cs" Link="AskUserInteractionCoordinator.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AssetPersistenceModels.cs" Link="AssetPersistenceModels.cs" />
@@ -76,6 +77,11 @@
     <Compile Include="..\..\src\Mesh.App\Services\AgentPromptContentSelector.cs" Link="AgentPromptContentSelector.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProviderModelMetadata.cs" Link="ProviderModelMetadata.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\RuntimeDiagnostics.cs" Link="RuntimeDiagnostics.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\ManagedOperationDiagnostics.cs" Link="ManagedOperationDiagnostics.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\UiOperationCoordinator.cs" Link="UiOperationCoordinator.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\TopicSendCoordinator.cs" Link="TopicSendCoordinator.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\LatestWinsRefreshCoordinator.cs" Link="LatestWinsRefreshCoordinator.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\DesktopSelectionPersistenceCoordinator.cs" Link="DesktopSelectionPersistenceCoordinator.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MessageRenderWindow.cs" Link="MessageRenderWindow.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MobileOverlayState.cs" Link="MobileOverlayState.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ImageSharePolicy.cs" Link="ImageSharePolicy.cs" />
@@ -87,6 +93,7 @@
     <Compile Include="..\..\src\Mesh.App\Services\MemoryService.cs" Link="MemoryService.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MeshExport.cs" Link="MeshExport.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProfileProjection.cs" Link="ProfileProjection.cs" />
+    <Compile Include="..\..\src\Mesh.App\Services\DeviceKeyRefreshPolicy.cs" Link="DeviceKeyRefreshPolicy.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionContracts.cs" Link="TopicExecutionContracts.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionRouter.cs" Link="TopicExecutionRouter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicTurnRunner.cs" Link="TopicTurnRunner.cs" />
@@ -113,7 +120,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Mesh.Shared\Mesh.Shared.csproj" />
-    <ProjectReference Include="..\..\src\Mesh.Relay\Mesh.Relay.csproj" />
+    <ProjectReference Include="..\..\src\Mesh.Relay\Mesh.Relay.csproj"
+                      AdditionalProperties="MeshRelayTestFaults=true" />
     <ProjectReference Include="..\..\src\Mesh.BuiltIns.Compiler\Mesh.BuiltIns.Compiler.csproj" />
   </ItemGroup>
 

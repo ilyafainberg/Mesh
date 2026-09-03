@@ -2,6 +2,9 @@ using System.Text;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 using Mesh.Relay.Backplane;
+#if MESH_TEST_RELAY_FAULTS
+using Mesh.Relay.LiveFaults;
+#endif
 using Mesh.Relay.Observability;
 using Mesh.Relay.Push;
 using Mesh.Relay.RateLimiting;
@@ -40,6 +43,12 @@ public sealed class MeshHub(
     RelayFrameDedup dedup,
     PushDispatcher push,
     RelayMetrics metrics,
+    TimeProvider clock,
+#if MESH_TEST_RELAY_FAULTS
+    LiveFaultStore liveFaults,
+    LiveFaultHandshakeObserver handshakeObserver,
+    LiveFaultTransportObserver transportObserver,
+#endif
     ILogger<MeshHub> logger) : Microsoft.AspNetCore.SignalR.Hub
 {
     private static readonly TimeSpan PresenceTtl = TimeSpan.FromSeconds(30);
@@ -93,11 +102,28 @@ public sealed class MeshHub(
             || record.AuthGeneration != authGeneration
             || !string.Equals(record.CustodyHead, custodyHead, StringComparison.Ordinal))
         {
+#if MESH_TEST_RELAY_FAULTS
+            handshakeObserver.Record(new LiveFaultHandshakeEvent(
+                "rejected-before-challenge",
+                handle,
+                deviceId,
+                authGeneration,
+                custodyHead));
+#endif
             Context.Abort();
             return;
         }
 
         var nonce = MeshCrypto.NewNonce();
+#if MESH_TEST_RELAY_FAULTS
+        handshakeObserver.Record(new LiveFaultHandshakeEvent(
+            "challenge",
+            handle,
+            deviceId,
+            authGeneration,
+            custodyHead,
+            nonce));
+#endif
         registry.Add(Context.ConnectionId, handle, nonce, protocolVersion, authGeneration, custodyHead);
         var state = registry.Get(Context.ConnectionId);
         if (state is not null) state.DeviceId = deviceId; // claimed device, proven at Authenticate
@@ -129,19 +155,32 @@ public sealed class MeshHub(
         var canonical = RelayConnectChallenge.Canonical(
             state.Nonce, state.Handle, state.DeviceId, state.ProtocolVersion, state.AuthGeneration, state.CustodyHead);
 
-        if (record is null
-            || !record.DevicePublicKeys.Contains(publicKey)
-            || !string.Equals(DeviceProtocol.DeviceId(publicKey), state.DeviceId, StringComparison.Ordinal)
-            || record.AuthGeneration != state.AuthGeneration
-            || !string.Equals(record.CustodyHead, state.CustodyHead, StringComparison.Ordinal)
-            || !MeshCrypto.Verify(publicKey, canonical, signature))
+        var accepted = record is not null
+            && record.DevicePublicKeys.Contains(publicKey)
+            && string.Equals(DeviceProtocol.DeviceId(publicKey), state.DeviceId, StringComparison.Ordinal)
+            && record.AuthGeneration == state.AuthGeneration
+            && string.Equals(record.CustodyHead, state.CustodyHead, StringComparison.Ordinal)
+            && MeshCrypto.Verify(publicKey, canonical, signature);
+#if MESH_TEST_RELAY_FAULTS
+        handshakeObserver.Record(new LiveFaultHandshakeEvent(
+            "authenticate",
+            state.Handle,
+            state.DeviceId,
+            state.AuthGeneration,
+            state.CustodyHead,
+            state.Nonce,
+            canonical,
+            signature,
+            accepted));
+#endif
+        if (!accepted)
         {
             Context.Abort();
             return;
         }
 
         registry.MarkAuthenticated(Context.ConnectionId, publicKey);
-        var now = DateTimeOffset.UtcNow;
+        var now = clock.GetUtcNow();
         await backplane.SetPresenceAsync(state.Handle);
         await backplane.SetDevicePresenceAsync(state.Handle, state.DeviceId);
 
@@ -182,6 +221,18 @@ public sealed class MeshHub(
         var pushClass = OnlinePushClasses.IsKnown(frame.PushClass) ? frame.PushClass : OnlinePushClasses.Normal;
         var toHandle = Normalize(frame.ToHandle);
         var directed = !string.IsNullOrWhiteSpace(frame.ToDevice);
+#if MESH_TEST_RELAY_FAULTS
+        if (directed)
+        {
+            var faultResult = ApplyOnlineFrameFault(
+                connection.Handle,
+                connection.DeviceId,
+                toHandle,
+                frame.ToDevice!,
+                frame.FrameId);
+            if (faultResult is not null) return faultResult;
+        }
+#endif
 
         var admission = dedup.TryBegin(frame.FrameId);
         if (admission == RelayFrameDedup.Admission.Delivered)
@@ -360,6 +411,16 @@ public sealed class MeshHub(
         {
             if (!authorized.Contains(directedDevice))
                 return MeshSendResult.Reject(OnlineRelaySendCodes.TargetDeviceUnknown);
+#if MESH_TEST_RELAY_FAULTS
+            var faultResult = ApplyControlFault(
+                connection.Handle,
+                connection.DeviceId,
+                toHandle,
+                directedDevice,
+                stamped.Kind,
+                stamped.Id);
+            if (faultResult is not null) return faultResult;
+#endif
             var outcome = await router.ForwardControlToDeviceAsync(
                 toHandle,
                 directedDevice,
@@ -377,6 +438,22 @@ public sealed class MeshHub(
         var delivered = 0;
         foreach (var device in authorized)
         {
+#if MESH_TEST_RELAY_FAULTS
+            var faultResult = ApplyControlFault(
+                connection.Handle,
+                connection.DeviceId,
+                toHandle,
+                device,
+                stamped.Kind,
+                stamped.Id);
+            if (faultResult is { Accepted: true })
+            {
+                delivered++;
+                continue;
+            }
+            if (faultResult is not null) continue;
+#endif
+
             var outcome = await router.ForwardControlToDeviceAsync(
                 toHandle,
                 device,
@@ -393,6 +470,70 @@ public sealed class MeshHub(
     }
 
     public Task<MeshSendResult> SendEphemeralEnvelope(MeshEnvelope env) => SendEnvelope(env);
+
+#if MESH_TEST_RELAY_FAULTS
+    private OnlineRelaySendResult? ApplyOnlineFrameFault(
+        string sourceAccount,
+        string sourceDevice,
+        string targetAccount,
+        string targetDevice,
+        string stableId)
+    {
+        var decision = liveFaults.TryApply(
+            LiveFaultDirection.Outbound,
+            sourceAccount,
+            sourceDevice,
+            targetAccount,
+            targetDevice,
+            LiveFaultStore.OnlineFrameKind,
+            stableId);
+        if (decision is null) return null;
+        logger.LogWarning(
+            "live fault consumed: rule={RuleId} mode={Mode} source={Source} sourceDevice={SourceDevice} target={Target} targetDevice={TargetDevice} kind={Kind} idHash={StableIdHash}",
+            decision.RuleId, decision.Mode, sourceAccount, sourceDevice, targetAccount, targetDevice,
+            LiveFaultStore.OnlineFrameKind, LiveFaultIds.Hash(stableId));
+        return decision.Mode switch
+        {
+            LiveFaultMode.RejectBeforeForwarding
+                => new OnlineRelaySendResult(false, LiveFaultStore.RejectedCode),
+            LiveFaultMode.DropBeforeForwarding
+                => new OnlineRelaySendResult(false, OnlineRelaySendCodes.NotOnline),
+            _ => new OnlineRelaySendResult(true, OnlineRelaySendCodes.Delivered)
+        };
+    }
+
+    private MeshSendResult? ApplyControlFault(
+        string sourceAccount,
+        string sourceDevice,
+        string targetAccount,
+        string targetDevice,
+        string kind,
+        string stableId)
+    {
+        transportObserver.RecordAttempt(stableId);
+        var decision = liveFaults.TryApply(
+            LiveFaultDirection.Outbound,
+            sourceAccount,
+            sourceDevice,
+            targetAccount,
+            targetDevice,
+            kind,
+            stableId);
+        if (decision is null) return null;
+        logger.LogWarning(
+            "live fault consumed: rule={RuleId} mode={Mode} source={Source} sourceDevice={SourceDevice} target={Target} targetDevice={TargetDevice} kind={Kind} idHash={StableIdHash}",
+            decision.RuleId, decision.Mode, sourceAccount, sourceDevice, targetAccount, targetDevice,
+            kind, LiveFaultIds.Hash(stableId));
+        return decision.Mode switch
+        {
+            LiveFaultMode.RejectBeforeForwarding
+                => MeshSendResult.Reject(LiveFaultStore.RejectedCode),
+            LiveFaultMode.DropBeforeForwarding
+                => MeshSendResult.Reject(OnlineRelaySendCodes.NotOnline),
+            _ => MeshSendResult.Ok()
+        };
+    }
+#endif
 
     private async Task<OnlineRelaySendResult> RelayDirectedAsync(
         ConnectionRegistry.ConnState connection,

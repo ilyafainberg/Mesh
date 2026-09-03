@@ -39,7 +39,9 @@ public static class ReplicationDomainMaterializer
         DateTimeOffset? LastActivityAt,
         bool IsPinned,
         DateTimeOffset? ExecutionAt,
-        string? ExecutionRunId);
+        string? ExecutionRunId,
+        string? ExecutionTriggerLineId = null,
+        TopicRunUpdatePayload? TerminalUpdate = null);
 
     /// <summary>Wire shape of a replicated asset (summary plus its bytes).</summary>
     internal sealed record AssetBody(
@@ -187,6 +189,7 @@ public static class ReplicationDomainMaterializer
                     ExecutionRunId = topic.ExecutionRunId
                 };
                 Protocol9DomainTables.UpsertOwnThreadMetadata(conn, tx, thread, topic.SortOrder);
+                MaterializeTopicRunState(conn, tx, thread, topic);
                 return true;
             }
             case ReplicationOpKinds.Message:
@@ -196,6 +199,7 @@ public static class ReplicationDomainMaterializer
                 Protocol9DomainTables.AppendChatLine(conn, tx, envelope.EntityId, line);
                 return true;
             }
+
             case ReplicationOpKinds.Contact:
             {
                 var contact = Deserialize<ContactProjection>(envelope.BodyJson, "contact");
@@ -235,6 +239,110 @@ public static class ReplicationDomainMaterializer
                 throw new ReplicationProjectionException(
                     $"Replication kind '{envelope.Kind}' has no upsert materialisation.");
         }
+    }
+
+    private static void MaterializeTopicRunState(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        OwnThread thread,
+        TopicBody topic)
+    {
+        if (TopicRunProtocol.IsValidIdentifier(thread.ExecutionRunId)
+            && TopicRunProtocol.IsValidIdentifier(thread.ExecutionDeviceId)
+            && TopicRunProtocol.IsValidIdentifier(topic.ExecutionTriggerLineId)
+            && thread.ExecutionAt is { } executionAt)
+        {
+            UpsertTopicRunCorrelation(
+                conn,
+                tx,
+                thread.ExecutionRunId!,
+                thread.Id,
+                thread.ExecutionDeviceId!,
+                topic.ExecutionTriggerLineId!,
+                executionAt,
+                terminalAt: null);
+        }
+
+        var terminal = topic.TerminalUpdate;
+        if (terminal is null)
+            return;
+        if (!TopicControlProtocol.IsTerminal(terminal)
+            || !string.Equals(terminal.ThreadId, thread.Id, StringComparison.Ordinal)
+            || !TopicRunProtocol.IsValidIdentifier(terminal.TriggerLineId)
+            || !TopicRunProtocol.IsValidIdentifier(thread.ExecutionDeviceId))
+            throw new ReplicationProjectionException(
+                $"Replicated topic terminal control for '{thread.Id}' was invalid.");
+
+        UpsertTopicRunCorrelation(
+            conn,
+            tx,
+            terminal.RunId,
+            thread.Id,
+            thread.ExecutionDeviceId!,
+            terminal.TriggerLineId!,
+            thread.ExecutionAt ?? terminal.Timestamp,
+            terminal.Timestamp);
+
+        using var clear = conn.CreateCommand();
+        clear.Transaction = tx;
+        clear.CommandText = """
+            UPDATE own_threads
+            SET execution_run_id = NULL,
+                last_activity_at = CASE
+                    WHEN last_activity_at IS NULL
+                         OR julianday($terminal) > julianday(last_activity_at)
+                    THEN $terminal ELSE last_activity_at
+                END
+            WHERE id = $thread
+              AND (execution_run_id = $run OR execution_run_id IS NULL);
+            """;
+        clear.Parameters.AddWithValue("$thread", thread.Id);
+        clear.Parameters.AddWithValue("$run", terminal.RunId);
+        clear.Parameters.AddWithValue("$terminal", terminal.Timestamp.UtcDateTime.ToString("O"));
+        clear.ExecuteNonQuery();
+    }
+
+    private static void UpsertTopicRunCorrelation(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        string runId,
+        string threadId,
+        string targetDeviceId,
+        string triggerLineId,
+        DateTimeOffset createdAt,
+        DateTimeOffset? terminalAt)
+    {
+        using var upsert = conn.CreateCommand();
+        upsert.Transaction = tx;
+        upsert.CommandText = """
+            INSERT INTO topic_run_correlations(
+                run_id, thread_id, target_device_id, trigger_line_id, created_at,
+                terminal_at, terminal_event_at)
+            VALUES($run, $thread, $target, $trigger, $created, $terminal, $terminal)
+            ON CONFLICT(run_id) DO UPDATE SET
+                terminal_at = CASE
+                    WHEN $terminal IS NULL THEN topic_run_correlations.terminal_at
+                    ELSE COALESCE(topic_run_correlations.terminal_at, $terminal)
+                END,
+                terminal_event_at = CASE
+                    WHEN $terminal IS NULL THEN topic_run_correlations.terminal_event_at
+                    ELSE COALESCE(topic_run_correlations.terminal_event_at, $terminal)
+                END
+            WHERE topic_run_correlations.thread_id = excluded.thread_id
+              AND topic_run_correlations.target_device_id = excluded.target_device_id
+              AND topic_run_correlations.trigger_line_id = excluded.trigger_line_id;
+            """;
+        upsert.Parameters.AddWithValue("$run", runId);
+        upsert.Parameters.AddWithValue("$thread", threadId);
+        upsert.Parameters.AddWithValue("$target", targetDeviceId);
+        upsert.Parameters.AddWithValue("$trigger", triggerLineId);
+        upsert.Parameters.AddWithValue("$created", createdAt.UtcDateTime.ToString("O"));
+        upsert.Parameters.AddWithValue(
+            "$terminal",
+            terminalAt is { } at ? at.UtcDateTime.ToString("O") : DBNull.Value);
+        if (upsert.ExecuteNonQuery() != 1)
+            throw new ReplicationProjectionException(
+                $"Replicated topic run '{runId}' conflicts with its durable correlation.");
     }
 
     // -----------------------------------------------------------------------
@@ -638,4 +746,3 @@ public static class ReplicationDomainMaterializer
         };
     }
 }
-

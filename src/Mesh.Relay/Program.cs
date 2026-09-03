@@ -6,6 +6,9 @@ using System.Text.Json;
 using System.Threading.RateLimiting;
 using Mesh.Relay.Backplane;
 using Mesh.Relay.Hub;
+#if MESH_TEST_RELAY_FAULTS
+using Mesh.Relay.LiveFaults;
+#endif
 using Mesh.Relay.Push;
 using Mesh.Relay.Observability;
 using Mesh.Relay.Quota;
@@ -16,6 +19,7 @@ using Microsoft.AspNetCore.SignalR;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
+var clock = TimeProvider.System;
 
 // Cap REST request bodies. Message attachments travel over the hub (WebSocket), not REST, so
 // REST payloads (registration, link, token broker, model prompt) are always small.
@@ -35,7 +39,7 @@ if (requireMetadataStorage && string.IsNullOrWhiteSpace(cosmosConn))
 var metadataStorage = !string.IsNullOrWhiteSpace(cosmosConn);
 
 IRelayStore store = string.IsNullOrWhiteSpace(cosmosConn)
-    ? new InMemoryRelayStore()
+    ? new InMemoryRelayStore(clock)
     : new CosmosRelayStore(cosmosConn, Config(builder.Configuration, "COSMOS_DB", "Cosmos:Database") ?? "mesh");
 
 // Protocol 9 is online-only: attachments are opaque end-to-end-encrypted frames forwarded over the
@@ -43,7 +47,7 @@ IRelayStore store = string.IsNullOrWhiteSpace(cosmosConn)
 // blob store here and no SAS-issuing endpoints.
 
 IBackplane backplane = string.IsNullOrWhiteSpace(redisConn)
-    ? new InMemoryBackplane()
+    ? new InMemoryBackplane(clock)
     : new RedisBackplane(redisConn);
 
 // Durable per-handle free-model quota: Redis in production (exact + shared across replicas),
@@ -71,9 +75,38 @@ var ratePolicyProvider = new HandleRatePolicyProvider(
     store, defaultRatePolicy, TimeSpan.FromSeconds(policyCacheSeconds));
 IMessageRateLimiter messageRateLimiter = new PerHandleRateLimiter(ratePolicyProvider, rateLimitStore);
 var adminKey = Config(builder.Configuration, "MESH_ADMIN_KEY", "Mesh:AdminKey");
+#if MESH_TEST_RELAY_FAULTS
+var liveFaultsEnabled = bool.TryParse(
+    Config(builder.Configuration, "MESH_LIVE_FAULTS_ENABLED", "Mesh:LiveFaultsEnabled"),
+    out var parsedLiveFaultsEnabled) && parsedLiveFaultsEnabled;
+var liveFaultMaxTtlSeconds = int.TryParse(
+    Config(builder.Configuration, "MESH_LIVE_FAULT_MAX_TTL_SECONDS", "Mesh:LiveFaultMaxTtlSeconds"),
+    out var parsedFaultTtl) ? Math.Clamp(parsedFaultTtl, 1, 3600) : 3600;
+var liveFaultMaxUses = int.TryParse(
+    Config(builder.Configuration, "MESH_LIVE_FAULT_MAX_USES", "Mesh:LiveFaultMaxUses"),
+    out var parsedFaultUses) ? Math.Clamp(parsedFaultUses, 1, 1000) : 1000;
+var liveFaultEnvironment = builder.Environment.IsDevelopment()
+                           || builder.Environment.IsEnvironment("Test");
+if (liveFaultsEnabled && !liveFaultEnvironment)
+{
+    Console.Error.WriteLine(
+        "This test-relay build refuses live-fault activation outside Development or Test.");
+    Environment.ExitCode = 2;
+    return;
+}
+var liveFaultStore = new LiveFaultStore(new LiveFaultOptions
+{
+    Enabled = liveFaultsEnabled
+              && liveFaultEnvironment
+              && !string.IsNullOrWhiteSpace(adminKey),
+    MaxTtlSeconds = liveFaultMaxTtlSeconds,
+    MaxUses = liveFaultMaxUses
+});
+#endif
 
 builder.Services.AddSingleton(store);
 builder.Services.AddSingleton(backplane);
+builder.Services.AddSingleton(clock);
 builder.Services.AddSingleton(quota);
 builder.Services.AddSingleton<IRateLimitStore>(rateLimitStore);
 builder.Services.AddSingleton<IHandleRatePolicyProvider>(ratePolicyProvider);
@@ -81,6 +114,12 @@ builder.Services.AddSingleton<IMessageRateLimiter>(messageRateLimiter);
 builder.Services.AddSingleton<ConnectionRegistry>();
 builder.Services.AddSingleton<MeshRouter>();
 builder.Services.AddSingleton<RelayFrameDedup>();
+#if MESH_TEST_RELAY_FAULTS
+builder.Services.AddSingleton(liveFaultStore);
+builder.Services.AddSingleton<LiveFaultHandshakeObserver>();
+builder.Services.AddSingleton<LiveFaultTransportObserver>();
+builder.Services.AddSingleton<LiveFaultAuthorityObserver>();
+#endif
 builder.Services.AddMeshPush(builder.Configuration);
 builder.Services.AddSingleton<Mesh.Relay.RelayConnectorCatalog>();
 builder.Services.AddHostedService<PresenceRenewer>();
@@ -120,6 +159,9 @@ builder.Services.AddRateLimiter(o =>
 });
 
 var app = builder.Build();
+#if MESH_TEST_RELAY_FAULTS
+liveFaultStore.CleanupExpired();
+#endif
 
 var json = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 var brokerHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -632,6 +674,9 @@ app.MapGet("/handles/{handle}", async (string handle) =>
     var key = Normalize(handle);
     var rec = await store.GetHandleAsync(key);
     if (rec is null) return Results.NotFound();
+#if MESH_TEST_RELAY_FAULTS
+    app.Services.GetRequiredService<LiveFaultAuthorityObserver>().Record(rec);
+#endif
     var online = await backplane.GetInstanceForAsync(key) is not null;
     return Results.Ok(new HandleInfo(
         rec.Handle, rec.DisplayName, rec.DevicePublicKeys, online, rec.RegisteredAt,
@@ -878,6 +923,16 @@ app.MapDelete("/admin/handles/{handle}/rate-policy", async (HttpContext ctx, str
     return removed ? Results.NoContent() : Results.NotFound(new { error = "rate policy not found" });
 });
 
+#if MESH_TEST_RELAY_FAULTS
+app.MapLiveFaultAdminEndpoints(
+    liveFaultStore,
+    adminKey,
+    store,
+    app.Services.GetRequiredService<LiveFaultTransportObserver>(),
+    app.Services.GetRequiredService<LiveFaultHandshakeObserver>(),
+    app.Services.GetRequiredService<LiveFaultAuthorityObserver>());
+#endif
+
 // ---- Capability directory + reputation (REST) -----------------------------
 // A public directory of published services with usage-gated up/down voting. Publishing, unpublishing,
 // voting, and usage attestation are all authenticated with a device key registered under the acting
@@ -1108,13 +1163,13 @@ static void SetSensitiveResponseHeaders(HttpContext context, string contentSecur
 
 static bool IsAdmin(HttpContext context, string? configuredKey)
 {
-    if (string.IsNullOrWhiteSpace(configuredKey)
-        || !context.Request.Headers.TryGetValue("X-Mesh-Admin-Key", out var supplied))
+    context.Request.Headers.TryGetValue("X-Mesh-Admin-Key", out var supplied);
+    if (string.IsNullOrWhiteSpace(configuredKey) || string.IsNullOrWhiteSpace(supplied))
         return false;
-    var expectedBytes = Encoding.UTF8.GetBytes(configuredKey);
-    var suppliedBytes = Encoding.UTF8.GetBytes(supplied.ToString());
-    return expectedBytes.Length == suppliedBytes.Length
-        && CryptographicOperations.FixedTimeEquals(expectedBytes, suppliedBytes);
+    var expected = Encoding.UTF8.GetBytes(configuredKey);
+    var actual = Encoding.UTF8.GetBytes(supplied.ToString());
+    return expected.Length == actual.Length
+           && CryptographicOperations.FixedTimeEquals(expected, actual);
 }
 
 static string? ValidateRatePolicy(HandleRatePolicy policy)

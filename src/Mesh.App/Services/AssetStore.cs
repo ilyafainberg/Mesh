@@ -68,7 +68,7 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
             ArgumentNullException.ThrowIfNull(summary);
             ArgumentNullException.ThrowIfNull(content);
             summary.EnsureValidForUpsert();
-            db.UpsertAsset(summary, content);
+            db.ExecuteDurableWrite(() => db.UpsertAsset(summary, content), ct);
         }, ct);
 
     public Task<IReadOnlyList<AssetRecord>> PageSummariesAsync(
@@ -93,7 +93,7 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
         {
             RequireNonBlank(id, nameof(id));
             RequireNonBlank(sourceDeviceId, nameof(sourceDeviceId));
-            return db.DeleteAsset(kind, id, sourceDeviceId);
+            return db.ExecuteDurableWrite(() => db.DeleteAsset(kind, id, sourceDeviceId), ct);
         }, ct);
 
     public Task<bool> ApplyRemoteUpsertAsync(
@@ -103,7 +103,7 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
             ArgumentNullException.ThrowIfNull(summary);
             ArgumentNullException.ThrowIfNull(content);
             summary.EnsureValidForUpsert();
-            return db.ApplyRemoteAssetUpsert(summary, content);
+            return db.ExecuteDurableWrite(() => db.ApplyRemoteAssetUpsert(summary, content), ct);
         }, ct);
 
     public Task<bool> ApplyRemoteDeleteAsync(AssetRecord tombstone, CancellationToken ct = default)
@@ -111,7 +111,7 @@ public sealed class AssetStore(MeshDb db, IStoreScheduler? scheduler = null) : I
         {
             ArgumentNullException.ThrowIfNull(tombstone);
             tombstone.EnsureValidTombstone();
-            return db.ApplyRemoteAssetDelete(tombstone);
+            return db.ExecuteDurableWrite(() => db.ApplyRemoteAssetDelete(tombstone), ct);
         }, ct);
 
     private static void RequireNonBlank(string? value, string name)

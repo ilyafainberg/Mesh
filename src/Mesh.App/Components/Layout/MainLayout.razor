@@ -108,6 +108,8 @@ else
 
 @code {
     bool navOpen;
+    bool disposed;
+    int renderQueued;
     DotNetObjectReference<MainLayout>? fileLinkRef;
     UiMode _prevEffectiveMode;
 
@@ -174,7 +176,31 @@ else
     private void Refresh()
     {
         if (!State.IsOnboarded) onboardingActive = true;
-        _ = InvokeAsync(StateHasChanged);
+        if (disposed || Interlocked.Exchange(ref renderQueued, 1) != 0) return;
+        _ = ApplyLatestRenderAsync();
+    }
+
+    private async Task ApplyLatestRenderAsync()
+    {
+        try
+        {
+            await InvokeAsync(() =>
+            {
+                Interlocked.Exchange(ref renderQueued, 0);
+                if (!disposed) StateHasChanged();
+            });
+        }
+        catch (Exception ex) when (disposed
+                                   && ex is ObjectDisposedException or InvalidOperationException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref renderQueued, 0);
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "main-layout-render-failed",
+                $"exception={ex.GetType().FullName}");
+        }
     }
 
     private void CompleteOnboarding()
@@ -331,6 +357,7 @@ else
 
     public void Dispose()
     {
+        disposed = true;
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;
