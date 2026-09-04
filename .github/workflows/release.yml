@@ -177,8 +177,22 @@ jobs:
           Move-Item $built $installer
 
           $installDir = Join-Path $env:RUNNER_TEMP "mesh-setup-smoke"
-          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $installDir "Mesh.App.exe"))) {
+          $installLog = Join-Path $env:RUNNER_TEMP "mesh-setup-smoke.log"
+          $install = Start-Process `
+            -FilePath $installer `
+            -ArgumentList @(
+              "/VERYSILENT",
+              "/SUPPRESSMSGBOXES",
+              "/NORESTART",
+              "/SP-",
+              "/DIR=$installDir",
+              "/LOG=$installLog") `
+            -Wait `
+            -PassThru
+          if ($install.ExitCode -ne 0 -or -not (Test-Path (Join-Path $installDir "Mesh.App.exe"))) {
+            if (Test-Path $installLog) {
+              Get-Content $installLog -Tail 80
+            }
             throw "Silent installer smoke test failed."
           }
           $installedVersion = (Get-Item (Join-Path $installDir "Mesh.App.exe")).VersionInfo.FileVersion
@@ -187,8 +201,12 @@ jobs:
           }
           $uninstaller = Join-Path $installDir "unins000.exe"
           if (Test-Path $uninstaller) {
-            & $uninstaller /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-            if ($LASTEXITCODE -ne 0) {
+            $uninstall = Start-Process `
+              -FilePath $uninstaller `
+              -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") `
+              -Wait `
+              -PassThru
+            if ($uninstall.ExitCode -ne 0) {
               throw "Silent uninstaller smoke test failed."
             }
           }
