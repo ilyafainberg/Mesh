@@ -22,13 +22,13 @@
 
 ### Licensing and Openness Legend
 
-Mesh is a mixed open/proprietary system. The boundary matters for security reasoning, because the parts that carry your data in transit and define the wire format are fully auditable, while the client that holds your keys is proprietary but has publicly stated security properties.
+Mesh is an open-source system with component-specific licenses. The boundaries still matter for security reasoning because the relay, shared protocol library, and client have different responsibilities and trust assumptions.
 
 | Component | Openness | License | This document describes |
 | --- | --- | --- | --- |
 | **Relay** (`Mesh.Relay`) | Open source | AGPL-3.0 | Full technical detail |
 | **Shared library** (`Mesh.Shared`) | Open source | Apache-2.0 | Full technical detail (wire contracts + crypto) |
-| **Client app** | Proprietary | PolyForm Noncommercial | Externally observable security properties and high-level responsibilities only |
+| **Client app** | Open source | GPL-3.0 | Full technical detail |
 
 Throughout this document, sections that discuss the client describe only its **externally observable security properties** (local key generation, encrypted local storage, TOFU pinning, E2EE endpoints, sandboxed public-service agent). The client's internal implementation, source layout, agent orchestration, tool-sandbox internals, and model-provider adapters are intentionally out of scope.
 
@@ -72,7 +72,7 @@ Mesh has three logical components: **client peers**, the **relay**, and the **sh
 
 | Component | Role | Trust posture |
 | --- | --- | --- |
-| **Client peer** | Holds identity keys, encrypts/decrypts, pins contact keys (TOFU), stores data locally encrypted, and binds owner memory only to Me-topic execution. Peers are symmetric: there is no "server account." | Trusted with the user's own keys and data. Proprietary but with publicly stated security properties. |
+| **Client peer** | Holds identity keys, encrypts/decrypts, pins contact keys (TOFU), stores data locally encrypted, and binds owner memory only to Me-topic execution. Peers are symmetric: there is no "server account." | Trusted with the user's own keys and data. The GPL-3.0 client source is auditable. |
 | **Relay** | Stateless-ish transport. Authenticates connections and senders by signature, routes sealed envelopes, queues offline messages, enforces rate limits, optionally offers helper services. Never sees plaintext. | Untrusted for confidentiality; trusted for availability and honest routing (and honest routing is verified via TOFU). Open source. |
 | **Shared library** | Defines `MeshEnvelope`, claim/registration contracts, and the crypto primitives (`MeshCrypto`). Used by both client and relay. | The definition of the security-critical wire format and crypto. Open source and auditable. |
 
@@ -80,14 +80,14 @@ Mesh has three logical components: **client peers**, the **relay**, and the **sh
 
 ```mermaid
 flowchart TB
-    subgraph ClientA["Client Peer A (proprietary, PolyForm Noncommercial)"]
+    subgraph ClientA["Client Peer A (open source, GPL-3.0)"]
         A_Keys["Device signing + recovery keys<br/>(local, never leave device)"]
         A_Store["Encrypted local store<br/>(SQLCipher + secure enclave)<br/>including owner-only memories"]
         A_Crypto["Uses Mesh.Shared crypto"]
         A_TOFU["TOFU key pins for contacts"]
     end
 
-    subgraph ClientB["Client Peer B (proprietary, PolyForm Noncommercial)"]
+    subgraph ClientB["Client Peer B (open source, GPL-3.0)"]
         B_Keys["Device signing + recovery keys"]
         B_Store["Encrypted local store"]
         B_Crypto["Uses Mesh.Shared crypto"]

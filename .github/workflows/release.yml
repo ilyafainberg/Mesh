@@ -1,0 +1,241 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows portable and setup
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read and validate release identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $config = Get-Content ".github/release-build.json" -Raw | ConvertFrom-Json
+          $version = $env:GITHUB_REF_NAME -replace "^v", ""
+          if ($version -ne $config.version) {
+            throw "Tag version $version does not match release configuration $($config.version)."
+          }
+          git merge-base --is-ancestor $config.productCommit HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Approved product commit is not an ancestor of the release tag."
+          }
+          $changed = @(git diff --name-only $config.productCommit HEAD)
+          $productChanges = @($changed | Where-Object { $_ -match "^(src|tests)/" })
+          if ($productChanges.Count -ne 0) {
+            throw "Release infrastructure commit changed approved product/test source."
+          }
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "RELEASE_BUILD=$($config.buildNumber)" >> $env:GITHUB_ENV
+          "PRODUCT_COMMIT=$($config.productCommit)" >> $env:GITHUB_ENV
+          "APPROVED_MANIFEST_SHA256=$($config.approvedManifestSha256)" >> $env:GITHUB_ENV
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Install MAUI Windows workload
+        shell: pwsh
+        run: dotnet workload install maui-windows --skip-manifest-update
+
+      - name: Publish self-contained Windows app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publish = Join-Path $PWD "dist\portable"
+          dotnet publish "src\Mesh.App\Mesh.App.csproj" `
+            -f "net10.0-windows10.0.19041.0" `
+            -c Release `
+            -p:WindowsPackageType=None `
+            -p:RuntimeIdentifierOverride=win10-x64 `
+            -p:ApplicationDisplayVersion="$env:RELEASE_VERSION" `
+            -p:ApplicationVersion="$env:RELEASE_BUILD" `
+            -p:Version="$env:RELEASE_VERSION" `
+            -p:AssemblyVersion="$env:RELEASE_VERSION.$env:RELEASE_BUILD" `
+            -p:FileVersion="$env:RELEASE_VERSION.$env:RELEASE_BUILD" `
+            -p:InformationalVersion="$env:RELEASE_VERSION+build.$env:RELEASE_BUILD.$env:GITHUB_SHA" `
+            -p:ContinuousIntegrationBuild=true `
+            --self-contained true `
+            -o $publish `
+            --nologo
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows publish failed."
+          }
+          $exe = Join-Path $publish "Mesh.App.exe"
+          $node = Join-Path $publish ".playwright\node\win32_x64\node.exe"
+          if (-not (Test-Path $exe -PathType Leaf)) {
+            throw "Publish produced no Mesh.App.exe."
+          }
+          if (-not (Test-Path $node -PathType Leaf)) {
+            throw "Publish produced no Windows Playwright runtime."
+          }
+          $foreignDrivers = @(
+            Get-ChildItem (Split-Path $node -Parent | Split-Path -Parent) -Directory |
+              Where-Object Name -ne "win32_x64"
+          )
+          if ($foreignDrivers.Count -ne 0) {
+            throw "Publish retained non-Windows Playwright runtimes."
+          }
+          Copy-Item "LICENSE" (Join-Path $publish "LICENSE.txt")
+          Copy-Item "_deploy\THIRD-PARTY-NOTICES.txt" $publish
+          Copy-Item "_deploy\brand\meshicon.ico" $publish
+          [ordered]@{
+            product = "Mesh"
+            version = $env:RELEASE_VERSION
+            buildNumber = [int]$env:RELEASE_BUILD
+            tagCommit = $env:GITHUB_SHA
+            productCommit = $env:PRODUCT_COMMIT
+            approvedManifestSha256 = $env:APPROVED_MANIFEST_SHA256
+          } | ConvertTo-Json | Set-Content (Join-Path $publish "BUILD-METADATA.json") -Encoding utf8
+
+          $versionInfo = (Get-Item $exe).VersionInfo
+          if ($versionInfo.FileVersion -ne "$env:RELEASE_VERSION.$env:RELEASE_BUILD") {
+            throw "Unexpected file version $($versionInfo.FileVersion)."
+          }
+          if ($versionInfo.ProductVersion -notlike "$env:RELEASE_VERSION+build.$env:RELEASE_BUILD.*") {
+            throw "Unexpected product version $($versionInfo.ProductVersion)."
+          }
+
+      - name: Smoke-test portable app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Join-Path $PWD "dist\portable\Mesh.App.exe"
+          $env:MESH_PROFILE_DIR = Join-Path $env:RUNNER_TEMP "mesh-release-smoke"
+          $process = Start-Process $exe -WorkingDirectory (Split-Path $exe) -PassThru
+          try {
+            Start-Sleep -Seconds 15
+            $process.Refresh()
+            if ($process.HasExited) {
+              throw "Portable Mesh exited during smoke test with code $($process.ExitCode)."
+            }
+          } finally {
+            $process.Refresh()
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+              $process.WaitForExit()
+            }
+          }
+
+      - name: Package portable archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "dist\Mesh-$env:RELEASE_VERSION-portable-win-x64.zip"
+          Compress-Archive -Path "dist\portable\*" -DestinationPath $zip -CompressionLevel Optimal
+          if (-not (Test-Path $zip -PathType Leaf)) {
+            throw "Portable archive was not produced."
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build and smoke-test installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $iscc) {
+            throw "Inno Setup compiler was not found."
+          }
+          $source = Join-Path $PWD "dist\portable"
+          $output = Join-Path $PWD "dist"
+          & $iscc `
+            "/DAppVersion=$env:RELEASE_VERSION" `
+            "/DSourceDir=$source" `
+            "/DOutputDir=$output" `
+            "_deploy\mesh-client.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed."
+          }
+          $built = Join-Path $output "Mesh-Setup-v$env:RELEASE_VERSION.exe"
+          $installer = Join-Path $output "Mesh-$env:RELEASE_VERSION-setup.exe"
+          if (-not (Test-Path $built -PathType Leaf)) {
+            throw "Inno Setup installer was not produced."
+          }
+          Move-Item $built $installer
+
+          $installDir = Join-Path $env:RUNNER_TEMP "mesh-setup-smoke"
+          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$installDir"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $installDir "Mesh.App.exe"))) {
+            throw "Silent installer smoke test failed."
+          }
+          $installedVersion = (Get-Item (Join-Path $installDir "Mesh.App.exe")).VersionInfo.FileVersion
+          if ($installedVersion -ne "$env:RELEASE_VERSION.$env:RELEASE_BUILD") {
+            throw "Installed executable version was $installedVersion."
+          }
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (Test-Path $uninstaller) {
+            & $uninstaller /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+            if ($LASTEXITCODE -ne 0) {
+              throw "Silent uninstaller smoke test failed."
+            }
+          }
+
+          $setupZip = Join-Path $output "Mesh-$env:RELEASE_VERSION-setup.zip"
+          Compress-Archive -LiteralPath $installer -DestinationPath $setupZip -CompressionLevel Optimal
+          Add-Type -AssemblyName System.IO.Compression
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($setupZip)
+          try {
+            $entries = @($archive.Entries | Where-Object { $_.Name })
+            if ($entries.Count -ne 1 -or $entries[0].Name -ne "Mesh-$env:RELEASE_VERSION-setup.exe") {
+              throw "Setup archive must contain exactly the versioned installer."
+            }
+          } finally {
+            $archive.Dispose()
+          }
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = @(
+            "dist\Mesh-$env:RELEASE_VERSION-portable-win-x64.zip",
+            "dist\Mesh-$env:RELEASE_VERSION-setup.zip"
+          )
+          $lines = foreach ($asset in $assets) {
+            $item = Get-Item $asset
+            "$((Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant())  $($item.Name)"
+          }
+          [IO.File]::WriteAllLines(
+            (Join-Path $PWD "dist\SHA256SUMS"),
+            $lines,
+            [Text.UTF8Encoding]::new($false))
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gh release create $env:GITHUB_REF_NAME `
+            --verify-tag `
+            --title "Mesh $env:RELEASE_VERSION" `
+            --notes-file "RELEASE-NOTES-v1.19.1.md" `
+            "dist\Mesh-$env:RELEASE_VERSION-portable-win-x64.zip" `
+            "dist\Mesh-$env:RELEASE_VERSION-setup.zip" `
+            "dist\SHA256SUMS"
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub release creation failed."
+          }

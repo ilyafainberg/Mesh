@@ -17,7 +17,7 @@ agent, and its open-source relay.
 
 ## What is open source
 
-Mesh is a mixed open and proprietary system:
+Mesh is an open-source system with component-specific licenses:
 
 - **Relay** (`Mesh.Relay`, AGPL-3.0): the ASP.NET Core SignalR service that routes
   end-to-end encrypted messages. It never sees message contents. Public repo:
@@ -25,9 +25,6 @@ Mesh is a mixed open and proprietary system:
 - **Shared library** (`Mesh.Shared`, Apache-2.0): the wire contracts and the crypto
   library (`MeshCrypto`). Permissively licensed so any client can link it. Public repo:
   `MeshRelayAI/Shared`.
-- **Client** (proprietary, PolyForm Noncommercial): the reference desktop and mobile app.
-  The documentation describes its user-facing behavior and its externally observable
-  security properties, not its internal implementation.
+- **Client** (`Mesh.App`, GPL-3.0): the reference desktop and mobile app.
 
-The parts that carry your data in transit and define the wire format are fully auditable;
-the client that holds your keys is proprietary but has publicly stated security properties.
+The relay, shared protocol, and reference client source can all be audited.

@@ -52,7 +52,7 @@ $Iss        = Join-Path $Deploy "mesh-client.iss"
 $PubDir     = Join-Path $Deploy "client-release\Mesh-win-x64"
 $Artifacts  = Join-Path $Deploy "artifacts"
 $BrandIcon  = Join-Path $Deploy "brand\meshicon.ico"
-$LicenseSrc = Join-Path $Deploy "LICENSE-polyform.txt"
+$LicenseSrc = Join-Path $Deploy "LICENSE-GPL-3.0.txt"
 $NoticesSrc = Join-Path $Deploy "THIRD-PARTY-NOTICES.txt"
 $RelayPublisher = Join-Path $Deploy "publish-relay-release.ps1"
 

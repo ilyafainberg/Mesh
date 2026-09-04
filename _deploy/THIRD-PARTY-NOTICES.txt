@@ -1,8 +1,8 @@
 THIRD-PARTY NOTICES FOR MESH
 ============================
 
-The Mesh desktop and mobile client is distributed under the PolyForm
-Noncommercial License 1.0.0 (see LICENSE.txt).
+The Mesh desktop and mobile client is distributed under the GNU General
+Public License v3.0 (see LICENSE.txt).
 
 This product includes the following open-source component:
 
