@@ -117,7 +117,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = Join-Path $PWD "dist\portable\Mesh.App.exe"
+          # Run a disposable copy so WebView2 cannot write its runtime profile into
+          # the portable folder that is packaged for release.
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "mesh-portable-smoke"
+          Copy-Item "dist\portable" $smokeRoot -Recurse
+          $exe = Join-Path $smokeRoot "Mesh.App.exe"
           $env:MESH_PROFILE_DIR = Join-Path $env:RUNNER_TEMP "mesh-release-smoke"
           $process = Start-Process $exe -WorkingDirectory (Split-Path $exe) -PassThru
           try {
@@ -132,6 +136,15 @@ jobs:
               Stop-Process -Id $process.Id -Force
               $process.WaitForExit()
             }
+            Start-Sleep -Seconds 2
+            Remove-Item $smokeRoot -Recurse -Force
+          }
+          $unexpectedRuntimeState = @(
+            Get-ChildItem "dist\portable" -Force |
+              Where-Object Name -like "*.WebView2"
+          )
+          if ($unexpectedRuntimeState.Count -ne 0) {
+            throw "Portable package contains runtime-generated WebView2 state."
           }
 
       - name: Package portable archive
