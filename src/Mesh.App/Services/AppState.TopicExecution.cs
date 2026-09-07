@@ -727,18 +727,6 @@ public sealed partial class AppState
         }
     }
 
-    public bool ReplaceDeviceEnvelopeOutboxForTargetAndKind(
-        MeshDb.DeviceEnvelopeOutboxItem item,
-        Func<MeshDb.DeviceEnvelopeOutboxItem, bool>? shouldReplaceExisting = null)
-    {
-        lock (profileSyncGate)
-        {
-            if (activeDb is null) return false;
-            activeDb.ReplaceDeviceEnvelopeOutboxForTargetAndKind(item, shouldReplaceExisting);
-            return true;
-        }
-    }
-
     public TopicReceiptOutboxPersistenceResult GetOrCreateTopicReceiptOutbox(
         MeshDb.DeviceEnvelopeOutboxItem item)
     {

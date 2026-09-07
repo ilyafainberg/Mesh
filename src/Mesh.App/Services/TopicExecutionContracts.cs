@@ -885,7 +885,8 @@ public static class TopicTransportPolicy
             or "invalid_push_hint"
             or "target_device_unknown"
             or "sync_target_unknown"
-            or "device_revoked";
+            or "device_revoked"
+            or "device_not_eligible";
 
     public static bool ShouldAttemptRequestDelivery(
         string state,

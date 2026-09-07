@@ -56,6 +56,9 @@ _deploy/relay-repo/
 _deploy/shared-repo/
 _deploy/android-signing/
 _deploy/android-artifacts/
+dist/
+Output/
+_deploy/Output/
 
 # Secrets and credentials (never commit)
 *Key.txt

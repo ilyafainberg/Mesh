@@ -169,11 +169,26 @@ public sealed class Protocol9TopicExecutionTests
         Assert.IsFalse(DevicePlatforms.CanHostRemoteAgent(true, null));
         Assert.IsFalse(DevicePlatforms.CanHostRemoteAgent(false, DevicePlatforms.Windows));
 
-        var phone = new DeviceInfo("d1", "Phone", true, DevicePlatforms.Android, RemoteAgentEnabled: true);
-        var desktop = new DeviceInfo("d2", "PC", true, DevicePlatforms.Windows, RemoteAgentEnabled: true);
-        var desktopNoModel = new DeviceInfo("d3", "PC2", true, DevicePlatforms.Windows, RemoteAgentEnabled: false);
+        var phone = new DeviceInfo(
+            "d1", "Phone", true, DevicePlatforms.Android,
+            RemoteAgentEnabled: true, AgentHostEnabled: true);
+        var desktop = new DeviceInfo(
+            "d2", "PC", true, DevicePlatforms.Windows,
+            RemoteAgentEnabled: true, AgentHostEnabled: true);
+        var desktopNoModel = new DeviceInfo(
+            "d3", "PC2", true, DevicePlatforms.Windows,
+            RemoteAgentEnabled: false, AgentHostEnabled: true);
+        var desktopNoHost = new DeviceInfo(
+            "d4", "PC3", true, DevicePlatforms.Windows,
+            RemoteAgentEnabled: true, AgentHostEnabled: false);
+        var oldDesktop = new DeviceInfo(
+            "d5", "PC4", true, DevicePlatforms.Windows,
+            RemoteAgentEnabled: true, AgentHostEnabled: true,
+            ProtocolVersion: MeshProtocol.Version - 1);
         Assert.IsFalse(phone.CanHostRemoteTurn, "a mobile device is never an eligible remote host");
         Assert.IsTrue(desktop.CanHostRemoteTurn);
         Assert.IsFalse(desktopNoModel.CanHostRemoteTurn);
+        Assert.IsFalse(desktopNoHost.CanHostRemoteTurn);
+        Assert.IsFalse(oldDesktop.CanHostRemoteTurn);
     }
 }

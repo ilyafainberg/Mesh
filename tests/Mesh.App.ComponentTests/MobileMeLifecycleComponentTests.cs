@@ -3,6 +3,7 @@ using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using Mesh.App.Components.Mobile;
+using Mesh.App.Components.Pages;
 using Mesh.App.Domain;
 using Mesh.App.Services;
 using Mesh.Shared;
@@ -21,6 +22,235 @@ namespace Mesh.App.ComponentTests;
 [DoNotParallelize]
 public sealed class MobileMeLifecycleComponentTests
 {
+    [TestMethod]
+    public async Task MobileLocalSelection_UsesExplicitCurrentDeviceTarget()
+    {
+        var state = CreateFirstRunState(
+            NewStateRoot(),
+            new MemorySecretStore(),
+            "thread");
+        var currentDeviceId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
+        var thread = state.Profile.OwnThreads.Single();
+        thread.ExecutionDeviceId = currentDeviceId;
+        thread.ExecutionDeviceName = "This phone";
+        thread.ExecutionDevicePlatform = DevicePlatforms.IOS;
+        state.Save();
+        var transport = new ControllableDeviceTransport();
+        var harness = CreateHarness(transport, state: state, initializeState: false);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<MobileMe>();
+
+        await renderer.InputAsync(mounted.Id, "Message your assistant", "run locally");
+        var send = renderer.ClickAsync(mounted.Id, "Send");
+        await transport.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.AreEqual(1, transport.SubmitCount);
+        Assert.AreEqual(currentDeviceId, transport.LastDraft?.TargetDeviceId);
+        Assert.AreEqual(
+            1,
+            state.Profile.OwnThreads.Single().Lines.Count(line => line.Text == "run locally"));
+        transport.Release.TrySetResult();
+        await send.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [TestMethod]
+    public async Task MobilePicker_ShowsThisDeviceAndOnlyOnlineAgentDesktopHosts()
+    {
+        var state = CreateFirstRunState(
+            NewStateRoot(),
+            new MemorySecretStore(),
+            "thread");
+        state.Profile.OwnThreads.Clear();
+        state.Save();
+        var transport = new ControllableDeviceTransport
+        {
+            Devices =
+            [
+                new Mesh.Shared.DeviceInfo(
+                    "desktop",
+                    "Eligible desktop",
+                    true,
+                    DevicePlatforms.Windows,
+                    RemoteAgentEnabled: true,
+                    AgentHostEnabled: true),
+                new Mesh.Shared.DeviceInfo(
+                    "phone",
+                    "Remote phone",
+                    true,
+                    DevicePlatforms.IOS,
+                    RemoteAgentEnabled: true,
+                    AgentHostEnabled: true),
+                new Mesh.Shared.DeviceInfo(
+                    "offline",
+                    "Offline desktop",
+                    false,
+                    DevicePlatforms.Windows,
+                    RemoteAgentEnabled: true,
+                    AgentHostEnabled: true),
+                new Mesh.Shared.DeviceInfo(
+                    "no-agent",
+                    "No-agent desktop",
+                    true,
+                    DevicePlatforms.Windows,
+                    RemoteAgentEnabled: false,
+                    AgentHostEnabled: true)
+            ]
+        };
+        var harness = CreateHarness(transport, state: state, initializeState: false);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<MobileMe>();
+
+        await renderer.ClickAsync(mounted.Id, "Choose a device for new chat");
+        await renderer.WaitUntilAsync(
+            () => renderer.RenderedText(mounted.Id).Contains(
+                "Eligible desktop",
+                StringComparison.Ordinal),
+            TimeSpan.FromSeconds(5));
+        var text = renderer.RenderedText(mounted.Id);
+
+        StringAssert.Contains(text, "Talk to this device");
+        StringAssert.Contains(text, "Ready on this device");
+        StringAssert.Contains(text, "Eligible desktop");
+        Assert.IsFalse(text.Contains("Remote phone", StringComparison.Ordinal));
+        Assert.IsFalse(text.Contains("Offline desktop", StringComparison.Ordinal));
+        Assert.IsFalse(text.Contains("No-agent desktop", StringComparison.Ordinal));
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task DesktopColdStart_AndroidOwnerPresenceConvergesAcrossMaterializationOrder(
+        bool presenceBeforeMaterialization)
+    {
+        const string mobileDevice = "android-owner";
+        var state = CreateFirstRunState(
+            NewStateRoot(),
+            new MemorySecretStore(),
+            "thread");
+        var thread = state.Profile.OwnThreads.Single();
+        thread.ExecutionDeviceId = mobileDevice;
+        thread.ExecutionDeviceName = "Android owner";
+        thread.ExecutionDevicePlatform = DevicePlatforms.Android;
+        thread.ExecutionRunId = null;
+        thread.Lines.Add(new ChatLine
+        {
+            Id = "trigger",
+            Role = "user",
+            Text = "cold start",
+            At = DateTimeOffset.UtcNow
+        });
+        thread.Lines.Add(new ChatLine
+        {
+            Id = "answer",
+            Role = "assistant",
+            Text = "terminal",
+            ReplyToLineId = "trigger",
+            At = DateTimeOffset.UtcNow.AddSeconds(1)
+        });
+        state.Save();
+        var transport = new ControllableDeviceTransport { Devices = [] };
+        var harness = CreateHarness(transport, state: state, initializeState: false);
+        var mesh = harness.Services.GetRequiredService<MeshClient>();
+        var notifications = 0;
+        mesh.AccountDevicePresenceChanged += CountNotification;
+        void CountNotification() => notifications++;
+        var onlineRoster = new[] { mesh.MyDeviceId, mobileDevice };
+
+        if (presenceBeforeMaterialization)
+        {
+            mesh.ApplyAccountDevicePresenceSnapshot(onlineRoster);
+            mesh.ApplyAccountDevicePresenceSnapshot(onlineRoster);
+        }
+
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<Home>();
+        if (!presenceBeforeMaterialization)
+        {
+            StringAssert.Contains(renderer.RenderedText(mounted.Id), "Android owner (offline)");
+            mesh.ApplyAccountDevicePresenceSnapshot(onlineRoster);
+            mesh.ApplyAccountDevicePresenceSnapshot(onlineRoster);
+        }
+
+        await renderer.WaitUntilAsync(
+            () => renderer.RenderedText(mounted.Id).Contains(
+                "Android owner (online)",
+                StringComparison.Ordinal),
+            TimeSpan.FromSeconds(5));
+        var onlineText = renderer.RenderedText(mounted.Id);
+        Assert.IsFalse(onlineText.Contains(
+            "Android owner is offline",
+            StringComparison.Ordinal));
+        Assert.IsFalse(onlineText.Contains("thinking", StringComparison.OrdinalIgnoreCase));
+        Assert.IsTrue(renderer.ElementHasAttribute(
+            mounted.Id,
+            "button",
+            "aria-label",
+            "Send",
+            "disabled"));
+        Assert.AreEqual(1, notifications, "duplicate roster observations must be idempotent");
+
+        await renderer.InputAsync(mounted.Id, "Message your assistant", "must stay local");
+        Assert.IsTrue(renderer.ElementHasAttribute(
+            mounted.Id,
+            "button",
+            "aria-label",
+            "Send",
+            "disabled"), "an online mobile owner must not become a remote dispatch target");
+
+        mesh.ApplyAccountDevicePresenceSnapshot([mesh.MyDeviceId]);
+        await renderer.WaitUntilAsync(
+            () => renderer.RenderedText(mounted.Id).Contains(
+                "Android owner (offline)",
+                StringComparison.Ordinal),
+            TimeSpan.FromSeconds(5));
+        mesh.ApplyAccountDevicePresenceSnapshot(onlineRoster);
+        await renderer.WaitUntilAsync(
+            () => renderer.RenderedText(mounted.Id).Contains(
+                "Android owner (online)",
+                StringComparison.Ordinal),
+            TimeSpan.FromSeconds(5));
+
+        await renderer.UnmountAsync(mounted.Id);
+        var restarted = await renderer.MountAsync<Home>();
+        StringAssert.Contains(renderer.RenderedText(restarted.Id), "Android owner (online)");
+        Assert.AreEqual(3, notifications);
+        Assert.AreEqual(0, transport.SubmitCount);
+        mesh.AccountDevicePresenceChanged -= CountNotification;
+    }
+
+    [TestMethod]
+    public async Task MobileSelf_UnconfiguredProvider_RemainsVisibleWithSettingsGuidance()
+    {
+        var state = CreateFirstRunState(
+            NewStateRoot(),
+            new MemorySecretStore(),
+            "thread");
+        state.Profile.OwnThreads.Clear();
+        state.Profile.Model.ApiKey = "";
+        state.Save();
+        var transport = new ControllableDeviceTransport { Devices = [] };
+        var harness = CreateHarness(transport, state: state, initializeState: false);
+        await using var renderer = new ComponentRenderer(harness.Services);
+        var mounted = await renderer.MountAsync<MobileMe>();
+
+        await renderer.ClickAsync(mounted.Id, "Choose a device for new chat");
+        await renderer.WaitUntilAsync(
+            () => renderer.RenderedText(mounted.Id).Contains(
+                "Configure a model in Settings",
+                StringComparison.Ordinal),
+            TimeSpan.FromSeconds(5));
+        var text = renderer.RenderedText(mounted.Id);
+
+        StringAssert.Contains(text, "Talk to this device");
+        StringAssert.Contains(text, "Configure a model in Settings");
+        Assert.IsTrue(renderer.ElementHasAttribute(
+            mounted.Id,
+            "button",
+            "aria-label",
+            "New chat on this device",
+            "disabled"));
+    }
+
     [TestMethod]
     public async Task AtomicRetry_AccountSwitchBeforeBegin_CommitsNowhereAndRequiresFreshReconciliation()
     {
@@ -2020,7 +2250,6 @@ public sealed class MobileMeLifecycleComponentTests
         services.AddSingleton<IAppLifecycleState>(lifecycle);
         services.AddSingleton(new NotificationViewState(lifecycle));
         services.AddSingleton(new MobileOverlayState());
-        services.AddSingleton(new AppShutdownCoordinator(new AppShutdownState()));
         if (observerDispatcherFactory is not null)
             services.AddSingleton(observerDispatcherFactory);
         services.AddLogging();
@@ -2389,6 +2618,8 @@ public sealed class MobileMeLifecycleComponentTests
                     await eventCallback.InvokeAsync();
                 else if (callback is Func<Task> action)
                     await action();
+                else if (callback is Action syncAction)
+                    syncAction();
                 else
                     Assert.Fail($"Unsupported click callback type {callback?.GetType()}.");
             });
@@ -2416,6 +2647,14 @@ public sealed class MobileMeLifecycleComponentTests
                 }
                 return false;
             }).GetAwaiter().GetResult();
+
+        public bool ElementHasAttribute(
+            int componentId,
+            string element,
+            string matchAttribute,
+            string matchValue,
+            string attribute)
+            => HasAttribute(componentId, element, matchAttribute, matchValue, attribute);
 
         public string RenderedText(int componentId)
             => Dispatcher.InvokeAsync(() =>
@@ -2704,7 +2943,14 @@ public sealed class MobileMeLifecycleComponentTests
     {
         public AppState? State { private get; set; }
         public Mesh.Shared.DeviceInfo Device { get; } =
-            new("remote-device", "Remote", true, DevicePlatforms.Windows, true);
+            new(
+                "remote-device",
+                "Remote",
+                true,
+                DevicePlatforms.Windows,
+                RemoteAgentEnabled: true,
+                AgentHostEnabled: true);
+        public IReadOnlyList<Mesh.Shared.DeviceInfo> Devices { get; set; }
         public TaskCompletionSource Entered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } =
@@ -2712,6 +2958,11 @@ public sealed class MobileMeLifecycleComponentTests
         public int SubmitCount;
         public TopicTurnDraft? LastDraft { get; private set; }
         public TopicDispatchResult? ImmediateResult { get; set; }
+
+        public ControllableDeviceTransport()
+        {
+            Devices = [Device];
+        }
 
         public async Task<TopicDispatchResult> SubmitAsync(
             TopicTurnDraft draft,
@@ -2756,7 +3007,7 @@ public sealed class MobileMeLifecycleComponentTests
 
         public Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
             CancellationToken cancellationToken)
-            => Task.FromResult<IReadOnlyList<Mesh.Shared.DeviceInfo>>([Device]);
+            => Task.FromResult(Devices);
     }
 
     private sealed class DurableTransportCounter
@@ -2779,7 +3030,13 @@ public sealed class MobileMeLifecycleComponentTests
         bool completeRemoteRun = false) : IDeviceTopicTransport
     {
         private readonly Mesh.Shared.DeviceInfo remote =
-            new("remote-device", "Remote", true, DevicePlatforms.Windows, true);
+            new(
+                "remote-device",
+                "Remote",
+                true,
+                DevicePlatforms.Windows,
+                RemoteAgentEnabled: true,
+                AgentHostEnabled: true);
         private readonly HashSet<string> observedOutboxes = new(StringComparer.Ordinal);
         private readonly HashSet<string> observedCorrelations = new(StringComparer.Ordinal);
         private readonly HashSet<string> requestEnvelopes = new(StringComparer.Ordinal);

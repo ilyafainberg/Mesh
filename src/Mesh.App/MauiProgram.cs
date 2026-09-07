@@ -15,9 +15,6 @@ public static class MauiProgram
 		var builder = MauiApp.CreateBuilder();
 		var diagnostics = new RuntimeDiagnostics(Path.Combine(StoragePaths.Root, "Diagnostics"));
 		builder.Services.AddSingleton(diagnostics);
-		builder.Services.AddSingleton<AppShutdownState>();
-		builder.Services.AddSingleton<AppShutdownCoordinator>();
-		builder.Services.AddSingleton<WidgetDiagnosticsBridge>();
 		diagnostics.StartSession(PlatformCaps.DevicePlatform, detectUnexpectedTermination: OperatingSystem.IsIOS());
 		diagnostics.InstallManagedHandlers();
 		builder.Logging.AddProvider(new RuntimeDiagnosticsLoggerProvider(diagnostics));
@@ -60,9 +57,7 @@ public static class MauiProgram
 		// well past the default 100s HttpClient timeout. Give model calls plenty of room.
 		builder.Services.AddHttpClient("model", c => c.Timeout = TimeSpan.FromMinutes(10));
 		builder.Services.AddHttpClient("connector");
-		builder.Services.AddTransient<RelayTransportPolicyHandler>();
-		builder.Services.AddHttpClient("relay")
-			.AddHttpMessageHandler<RelayTransportPolicyHandler>();
+		builder.Services.AddHttpClient("relay");
 		builder.Services.AddSingleton(TimeProvider.System);
 		// The self-updater downloads a large (hundreds of MB) client zip, so give it a generous
 		// timeout and the User-Agent the GitHub API requires.
@@ -185,9 +180,6 @@ public static class MauiProgram
 #endif
 
 		var app = builder.Build();
-#if WINDOWS
-		_ = app.Services.GetRequiredService<IAppControl>();
-#endif
 
 		// Bind the singleton service to the static bridge so the Windows platform layer
 		// can forward --ui-mode args from a second launch without a service-locator call.
@@ -220,12 +212,14 @@ public static class MauiProgram
 #endif
 
 		// Auto-update marketplace-imported skills in the background at startup (never blocks launch).
-		var shutdown = app.Services.GetRequiredService<AppShutdownCoordinator>();
-		shutdown.Track(
-			Task.Run(
-				() => app.Services.GetRequiredService<SkillMarketplaceService>().SyncAllAsync(shutdown.Token),
-				shutdown.Token),
-			"marketplace startup sync");
+		_ = Task.Run(async () =>
+		{
+			try
+			{
+				await app.Services.GetRequiredService<SkillMarketplaceService>().SyncAllAsync();
+			}
+			catch (Exception ex) { RuntimeDiagnostics.Current?.RecordException("marketplace-startup-sync", ex); }
+		});
 		return app;
 	}
 

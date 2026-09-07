@@ -6,34 +6,8 @@ using Mesh.Shared;
 namespace Mesh.App.Services;
 
 /// <summary>Serializes owner turns per topic while allowing unrelated topics to run concurrently.</summary>
-public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
+public sealed class TopicTurnRunner(AgentService agent, AppState state) : ITopicTurnRunner
 {
-    private readonly AgentService agent;
-    private readonly AppState state;
-    private readonly CancellationTokenSource lifetime;
-    private readonly ConcurrentDictionary<long, Task> drainTasks = new();
-    private readonly object stopGate = new();
-    private long nextDrainTaskId;
-    private Task? stopTask;
-
-    public TopicTurnRunner(AgentService agent, AppState state)
-        : this(agent, state, new AppShutdownState(), null)
-    {
-    }
-
-    public TopicTurnRunner(
-        AgentService agent,
-        AppState state,
-        AppShutdownState shutdownState,
-        AppShutdownCoordinator? shutdown)
-    {
-        this.agent = agent;
-        this.state = state;
-        lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdownState.Token);
-        shutdown?.Register(
-            "topic-turn-runner",
-            cancellationToken => StopAsync().WaitAsync(cancellationToken));
-    }
     private sealed class TopicQueue
     {
         public readonly object Sync = new();
@@ -76,15 +50,12 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(draft);
         ArgumentNullException.ThrowIfNull(progress);
 
-        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken, lifetime.Token);
-        var effectiveCancellation = linkedCancellation.Token;
         var queue = queues.GetOrAdd(draft.ThreadId, static _ => new TopicQueue());
         var item = new WorkItem
         {
             Draft = draft,
             Progress = progress,
-            CancellationToken = effectiveCancellation,
+            CancellationToken = cancellationToken,
             OnStarted = onStarted
         };
         var startDrain = false;
@@ -112,9 +83,9 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         }
         finally
         {
-            if (startDrain) TrackDrain(DrainAsync(queue));
+            if (startDrain) _ = DrainAsync(queue);
         }
-        using var registration = effectiveCancellation.Register(() =>
+        using var registration = cancellationToken.Register(() =>
         {
             var clearQueued = false;
             lock (queue.Sync)
@@ -194,67 +165,6 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         }
     }
 
-    private void TrackDrain(Task task)
-    {
-        var id = Interlocked.Increment(ref nextDrainTaskId);
-        drainTasks[id] = task;
-        _ = ObserveDrainAsync(id, task);
-    }
-
-    private async Task ObserveDrainAsync(long id, Task task)
-    {
-        try
-        {
-            await task.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            RuntimeDiagnostics.Current?.RecordException("topic-turn-drain", ex);
-        }
-        finally
-        {
-            drainTasks.TryRemove(id, out _);
-        }
-    }
-
-    private Task StopAsync()
-    {
-        lock (stopGate)
-            return stopTask ??= StopCoreAsync();
-    }
-
-    private async Task StopCoreAsync()
-    {
-        try
-        {
-            lifetime.Cancel();
-        }
-        catch (AggregateException ex)
-        {
-            RuntimeDiagnostics.Current?.RecordException("topic-turn-cancel", ex);
-        }
-
-        while (true)
-        {
-            var pending = drainTasks.Values.Where(task => !task.IsCompleted).ToArray();
-            if (pending.Length == 0) return;
-            var completions = pending.Select(task => task.ContinueWith(
-                static _ => { },
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default));
-            await Task.WhenAll(completions).ConfigureAwait(false);
-        }
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await StopAsync().ConfigureAwait(false);
-        lifetime.Dispose();
-    }
     private static bool TryDequeue(TopicQueue queue, out WorkItem item)
     {
         lock (queue.Sync)
@@ -280,6 +190,7 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, stateToken);
         ChatLine? trigger = null;
+        TopicRunCompletion? completion = null;
 
         try
         {
@@ -302,36 +213,54 @@ public sealed class TopicTurnRunner : ITopicTurnRunner, IAsyncDisposable
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Completed);
             await PublishTerminalAsync(draft, NotificationKind.TopicCompleted).ConfigureAwait(false);
             state.MarkThreadCompleted(draft.ThreadId);
-            return Complete(progress, draft, TopicRunPhase.Completed, "Completed");
+            completion = Complete(progress, draft, TopicRunPhase.Completed, "Completed");
+            return completion;
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested)
         {
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Cancelled);
             await PublishTerminalAsync(draft, NotificationKind.TopicCancelled).ConfigureAwait(false);
-            return Complete(progress, draft, TopicRunPhase.Cancelled, "Cancelled");
+            completion = Complete(progress, draft, TopicRunPhase.Cancelled, "Cancelled");
+            return completion;
         }
         catch (InvalidWidgetContextException ex)
         {
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Failed);
             await PublishTerminalAsync(draft, NotificationKind.TopicFailed).ConfigureAwait(false);
-            return Complete(
+            completion = Complete(
                 progress, draft, TopicRunPhase.Failed, "Failed",
                 ex.Message, "invalid_widget_context");
+            return completion;
         }
         catch (Exception ex)
         {
             state.UpdateAgentRun(draft.ThreadId, AgentRunPhase.Failed);
             await PublishTerminalAsync(draft, NotificationKind.TopicFailed).ConfigureAwait(false);
-            return Complete(
+            completion = Complete(
                 progress, draft, TopicRunPhase.Failed, "Failed",
                 ex.Message, "execution_failed");
+            return completion;
         }
         finally
         {
             if (trigger is not null) trigger.Attachments.Clear();
             state.ClearThreadBuilding(draft.ThreadId);
             state.EndThreadTurn(draft.ThreadId);
-            state.ClearRemoteRunProjection(draft.ThreadId, draft.RunId);
+            state.ClearRemoteRunProjection(
+                draft.ThreadId,
+                draft.RunId,
+                completion?.CompletedAt,
+                completion is null
+                    ? null
+                    : new TopicRunUpdatePayload(
+                        completion.RunId,
+                        completion.ThreadId,
+                        completion.Phase,
+                        completion.Phase.ToString(),
+                        Error: completion.Error,
+                        FailureCode: completion.FailureCode,
+                        Timestamp: completion.CompletedAt,
+                        TriggerLineId: draft.TriggerLineId));
         }
     }
     private async Task PublishTerminalAsync(TopicTurnDraft draft, NotificationKind kind)

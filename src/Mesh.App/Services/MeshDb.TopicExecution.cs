@@ -2087,66 +2087,6 @@ public sealed partial class MeshDb
         cmd.ExecuteNonQuery();
     }
 
-    public void ReplaceDeviceEnvelopeOutboxForTargetAndKind(
-        DeviceEnvelopeOutboxItem item,
-        Func<DeviceEnvelopeOutboxItem, bool>? shouldReplaceExisting = null)
-    {
-        using var transaction = conn.BeginTransaction();
-        if (shouldReplaceExisting is not null)
-        {
-            var preserveExisting = false;
-            using (var select = conn.CreateCommand())
-            {
-                select.Transaction = transaction;
-                select.CommandText = """
-                    SELECT * FROM device_envelope_outbox
-                    WHERE target_device_id = $device AND kind = $kind;
-                    """;
-                select.Parameters.AddWithValue("$device", item.TargetDeviceId);
-                select.Parameters.AddWithValue("$kind", item.Kind);
-                using var reader = select.ExecuteReader();
-                while (reader.Read())
-                {
-                    if (shouldReplaceExisting(ReadDeviceEnvelopeOutbox(reader))) continue;
-                    preserveExisting = true;
-                    break;
-                }
-            }
-            if (preserveExisting)
-            {
-                transaction.Commit();
-                return;
-            }
-        }
-        using (var remove = conn.CreateCommand())
-        {
-            remove.Transaction = transaction;
-            remove.CommandText = """
-                DELETE FROM device_envelope_outbox
-                WHERE target_device_id = $device AND kind = $kind;
-                """;
-            remove.Parameters.AddWithValue("$device", item.TargetDeviceId);
-            remove.Parameters.AddWithValue("$kind", item.Kind);
-            remove.ExecuteNonQuery();
-        }
-        using (var insert = conn.CreateCommand())
-        {
-            insert.Transaction = transaction;
-            insert.CommandText = """
-                INSERT INTO device_envelope_outbox(
-                    envelope_id, target_device_id, kind, plaintext, push_hint, created_at)
-                VALUES($id, $device, $kind, $plaintext, $push, $created);
-                """;
-            insert.Parameters.AddWithValue("$id", item.EnvelopeId);
-            insert.Parameters.AddWithValue("$device", item.TargetDeviceId);
-            insert.Parameters.AddWithValue("$kind", item.Kind);
-            insert.Parameters.AddWithValue("$plaintext", item.Plaintext);
-            insert.Parameters.AddWithValue("$push", (object?)item.PushHint ?? DBNull.Value);
-            insert.Parameters.AddWithValue("$created", item.CreatedAt.ToString("O"));
-            insert.ExecuteNonQuery();
-        }
-        transaction.Commit();
-    }
     private static bool TopicReceiptOutboxSemanticallyMatches(
         DeviceEnvelopeOutboxItem existing,
         DeviceEnvelopeOutboxItem candidate)

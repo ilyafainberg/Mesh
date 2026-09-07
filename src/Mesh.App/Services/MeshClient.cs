@@ -29,9 +29,6 @@ public sealed partial class MeshClient :
     private readonly IHttpClientFactory httpFactory;
     private readonly IPushService push;
     private readonly IAppLifecycleState lifecycle;
-    private readonly CancellationTokenSource lifetime;
-    private readonly object shutdownGate = new();
-    private Task? shutdownTask;
     private readonly TimeProvider timeProvider;
     private readonly ITopicEnvelopeTransport? topicEnvelopeTransport;
     private readonly TopicControlOutboxDelivery topicControlOutboxDelivery;
@@ -79,7 +76,11 @@ public sealed partial class MeshClient :
     private readonly TopicDeliveryRetryLoop onlineDeliveryRetry;
     private int shutdownRequested;
     private string? terminalRosterFailureDeviceId;
-    private string? lastConnectionError;
+    private readonly object accountDevicePresenceGate = new();
+    private volatile IReadOnlySet<string>? latestAccountOnlineDevices;
+    private volatile IReadOnlyDictionary<string, Mesh.Shared.DeviceInfo> latestDeviceDirectory =
+        new Dictionary<string, Mesh.Shared.DeviceInfo>(StringComparer.Ordinal);
+    private readonly Func<string>? currentPlatformProvider;
     internal ITopicEnvelopeTestFaultScheduler? TopicEnvelopeTestFaultScheduler { get; set; }
 
     public MeshClient(
@@ -91,8 +92,7 @@ public sealed partial class MeshClient :
         IAppLifecycleState lifecycle,
         TimeProvider? timeProvider = null,
         ITopicEnvelopeTransport? topicEnvelopeTransport = null,
-        AppShutdownState? shutdownState = null,
-        AppShutdownCoordinator? shutdown = null)
+        Func<string>? currentPlatformProvider = null)
     {
         this.state = state;
         this.agent = agent;
@@ -100,10 +100,9 @@ public sealed partial class MeshClient :
         this.httpFactory = httpFactory;
         this.push = push;
         this.lifecycle = lifecycle;
-        lifetime = CancellationTokenSource.CreateLinkedTokenSource(
-            (shutdownState ?? new AppShutdownState()).Token);
         this.timeProvider = timeProvider ?? TimeProvider.System;
         this.topicEnvelopeTransport = topicEnvelopeTransport;
+        this.currentPlatformProvider = currentPlatformProvider;
         topicControlOutboxDelivery = new TopicControlOutboxDelivery(
             state, topicEnvelopeTransport ?? this, this.timeProvider);
         topicDurabilityHandler = new TopicDurabilityHandler(state, this.timeProvider);
@@ -125,14 +124,17 @@ public sealed partial class MeshClient :
         state.ActiveAccountChanging += OnActiveAccountChanging;
         replicationActivity.Changed += () => ReplicationStateChanged?.Invoke();
         Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged += OnConnectivityChanged;
-        shutdown?.Register(
-            "mesh-client",
-            cancellationToken => ShutdownAsync().WaitAsync(cancellationToken));
     }
 
     private void OnActiveAccountChanging()
     {
         Volatile.Write(ref terminalRosterFailureDeviceId, null);
+        lock (accountDevicePresenceGate)
+        {
+            latestAccountOnlineDevices = null;
+            latestDeviceDirectory =
+                new Dictionary<string, Mesh.Shared.DeviceInfo>(StringComparer.Ordinal);
+        }
         var pushIdentity = CapturePushUnregistrationIdentity();
         StopReplicationAsync("active-account-changing").GetAwaiter().GetResult();
         Volatile.Write(ref registeredPushIdentity, null);
@@ -211,7 +213,6 @@ public sealed partial class MeshClient :
     }
 
     public bool Connected => hub?.State == HubConnectionState.Connected && authenticated;
-    public string? LastConnectionError => Volatile.Read(ref lastConnectionError);
     public bool IsReplicationActive
         => replicationActivity.IsActive
            || CurrentReplicationStatus.Phase is ReplicationPhase.Connecting
@@ -225,13 +226,8 @@ public sealed partial class MeshClient :
         : MeshKinds.Chat;
     public event Action? StateChanged;
     public event Action? ReplicationStateChanged;
+    public event Action? AccountDevicePresenceChanged;
     public event Action<string>? Log;
-
-    private void NotifyStateChanged()
-    {
-        if (!lifetime.IsCancellationRequested)
-            StateChanged?.Invoke();
-    }
 
     /// <summary>
     /// This device's stable id, derived from its public signing key. Same derivation the relay uses,
@@ -278,8 +274,8 @@ public sealed partial class MeshClient :
                     NullIfBlank(p.RecoveryPublicKey),
                     sig,
                     deviceName,
-                    PlatformCaps.DevicePlatform,
-                    PlatformCaps.CanRunAgent && agent.IsModelReady,
+                    CurrentDevicePlatform,
+                    DevicePlatforms.IsDesktop(CurrentDevicePlatform) && agent.IsModelReady,
                     AgentHostEnabled: true,
                     ProtocolVersion: MeshProtocol.Version,
                     CustodyAuthority: custody),
@@ -509,32 +505,9 @@ public sealed partial class MeshClient :
 
     public async Task ConnectAsync()
     {
-        try
-        {
-            await using var lease = await EnsureConnectedAsync(
-                ConnectionPurpose.Foreground,
-                CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (OnlineReplicationError ex)
-        {
-            Volatile.Write(ref lastConnectionError, ex.Message);
-            NotifyStateChanged();
-            ScheduleRecovery();
-            throw;
-        }
-        catch (Exception ex) when (ex is HttpRequestException
-                                   or TimeoutException
-                                   or InvalidOperationException)
-        {
-            var failure = new OnlineReplicationError(
-                $"Could not establish an authenticated Protocol {MeshProtocol.Version} relay connection: {ex.Message}",
-                ex);
-            Volatile.Write(ref lastConnectionError, failure.Message);
-            Log?.Invoke($"relay connection failed: {ex.GetType().Name}: {ex.Message}");
-            NotifyStateChanged();
-            ScheduleRecovery();
-            throw failure;
-        }
+        await using var lease = await EnsureConnectedAsync(
+            ConnectionPurpose.Foreground,
+            CancellationToken.None).ConfigureAwait(false);
     }
 
     internal async Task<ReplicationConnectionLease> EnsureConnectedAsync(
@@ -715,17 +688,11 @@ public sealed partial class MeshClient :
                     lifecycle.IsForeground,
                     PlatformCaps.IsMobile,
                     MeshProcessContext.IsHeadless)) return;
-            if (!Uri.TryCreate(p.RelayUrl, UriKind.Absolute, out var relayUri))
-                throw new OnlineReplicationError("The configured relay URL is invalid.");
-            try
+            if (!await DetectRelayCapabilitiesAsync(p.RelayUrl, ct).ConfigureAwait(false))
             {
-                RelayTransportPolicy.EnsureAllowed(relayUri);
+                StateChanged?.Invoke();
+                throw new OnlineReplicationError("The relay is missing required Protocol 9 capabilities.");
             }
-            catch (RelayTransportPolicyException ex)
-            {
-                throw new OnlineReplicationError(ex.Message, ex);
-            }
-            await EnsureRelayCapabilitiesAsync(p.RelayUrl, ct).ConfigureAwait(false);
 
             var normHandle = AppState.Norm(p.Handle);
             var rosterReconciliation = await DeviceRosterReconciliationPolicy.ReconcileCurrentDeviceAsync(
@@ -834,7 +801,6 @@ public sealed partial class MeshClient :
             connection.On<PresenceConfirmed>(MeshHubProtocol.PresenceConfirmed, _ =>
             {
                 authenticated = true;
-                Volatile.Write(ref lastConnectionError, null);
                 var identity = CaptureReplicationConnectionIdentity(connection);
                 authenticatedReplicationConnectionIdentity = identity;
                 Log?.Invoke("hub connected + authenticated");
@@ -916,7 +882,7 @@ public sealed partial class MeshClient :
             {
                 authenticationReady.TrySetException(ex);
                 Log?.Invoke($"hub connect failed: {ex.Message}");
-                NotifyStateChanged();
+                StateChanged?.Invoke();
                 ScheduleRecovery();
                 if (purpose == ConnectionPurpose.BackgroundWake) throw;
             }
@@ -978,7 +944,7 @@ public sealed partial class MeshClient :
             OnlineReplicationWakeCapabilityPolicy.IsSupported(capabilities));
     }
 
-    private async Task EnsureRelayCapabilitiesAsync(
+    private async Task<bool> DetectRelayCapabilitiesAsync(
         string relayUrl,
         CancellationToken ct = default)
     {
@@ -990,40 +956,37 @@ public sealed partial class MeshClient :
         supportsAuthoritativeTopicState = false;
         supportsAgentHost = false;
         supportsWakeConnect = false;
-        RelayCapabilities capabilities;
         try
         {
-            capabilities = await ReadRelayCapabilitiesAsync(relayUrl, ct).ConfigureAwait(false);
+            var capabilities = await ReadRelayCapabilitiesAsync(relayUrl, ct).ConfigureAwait(false);
+            if (capabilities.ProtocolVersion != MeshProtocol.Version)
+            {
+                Log?.Invoke($"relay protocol mismatch: expected {MeshProtocol.Version}, got {capabilities.ProtocolVersion}");
+                return false;
+            }
+            if (!capabilities.SendResults
+                || !capabilities.Replication
+                || !capabilities.SnapshotTransferV2
+                || !capabilities.OnlineDelivery)
+            {
+                Log?.Invoke("relay is missing required online replication capabilities");
+                return false;
+            }
+            supportsSendResults = capabilities.SendResults;
+            supportsEphemeralDelivery = capabilities.EphemeralDelivery;
+            supportsFanout = capabilities.Fanout;
+            supportsReplication = capabilities.Replication;
+            supportsDeviceRevocation = capabilities.DeviceRevocation;
+            supportsAuthoritativeTopicState = capabilities.AuthoritativeTopicState;
+            supportsAgentHost = capabilities.AgentHost;
+            supportsWakeConnect = capabilities.WakeConnect;
+            return true;
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            Log?.Invoke($"relay capability detection failed: {ex.GetType().Name}: {ex.Message}");
-            throw new OnlineReplicationError(
-                $"Could not read Protocol {MeshProtocol.Version} capabilities from the relay.",
-                ex);
+            Log?.Invoke($"relay capability detection failed: {ex.Message}");
+            return false;
         }
-        if (capabilities.ProtocolVersion != MeshProtocol.Version)
-            throw new OnlineReplicationError(
-                $"Relay protocol mismatch: expected {MeshProtocol.Version}, got {capabilities.ProtocolVersion}.");
-
-        var missing = new List<string>();
-        if (!capabilities.SendResults) missing.Add("sendResults");
-        if (!capabilities.Replication) missing.Add("replication");
-        if (!capabilities.SnapshotTransferV2) missing.Add("snapshotTransferV2");
-        if (!capabilities.OnlineDelivery) missing.Add("onlineDelivery");
-        if (missing.Count != 0)
-            throw new OnlineReplicationError(
-                $"The relay is missing required Protocol {MeshProtocol.Version} capabilities: {string.Join(", ", missing)}.");
-
-        supportsSendResults = capabilities.SendResults;
-        supportsEphemeralDelivery = capabilities.EphemeralDelivery;
-        supportsFanout = capabilities.Fanout;
-        supportsReplication = capabilities.Replication;
-        supportsDeviceRevocation = capabilities.DeviceRevocation;
-        supportsAuthoritativeTopicState = capabilities.AuthoritativeTopicState;
-        supportsAgentHost = capabilities.AgentHost;
-        supportsWakeConnect = capabilities.WakeConnect;
     }
     /// <summary>
     /// Guards the auth handshake: if the connection is up but the challenge/response never completes
@@ -1034,7 +997,7 @@ public sealed partial class MeshClient :
     {
         TrackBackground(Task.Run(async () =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(12), lifetime.Token);
+            await Task.Delay(TimeSpan.FromSeconds(12));
             if (!ReferenceEquals(hub, connection)) return; // superseded by a newer connection
             if (wantConnected && ShouldMaintainContinuousTransport
                 && !authenticated && connection.State == HubConnectionState.Connected)
@@ -1067,7 +1030,7 @@ public sealed partial class MeshClient :
                 var delay = TimeSpan.FromSeconds(2);
                 while (wantConnected && ShouldMaintainContinuousTransport)
                 {
-                    await Task.Delay(delay, timeProvider, lifetime.Token);
+                    await Task.Delay(delay, timeProvider, CancellationToken.None);
                     if (!wantConnected) break;
                     if (Connected)
                     {
@@ -1411,7 +1374,7 @@ public sealed partial class MeshClient :
                     $"request:{from}", NotificationKind.ContactRequest, from, NotificationRoutes.Requests,
                     $"Request from @{from}", text, ct);
             Log?.Invoke($"inbound from @{from} held for approval");
-            NotifyStateChanged();
+            StateChanged?.Invoke();
             return;
         }
 
@@ -1629,6 +1592,8 @@ public sealed partial class MeshClient :
             env.Body, state.Profile.PrivateKey, state.Profile.PublicKey);
         if (!decrypted || plaintext is null)
             throw new InboundPermanentRejectException("topic_decryption_failed");
+        if (string.Equals(env.Kind, MeshKinds.TopicRunRequest, StringComparison.Ordinal))
+            await EnsureCurrentDeviceCanHostRemoteTopicAsync(ct).ConfigureAwait(false);
 
         switch (env.Kind)
         {
@@ -1791,7 +1756,7 @@ public sealed partial class MeshClient :
                 if (update.Phase is TopicRunPhase.Completed or TopicRunPhase.Failed or TopicRunPhase.Cancelled)
                     state.DeleteDeferredTopicRunUpdates(update.RunId);
                 RememberReplay(topicEnvelopeReplay, env.Id);
-                NotifyStateChanged();
+                StateChanged?.Invoke();
                 break;
 
             case MeshKinds.TopicRunCancel:
@@ -2326,7 +2291,6 @@ public sealed partial class MeshClient :
 
     private void TrackBackground(Task task, string operation)
     {
-        ArgumentNullException.ThrowIfNull(task);
         var id = Interlocked.Increment(ref nextBackgroundTaskId);
         backgroundTasks[id] = task;
         task.ContinueWith(completed =>
@@ -2755,7 +2719,7 @@ public sealed partial class MeshClient :
             keyCache[h] = keys;
             keyCacheUpdated[h] = DateTimeOffset.UtcNow;
             state.ReverifyContact(h, keys);
-            NotifyStateChanged();
+            StateChanged?.Invoke();
             return true;
         }
         catch { return false; }
@@ -2817,6 +2781,13 @@ public sealed partial class MeshClient :
         if (thread is null
             || !string.Equals(thread.ExecutionDeviceId, targetDeviceId, StringComparison.Ordinal))
             return TopicDispatchResult.Reject("invalid_thread_target", request.RunId);
+        var target = await ResolveAccountDeviceAsync(targetDeviceId, cancellationToken)
+            .ConfigureAwait(false);
+        if (target is null || !target.CanHostRemoteTurn)
+            return TopicDispatchResult.Reject(
+                "device_not_eligible",
+                request.RunId,
+                "The selected device is not agent-ready.");
 
         var manifest = request.Attachments ?? Array.Empty<TopicRunAttachment>();
         var ids = request.AttachmentIds ?? manifest.Select(item => item.Id).ToArray();
@@ -2882,7 +2853,7 @@ public sealed partial class MeshClient :
     public async Task<IReadOnlyList<Mesh.Shared.DeviceInfo>> ListEligibleDevicesAsync(
         CancellationToken cancellationToken)
         => (await ListMyDevicesCoreAsync(cancellationToken))
-            .Where(device => device.CanHostRemoteTurn)
+            .Where(device => device.Online && device.CanHostRemoteTurn)
             .ToArray();
 
     private Task<bool> SendTargetedTopicEnvelopeAsync(
@@ -3021,11 +2992,113 @@ public sealed partial class MeshClient :
         var h = AppState.Norm(state.Profile.Handle);
         if (string.IsNullOrWhiteSpace(h)) return Array.Empty<Mesh.Shared.DeviceInfo>();
         var http = httpFactory.CreateClient("relay");
-        return await http.GetFromJsonAsync<Mesh.Shared.DeviceInfo[]>(
+        var fetched = await http.GetFromJsonAsync<Mesh.Shared.DeviceInfo[]>(
                    $"{state.Profile.RelayUrl.TrimEnd('/')}/handles/{Uri.EscapeDataString(h)}/devices",
                    Json,
                    ct)
                ?? Array.Empty<Mesh.Shared.DeviceInfo>();
+        lock (accountDevicePresenceGate)
+        {
+            var observed = latestAccountOnlineDevices;
+            var devices = observed is null
+                ? fetched
+                : fetched.Select(device =>
+                        device.Online == observed.Contains(device.DeviceId)
+                            ? device
+                            : device with { Online = observed.Contains(device.DeviceId) })
+                    .ToArray();
+            latestDeviceDirectory = devices
+                .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+            return devices;
+        }
+    }
+
+    public bool IsAccountDeviceOnline(string? deviceId)
+    {
+        if (string.Equals(deviceId, MyDeviceId, StringComparison.Ordinal)) return true;
+        if (deviceId is null) return false;
+        var observed = latestAccountOnlineDevices;
+        return observed?.Contains(deviceId)
+               ?? latestDeviceDirectory.TryGetValue(deviceId, out var device) && device.Online;
+    }
+
+    internal bool HasAccountDevicePresenceSnapshot => latestAccountOnlineDevices is not null;
+
+    internal void ApplyAccountDevicePresenceSnapshot(IReadOnlyCollection<string> onlineDevices)
+    {
+        ArgumentNullException.ThrowIfNull(onlineDevices);
+        var observed = onlineDevices
+            .Where(static device => !string.IsNullOrWhiteSpace(device))
+            .ToHashSet(StringComparer.Ordinal);
+        var changed = false;
+        lock (accountDevicePresenceGate)
+        {
+            changed = latestAccountOnlineDevices?.SetEquals(observed) != true;
+            latestAccountOnlineDevices = observed;
+            var directory = latestDeviceDirectory;
+            if (directory.Count > 0)
+            {
+                latestDeviceDirectory = directory.ToDictionary(
+                    static item => item.Key,
+                    item =>
+                    {
+                        var online = observed.Contains(item.Key);
+                        return item.Value.Online == online
+                            ? item.Value
+                            : item.Value with { Online = online };
+                    },
+                    StringComparer.Ordinal);
+            }
+        }
+        if (changed) AccountDevicePresenceChanged?.Invoke();
+    }
+
+    private string CurrentDevicePlatform =>
+        currentPlatformProvider?.Invoke() ?? PlatformCaps.DevicePlatform;
+
+    private async Task<Mesh.Shared.DeviceInfo?> ResolveAccountDeviceAsync(
+        string deviceId,
+        CancellationToken cancellationToken)
+        => (await ListMyDevicesCoreAsync(cancellationToken).ConfigureAwait(false))
+            .FirstOrDefault(device =>
+                string.Equals(device.DeviceId, deviceId, StringComparison.Ordinal));
+
+    private async Task EnsureCurrentDeviceCanHostRemoteTopicAsync(
+        CancellationToken cancellationToken)
+    {
+        var locallyEligible = Connected
+                              && supportsAgentHost
+                              && agent.IsModelReady
+                              && DevicePlatforms.IsDesktop(CurrentDevicePlatform);
+        if (!locallyEligible)
+        {
+            TraceTransport("topic-remote-host-rejected", "local_capability");
+            throw new InboundPermanentRejectException("topic_remote_host_not_eligible");
+        }
+
+        Mesh.Shared.DeviceInfo? registered;
+        try
+        {
+            registered = await ResolveAccountDeviceAsync(MyDeviceId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new InboundRetryException(
+                "topic_remote_host_authorization_unavailable:" + ex.GetType().Name);
+        }
+        catch (JsonException ex)
+        {
+            throw new InboundRetryException(
+                "topic_remote_host_authorization_unavailable:" + ex.GetType().Name);
+        }
+
+        if (registered is not { Online: true, CanHostRemoteTurn: true })
+        {
+            TraceTransport("topic-remote-host-rejected", "directory_capability");
+            throw new InboundPermanentRejectException("topic_remote_host_not_eligible");
+        }
     }
 
     /// <summary>
@@ -3393,7 +3466,7 @@ public sealed partial class MeshClient :
     {
         if (string.IsNullOrWhiteSpace(text)) return "(no content)";
         var clean = text.Replace("\r", " ").Replace("\n", " ").Trim();
-        return clean.Length > 120 ? clean[..120] + "â€¦" : clean;
+        return clean.Length > 120 ? clean[..120] + "…" : clean;
     }
 
     private async Task PublishLegacyNotificationAsync(
@@ -3727,54 +3800,6 @@ public sealed partial class MeshClient :
                 catch (Exception ex) { TraceTransport("background-dispose-failed", ex.Message); }
             }
         }
-        NotifyStateChanged();
-    }
-
-    private Task ShutdownAsync()
-    {
-        lock (shutdownGate)
-            return shutdownTask ??= ShutdownCoreAsync();
-    }
-
-    private async Task ShutdownCoreAsync()
-    {
-        wantConnected = false;
-        lifecycle.ForegroundChanged -= OnForegroundChanged;
-        lifecycle.ForegroundChanged -= OnReplicationForegroundChanged;
-        Microsoft.Maui.Networking.Connectivity.Current.ConnectivityChanged -= OnConnectivityChanged;
-
-        try
-        {
-            lifetime.Cancel();
-        }
-        catch (AggregateException ex)
-        {
-            RuntimeDiagnostics.Current?.RecordException("mesh-client-cancel", ex);
-        }
-
-        foreach (var active in activeTopicRuns.Values)
-        {
-            try { active.Cancellation.Cancel(); }
-            catch (ObjectDisposedException) { }
-        }
-
-        await DisconnectAsync().ConfigureAwait(false);
-        while (true)
-        {
-            var pending = backgroundTasks.Values.Where(task => !task.IsCompleted).ToArray();
-            if (pending.Length == 0) return;
-            var completions = pending.Select(task => task.ContinueWith(
-                static _ => { },
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default));
-            await Task.WhenAll(completions).ConfigureAwait(false);
-        }
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await ShutdownAsync().ConfigureAwait(false);
-        lifetime.Dispose();
+        StateChanged?.Invoke();
     }
 }

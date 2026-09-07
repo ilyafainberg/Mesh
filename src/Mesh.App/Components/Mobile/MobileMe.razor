@@ -5,7 +5,6 @@
    OnInitialized defaulting to the LIST view instead of auto-opening a thread. *@
 @page "/m/me"
 @inject AppState State
-@inject AppShutdownCoordinator Shutdown
 @inject AgentService Agent
 @inject MeshClient Mesh
 @inject ITopicExecutionRouter TopicRouter
@@ -122,7 +121,7 @@
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "Talk to this device" : $"Talk to {FriendlyName(device)}")</strong>
-                            <small>@(device.Online ? "Online" : "Offline")</small>
+                            <small>@DeviceAvailability(device)</small>
                         </span>
                     </button>
                 }
@@ -581,7 +580,7 @@ else
                         <i class="bi @PlatformIcon(device.Platform)"></i>
                         <span class="device-choice-main">
                             <strong>@(IsCurrentDevice(device) ? "This device" : FriendlyName(device))</strong>
-                            <small>@(device.Online ? "Online" : "Offline")</small>
+                            <small>@DeviceAvailability(device)</small>
                         </span>
                     </button>
                 }
@@ -770,9 +769,15 @@ else
     bool ReconciliationPending => CurrentSendSnapshot is { } snapshot
         && TopicSends.TryGetOutcome(snapshot.OperationId, out var outcome)
         && outcome?.Kind == TopicSendOutcomeKind.Reconciling;
+    bool ActiveExecutionReady => ActiveUsesCurrentDevice
+        ? Agent.IsModelReady
+        : Active is not null
+          && DeviceChoices.Any(device =>
+              string.Equals(device.DeviceId, Active.ExecutionDeviceId, StringComparison.Ordinal)
+              && IsEligibleRemoteHost(device));
     bool CanSend => !widgetLoading
         && widgetLoadError is null
-        && (!ActiveUsesCurrentDevice || Agent.IsModelReady)
+        && ActiveExecutionReady
         && HasSendableDraft;
     string SendTitle => ActiveUsesCurrentDevice && !Agent.IsModelReady
         ? "Configure a model to use this device"
@@ -884,10 +889,9 @@ else
         Mesh.MyDeviceId,
         string.IsNullOrWhiteSpace(State.Profile.DeviceName) ? "This device" : State.Profile.DeviceName,
         true,
-        PlatformCaps.DevicePlatform,
-        PlatformCaps.CanRunAgent && Agent.IsModelReady);
+        PlatformCaps.DevicePlatform);
     IReadOnlyList<global::Mesh.Shared.DeviceInfo> DeviceChoices => new[] { CurrentDevice }
-        .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d)))
+        .Concat(eligibleDevices.Where(d => !IsCurrentDevice(d) && IsEligibleRemoteHost(d)))
         .GroupBy(d => d.DeviceId, StringComparer.Ordinal)
         .Select(g => g.First())
         .ToList();
@@ -921,12 +925,12 @@ else
         else
             activeThread = null;
         Mesh.StateChanged += OnMeshStateChanged;
+        Mesh.AccountDevicePresenceChanged += OnMeshStateChanged;
         RequestDeviceRefresh();
     }
 
     void OnMeshStateChanged()
     {
-        if (disposed || Shutdown.IsStopping) return;
         RequestDeviceRefresh();
         Refresh();
     }
@@ -945,12 +949,12 @@ else
 
     void Refresh()
     {
-        if (disposed || Shutdown.IsStopping || Interlocked.Exchange(ref renderQueued, 1) != 0) return;
-        Shutdown.Track(InvokeAsync(() =>
+        if (disposed || Interlocked.Exchange(ref renderQueued, 1) != 0) return;
+        ObserveComponentTask(InvokeAsync(() =>
         {
             Interlocked.Exchange(ref renderQueued, 0);
-            if (!disposed && !Shutdown.IsStopping) StateHasChanged();
-        }), "mobile Me refresh");
+            if (!disposed) StateHasChanged();
+        }), "state-refresh");
     }
 
     readonly HashSet<string> askResolving = new(StringComparer.Ordinal);
@@ -1351,7 +1355,7 @@ else
 
     async Task NewThread(global::Mesh.Shared.DeviceInfo device)
     {
-        if (!device.Online) return;
+        if (!CanRunHere(device)) return;
         var target = ToExecutionDevice(device);
         var t = await State.NewOwnThreadAsync("New chat", target);
         activeThread = t.Id;
@@ -1363,7 +1367,7 @@ else
 
     void ChooseMoveTarget(global::Mesh.Shared.DeviceInfo device)
     {
-        if (Active is null || !device.Online || IsActiveDevice(device)) return;
+        if (Active is null || !CanRunHere(device) || IsActiveDevice(device)) return;
         moveMenuOpen = false;
         if (ActiveBusy)
         {
@@ -1384,7 +1388,7 @@ else
 
     void MoveActiveTo(global::Mesh.Shared.DeviceInfo device)
     {
-        if (Active is null || !device.Online) return;
+        if (Active is null || !CanRunHere(device)) return;
         State.MoveOwnThreadToDevice(Active.Id, ToExecutionDevice(device));
         ScheduleComposerSnapshot();
         CloseDeviceMenus();
@@ -2108,7 +2112,19 @@ else
     bool CanRunHere(global::Mesh.Shared.DeviceInfo device) =>
         IsCurrentDevice(device)
             ? Agent.IsModelReady
-            : device.Online && device.CanHostRemoteTurn;
+            : IsEligibleRemoteHost(device);
+
+    static bool IsEligibleRemoteHost(global::Mesh.Shared.DeviceInfo device) =>
+        device.Online && device.CanHostRemoteTurn;
+
+    string DeviceAvailability(global::Mesh.Shared.DeviceInfo device) =>
+        IsCurrentDevice(device)
+            ? Agent.IsModelReady
+                ? "Ready on this device"
+                : "Configure a model in Settings"
+            : IsEligibleRemoteHost(device)
+                ? "Online · Agent ready"
+                : "Unavailable";
 
     bool IsTopicBusy(OwnThread thread) => RemoteRunActivity.IsBusy(
         thread,
@@ -2133,8 +2149,11 @@ else
         if (string.IsNullOrWhiteSpace(deviceId)
             || string.Equals(deviceId, Mesh.MyDeviceId, StringComparison.Ordinal))
             return true;
-        return eligibleDevices.FirstOrDefault(d =>
-            string.Equals(d.DeviceId, deviceId, StringComparison.Ordinal))?.Online == true;
+        return Mesh.IsAccountDeviceOnline(deviceId)
+               || !Mesh.HasAccountDevicePresenceSnapshot
+               && eligibleDevices.Any(device =>
+                   string.Equals(device.DeviceId, deviceId, StringComparison.Ordinal)
+                   && device.Online);
     }
 
     bool IsActiveDevice(global::Mesh.Shared.DeviceInfo device) =>
@@ -2239,6 +2258,7 @@ else
         await ResetMobileThreadFlagAsync();
         State.Changed -= Refresh;
         Mesh.StateChanged -= OnMeshStateChanged;
+        Mesh.AccountDevicePresenceChanged -= OnMeshStateChanged;
         Mesh.ReplicationStateChanged -= Refresh;
         selfRef?.Dispose();
     }

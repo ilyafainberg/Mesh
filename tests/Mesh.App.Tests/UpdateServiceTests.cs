@@ -273,7 +273,7 @@ namespace Mesh.App.Tests
         private sealed class TestAppControl : IAppControl
         {
             public void ShowMainWindow() { }
-            public Task QuitAsync() => Task.CompletedTask;
+            public void Quit() { }
             public bool IsLaunchAtStartupEnabled() => false;
             public void SetLaunchAtStartup(bool enabled) { }
         }
@@ -285,7 +285,7 @@ namespace Mesh.App.Services
     public interface IAppControl
     {
         void ShowMainWindow();
-        Task QuitAsync();
+        void Quit();
         bool IsLaunchAtStartupEnabled();
         void SetLaunchAtStartup(bool enabled);
     }

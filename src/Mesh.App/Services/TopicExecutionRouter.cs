@@ -8,41 +8,13 @@ using Mesh.Shared;
 namespace Mesh.App.Services;
 
 /// <summary>Validates and routes one owner topic turn to its bound execution device.</summary>
-public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposable
+public sealed class TopicExecutionRouter(
+    AppState state,
+    ITopicTurnRunner localRunner,
+    IDeviceTopicTransport deviceTransport,
+    Func<string>? currentPlatformProvider = null) : ITopicExecutionRouter
 {
-    private readonly AppState state;
-    private readonly ITopicTurnRunner localRunner;
-    private readonly IDeviceTopicTransport deviceTransport;
-    private readonly CancellationTokenSource lifetime;
-    private readonly ConcurrentDictionary<long, Task> localTasks = new();
-    private readonly object stopGate = new();
-    private long nextLocalTaskId;
-    private Task? stopTask;
     internal static Action<string>? BeforeTransportCheckpointHook { get; set; }
-
-    public TopicExecutionRouter(
-        AppState state,
-        ITopicTurnRunner localRunner,
-        IDeviceTopicTransport deviceTransport)
-        : this(state, localRunner, deviceTransport, new AppShutdownState(), null)
-    {
-    }
-
-    public TopicExecutionRouter(
-        AppState state,
-        ITopicTurnRunner localRunner,
-        IDeviceTopicTransport deviceTransport,
-        AppShutdownState shutdownState,
-        AppShutdownCoordinator? shutdown)
-    {
-        this.state = state;
-        this.localRunner = localRunner;
-        this.deviceTransport = deviceTransport;
-        lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdownState.Token);
-        shutdown?.Register(
-            "topic-execution-router",
-            cancellationToken => StopAsync().WaitAsync(cancellationToken));
-    }
 
     private sealed class RunEntry
     {
@@ -81,9 +53,6 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         var validation = Validate(draft);
         if (validation is not null)
             return TopicDispatchResult.Reject(validation, draft.RunId);
-        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken, lifetime.Token);
-        var effectiveCancellation = linkedCancellation.Token;
 
         RunEntry entry;
         var owner = false;
@@ -124,18 +93,18 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         }
 
         if (!owner)
-            return await entry.Dispatch.Task.WaitAsync(effectiveCancellation);
+            return await entry.Dispatch.Task.WaitAsync(cancellationToken);
 
         try
         {
             var result = await DispatchNewAsync(
-                entry, progress, effectiveCancellation, handoffContext);
+                entry, progress, cancellationToken, handoffContext);
             entry.Dispatch.TrySetResult(result);
             if (!result.Accepted || entry.RemoteDeviceId is not null)
                 RememberCompletion(entry);
             return result;
         }
-        catch (OperationCanceledException) when (effectiveCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             var result = TopicDispatchResult.Reject("cancelled", draft.RunId);
             entry.Dispatch.TrySetResult(result);
@@ -269,7 +238,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         {
             var devices = await deviceTransport.ListEligibleDevicesAsync(cancellationToken);
             var eligible = devices
-                .Where(device => device.CanHostRemoteTurn)
+                .Where(device => device.Online && device.CanHostRemoteTurn)
                 .GroupBy(device => device.DeviceId, StringComparer.Ordinal)
                 .Select(group => group.First())
                 .OrderBy(device => device.Name ?? device.DeviceId, StringComparer.OrdinalIgnoreCase)
@@ -305,6 +274,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 "The trigger line ID already refers to different content.");
         }
         var current = CurrentDevice();
+        var currentDeviceId = DeviceProtocol.DeviceId(state.Profile.PublicKey);
         var targetId = string.IsNullOrWhiteSpace(draft.TargetDeviceId)
             ? thread.ExecutionDeviceId ?? current?.DeviceId
             : draft.TargetDeviceId;
@@ -314,7 +284,13 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 "This device is not ready to execute agent turns.");
 
         Mesh.Shared.DeviceInfo? target = null;
-        if (targetId is not null)
+        var targetsCurrentDevice = string.Equals(
+            targetId, currentDeviceId, StringComparison.Ordinal);
+        if (targetsCurrentDevice)
+        {
+            target = current;
+        }
+        else
         {
             try
             {
@@ -326,28 +302,20 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
             {
                 target = null;
             }
-            if (target is null
-                && string.Equals(thread.ExecutionDeviceId, targetId, StringComparison.Ordinal)
-                && DevicePlatforms.CanHostRemoteAgent(
-                    true, thread.ExecutionDevicePlatform ?? DevicePlatforms.Unknown))
-                target = new Mesh.Shared.DeviceInfo(
-                    targetId,
-                    thread.ExecutionDeviceName,
-                    false,
-                    thread.ExecutionDevicePlatform ?? DevicePlatforms.Unknown,
-                    true);
-            if (target is null)
-                return TopicDispatchResult.Reject(
-                    "device_not_eligible", draft.RunId,
-                    "The selected device is not agent-ready.");
-            if (thread.ExecutionDeviceId is not null
-                && !string.Equals(
-                         thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
-            {
-                return TopicDispatchResult.Reject(
-                    "topic_bound_elsewhere", draft.RunId,
-                    "Move the topic before sending it to a different device.");
-            }
+        }
+        if (target is null)
+            return TopicDispatchResult.Reject(
+                "device_not_eligible", draft.RunId,
+                targetsCurrentDevice
+                    ? "This device is not ready to execute agent turns."
+                    : "The selected device is not online and agent-ready.");
+        if (thread.ExecutionDeviceId is not null
+            && !string.Equals(
+                     thread.ExecutionDeviceId, target.DeviceId, StringComparison.Ordinal))
+        {
+            return TopicDispatchResult.Reject(
+                "topic_bound_elsewhere", draft.RunId,
+                "Move the topic before sending it to a different device.");
         }
         var queuedUpdate = new TopicRunUpdatePayload(
             draft.RunId,
@@ -361,8 +329,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         var executionTarget = new ExecutionDevice(
             target!.DeviceId, target.Name, target.Platform);
 
-        if (current is not null
-            && string.Equals(target.DeviceId, current.DeviceId, StringComparison.Ordinal))
+        if (targetsCurrentDevice)
         {
             var beginCommand = new TopicRunBeginCommand(
                     draft,
@@ -397,8 +364,7 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 return TopicDispatchResult.Ok(
                     authoritativeDraft.RunId, begin.Code, durable: true);
 
-            var linked = CancellationTokenSource.CreateLinkedTokenSource(
-                cancellationToken, lifetime.Token);
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             entry.LocalCancellation = linked;
             var projectedProgress = new InlineProgress<TopicRunUpdatePayload>(update =>
             {
@@ -415,9 +381,11 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                     state.StartQueuedTopicRun(update.ThreadId, update.RunId);
                 progress?.Report(update);
             });
-            TrackLocal(
-                RunLocalAsync(entry, authoritativeDraft, projectedProgress, linked),
-                authoritativeDraft.RunId);
+            _ = ObserveLocalRunAsync(RunLocalAsync(
+                entry,
+                authoritativeDraft,
+                projectedProgress,
+                linked));
             return TopicDispatchResult.Ok(authoritativeDraft.RunId, durable: true);
         }
 
@@ -554,73 +522,20 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
         }
     }
 
-    private void TrackLocal(Task task, string runId)
-    {
-        var id = Interlocked.Increment(ref nextLocalTaskId);
-        localTasks[id] = task;
-        _ = ObserveLocalAsync(id, task, runId);
-    }
-
-    private async Task ObserveLocalAsync(long id, Task task, string runId)
+    private static async Task ObserveLocalRunAsync(Task run)
     {
         try
         {
-            await task.ConfigureAwait(false);
+            await run.ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        catch (Exception exception)
         {
-        }
-        catch (Exception ex)
-        {
-            RuntimeDiagnostics.Current?.RecordException($"topic-local-run-{runId}", ex);
-        }
-        finally
-        {
-            localTasks.TryRemove(id, out _);
+            RuntimeDiagnostics.Current?.RecordEvent(
+                "topic-local-run-failed",
+                $"exception={exception.GetType().FullName}");
         }
     }
 
-    private Task StopAsync()
-    {
-        lock (stopGate)
-            return stopTask ??= StopCoreAsync();
-    }
-
-    private async Task StopCoreAsync()
-    {
-        try
-        {
-            lifetime.Cancel();
-        }
-        catch (AggregateException ex)
-        {
-            RuntimeDiagnostics.Current?.RecordException("topic-router-cancel", ex);
-        }
-
-        foreach (var entry in runs.Values)
-        {
-            try { entry.LocalCancellation?.Cancel(); }
-            catch (ObjectDisposedException) { }
-        }
-
-        while (true)
-        {
-            var pending = localTasks.Values.Where(task => !task.IsCompleted).ToArray();
-            if (pending.Length == 0) return;
-            var completions = pending.Select(task => task.ContinueWith(
-                static _ => { },
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default));
-            await Task.WhenAll(completions).ConfigureAwait(false);
-        }
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await StopAsync().ConfigureAwait(false);
-        lifetime.Dispose();
-    }
     private string? Validate(TopicTurnDraft draft)
     {
         if (!TopicRunProtocol.IsValidIdentifier(draft.RunId)) return "invalid_run";
@@ -798,16 +713,16 @@ public sealed class TopicExecutionRouter : ITopicExecutionRouter, IAsyncDisposab
                 ? null
                 : state.Profile.DeviceName.Trim(),
             true,
-            CurrentPlatform(),
-            true);
+            CurrentPlatform());
     }
 
-    private static string CurrentPlatform() =>
-        OperatingSystem.IsWindows() ? DevicePlatforms.Windows :
-        OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS() ? DevicePlatforms.MacOS :
-        OperatingSystem.IsAndroid() ? DevicePlatforms.Android :
-        OperatingSystem.IsIOS() ? DevicePlatforms.IOS :
-        DevicePlatforms.Unknown;
+    private string CurrentPlatform() =>
+        currentPlatformProvider?.Invoke()
+        ?? (OperatingSystem.IsWindows() ? DevicePlatforms.Windows :
+            OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS() ? DevicePlatforms.MacOS :
+            OperatingSystem.IsAndroid() ? DevicePlatforms.Android :
+            OperatingSystem.IsIOS() ? DevicePlatforms.IOS :
+            DevicePlatforms.Unknown);
 
     private void RememberCompletion(RunEntry entry)
     {

@@ -10,7 +10,6 @@
 @inject IAppControl AppControl
 @inject IAccountInstanceCoordinator AccountInstances
 @inject RuntimeDiagnostics Diagnostics
-@inject IJSRuntime JS
 @implements IDisposable
 
 <div class="pane-scroll">
@@ -702,62 +701,64 @@
                 <span>@Updater.CurrentVersion.ToString(3)</span>
             </div>
 
-            @if (Updater.Available is { } availableUpdate)
+            @if (updatePhase == UpdatePhase.Downloading || updatePhase == UpdatePhase.Extracting
+                 || updatePhase == UpdatePhase.Preparing || updatePhase == UpdatePhase.Applying)
             {
-                @if (Updater.Phase == UpdatePhase.Downloading || Updater.Phase == UpdatePhase.Extracting
-                     || Updater.Phase == UpdatePhase.Preparing || Updater.Phase == UpdatePhase.Applying)
-                {
-                    <div class="field">
-                        <div class="update-progress-head">
-                            <span>@(Updater.Status ?? "Preparing update.")</span>
-                            @if (Updater.Percent >= 0) { <span>@Updater.Percent%</span> }
-                        </div>
-                        <div class="progress-track" role="progressbar"
-                             aria-valuenow="@(Updater.Percent < 0 ? 0 : Updater.Percent)" aria-valuemin="0" aria-valuemax="100">
-                            <div class="progress-fill @(Updater.Percent < 0 ? "indeterminate" : "")"
-                                 style="@(Updater.Percent >= 0 ? $"width:{Updater.Percent}%" : "")"></div>
-                        </div>
-                        @if (Updater.TotalBytes > 0)
-                        {
-                            <div class="field-hint">@FormatMb(Updater.BytesReceived) of @FormatMb(Updater.TotalBytes) MB</div>
-                        }
+                <div class="field">
+                    <div class="update-progress-head">
+                        <span>@updateStatus</span>
+                        @if (updatePercent >= 0) { <span>@updatePercent%</span> }
                     </div>
-                }
-
+                    <div class="progress-track" role="progressbar"
+                         aria-valuenow="@(updatePercent < 0 ? 0 : updatePercent)" aria-valuemin="0" aria-valuemax="100">
+                        <div class="progress-fill @(updatePercent < 0 ? "indeterminate" : "")"
+                             style="@(updatePercent >= 0 ? $"width:{updatePercent}%" : "")"></div>
+                    </div>
+                    @if (updateBytesTotal > 0)
+                    {
+                        <div class="field-hint">@FormatMb(updateBytesReceived) of @FormatMb(updateBytesTotal) MB</div>
+                    }
+                </div>
+            }
+            else if (updateInfo is not null && updatePhase == UpdatePhase.ReadyToApply)
+            {
+                <div class="field">
+                    <div class="update-avail">Version @updateInfo.Version.ToString(3) is ready to install.</div>
+                    <div class="field-hint">Mesh will close and the installer will open to finish updating, then reopen Mesh. Save any unsaved work first.</div>
+                    <div class="model-row">
+                        <button class="primary" @onclick="ApplyUpdate" disabled="@updateOperationActive">Install update</button>
+                        <button class="ghost" @onclick="DismissUpdate" disabled="@updateOperationActive">Later</button>
+                    </div>
+                </div>
+            }
+            else if (updatePhase == UpdatePhase.Failed)
+            {
+                <div class="field">
+                    <div class="field-hint err-text">@updateStatus</div>
+                    <button class="ghost" @onclick="CheckUpdate" disabled="@updateOperationActive">Try again</button>
+                </div>
+            }
+            else if (updateInfo is not null && updateAvailable)
+            {
                 <div class="field">
                     <div class="update-avail">
                         <i class="bi bi-arrow-up-circle-fill"></i>
-                        Version @availableUpdate.Version.ToString(3) is available.
+                        Version @updateInfo.Version.ToString(3) is available.
                     </div>
-                    @if (!string.IsNullOrWhiteSpace(availableUpdate.ReleaseNotes))
+                    @if (!string.IsNullOrWhiteSpace(updateInfo.ReleaseNotes))
                     {
                         <details class="update-notes">
                             <summary>What's new</summary>
-                            <div class="notes-md">@((MarkupString)global::Mesh.App.Services.Markdown.ToHtml(availableUpdate.ReleaseNotes))</div>
+                            <div class="notes-md">@((MarkupString)global::Mesh.App.Services.Markdown.ToHtml(updateInfo.ReleaseNotes))</div>
                         </details>
                     }
-                    @if (Updater.Phase == UpdatePhase.ReadyToApply)
-                    {
-                        <div class="field-hint">The setup file is ready. Update closes Mesh, installs silently, and reopens it.</div>
-                    }
-                    else if (Updater.Phase == UpdatePhase.Failed)
-                    {
-                        <div class="field-hint err-text">@Updater.Error</div>
-                    }
-                    else if (Updater.IsLaunchRequested)
-                    {
-                        <div class="field-hint">Mesh will start the updater as soon as the setup file is ready.</div>
-                    }
-                    else if (Updater.Phase == UpdatePhase.Downloading || Updater.Phase == UpdatePhase.Extracting
-                             || Updater.Phase == UpdatePhase.Preparing)
-                    {
-                        <div class="field-hint">Mesh is preparing this update in the background.</div>
-                    }
                     <div class="model-row">
-                        <button class="primary" @onclick="StartUpdate" disabled="@Updater.IsLaunchRequested">@Updater.ActionText</button>
-                        @if (availableUpdate.HtmlUrl is not null)
+                        <button class="primary" @onclick="DownloadUpdate" disabled="@updateOperationActive">
+                            Download @(updateInfo.Size > 0 ? $"({FormatMb(updateInfo.Size)} MB)" : "")
+                        </button>
+                        @if (updateInfo.HtmlUrl is not null)
                         {
-                            <button class="ghost" @onclick="() => OpenUrl(availableUpdate.HtmlUrl)">View release</button>
+                            <button class="ghost" @onclick="() => OpenUrl(updateInfo.HtmlUrl)" disabled="@updateOperationActive">View release</button>
                         }
                     </div>
                 </div>
@@ -766,8 +767,8 @@
             {
                 <div class="field">
                     <div class="model-row">
-                        <button class="ghost" @onclick="CheckUpdate" disabled="@checkingUpdate">
-                            @(checkingUpdate ? "Checking..." : "Check for updates")
+                        <button class="ghost" @onclick="CheckUpdate" disabled="@updateOperationActive">
+                            @(updatePhase == UpdatePhase.Checking ? "Checking" : "Check for updates")
                         </button>
                     </div>
                     @if (updateStatus is not null)
@@ -778,6 +779,7 @@
             }
         </div>
         }
+
         @if (AppControl.IsLaunchAtStartupEnabled() || OperatingSystem.IsWindows())
         {
         <div class="card-panel">
@@ -808,34 +810,14 @@
                     Copy diagnostics and include them with the crash report.
                 </div>
             }
-            <div class="model-row" style="flex-wrap:wrap;">
+            <div class="model-row">
                 <button class="ghost" @onclick="CopyDiagnostics">
                     <i class="bi bi-clipboard"></i> Copy diagnostics
                 </button>
-                <button class="ghost" @onclick="RunWidgetSelfTest" disabled="@widgetSelfTestRunning">
-                    <i class="bi bi-window"></i> @(widgetSelfTestRunning ? "Testing widget..." : "Run widget self-test")
-                </button>
-                <button class="ghost" @onclick="CopyWidgetDiagnostics">
-                    <i class="bi bi-clipboard-check"></i> Copy widget diagnostics
-                </button>
-                <button class="ghost" @onclick="ClearDiagnostics">
+                <button class="ghost" @onclick="ClearDiagnostics" disabled="@(!Diagnostics.HasEntries)">
                     Clear
                 </button>
             </div>
-            @if (widgetSelfTestVisible)
-            {
-                <div class="app-frame" style="height:190px;min-height:190px;resize:none;margin-top:12px;">
-                    <iframe @ref="widgetSelfTestFrame"
-                            sandbox="allow-scripts"
-                            referrerpolicy="no-referrer"
-                            title="Widget renderer self-test"></iframe>
-                    <div class="widget-render-status" hidden aria-live="polite"></div>
-                </div>
-                @if (!string.IsNullOrWhiteSpace(widgetSelfTestStatus))
-                {
-                    <div class="field-hint" role="status">@widgetSelfTestStatus</div>
-                }
-            }
             @if (!string.IsNullOrWhiteSpace(diagnosticsStatus))
             {
                 <div class="field-hint">@diagnosticsStatus</div>
@@ -886,24 +868,6 @@
     bool agentRoutingAttempted;
     string? agentRoutingError;
     string? diagnosticsStatus;
-    ElementReference widgetSelfTestFrame;
-    bool widgetSelfTestVisible;
-    bool widgetSelfTestPending;
-    bool widgetSelfTestRunning;
-    string? widgetSelfTestStatus;
-
-    private const string WidgetSelfTestHtml =
-        "<!doctype html><html><head><meta charset='utf-8'>" +
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
-        "<style>html,body{margin:0;min-height:100%;font:16px system-ui,sans-serif}" +
-        "body{display:grid;place-items:center;background:#fff4ce;color:#5c4813;text-align:center}" +
-        "body[data-mesh-self-test='script-ok']{background:#dff6dd;color:#14532d}" +
-        ".card{padding:24px;border:1px solid currentColor;border-radius:12px;max-width:320px}" +
-        "strong{display:block;font-size:18px;margin-bottom:6px}</style></head>" +
-        "<body data-mesh-self-test='pending'><main class='card'><strong id='result'>Renderer loaded</strong>" +
-        "<span>Checking script execution and first paint...</span></main>" +
-        "<script>document.body.dataset.meshSelfTest='script-ok';" +
-        "document.getElementById('result').textContent='Widget rendering works';</script></body></html>";
 
     IReadOnlyList<Mesh.Shared.DeviceInfo> AgentRoutingDevices => agentDevices
         .Where(device => device.IsDesktop && device.AgentHostEnabled)
@@ -995,51 +959,6 @@
         catch { /* clipboard is best-effort */ }
     }
 
-    void RunWidgetSelfTest()
-    {
-        if (widgetSelfTestRunning) return;
-        widgetSelfTestVisible = true;
-        widgetSelfTestPending = true;
-        widgetSelfTestRunning = true;
-        widgetSelfTestStatus = "Starting the secure widget renderer...";
-    }
-
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (!widgetSelfTestPending) return;
-        widgetSelfTestPending = false;
-        try
-        {
-            var result = await JS.InvokeAsync<string>(
-                "sandboxFrame.runSelfTest",
-                widgetSelfTestFrame,
-                WidgetSelfTestHtml,
-                PlatformCaps.DevicePlatform) ?? "failed:no-result";
-            if (result.StartsWith("passed:", StringComparison.Ordinal))
-            {
-                var mode = result["passed:".Length..];
-                widgetSelfTestStatus = $"Widget self-test passed using the {mode} renderer.";
-            }
-            else
-            {
-                var reason = result.StartsWith("failed:", StringComparison.Ordinal)
-                    ? result["failed:".Length..].Replace('-', ' ')
-                    : "unknown result";
-                widgetSelfTestStatus = $"Widget self-test failed: {reason}. Copy widget diagnostics and include them with the report.";
-            }
-        }
-        catch (Exception ex)
-        {
-            Diagnostics.RecordException("widget-self-test", ex);
-            widgetSelfTestStatus = "Widget self-test could not run: " + ex.Message;
-        }
-        finally
-        {
-            widgetSelfTestRunning = false;
-            await InvokeAsync(StateHasChanged);
-        }
-    }
-
     async Task CopyDiagnostics()
     {
         try
@@ -1055,29 +974,11 @@
         }
     }
 
-    async Task CopyWidgetDiagnostics()
-    {
-        try
-        {
-            var rendererReport = await JS.InvokeAsync<string>("sandboxFrame.getDiagnostics")
-                ?? "Mesh widget diagnostics were unavailable.";
-            var report = rendererReport + Environment.NewLine + Environment.NewLine + Diagnostics.CreateReport();
-            await Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(report);
-            diagnosticsStatus = "Widget diagnostics copied. Paste them into the widget report.";
-        }
-        catch (Exception ex)
-        {
-            Diagnostics.RecordException("widget-diagnostics-copy", ex);
-            diagnosticsStatus = "Could not copy widget diagnostics: " + ex.Message;
-        }
-    }
-
-    async Task ClearDiagnostics()
+    void ClearDiagnostics()
     {
         try
         {
             Diagnostics.Clear();
-            await JS.InvokeVoidAsync("sandboxFrame.clearDiagnostics");
             diagnosticsStatus = "Diagnostics cleared.";
         }
         catch (Exception ex)
@@ -1247,7 +1148,15 @@
         foundryModels = Foundry.CachedModels.ToList();
         SyncModelCustomFlag();
 
-        Updater.Changed += Refresh;
+        // Adopt any update already discovered by the background auto-check so the panel shows it
+        // immediately (for example when the user arrives here via the update banner).
+        if (Updater.Available is not null)
+        {
+            updateAvailable = true;
+            updateInfo = Updater.Available;
+        }
+        Updater.Changed += RefreshUpdater;
+
         launchAtStartup = AppControl.IsLaunchAtStartupEnabled();
     }
 
@@ -1300,6 +1209,16 @@
         if (foundryModels.Count == 0 && Foundry.CachedModels.Count > 0)
             foundryModels = Foundry.CachedModels.ToList();
         InvokeAsync(StateHasChanged);
+    }
+
+    void RefreshUpdater()
+    {
+        InvokeAsync(() =>
+        {
+            updateInfo = Updater.Available;
+            updateAvailable = updateInfo is not null;
+            StateHasChanged();
+        });
     }
 
     void OnProviderChange(ChangeEventArgs e)
@@ -1456,13 +1375,6 @@
 
     async Task ChangeModel()
     {
-        if (!RelayTransportPolicy.TryValidateBaseUrl(
-                relay, RelayTransportPolicy.LocalHttpEnabled, out var policyError))
-        {
-            relayTestOk = false;
-            relayTestMsg = policyError;
-            return;
-        }
         var apiKeyToSet = apiKey;
         var tokenOptimizationToSet = SelectedTokenOptimization;
         apiKey = "";
@@ -1725,14 +1637,6 @@
         relay = e.Value?.ToString() ?? "";
         var url = relay.Trim();
         if (string.IsNullOrWhiteSpace(url)) return;
-        if (!RelayTransportPolicy.TryValidateBaseUrl(
-                url, RelayTransportPolicy.LocalHttpEnabled, out var policyError))
-        {
-            relayTestOk = false;
-            relayTestMsg = policyError;
-            relay = State.Profile.RelayUrl;
-            return;
-        }
         Toggle(p => p.RelayUrl = url);
         // A handle is registered per relay, so switching relays re-registers there and reconnects.
         try { await Mesh.RegisterAsync(); await Mesh.ConnectAsync(); await LoadAgentRoutingAsync(); } catch { }
@@ -1764,13 +1668,6 @@
         testingRelay = true;
         try
         {
-            if (!RelayTransportPolicy.TryValidateBaseUrl(
-                    url, RelayTransportPolicy.LocalHttpEnabled, out var policyError))
-            {
-                relayTestOk = false;
-                relayTestMsg = policyError;
-                return;
-            }
             var http = HttpFactory.CreateClient("relay");
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             var resp = await http.GetAsync($"{url.TrimEnd('/')}/health", cts.Token);
@@ -1794,67 +1691,161 @@
     }
 
     // ---- self-update ----
-    bool checkingUpdate;
+    bool updateOperationActive;
+    CancellationTokenSource? updateOperationCts;
+    bool updateAvailable;
     bool updateFailed;
     string? updateStatus;
+    UpdateInfo? updateInfo;
+    UpdatePhase updatePhase = UpdatePhase.Idle;
+    int updatePercent = -1;
+    long updateBytesReceived;
+    long updateBytesTotal;
 
     static string FormatMb(long bytes) => (bytes / 1024.0 / 1024.0).ToString("N0");
 
     async Task CheckUpdate()
     {
-        checkingUpdate = true;
+        if (updateOperationActive) return;
+        updateOperationActive = true;
         updateFailed = false;
-        updateStatus = null;
+        updatePhase = UpdatePhase.Checking;
+        updateStatus = "Checking";
+        updateOperationCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            var result = await Updater.CheckNowAsync(cts.Token);
-            if (result.Available)
+            var result = await Updater.CheckAsync(updateOperationCts.Token);
+            if (result.Available && result.Info is not null)
             {
+                updateAvailable = true;
+                updateInfo = result.Info;
+                updatePhase = UpdatePhase.Idle;
                 updateStatus = null;
             }
             else if (result.Error is not null)
             {
                 updateFailed = true;
-                updateStatus = result.Error;
+                updatePhase = UpdatePhase.Failed;
+                updateStatus = $"Failed: {result.Error}";
             }
             else
             {
-                updateStatus = $"You're on the latest version ({Updater.CurrentVersion.ToString(3)}).";
+                updateAvailable = false;
+                updateInfo = null;
+                updatePhase = UpdatePhase.UpToDate;
+                updateStatus = $"UpToDate: {Updater.CurrentVersion.ToString(3)}";
             }
         }
         catch (OperationCanceledException)
         {
+            updatePhase = UpdatePhase.Idle;
+            updateStatus = null;
+        }
+        catch (Exception ex)
+        {
             updateFailed = true;
-            updateStatus = "The update check timed out. Try again.";
+            updatePhase = UpdatePhase.Failed;
+            updateStatus = $"Failed: {ex.Message}";
         }
         finally
         {
-            checkingUpdate = false;
+            updateOperationCts?.Dispose();
+            updateOperationCts = null;
+            updateOperationActive = false;
         }
     }
 
-    async Task StartUpdate()
+    async Task DownloadUpdate()
     {
+        if (updateInfo is null || updateOperationActive) return;
+        updateOperationActive = true;
         updateFailed = false;
-        updateStatus = null;
-        var started = await Updater.StartUpdateAsync();
-        if (!started && !Updater.IsLaunchRequested)
+        updatePhase = UpdatePhase.Downloading;
+        updateStatus = "Downloading";
+        updateBytesReceived = 0;
+        updateBytesTotal = updateInfo.Size;
+        updatePercent = updateInfo.Size > 0 ? 0 : -1;
+        updateOperationCts = new CancellationTokenSource();
+
+        var progress = new Progress<UpdateProgress>(p =>
+        {
+            updatePhase = p.Phase;
+            updateBytesReceived = p.BytesReceived;
+            updateBytesTotal = p.TotalBytes;
+            updatePercent = p.Percent;
+            updateStatus = p.Phase switch
+            {
+                UpdatePhase.Downloading => "Downloading",
+                UpdatePhase.Extracting => "Extracting",
+                UpdatePhase.Preparing => "Preparing",
+                UpdatePhase.ReadyToApply => "Ready",
+                _ => updateStatus
+            };
+            InvokeAsync(StateHasChanged);
+        });
+
+        try
+        {
+            preparedUpdaterPath = await Updater.DownloadAndPrepareAsync(updateInfo, progress, updateOperationCts.Token);
+            updatePhase = UpdatePhase.ReadyToApply;
+            updateStatus = "Ready";
+        }
+        catch (OperationCanceledException)
+        {
+            preparedUpdaterPath = null;
+            updatePhase = UpdatePhase.Idle;
+            updateStatus = null;
+        }
+        catch (Exception ex)
         {
             updateFailed = true;
-            updateStatus = Updater.Error ?? "The Mesh updater could not be started.";
+            updatePhase = UpdatePhase.Failed;
+            updateStatus = $"Failed: {ex.Message}";
+        }
+        finally
+        {
+            updateOperationCts?.Dispose();
+            updateOperationCts = null;
+            updateOperationActive = false;
         }
     }
 
-    async Task OpenUrl(string url)
+    void ApplyUpdate()
     {
-        try { await Microsoft.Maui.ApplicationModel.Launcher.OpenAsync(new Uri(url)); }
-        catch (Exception ex) when (ex is UriFormatException or InvalidOperationException or NotSupportedException)
+        if (preparedUpdaterPath is null || updateOperationActive) return;
+        updateOperationActive = true;
+        updatePhase = UpdatePhase.Applying;
+        updateStatus = "Applying";
+        try
         {
+            Updater.ApplyAndExit(preparedUpdaterPath);
+        }
+        catch (Exception ex)
+        {
+            updateOperationActive = false;
             updateFailed = true;
-            updateStatus = $"Could not open the release page: {ex.Message}";
+            updatePhase = UpdatePhase.Failed;
+            updateStatus = $"Failed: {ex.Message}";
         }
     }
+
+    void DismissUpdate()
+    {
+        if (updateOperationActive) return;
+        updatePhase = UpdatePhase.Idle;
+        updateAvailable = false;
+        updateInfo = null;
+        preparedUpdaterPath = null;
+        updateStatus = null;
+    }
+
+    void OpenUrl(string url)
+    {
+        try { Microsoft.Maui.ApplicationModel.Launcher.OpenAsync(new Uri(url)); } catch { }
+    }
+
+    string? preparedUpdaterPath;
+
     async Task OnDoNotDisturbChanged(ChangeEventArgs e)
     {
         Toggle(profile => profile.DoNotDisturb = (bool)(e.Value ?? false));
@@ -1869,10 +1860,10 @@
         linkWorking = true;
         try
         {
-            if (!RelayTransportPolicy.TryValidateBaseUrl(
-                    State.Profile.RelayUrl,
-                    RelayTransportPolicy.LocalHttpEnabled,
-                    out _))
+            if (!Uri.TryCreate(State.Profile.RelayUrl, UriKind.Absolute, out var relayUri) ||
+                (relayUri.Scheme != Uri.UriSchemeHttps && !(relayUri.Scheme == Uri.UriSchemeHttp && relayUri.IsLoopback)) ||
+                !string.IsNullOrEmpty(relayUri.UserInfo) || !string.IsNullOrEmpty(relayUri.Query) ||
+                !string.IsNullOrEmpty(relayUri.Fragment))
             {
                 linkError = "A valid HTTPS relay URL is required before generating a device-link.";
                 return;
@@ -1914,11 +1905,13 @@
 
     public void Dispose()
     {
+        updateOperationCts?.Cancel();
+        updateOperationCts?.Dispose();
         linkTimer?.Dispose();
         State.Changed -= Refresh;
         Setup.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Foundry.ModelsChanged -= Refresh;
-        Updater.Changed -= Refresh;
+        Updater.Changed -= RefreshUpdater;
     }
 }

@@ -63,10 +63,9 @@ public sealed class LiveAgentRenderStateTests
             start.Wait();
             for (var i = 0; i < updateCount; i++)
             {
-                var snapshot = state.Capture("thread");
-                foreach (var step in snapshot.Steps)
+                foreach (var step in state.StepsFor("thread"))
                     _ = step.Label;
-                _ = snapshot.Draft?.Answer.Length;
+                _ = state.DraftFor("thread")?.Answer.Length;
             }
         });
 
@@ -75,25 +74,6 @@ public sealed class LiveAgentRenderStateTests
 
         Assert.AreEqual(updateCount, state.StepsFor("thread").Count);
         Assert.AreEqual(updateCount, state.DraftFor("thread")?.Answer.Length);
-    }
-
-    [TestMethod]
-    public void CombinedSnapshotRemainsStableAfterBothStreamsChange()
-    {
-        var state = new LiveAgentRenderState();
-        state.BeginSteps("thread");
-        state.BeginDraft("thread");
-        state.ReportStep("thread", Step("one"));
-        state.AppendDraft("thread", new AgentDelta(AgentDeltaKind.Answer, "first"));
-
-        var snapshot = state.Capture("thread");
-
-        state.ReportStep("thread", Step("two"));
-        state.AppendDraft("thread", new AgentDelta(AgentDeltaKind.Answer, " second"));
-
-        Assert.AreEqual(1, snapshot.Steps.Count);
-        Assert.AreEqual("one", snapshot.Steps[0].Label);
-        Assert.AreEqual("first", snapshot.Draft?.Answer);
     }
 
     private static AgentStep Step(string id)

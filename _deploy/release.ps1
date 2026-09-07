@@ -52,14 +52,12 @@ $Iss        = Join-Path $Deploy "mesh-client.iss"
 $PubDir     = Join-Path $Deploy "client-release\Mesh-win-x64"
 $Artifacts  = Join-Path $Deploy "artifacts"
 $BrandIcon  = Join-Path $Deploy "brand\meshicon.ico"
-$LicenseSrc = Join-Path $Deploy "LICENSE-polyform.txt"
+$LicenseSrc = Join-Path $Deploy "LICENSE-GPL-3.0.txt"
 $NoticesSrc = Join-Path $Deploy "THIRD-PARTY-NOTICES.txt"
 $RelayPublisher = Join-Path $Deploy "publish-relay-release.ps1"
 
 $WinTfm     = "net10.0-windows10.0.19041.0"
 $AndTfm     = "net10.0-android"
-$RequiredDotNetSdk = "10.0.302"
-$ApprovedDotNet = "C:\Users\ifain\source\repos\dotnet-sdk-$RequiredDotNetSdk-win-x64\dotnet.exe"
 $ISCC       = "C:\Users\ifain\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
 $DefaultJdk = "C:\Program Files\Android\openjdk\jdk-21.0.8"
 
@@ -70,7 +68,6 @@ $SignTool   = Join-Path $Deploy "signing\sdk\bin\10.0.28000.0\x64\signtool.exe"
 $SignDlib   = Join-Path $Deploy "signing\tsc\bin\x64\Azure.CodeSigning.Dlib.dll"
 $SignMeta   = Join-Path $Deploy "signing\metadata.json"
 $TimeStamp  = "http://timestamp.acs.microsoft.com"
-$ExpectedWindowsPublisher = "Feincraft"
 
 # Android keystore.
 $Keystore   = Join-Path $Deploy "android-signing\mesh-upload.keystore"
@@ -99,20 +96,6 @@ function Invoke-Native([string]$exe, [string[]]$argv, [string]$what) {
   if ($LASTEXITCODE -ne 0) { Die "$what failed (exit $LASTEXITCODE)." }
 }
 
-function Assert-MeshInstallerSignature([string]$path, [string]$context) {
-  $sig = Get-AuthenticodeSignature $path
-  if ($sig.Status -ne "Valid") {
-    Die "$context signature is not valid (status: $($sig.Status))."
-  }
-
-  $publisher = $sig.SignerCertificate.GetNameInfo(
-    [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-  $organizationPattern = "(^|,\s*)O=$([regex]::Escape($ExpectedWindowsPublisher))(,|$)"
-  if ($publisher -ne $ExpectedWindowsPublisher -or $sig.SignerCertificate.Subject -notmatch $organizationPattern) {
-    Die "$context signer '$($sig.SignerCertificate.Subject)' is not the expected Mesh publisher."
-  }
-}
-
 function Get-KeystorePassword {
   if ($env:MESH_KEYSTORE_PASS) { return $env:MESH_KEYSTORE_PASS }
   if (Test-Path $CredFile) {
@@ -128,30 +111,14 @@ function Resolve-Jdk {
   Die "JDK not found. Set JAVA_HOME (needed for the Android build)."
 }
 
-function Resolve-DotNet {
-  $candidate = if ($env:MESH_DOTNET) { $env:MESH_DOTNET } elseif (Test-Path $ApprovedDotNet) { $ApprovedDotNet } else { "dotnet" }
-  if ($candidate -eq "dotnet" -and -not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-    Die "Required .NET SDK $RequiredDotNetSdk is not available."
-  }
-  $global:LASTEXITCODE = 0
-  $actual = (& $candidate --version 2>$null | Select-Object -First 1)
-  $exitCode = $global:LASTEXITCODE
-  if ($exitCode -ne 0 -or $actual -ne $RequiredDotNetSdk) {
-    Die "Mesh releases require .NET SDK $RequiredDotNetSdk; '$candidate' resolved '$actual'."
-  }
-  return $candidate
-}
-
 # --------------------------------------------------------------- preflight ----
 function Test-Preflight {
   Say "Preflight"
   if ($Version -notmatch '^\d+\.\d+\.\d+$') { Die "Version '$Version' must look like 1.4.1." }
 
-  foreach ($t in "git","gh","az") {
+  foreach ($t in "dotnet","git","gh","az") {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { Die "Required tool '$t' not on PATH." }
   }
-  $script:DotNet = Resolve-DotNet
-  Ok ".NET SDK ${RequiredDotNetSdk}: $script:DotNet"
   if (-not (Test-Path $Csproj)) { Die "csproj not found at $Csproj" }
   if (-not $SkipWindows -and -not (Test-Path $ISCC)) { Die "Inno Setup ISCC.exe not found at $ISCC" }
 
@@ -227,7 +194,7 @@ function Invoke-EmDashLint {
 function Build-Windows {
   Say "Windows: publish self-contained"
   if (Test-Path $PubDir) { Remove-Item $PubDir -Recurse -Force }
-  Invoke-Native $script:DotNet @(
+  Invoke-Native "dotnet" @(
     "publish", $Csproj, "-f", $WinTfm, "-c", "Release",
     "-p:WindowsPackageType=None", "-p:RuntimeIdentifierOverride=win10-x64",
     "--self-contained", "true", "-o", $PubDir, "--nologo"
@@ -245,7 +212,6 @@ function Build-Windows {
   if ($foreignPlaywrightDrivers.Count -gt 0) {
     Die "Windows publish contains non-Windows Playwright drivers: $($foreignPlaywrightDrivers.Name -join ', ')"
   }
-  if (-not (Test-Path (Join-Path $PubDir "Mesh.Updater.exe"))) { Die "publish produced no Mesh.Updater.exe" }
   Ok "published"
 
   Note "staging license/notices/icon"
@@ -270,7 +236,8 @@ function Build-Windows {
     "sign", "/q", "/fd", "SHA256", "/tr", $TimeStamp, "/td", "SHA256",
     "/dlib", $SignDlib, "/dmdf", $SignMeta, $exe
   ) "signtool sign"
-  Assert-MeshInstallerSignature $exe "installer"
+  $sig = Get-AuthenticodeSignature $exe
+  if ($sig.Status -ne "Valid") { Die "signature not valid (status: $($sig.Status))." }
   Ok "installer signature valid"
 
   # Use script scope (not a return value): external tool stdout from Invoke-Native would otherwise
@@ -283,7 +250,7 @@ function Build-Android {
   Say "Android: build signed AAB (versionCode $script:AndroidVersionCode)"
   $env:JAVA_HOME = Resolve-Jdk
   $pw = Get-KeystorePassword
-  Invoke-Native $script:DotNet @(
+  Invoke-Native "dotnet" @(
     "publish", $Csproj, "-f", $AndTfm, "-c", "Release",
     "-p:AndroidPackageFormat=aab", "-p:AndroidKeyStore=true",
     "-p:AndroidSigningKeyStore=$Keystore", "-p:AndroidSigningKeyAlias=$KeyAlias",
@@ -430,7 +397,10 @@ if (-not $SkipAndroid) { Build-Android } else { Warn "skipping Android build" }
 if (-not $SkipPush)   { Invoke-GitCommitPush }
 if ($script:WinExe -and -not $SkipBlob)   { Publish-Blob   $script:WinExe }
 if ($script:WinExe -and -not $SkipGitHub) {
-  Assert-MeshInstallerSignature $script:WinExe "GitHub upload installer"
+  $sig = Get-AuthenticodeSignature $script:WinExe
+  if ($sig.Status -ne "Valid") {
+    Die "refusing GitHub upload: installer signature is not valid."
+  }
   Publish-GitHubRelease $script:WinExe
   & $RelayPublisher -Version $Version -RepoRoot $RepoRoot -DryRun:$DryRun
 }

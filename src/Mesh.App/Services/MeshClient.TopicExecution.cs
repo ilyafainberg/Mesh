@@ -506,6 +506,14 @@ public sealed partial class MeshClient
 
     private bool TryStartInboundTopicRun(TopicRunRequestPayload request, string sourceDeviceId)
     {
+        if (!Connected
+            || !supportsAgentHost
+            || !agent.IsModelReady
+            || !DevicePlatforms.IsDesktop(CurrentDevicePlatform))
+        {
+            TraceTransport("topic-execution-deferred", "remote_host_not_eligible");
+            return false;
+        }
         if (!EnsureInboundTopicContext(request)) return false;
         var next = state.ListInboundTopicRuns(
                 InboundTopicRunStates.Accepted,
@@ -707,6 +715,11 @@ public sealed partial class MeshClient
                 item.UpdatedAt,
                 timeProvider.GetUtcNow()))
             return null;
+
+        var target = await ResolveAccountDeviceAsync(item.TargetDeviceId, ct)
+            .ConfigureAwait(false);
+        if (target is null || !target.CanHostRemoteTurn)
+            return MeshSendResult.Reject("device_not_eligible");
 
         var prepared = await PrepareTopicOutboxItemAsync(item, ct);
         if (prepared is null) return null;

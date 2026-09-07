@@ -1942,6 +1942,56 @@ public sealed class OnlineReplicationRuntimeTests
     }
 
     [TestMethod]
+    public async Task Poller_AccountRoster_ReportsOnlineOfflineReconnectAndCoalescesReplays()
+    {
+        var source = new FakeMetadataSource();
+        var mine = KeyPair.New();
+        var mobile = KeyPair.New();
+        var myDevice = DeviceProtocol.DeviceId(mine.PublicB64);
+        var mobileDevice = DeviceProtocol.DeviceId(mobile.PublicB64);
+        source.SetHandle("alice", Dir("alice", 0, "", mine.PublicB64, mobile.PublicB64));
+        source.SetPresence("alice", true, myDevice);
+
+        var roster = NewRoster(source, "alice", new List<string>());
+        var engine = NewEngine("alice", myDevice, roster, new RecordingTransport(), mine);
+        var observed = new List<string[]>();
+        var poller = new ReplicationPresencePoller(
+            engine,
+            roster,
+            source,
+            () => new[] { "alice" },
+            _ => false,
+            "alice",
+            myDevice,
+            _ => { },
+            accountRosterObserved: devices => observed.Add(
+                devices.OrderBy(device => device, StringComparer.Ordinal).ToArray()));
+        _disposables.Add(poller);
+
+        await poller.PollOnceAsync(default);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(1, observed.Count, "a replayed roster must not duplicate notifications");
+        CollectionAssert.AreEqual(new[] { myDevice }, observed[0]);
+
+        source.SetPresence("alice", true, myDevice, mobileDevice);
+        await poller.PollOnceAsync(default);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(2, observed.Count);
+        CollectionAssert.AreEqual(
+            new[] { mobileDevice, myDevice }.OrderBy(device => device, StringComparer.Ordinal).ToArray(),
+            observed[1]);
+
+        source.SetPresence("alice", true, myDevice);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(3, observed.Count, "disconnect must remove the expired device");
+        CollectionAssert.AreEqual(new[] { myDevice }, observed[2]);
+
+        source.SetPresence("alice", true, myDevice, mobileDevice);
+        await poller.PollOnceAsync(default);
+        Assert.AreEqual(4, observed.Count, "reconnect must be observable after an offline transition");
+    }
+
+    [TestMethod]
     public async Task Poller_OnlineNewSibling_BypassesFreshStaleRoster()
     {
         var source = new FakeMetadataSource();

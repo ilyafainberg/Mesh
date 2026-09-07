@@ -216,7 +216,7 @@
             if (!appHtml.TryGetValue(id, out var html)) continue;
             try
             {
-                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, html, PlatformCaps.DevicePlatform);
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, html);
                 mounted.Add(id);
             }
             catch { /* frame not ready yet; retry on the next render */ }

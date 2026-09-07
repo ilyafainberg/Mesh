@@ -49,6 +49,23 @@ _hostedtest/      Hosted free-model tool-calling test
 _deploy/          Relay deploy + asset build scripts
 ```
 
+## Install on Windows
+
+GitHub Releases provide both supported Windows x64 packages:
+
+- **Installer (recommended):** download `Mesh-<version>-setup.zip`, extract it, and
+  run the contained setup executable. The per-user installer does not require
+  administrator rights and adds normal shortcuts and uninstall support.
+- **Portable:** download `Mesh-<version>-portable-win-x64.zip`, extract the archive
+  to any writable folder, and run `Mesh.App.exe`. It does not install shortcuts or
+  registry entries. By default, Mesh still keeps the encrypted profile in the
+  current user's local application-data folder; set `MESH_PROFILE_DIR` before
+  launch only when an intentionally isolated profile is required.
+
+Use the release's `SHA256SUMS` file to verify either download.
+Windows may show a SmartScreen warning when a GitHub Actions package is not
+Authenticode-signed. Verify the checksum before choosing **More info > Run anyway**.
+
 ## Build
 
 ```powershell
@@ -74,6 +91,4 @@ dotnet run --project _hostedtest -- <relayUrl>   # hosted free-model tool call
 
 ## License
 
-Mesh is free for personal and noncommercial use under the PolyForm Noncommercial
-License 1.0.0. See [LICENSE](LICENSE). Commercial use, including any use by or for
-a business, requires a separate commercial license: open an issue to arrange one.
+Mesh is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).

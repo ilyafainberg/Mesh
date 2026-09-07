@@ -77,8 +77,6 @@
     <Compile Include="..\..\src\Mesh.App\Services\AgentPromptContentSelector.cs" Link="AgentPromptContentSelector.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ProviderModelMetadata.cs" Link="ProviderModelMetadata.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\RuntimeDiagnostics.cs" Link="RuntimeDiagnostics.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\AppShutdown.cs" Link="AppShutdown.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\WidgetDiagnosticsBridge.cs" Link="WidgetDiagnosticsBridge.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\ManagedOperationDiagnostics.cs" Link="ManagedOperationDiagnostics.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\UiOperationCoordinator.cs" Link="UiOperationCoordinator.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicSendCoordinator.cs" Link="TopicSendCoordinator.cs" />
@@ -89,8 +87,6 @@
     <Compile Include="..\..\src\Mesh.App\Services\ImageSharePolicy.cs" Link="ImageSharePolicy.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\AssistantDraftRefreshGate.cs" Link="AssistantDraftRefreshGate.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\LiveAgentRenderState.cs" Link="LiveAgentRenderState.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\RelayTransportPolicy.cs" Link="RelayTransportPolicy.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\StartupConnectionRecovery.cs" Link="StartupConnectionRecovery.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\PasteFiles.cs" Link="PasteFiles.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\PickedFileStager.cs" Link="PickedFileStager.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\MemoryPolicy.cs" Link="MemoryPolicy.cs" />
@@ -101,9 +97,6 @@
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionContracts.cs" Link="TopicExecutionContracts.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicExecutionRouter.cs" Link="TopicExecutionRouter.cs" />
     <Compile Include="..\..\src\Mesh.App\Services\TopicTurnRunner.cs" Link="TopicTurnRunner.cs" />
-    <Compile Include="..\..\src\Mesh.App\Services\UpdatePackageCache.cs" Link="UpdatePackageCache.cs" />
-    <Compile Include="..\..\src\Mesh.Updater\AuthenticodeVerifier.cs" Link="Updater\AuthenticodeVerifier.cs" />
-    <Compile Include="..\..\src\Mesh.Updater\UpdateOptions.cs" Link="Updater\UpdateOptions.cs" />
     <Compile Include="..\..\src\Mesh.App\Domain\Models.cs" Link="Domain\Models.cs" />
     <Compile Include="..\..\src\Mesh.App\Domain\TopicTranscriptPresentation.cs" Link="Domain\TopicTranscriptPresentation.cs" />
   </ItemGroup>

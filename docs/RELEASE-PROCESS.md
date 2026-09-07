@@ -139,7 +139,7 @@ Expected:
 - JDK 21 and Android SDK for Android
 - Xcode on a supported Mac for iOS and Mac Catalyst
 
-Mesh 1.19.0 uses the approved patched .NET SDK `10.0.302`. Keep local, pipeline, workload, and Xcode versions aligned.
+Mesh 1.18.2 uses .NET SDK `10.0.303`. Keep local, pipeline, workload, and Xcode versions aligned.
 Do not let workload installation silently select a manifest that requires a newer unavailable Xcode.
 
 ### 5.2 Credential names
@@ -216,8 +216,8 @@ Publication to one channel does not imply authorization for another.
 Use the pinned SDK when available:
 
 ```powershell
-$dotnet = 'C:\Users\ifain\source\repos\dotnet-sdk-10.0.302-win-x64\dotnet.exe'
-if (-not (Test-Path $dotnet)) { throw 'Approved .NET SDK 10.0.302 is required.' }
+$dotnet = 'C:\Users\ifain\source\repos\dotnet-sdk-10.0.303-win-x64\dotnet.exe'
+if (-not (Test-Path $dotnet)) { $dotnet = 'dotnet' }
 
 & $dotnet test .\tests\Mesh.App.Tests\Mesh.App.Tests.csproj -c Release --nologo
 & $dotnet build .\src\Mesh.Relay\Mesh.Relay.csproj -c Release --nologo
@@ -320,7 +320,22 @@ The wrapper:
 Use `release-win.ps1`, not the shared `release.ps1`, for public Windows publication. The wrapper
 enforces the ZIP-only rule.
 
-### 8.4 Verify Windows
+### 8.4 Tag-driven source-repository release
+
+The private source repository also has `.github/workflows/release.yml` for an explicitly
+authorized tag-driven release. A `v*` tag builds and publishes:
+
+- `Mesh-X.Y.Z-portable-win-x64.zip`
+- `Mesh-X.Y.Z-setup.zip`, containing exactly one Inno Setup executable
+- `SHA256SUMS`
+
+The workflow validates its tag against `.github/release-build.json`, verifies that the approved
+product commit is an ancestor, rejects product/test changes after that commit, passes the release
+version and build number explicitly to `dotnet publish`, smoke-tests both package paths, and creates
+the GitHub release with the repository token. Do not use this workflow for Blob, Store, Relay, or
+mobile publication. Update the release configuration for each authorized tag.
+
+### 8.5 Verify Windows
 
 ```powershell
 $exe = ".\_deploy\artifacts\Mesh-Setup-vX.Y.Z.exe"

@@ -17,15 +17,9 @@ public sealed class WindowsAppControl : IAppControl
     private static TaskbarIcon? tray;
     private static bool forceQuit;
     private static bool headless;
-    private static readonly object quitGate = new();
-    private static AppShutdownCoordinator? shutdownCoordinator;
-    private static Task? quitTask;
-
-    public WindowsAppControl(AppShutdownCoordinator shutdown)
-        => shutdownCoordinator = shutdown;
 
     public void ShowMainWindow() => Show();
-    public Task QuitAsync() => QuitAppAsync();
+    public void Quit() => QuitApp();
 
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string RunValueName = "Mesh";
@@ -97,7 +91,7 @@ public sealed class WindowsAppControl : IAppControl
         var menu = new MenuFlyout();
         menu.Items.Add(new MenuFlyoutItem { Text = "Open Mesh", Command = new RelayCommand(Show) });
         menu.Items.Add(new MenuFlyoutSeparator());
-        menu.Items.Add(new MenuFlyoutItem { Text = "Quit Mesh", Command = new AsyncRelayCommand(QuitAppAsync) });
+        menu.Items.Add(new MenuFlyoutItem { Text = "Quit Mesh", Command = new RelayCommand(QuitApp) });
         tray = new TaskbarIcon
         {
             ToolTipText = "Mesh",
@@ -164,17 +158,9 @@ public sealed class WindowsAppControl : IAppControl
         appWindow.MoveInZOrderAtTop();
     }
 
-    private static Task QuitAppAsync()
-    {
-        lock (quitGate)
-            return quitTask ??= QuitAppCoreAsync();
-    }
-
-    private static async Task QuitAppCoreAsync()
+    private static void QuitApp()
     {
         if (MeshDesktopInstanceRuntime.RequestLocalShutdown()) return;
-        if (shutdownCoordinator is not null)
-            await shutdownCoordinator.ShutdownAsync().ConfigureAwait(false);
         ExitNow();
     }
 
@@ -196,17 +182,6 @@ public sealed class WindowsAppControl : IAppControl
             return;
         }
         action();
-    }
-
-    private sealed class AsyncRelayCommand(Func<Task> execute) : ICommand
-    {
-        public event EventHandler? CanExecuteChanged { add { } remove { } }
-        public bool CanExecute(object? parameter) => true;
-        public async void Execute(object? parameter)
-        {
-            try { await execute().ConfigureAwait(false); }
-            catch (Exception ex) { RuntimeDiagnostics.Current?.RecordException("tray-command", ex); }
-        }
     }
 
     private sealed class RelayCommand(Action execute) : ICommand

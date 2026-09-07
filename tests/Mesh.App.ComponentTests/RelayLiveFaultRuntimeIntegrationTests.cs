@@ -25,6 +25,7 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 namespace Mesh.App.ComponentTests;
 
 [TestClass]
+[DoNotParallelize]
 public sealed class RelayLiveFaultRuntimeIntegrationTests
 {
     private const string AdminKey = "runtime-test-key";
@@ -83,57 +84,6 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
             Console.WriteLine(
                 $"PROGRAM_GUARD test-enabled health=200 unauth={(int)unauthorized.StatusCode} auth={(int)response.StatusCode}");
-        }
-    }
-
-    [TestMethod]
-    public async Task ActualProgram_TransientCapabilityFailureRecoversWithStableIdentity()
-    {
-        var repository = FindRepositoryRoot();
-        var root = Path.Combine(
-            repository, "_artifacts", "capability-reconnect", Guid.NewGuid().ToString("n"));
-        Directory.CreateDirectory(root);
-        await using var relay = await RelayProcess.StartAsync(
-            TestRelayAssembly(repository), "Test", enabled: true, AdminKey);
-        ClientHarness? client = null;
-        try
-        {
-            var http = new OneShotHealthFailureFactory();
-            client = CreateClient(
-                "capability-reconnect", "Reconnect device", relay.BaseUrl, relay.BaseUrl,
-                root, "client", httpFactory: http);
-            Assert.IsTrue(await client.Client.RegisterAsync());
-            var deviceId = client.Client.MyDeviceId;
-
-            var failure = await Assert.ThrowsExactlyAsync<OnlineReplicationError>(
-                client.Client.ConnectAsync);
-            StringAssert.Contains(failure.Message, "Could not read Protocol 9 capabilities");
-            await EventuallyAsync(
-                () => client.Client.Connected,
-                TimeSpan.FromSeconds(15));
-
-            Assert.AreEqual(deviceId, client.Client.MyDeviceId);
-            Assert.AreEqual(2, http.HealthAttempts);
-            Assert.IsNull(client.Client.LastConnectionError);
-
-            await client.Client.DisconnectAsync();
-            Assert.IsFalse(client.Client.Connected);
-            await client.Client.ConnectAsync();
-            await EventuallyAsync(
-                () => client.Client.Connected,
-                TimeSpan.FromSeconds(15));
-            Assert.AreEqual(deviceId, client.Client.MyDeviceId);
-        }
-        finally
-        {
-            if (client is not null) await client.Client.DisconnectAsync();
-            client?.State.SignOut();
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            try
-            {
-                if (Directory.Exists(root)) Directory.Delete(root, true);
-            }
-            catch (IOException) { }
         }
     }
 
@@ -1416,6 +1366,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
                 using var response = await relay.Http.SendAsync(revoke);
                 response.EnsureSuccessStatusCode();
             }
+
             var after = await HandleAsync(relay.Http, "authority");
             Assert.AreEqual(before.AuthGeneration + 1, after.AuthGeneration);
 
@@ -1507,6 +1458,240 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         }
     }
 
+    [DataTestMethod]
+    [DataRow(DevicePlatforms.Android, true, false, "Android")]
+    [DataRow(DevicePlatforms.IOS, true, false, "iOS")]
+    [DataRow(DevicePlatforms.IOS, true, false, "iPadOS")]
+    [DataRow(DevicePlatforms.Windows, false, false, "ineligible desktop")]
+    [DataRow(DevicePlatforms.Windows, true, true, "eligible desktop")]
+    public async Task CraftedTopicRequest_ExecutesOnlyOnEligibleRemoteHost(
+        string recipientPlatform,
+        bool configureRecipientModel,
+        bool shouldExecute,
+        string scenario)
+    {
+        var repository = FindRepositoryRoot();
+        var root = Path.Combine(
+            repository,
+            "_artifacts",
+            "remote-host-authorization",
+            Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        await using var model = await DeterministicModelServer.StartAsync();
+        await using var relay = await RelayProcess.StartAsync(
+            TestRelayAssembly(repository), "Test", enabled: true, AdminKey);
+        ClientHarness? sender = null;
+        ClientHarness? recipient = null;
+        ConnectionEvidence? senderConnection = null;
+        try
+        {
+            var suffix = Guid.NewGuid().ToString("n")[..8];
+            var handle = "remote-auth-" + suffix;
+            sender = CreateClient(
+                handle, "Sender", relay.BaseUrl, model.BaseUrl, root, "sender");
+            recipient = CreateClient(
+                handle,
+                "Recipient",
+                relay.BaseUrl,
+                model.BaseUrl,
+                root,
+                "recipient",
+                currentPlatformProvider: () => recipientPlatform,
+                configureModel: configureRecipientModel);
+            await RegisterLinkedDevicesAsync(
+                relay.Http,
+                sender.State,
+                recipient.State,
+                secondaryPlatform: recipientPlatform,
+                secondaryRemoteAgentEnabled:
+                    DevicePlatforms.IsDesktop(recipientPlatform) && configureRecipientModel);
+
+            await recipient.Client.ConnectAsync();
+            await EventuallyAsync(
+                () => recipient.Client.Connected,
+                TimeSpan.FromSeconds(15));
+            var authority = await HandleAsync(relay.Http, handle);
+            senderConnection = await ConnectAsync(relay.BaseUrl, sender.State, authority);
+            var eligibleDevices = await sender.Client.ListEligibleDevicesAsync(
+                CancellationToken.None);
+            Assert.AreEqual(
+                shouldExecute,
+                eligibleDevices.Any(device =>
+                    device.DeviceId == recipient.Client.MyDeviceId),
+                scenario);
+            Assert.IsTrue(
+                sender.Client.IsAccountDeviceOnline(recipient.Client.MyDeviceId),
+                $"The full account roster must retain online presence for {scenario}.");
+
+            if (!shouldExecute)
+            {
+                var directAt = DateTimeOffset.UtcNow;
+                var directThread = sender.State.NewOwnThread(
+                    "Direct authorization",
+                    new ExecutionDevice(
+                        recipient.Client.MyDeviceId,
+                        "Recipient",
+                        recipientPlatform),
+                    createdAt: directAt);
+                var direct = await sender.Client.DispatchAsync(
+                    recipient.Client.MyDeviceId,
+                    new TopicRunRequestPayload(
+                        "run-direct-" + suffix,
+                        directThread.Id,
+                        "line-direct-" + suffix,
+                        handle,
+                        "crafted direct request",
+                        directAt,
+                        recipient.Client.MyDeviceId,
+                        TopicTurnMode.Single),
+                    [],
+                    CancellationToken.None);
+                Assert.IsFalse(direct.Accepted, scenario);
+                Assert.AreEqual("device_not_eligible", direct.Code, scenario);
+                Assert.IsNull(sender.State.GetTopicOutbox(direct.RunId));
+            }
+
+            var logs = new ConcurrentQueue<string>();
+            recipient.Client.Log += logs.Enqueue;
+            var at = DateTimeOffset.UtcNow;
+            var request = new TopicRunRequestPayload(
+                "run-crafted-" + suffix,
+                "thread-crafted-" + suffix,
+                "line-crafted-" + suffix,
+                handle,
+                "crafted inbound request",
+                at,
+                recipient.Client.MyDeviceId,
+                TopicTurnMode.Single);
+            var plaintext = TopicRunProtocol.RequestBody(request);
+            var ciphertext = MessageCrypto.Encrypt(
+                plaintext,
+                [recipient.State.Profile.PublicKey]);
+            Assert.IsNotNull(ciphertext);
+            var envelope = MeshEnvelope.Create(
+                handle,
+                handle,
+                MeshKinds.TopicRunRequest,
+                ciphertext,
+                Sign(sender.State.Profile.PrivateKey, ciphertext),
+                fromDevice: sender.Client.MyDeviceId,
+                toDevice: recipient.Client.MyDeviceId,
+                id: request.RunId);
+
+            var relayResult = await senderConnection.Connection.InvokeAsync<MeshSendResult>(
+                MeshHubProtocol.SendEnvelope,
+                envelope,
+                CancellationToken.None);
+            Assert.IsTrue(relayResult.Accepted, relayResult.Code);
+
+            if (shouldExecute)
+            {
+                await EventuallyAsync(
+                    () => recipient.State.ListInboundTopicRuns().Any(item =>
+                        item.RunId == request.RunId
+                        && item.State == InboundTopicRunStates.Completed),
+                    TimeSpan.FromSeconds(25));
+                Assert.AreEqual(1, model.CallCount, scenario);
+            }
+            else
+            {
+                await EventuallyAsync(
+                    () => logs.Any(message => message.Contains(
+                        "receive-permanent-reject: topic_remote_host_not_eligible",
+                        StringComparison.Ordinal)),
+                    TimeSpan.FromSeconds(15));
+                Assert.IsFalse(recipient.State.ListInboundTopicRuns().Any(item =>
+                    item.RunId == request.RunId), scenario);
+                Assert.AreEqual(0, model.CallCount, scenario);
+            }
+        }
+        finally
+        {
+            if (senderConnection is not null)
+                await senderConnection.Connection.DisposeAsync();
+            if (recipient is not null)
+                await recipient.Client.DisconnectAsync();
+            sender?.State.SignOut();
+            recipient?.State.SignOut();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try
+            {
+                if (Directory.Exists(root)) Directory.Delete(root, true);
+            }
+            catch (IOException) { }
+        }
+    }
+
+    [TestMethod]
+    public async Task MobileLocalSelfExecution_RemainsAllowedByRemoteHostGuard()
+    {
+        var repository = FindRepositoryRoot();
+        var root = Path.Combine(
+            repository,
+            "_artifacts",
+            "mobile-local-authorization",
+            Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        await using var model = await DeterministicModelServer.StartAsync();
+        ClientHarness? mobile = null;
+        try
+        {
+            mobile = CreateClient(
+                "mobile-local-auth",
+                "Mobile",
+                "http://127.0.0.1:1",
+                model.BaseUrl,
+                root,
+                "mobile",
+                currentPlatformProvider: () => DevicePlatforms.Android);
+            var at = DateTimeOffset.UtcNow;
+            var thread = mobile.State.NewOwnThread(
+                "Local mobile",
+                new ExecutionDevice(
+                    mobile.Client.MyDeviceId,
+                    "Mobile",
+                    DevicePlatforms.Android),
+                createdAt: at);
+            var router = new TopicExecutionRouter(
+                mobile.State,
+                mobile.Runner,
+                mobile.Client,
+                () => DevicePlatforms.Android);
+
+            var result = await router.SubmitAsync(
+                new TopicTurnDraft(
+                    "run-mobile-local",
+                    thread.Id,
+                    "line-mobile-local",
+                    mobile.State.Profile.Handle,
+                    "run on this phone",
+                    at,
+                    TopicTurnMode.Single,
+                    mobile.Client.MyDeviceId),
+                null,
+                CancellationToken.None);
+
+            Assert.IsTrue(result.Accepted, result.Error);
+            await EventuallyAsync(
+                () => mobile.State.Profile.OwnThreads.Single(item => item.Id == thread.Id)
+                          .Lines.Any(line => line.Role == "assistant")
+                      && mobile.State.Profile.OwnThreads.Single(item => item.Id == thread.Id)
+                          .ExecutionRunId is null,
+                TimeSpan.FromSeconds(20));
+            Assert.AreEqual(1, model.CallCount);
+        }
+        finally
+        {
+            mobile?.State.SignOut();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try
+            {
+                if (Directory.Exists(root)) Directory.Delete(root, true);
+            }
+            catch (IOException) { }
+        }
+    }
+
     private static HttpRequestMessage AdminRequest(
         HttpMethod method,
         string path,
@@ -1574,7 +1759,9 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         HttpClient http,
         AppState primary,
         AppState secondary,
-        string? thirdPublicKey = null)
+        string? thirdPublicKey = null,
+        string secondaryPlatform = DevicePlatforms.Windows,
+        bool secondaryRemoteAgentEnabled = true)
     {
         var handle = AppState.Norm(primary.Profile.Handle);
         var genesis = OnlineReplicationProtocol.CreateCustodyEntry(
@@ -1598,6 +1785,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
                            ClaimProtocol.Message(handle, primary.Profile.PublicKey)),
                        DeviceName: primary.Profile.DeviceName,
                        DevicePlatform: DevicePlatforms.Windows,
+                       RemoteAgentEnabled: true,
                        AgentHostEnabled: true,
                        CustodyAuthority: genesis)))
             response.EnsureSuccessStatusCode();
@@ -1608,6 +1796,21 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
 
         var authority = await HandleAsync(http, handle);
         Assert.IsNotNull(authority.CustodyAuthority);
+        using (var response = await http.PostAsJsonAsync(
+                   "/handles",
+                   new RegisterHandleRequest(
+                       handle,
+                       secondary.Profile.PublicKey,
+                       secondary.Profile.DisplayName,
+                       Signature: Sign(
+                           secondary.Profile.PrivateKey,
+                           ClaimProtocol.Message(handle, secondary.Profile.PublicKey)),
+                       DeviceName: secondary.Profile.DeviceName,
+                       DevicePlatform: secondaryPlatform,
+                       RemoteAgentEnabled: secondaryRemoteAgentEnabled,
+                       AgentHostEnabled: true,
+                       CustodyAuthority: authority.CustodyAuthority)))
+            response.EnsureSuccessStatusCode();
         primary.ImportCustodyAuthority(handle, authority.CustodyAuthority);
         secondary.ImportCustodyAuthority(handle, authority.CustodyAuthority);
     }
@@ -1675,7 +1878,8 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         TimeProvider? timeProvider = null,
         MemorySecretStore? secrets = null,
         bool initializeIdentity = true,
-        IHttpClientFactory? httpFactory = null)
+        Func<string>? currentPlatformProvider = null,
+        bool configureModel = true)
     {
         timeProvider ??= TimeProvider.System;
         secrets ??= new MemorySecretStore();
@@ -1693,13 +1897,16 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             state.Profile.DisplayName = name;
             state.Profile.DeviceName = name;
             state.Profile.RelayUrl = relayUrl;
-            state.Profile.Model.Provider = ModelProvider.FoundryLocal;
-            state.Profile.Model.Model = "deterministic-boundary";
-            state.Profile.Model.Endpoint = modelUrl;
-            state.Profile.Model.ApiKey = "test-boundary";
+            if (configureModel)
+            {
+                state.Profile.Model.Provider = ModelProvider.FoundryLocal;
+                state.Profile.Model.Model = "deterministic-boundary";
+                state.Profile.Model.Endpoint = modelUrl;
+                state.Profile.Model.ApiKey = "test-boundary";
+            }
             state.Save();
         }
-        var http = httpFactory ?? new RealHttpClientFactory();
+        var http = new RealHttpClientFactory();
         var meter = new TokenMeter(state);
         var media = new AgentMedia();
         var memory = new MemoryService(state);
@@ -1724,7 +1931,8 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
             http,
             new NoopPushService(),
             new ForegroundLifecycle(),
-            timeProvider);
+            timeProvider,
+            currentPlatformProvider: currentPlatformProvider);
         var harness = new ClientHarness(state, client, runner, secrets);
         createdClients.Add(harness);
         return harness;
@@ -1748,7 +1956,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
         }
         using var fixture = connection.CreateCommand();
         fixture.CommandText = """
-            INSERT INTO topic_run_correlations(
+            INSERT OR REPLACE INTO topic_run_correlations(
                 run_id, thread_id, target_device_id, trigger_line_id, created_at,
                 terminal_at, terminal_event_at, trigger_identity_state)
             VALUES($run, $thread, $target, NULL, $created, NULL, NULL, 'strict');
@@ -2431,32 +2639,6 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
     private sealed class RealHttpClientFactory : IHttpClientFactory
     {
         public HttpClient CreateClient(string name) => new();
-    }
-
-    private sealed class OneShotHealthFailureFactory : IHttpClientFactory
-    {
-        private int healthAttempts;
-        public int HealthAttempts => Volatile.Read(ref healthAttempts);
-
-        public HttpClient CreateClient(string name)
-            => new(new OneShotHealthFailureHandler(this));
-
-        private sealed class OneShotHealthFailureHandler(
-            OneShotHealthFailureFactory owner) : DelegatingHandler(new HttpClientHandler())
-        {
-            protected override Task<HttpResponseMessage> SendAsync(
-                HttpRequestMessage request,
-                CancellationToken cancellationToken)
-            {
-                if (request.RequestUri?.AbsolutePath == "/health"
-                    && Interlocked.Increment(ref owner.healthAttempts) == 1)
-                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
-                    {
-                        RequestMessage = request
-                    });
-                return base.SendAsync(request, cancellationToken);
-            }
-        }
     }
 
     private sealed class ForegroundLifecycle : IAppLifecycleState

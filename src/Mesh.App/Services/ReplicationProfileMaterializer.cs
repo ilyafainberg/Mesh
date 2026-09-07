@@ -155,8 +155,20 @@ public static class ReplicationProfileMaterializer
                     thread.ExecutionAt = body.ExecutionAt;
                     thread.ExecutionRunId = body.ExecutionRunId;
                 }
+                if (body.TerminalUpdate is { } terminal
+                    && string.Equals(
+                        thread.ExecutionRunId,
+                        terminal.RunId,
+                        StringComparison.Ordinal))
+                {
+                    thread.ExecutionRunId = null;
+                }
                 if (body.LastActivityAt.HasValue)
                     thread.LastActivityAt = ActivityTimestamp.Advance(thread.LastActivityAt, body.LastActivityAt.Value);
+                if (body.TerminalUpdate is { } terminalUpdate)
+                    thread.LastActivityAt = ActivityTimestamp.Advance(
+                        thread.LastActivityAt,
+                        terminalUpdate.Timestamp);
                 return true;
             }
             case ReplicationPayloadCodec.DomainAction.Delete:

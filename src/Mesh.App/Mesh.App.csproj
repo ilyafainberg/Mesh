@@ -41,10 +41,10 @@
         <ApplicationIcon>Platforms\Windows\appicon.ico</ApplicationIcon>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.19.0</ApplicationDisplayVersion>
-        <ApplicationVersion>76</ApplicationVersion>
+        <ApplicationDisplayVersion>1.18.10</ApplicationDisplayVersion>
+        <ApplicationVersion>75</ApplicationVersion>
         <!-- Drives AssemblyVersion/FileVersion/InformationalVersion, read by the self-updater. -->
-        <Version>1.19.0</Version>
+        <Version>1.18.10</Version>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
@@ -62,15 +62,6 @@
     <PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios' And '$(Configuration)' != 'Debug'">
         <CodesignEntitlements>Platforms\iOS\Entitlements.Release.plist</CodesignEntitlements>
     </PropertyGroup>
-
-    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android' And '$(Configuration)' == 'Debug'">
-        <AndroidResource Include="Platforms\Android\mesh_network_security.debug.xml"
-                         Link="Resources\xml\mesh_network_security.xml" />
-    </ItemGroup>
-    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android' And '$(Configuration)' != 'Debug'">
-        <AndroidResource Include="Platforms\Android\mesh_network_security.release.xml"
-                         Link="Resources\xml\mesh_network_security.xml" />
-    </ItemGroup>
 
     <!-- MainPage references the Razor-generated Routes component. On iOS, runtime inflation
          defers that type lookup until Razor components have been generated and loaded. -->
@@ -163,7 +154,7 @@
             Condition="'$(DesignTimeBuild)' != 'true'">
         <Error Condition="!Exists('$(BuiltInsCompilerAssembly)')"
                Text="The Mesh built-in content compiler was not built: $(BuiltInsCompilerAssembly)" />
-        <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(BuiltInsCompilerAssembly)&quot; &quot;$(BuiltInsRoot)&quot; &quot;$(BuiltInsIndex)&quot;" />
+        <Exec Command="dotnet &quot;$(BuiltInsCompilerAssembly)&quot; &quot;$(BuiltInsRoot)&quot; &quot;$(BuiltInsIndex)&quot;" />
 
     </Target>
 
@@ -183,39 +174,6 @@
         <PackageReference Include="Xamarin.Firebase.Messaging" Version="125.0.0" />
         <GoogleServicesJson Include="$(MeshGoogleServicesJson)" />
     </ItemGroup>
-
-    <!-- The Windows updater targets the .NET Framework already present on supported Windows
-         versions, keeping the bundled helper small instead of shipping a second .NET runtime. -->
-    <PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
-        <MeshUpdaterProject>$(MSBuildProjectDirectory)\..\Mesh.Updater\Mesh.Updater.csproj</MeshUpdaterProject>
-        <MeshUpdaterOutputDirectory>$(MSBuildProjectDirectory)\..\Mesh.Updater\bin\$(Configuration)\net472</MeshUpdaterOutputDirectory>
-    </PropertyGroup>
-    <Target Name="BuildMeshUpdater" BeforeTargets="Build"
-            Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
-        <MSBuild Projects="$(MeshUpdaterProject)" Targets="Restore;Build"
-                 Properties="Configuration=$(Configuration);TargetFramework=net472;Version=$(Version)"
-                 RemoveProperties="TargetFrameworks;RuntimeIdentifier;RuntimeIdentifierOverride;SelfContained" />
-        <Error Condition="!Exists('$(MeshUpdaterOutputDirectory)\Mesh.Updater.exe')"
-               Text="Mesh updater build produced no executable." />
-    </Target>
-    <Target Name="CopyMeshUpdaterBuild" AfterTargets="Build" DependsOnTargets="BuildMeshUpdater"
-            Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
-        <ItemGroup>
-            <MeshUpdaterFiles Include="$(MeshUpdaterOutputDirectory)\Mesh.Updater.exe" />
-            <MeshUpdaterFiles Include="$(MeshUpdaterOutputDirectory)\Mesh.Updater.exe.config"
-                              Condition="Exists('$(MeshUpdaterOutputDirectory)\Mesh.Updater.exe.config')" />
-        </ItemGroup>
-        <Copy SourceFiles="@(MeshUpdaterFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-    </Target>
-    <Target Name="CopyMeshUpdaterPublish" AfterTargets="Publish" DependsOnTargets="BuildMeshUpdater"
-            Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
-        <ItemGroup>
-            <MeshUpdaterPublishFiles Include="$(MeshUpdaterOutputDirectory)\Mesh.Updater.exe" />
-            <MeshUpdaterPublishFiles Include="$(MeshUpdaterOutputDirectory)\Mesh.Updater.exe.config"
-                                     Condition="Exists('$(MeshUpdaterOutputDirectory)\Mesh.Updater.exe.config')" />
-        </ItemGroup>
-        <Copy SourceFiles="@(MeshUpdaterPublishFiles)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
-    </Target>
 
     <!-- Windows-only: system tray icon support + the tray icon asset next to the exe. -->
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">

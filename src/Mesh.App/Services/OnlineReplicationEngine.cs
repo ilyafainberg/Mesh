@@ -2630,8 +2630,6 @@ public interface IReplicationMetadataSource
 public sealed class OnlineReplicationError : Exception
 {
     public OnlineReplicationError(string message) : base(message) { }
-    public OnlineReplicationError(string message, Exception innerException)
-        : base(message, innerException) { }
 }
 
 /// <summary>
@@ -3174,6 +3172,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
     private readonly Func<ReplicationBootstrapTarget, CancellationToken, Task>? bootstrapPeer;
     private readonly Action<bool, bool>? pollCompleted;
     private readonly Action<IReadOnlyCollection<string>>? rosterOnline;
+    private readonly Action<IReadOnlyCollection<string>>? accountRosterObserved;
 
     private readonly object gate = new();
     private readonly Random jitter = new();
@@ -3182,6 +3181,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
     private Task? loopTask;
     private readonly Dictionary<string, DateTimeOffset> offlineWakes = new(StringComparer.Ordinal);
     private Dictionary<string, string> onlineRosterIdentities = new(StringComparer.Ordinal);
+    private HashSet<string>? observedAccountRoster;
     private Task? disposeTask;
     private PollFlight? pollFlight;
     private long nextPollFlightId;
@@ -3209,7 +3209,8 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         Action<string> surface,
         Func<ReplicationBootstrapTarget, CancellationToken, Task>? bootstrapPeer = null,
         Action<bool, bool>? pollCompleted = null,
-        Action<IReadOnlyCollection<string>>? rosterOnline = null)
+        Action<IReadOnlyCollection<string>>? rosterOnline = null,
+        Action<IReadOnlyCollection<string>>? accountRosterObserved = null)
     {
         this.engine = engine ?? throw new ArgumentNullException(nameof(engine));
         this.roster = roster ?? throw new ArgumentNullException(nameof(roster));
@@ -3222,6 +3223,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         this.bootstrapPeer = bootstrapPeer;
         this.pollCompleted = pollCompleted;
         this.rosterOnline = rosterOnline;
+        this.accountRosterObserved = accountRosterObserved;
     }
 
     public bool HasOnlineAuthorizedPeer => onlineAuthorizedPeer;
@@ -3529,6 +3531,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         if (stalePresenceHandles.Count > 0)
             await roster.RefreshOwnedAsync(
                 stalePresenceHandles.ToArray(), authoritative: true, ct).ConfigureAwait(false);
+        ReportAccountRoster(presence);
 
         var dueHandles = new HashSet<string>(StringComparer.Ordinal);
         var pendingDevices = new Dictionary<string, bool>(StringComparer.Ordinal);
@@ -3674,6 +3677,31 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
         return onlineAuthorized || pendingSynchronizationWork;
     }
 
+    private void ReportAccountRoster(IReadOnlyList<RelayHandlePresence> presence)
+    {
+        if (accountRosterObserved is null || ownHandle.Length == 0) return;
+        var own = presence.FirstOrDefault(item =>
+            string.Equals(ReplicationHandle.Norm(item.Handle), ownHandle, StringComparison.Ordinal));
+        if (own is null) return;
+
+        var online = own.Online
+            ? (own.Devices ?? Array.Empty<string>())
+                .Where(static device => !string.IsNullOrWhiteSpace(device))
+                .ToHashSet(StringComparer.Ordinal)
+            : new HashSet<string>(StringComparer.Ordinal);
+        if (observedAccountRoster?.SetEquals(online) == true) return;
+
+        try
+        {
+            accountRosterObserved(online.ToArray());
+            observedAccountRoster = online;
+        }
+        catch (Exception ex)
+        {
+            surface($"account roster callback failed: {ex.Message}");
+        }
+    }
+
     private static string AvailabilityIdentity(string handle, ReplicationDevice device)
         => string.Join(
             "\0",
@@ -3812,6 +3840,7 @@ public sealed class ReplicationPresencePoller : IDisposable, IAsyncDisposable
                 loopTask = null;
                 offlineWakes.Clear();
                 onlineRosterIdentities.Clear();
+                observedAccountRoster = null;
                 remainingFlight?.Completion.TrySetCanceled();
             }
 

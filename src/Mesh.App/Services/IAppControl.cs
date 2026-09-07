@@ -12,7 +12,7 @@ public interface IAppControl
     void ShowMainWindow();
 
     /// <summary>Quit the application for good (bypasses close-to-tray).</summary>
-    Task QuitAsync();
+    void Quit();
 
     /// <summary>Whether "launch at Windows startup" is currently enabled for this user.</summary>
     bool IsLaunchAtStartupEnabled();
@@ -22,16 +22,11 @@ public interface IAppControl
 }
 
 /// <summary>Default no-frills implementation for platforms without a system tray.</summary>
-public sealed class DefaultAppControl(AppShutdownCoordinator shutdown) : IAppControl
+public sealed class DefaultAppControl : IAppControl
 {
     public void ShowMainWindow() { }
 
-    public async Task QuitAsync()
-    {
-        await shutdown.ShutdownAsync().ConfigureAwait(false);
-        await MainThread.InvokeOnMainThreadAsync(
-            () => Microsoft.Maui.Controls.Application.Current?.Quit());
-    }
+    public void Quit() => Microsoft.Maui.Controls.Application.Current?.Quit();
 
     public bool IsLaunchAtStartupEnabled() => false;
 

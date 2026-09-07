@@ -466,7 +466,7 @@
         {
             try
             {
-                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", draftFrameRef, draftHtml, PlatformCaps.DevicePlatform);
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", draftFrameRef, draftHtml);
                 draftMountedHtml = draftHtml;
             }
             catch { /* frame not in DOM yet; retry on the next render */ }
@@ -510,7 +510,7 @@
             if (widgetMountedHtmls.TryGetValue(w.Id, out var mounted) && mounted == html) continue;
             try
             {
-                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, html, PlatformCaps.DevicePlatform);
+                await JS.InvokeVoidAsync("sandboxFrame.setFrameHtml", el, html);
                 widgetMountedHtmls[w.Id] = html;
             }
             catch { /* retry on next render */ }

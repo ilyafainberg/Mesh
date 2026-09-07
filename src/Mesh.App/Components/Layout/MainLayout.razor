@@ -12,21 +12,7 @@
 @inject ConnectorCatalogService Catalog
 @inject IJSRuntime JS
 @inject IUiModeService UiModeSvc
-@inject WidgetDiagnosticsBridge WidgetDiagnostics
-@inject AppShutdownCoordinator Shutdown
 @implements IDisposable
-
-@if (State.IsOnboarded && Mesh.LastConnectionError is { } connectionIssue)
-{
-    <div class="global-banner err" role="alert">
-        <i class="bi bi-cloud-slash"></i>
-        <span class="gb-text">Mesh is offline: @connectionIssue</span>
-        <button type="button" class="gb-link" @onclick="RetryConnectionAsync" disabled="@retryingConnection">
-            @(retryingConnection ? "Retrying…" : "Retry")
-        </button>
-        <a class="gb-link" href="settings">Settings</a>
-    </div>
-}
 
 @if (onboardingActive || !State.IsOnboarded)
 {
@@ -85,8 +71,8 @@ else
                 {
                     <div class="global-banner update">
                         <i class="bi bi-arrow-up-circle-fill"></i>
-                        <span class="gb-text">@Updater.BannerText</span>
-                        <button type="button" class="gb-link" @onclick="StartUpdate" disabled="@Updater.IsLaunchRequested">@Updater.ActionText</button>
+                        <span class="gb-text">Mesh @Updater.Available.Version.ToString(3) is available.</span>
+                        <a class="gb-link" href="settings">Update</a>
                         <button class="gb-close" @onclick="Updater.DismissBanner" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
                     </div>
                 }
@@ -123,10 +109,8 @@ else
 @code {
     bool navOpen;
     bool disposed;
-    bool retryingConnection;
     int renderQueued;
     DotNetObjectReference<MainLayout>? fileLinkRef;
-    DotNetObjectReference<WidgetDiagnosticsBridge>? widgetDiagnosticsRef;
     UiMode _prevEffectiveMode;
 
     string DisplayName => string.IsNullOrWhiteSpace(State.Profile.DisplayName)
@@ -137,13 +121,9 @@ else
 
     void CloseNav() => navOpen = false;
 
-    async Task StartUpdate() => await Updater.StartUpdateAsync();
-
     protected override async Task OnInitializedAsync()
     {
         onboardingActive = !State.IsOnboarded;
-        Shutdown.RegisterDrain(
-            "blazor-renderer", cancellationToken => InvokeAsync(() => { }).WaitAsync(cancellationToken));
         _prevEffectiveMode = UiModeSvc.EffectiveMode;
         State.Changed += Refresh;
         Mesh.StateChanged += Refresh;
@@ -169,50 +149,24 @@ else
 
             await Msal.InitializeAsync();
             await Mesh.RegisterAsync();
-            await ConnectWithoutBreakingStartupAsync();
+            await Mesh.ConnectAsync();
             // Pull the relay's connector catalog (public OAuth metadata) in the background so the
             // Knowledge page can offer one-click connectors. Cached for brief offline periods.
-            Shutdown.Track(Catalog.RefreshAsync(Shutdown.Token), "connector catalog refresh");
+            _ = Task.Run(() => Catalog.RefreshAsync());
         }
-
         // Preload the on-device model catalog once, in the background, so Settings
         // shows it instantly without reloading (and without resetting the selection).
         if (State.Profile.Model.Provider == ModelProvider.FoundryLocal)
-            Shutdown.Track(Foundry.PreloadModelsAsync(ct: Shutdown.Token), "local model preload");
+            _ = Task.Run(() => Foundry.PreloadModelsAsync());
 
         // Automatic update checks: one now, then periodically. Surfaces the update banner.
         Updater.StartAutoChecks();
-    }
-
-    private async Task ConnectWithoutBreakingStartupAsync()
-    {
-        await StartupConnectionRecovery.TryConnectAsync(
-            Mesh.ConnectAsync,
-            message => RuntimeDiagnostics.Current?.RecordEvent(
-                "startup-relay-connection-failed", message));
-    }
-
-    private async Task RetryConnectionAsync()
-    {
-        if (retryingConnection) return;
-        retryingConnection = true;
-        try
-        {
-            await Mesh.RegisterAsync();
-            await ConnectWithoutBreakingStartupAsync();
-        }
-        finally
-        {
-            retryingConnection = false;
-        }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (!firstRender) return;
         fileLinkRef = DotNetObjectReference.Create(this);
-        widgetDiagnosticsRef = DotNetObjectReference.Create(WidgetDiagnostics);
-        await JS.InvokeVoidAsync("sandboxFrame.initialize", widgetDiagnosticsRef, PlatformCaps.DevicePlatform);
         await JS.InvokeVoidAsync("meshUI.initFileLinks", fileLinkRef);
     }
 
@@ -221,10 +175,9 @@ else
 
     private void Refresh()
     {
-        if (Shutdown.IsStopping) return;
         if (!State.IsOnboarded) onboardingActive = true;
         if (disposed || Interlocked.Exchange(ref renderQueued, 1) != 0) return;
-        Shutdown.Track(ApplyLatestRenderAsync(), "main layout refresh");
+        _ = ApplyLatestRenderAsync();
     }
 
     private async Task ApplyLatestRenderAsync()
@@ -234,7 +187,7 @@ else
             await InvokeAsync(() =>
             {
                 Interlocked.Exchange(ref renderQueued, 0);
-                if (!disposed && !Shutdown.IsStopping) StateHasChanged();
+                if (!disposed) StateHasChanged();
             });
         }
         catch (Exception ex) when (disposed
@@ -272,10 +225,7 @@ else
 
     // Raised from any thread by UiModeService; marshal to the UI thread.
     private void OnModeChanged(object? sender, EventArgs e)
-    {
-        if (Shutdown.IsStopping) return;
-        Shutdown.Track(InvokeAsync(HandleModeChange), "UI mode refresh");
-    }
+        => _ = InvokeAsync(HandleModeChange);
 
     private void HandleModeChange()
     {
@@ -417,6 +367,5 @@ else
 
         DeepLinkDispatch.SetHandler(null);
         fileLinkRef?.Dispose();
-        widgetDiagnosticsRef?.Dispose();
     }
 }

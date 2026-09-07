@@ -238,7 +238,8 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                     surface: reason => TraceTransport("replication-poll", reason),
                     bootstrapPeer: state.EmitOwnerBootstrapSnapshotAsync,
                     pollCompleted: OnReplicationPresencePollCompleted,
-                    rosterOnline: OnReplicationRosterOnline);
+                    rosterOnline: OnReplicationRosterOnline,
+                    accountRosterObserved: ApplyAccountDevicePresenceSnapshot);
                 replicationPoller = poller;
                 if (ShouldMaintainContinuousTransport) poller.Start();
             }
@@ -378,6 +379,7 @@ public sealed partial class MeshClient : IReplicationTransport, IReplicationMeta
                 TraceTransport("replication-deliver-reject", reject);
                 return;
             }
+            replicationPoller?.Poke();
             TrackBackground(engine.HandleDeliveryAsync(delivery, CancellationToken.None), "replication deliver");
         });
     }

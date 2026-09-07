@@ -1,6 +1,4 @@
-using System.ComponentModel;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -51,19 +49,14 @@ public sealed record UpdateInfo(
 
 public sealed record UpdateCheckResult(bool Available, Version Current, Version? Latest, UpdateInfo? Info, string? Error);
 
-/// <summary>
-/// Detects, pre-downloads, and starts signed Windows updates. The installer is cached until the
-/// user chooses Update, then a bundled helper closes Mesh, installs silently, and relaunches it.
-/// </summary>
 public sealed class UpdateService : IDisposable
 {
-    private const string Owner = "MeshRelayAI";
-    private const string Repo = "Mesh";
-    private const string InstallerPrefix = "Mesh-Setup";
-    private const string UpdaterFileName = "Mesh.Updater.exe";
     internal const long MaxMetadataBytes = 1 * 1024 * 1024;
     internal const long MaxArchiveBytes = 512 * 1024 * 1024;
     internal const long MaxInstallerBytes = 256 * 1024 * 1024;
+    private const string Owner = "MeshRelayAI";
+    private const string Repo = "Mesh";
+    private const string InstallerPrefix = "Mesh-Setup";
     private static readonly IReadOnlyDictionary<string, string> TrustedPublisherAttributes =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -81,36 +74,16 @@ public sealed class UpdateService : IDisposable
     private readonly IHttpClientFactory httpFactory;
     private readonly IAppControl appControl;
     private readonly ILogger<UpdateService> log;
-    private readonly AppShutdownCoordinator shutdown;
-    private readonly SemaphoreSlim checkGate = new(1, 1);
     private readonly SemaphoreSlim operationGate = new(1, 1);
-    private readonly CancellationTokenSource lifetimeCts;
+    private readonly CancellationTokenSource lifetimeCts = new();
     private readonly Func<bool> isSupported;
     private readonly object timerLock = new();
-    private readonly object preparationSync = new();
-    private readonly Dictionary<string, Task<PreparedUpdate>> preparationTasks = new(StringComparer.Ordinal);
-
     private Timer? autoTimer;
-    private PreparedUpdate? preparedUpdate;
-    private string? preparedTag;
-    private int launchRequested;
+    private string? preparedInstallerPath;
     private bool disposed;
 
-    public UpdateService(
-        IHttpClientFactory httpFactory,
-        IAppControl appControl,
-        ILogger<UpdateService> log)
-        : this(httpFactory, appControl, log, OperatingSystem.IsWindows,
-            new AppShutdownCoordinator(new AppShutdownState()))
-    {
-    }
-
-    public UpdateService(
-        IHttpClientFactory httpFactory,
-        IAppControl appControl,
-        ILogger<UpdateService> log,
-        AppShutdownCoordinator shutdown)
-        : this(httpFactory, appControl, log, OperatingSystem.IsWindows, shutdown)
+    public UpdateService(IHttpClientFactory httpFactory, IAppControl appControl, ILogger<UpdateService> log)
+        : this(httpFactory, appControl, log, OperatingSystem.IsWindows)
     {
     }
 
@@ -119,118 +92,62 @@ public sealed class UpdateService : IDisposable
         IAppControl appControl,
         ILogger<UpdateService> log,
         Func<bool> isSupported)
-        : this(httpFactory, appControl, log, isSupported,
-            new AppShutdownCoordinator(new AppShutdownState()))
-    {
-    }
-
-    private UpdateService(
-        IHttpClientFactory httpFactory,
-        IAppControl appControl,
-        ILogger<UpdateService> log,
-        Func<bool> isSupported,
-        AppShutdownCoordinator shutdown)
     {
         this.httpFactory = httpFactory;
         this.appControl = appControl;
         this.log = log;
         this.isSupported = isSupported;
-        this.shutdown = shutdown;
-        lifetimeCts = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token);
-        shutdown.Register("updates", StopAsync);
         CurrentVersion = DetectCurrentVersion();
-        CurrentProgress = new UpdateProgress(UpdatePhase.Idle, 0, 0, null);
+        CleanupStaleTempDirectories();
     }
 
     public Version CurrentVersion { get; }
     public bool IsSupported => isSupported();
     public UpdateInfo? Available { get; private set; }
     public bool BannerDismissed { get; private set; }
-    public UpdatePhase Phase { get; private set; }
-    public UpdateProgress CurrentProgress { get; private set; }
-    public string? Status { get; private set; }
-    public string? Error { get; private set; }
-    public bool IsLaunchRequested => Volatile.Read(ref launchRequested) != 0;
-    public int Percent => CurrentProgress.Percent;
-    public long BytesReceived => CurrentProgress.BytesReceived;
-    public long TotalBytes => CurrentProgress.TotalBytes;
-
-    public string BannerText
-    {
-        get
-        {
-            if (Available is null) return string.Empty;
-            var version = Available.Version.ToString(3);
-            if (Phase == UpdatePhase.Failed) return $"Mesh {version} update failed.";
-            if (IsLaunchRequested)
-            {
-                if (Phase == UpdatePhase.Downloading && Percent >= 0)
-                    return $"Downloading Mesh {version} ({Percent}%).";
-                return $"Starting the Mesh {version} update.";
-            }
-            return Phase switch
-            {
-                UpdatePhase.Downloading when Percent >= 0 => $"Mesh {version} is available. Downloading {Percent}%.",
-                UpdatePhase.Downloading => $"Mesh {version} is available. Downloading in the background.",
-                UpdatePhase.Extracting or UpdatePhase.Preparing => $"Mesh {version} is available. Preparing in the background.",
-                UpdatePhase.ReadyToApply => $"Mesh {version} is ready to update.",
-                _ => $"Mesh {version} is available."
-            };
-        }
-    }
-
-    public string ActionText => IsLaunchRequested ? "Updating..." : Phase == UpdatePhase.Failed ? "Retry" : "Update";
-
     public event Action? Changed;
 
     public void StartAutoChecks()
     {
-        if (!IsSupported || autoTimer is not null) return;
-        CleanupTemporaryLaunchers();
-        autoTimer = new Timer(_ =>
+        if (!IsSupported || disposed) return;
+        lock (timerLock)
         {
-            if (shutdown.IsStopping) return;
-            shutdown.Track(CheckInBackgroundAsync(shutdown.Token), "update check");
-        }, null, TimeSpan.Zero, TimeSpan.FromHours(6));
+            if (autoTimer is null)
+                autoTimer = new Timer(_ => _ = CheckInBackgroundAsync(), null, TimeSpan.Zero, TimeSpan.FromHours(6));
+        }
     }
 
-    public async Task CheckInBackgroundAsync(CancellationToken cancellationToken = default)
+    public async Task CheckInBackgroundAsync()
     {
         if (!IsSupported || disposed) return;
         try
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(TimeSpan.FromSeconds(30));
-            var result = await CheckNowAsync(cts.Token);
-            if (result.Error is not null)
-                log.LogInformation("Background update check did not complete: {Error}", result.Error);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetimeCts.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            var result = await CheckAsync(timeout.Token).ConfigureAwait(false);
+            if (result.Available && result.Info is not null)
+            {
+                var changed = Available?.Version != result.Info.Version;
+                Available = result.Info;
+                if (changed)
+                {
+                    BannerDismissed = false;
+                    Changed?.Invoke();
+                }
+            }
+            else if (result.Error is null && result.Latest is not null)
+            {
+                var changed = Available is not null;
+                Available = null;
+                if (changed) Changed?.Invoke();
+            }
         }
         catch (OperationCanceledException)
         {
-            log.LogDebug("Background update check timed out");
         }
-    }
-
-    public async Task<UpdateCheckResult> CheckNowAsync(CancellationToken cancellationToken = default)
-    {
-        await checkGate.WaitAsync(cancellationToken);
-        try
+        catch (Exception ex)
         {
-            var result = await CheckAsync(cancellationToken);
-            if (result.Available && result.Info is not null)
-            {
-                SetAvailable(result.Info);
-                StartPreDownload(result.Info);
-            }
-            else if (result.Error is null && Available is null)
-            {
-                SetState(UpdatePhase.UpToDate, "Mesh is up to date.");
-            }
-            return result;
-        }
-        finally
-        {
-            checkGate.Release();
+            log.LogWarning(ex, "Background update check failed");
         }
     }
 
@@ -238,16 +155,16 @@ public sealed class UpdateService : IDisposable
     {
         if (BannerDismissed) return;
         BannerDismissed = true;
-        NotifyChanged();
+        Changed?.Invoke();
     }
 
-    public async Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken = default)
+    public async Task<UpdateCheckResult> CheckAsync(CancellationToken ct = default)
     {
         ThrowIfDisposed();
         if (!IsSupported)
             return new UpdateCheckResult(false, CurrentVersion, null, null, "Updates are only supported on Windows.");
 
-        await operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await operationGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var http = httpFactory.CreateClient("updater");
@@ -257,18 +174,18 @@ public sealed class UpdateService : IDisposable
             request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
 
             using var response = await http.SendAsync(
-                request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 return new UpdateCheckResult(false, CurrentVersion, null, null,
                     $"GitHub returned {(int)response.StatusCode} when checking for updates.");
             if (response.Content.Headers.ContentLength is > MaxMetadataBytes)
                 return new UpdateCheckResult(false, CurrentVersion, null, null, "GitHub release metadata is too large.");
 
-            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             await using var bounded = new MemoryStream();
-            await CopyBoundedAsync(source, bounded, MaxMetadataBytes, cancellationToken).ConfigureAwait(false);
+            await CopyBoundedAsync(source, bounded, MaxMetadataBytes, ct).ConfigureAwait(false);
             bounded.Position = 0;
-            using var document = await JsonDocument.ParseAsync(bounded, cancellationToken: cancellationToken).ConfigureAwait(false);
+            using var document = await JsonDocument.ParseAsync(bounded, cancellationToken: ct).ConfigureAwait(false);
             return ParseLatestRelease(document.RootElement, CurrentVersion);
         }
         catch (OperationCanceledException)
@@ -284,538 +201,6 @@ public sealed class UpdateService : IDisposable
         {
             operationGate.Release();
         }
-    }
-
-    public async Task<bool> StartUpdateAsync(CancellationToken cancellationToken = default)
-    {
-        if (!IsSupported) return false;
-        if (Interlocked.CompareExchange(ref launchRequested, 1, 0) != 0) return false;
-
-        var updaterStarted = false;
-        UpdateInfo? targetInfo = null;
-        Error = null;
-        NotifyChanged();
-        try
-        {
-            targetInfo = Available;
-            if (targetInfo is null)
-            {
-                var result = await CheckNowAsync(cancellationToken);
-                targetInfo = result.Info;
-                if (targetInfo is null)
-                    throw new InvalidOperationException(result.Error ?? "No Mesh update is available.");
-            }
-
-            var prepared = await EnsurePreparedAsync(targetInfo, cancellationToken);
-            SetState(UpdatePhase.Applying, "Opening the Mesh updater.");
-            LaunchUpdaterAndExit(prepared, targetInfo);
-            updaterStarted = true;
-            return true;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex) when (IsExpectedUpdateException(ex))
-        {
-            log.LogWarning(ex, "Could not start the Mesh update");
-            PublishFailure(targetInfo, $"Update failed: {ex.Message}");
-            return false;
-        }
-        finally
-        {
-            if (!updaterStarted)
-            {
-                Interlocked.Exchange(ref launchRequested, 0);
-                NotifyChanged();
-            }
-        }
-    }
-
-    private void SetAvailable(UpdateInfo info)
-    {
-        var isNewRelease = !string.Equals(Available?.TagName, info.TagName, StringComparison.Ordinal);
-        Available = info;
-        if (isNewRelease)
-        {
-            BannerDismissed = false;
-            preparedUpdate = null;
-            preparedTag = null;
-            Error = null;
-            SetState(UpdatePhase.Idle, $"Mesh {info.Version.ToString(3)} is available.");
-        }
-        else
-        {
-            NotifyChanged();
-        }
-    }
-
-    private void StartPreDownload(UpdateInfo info)
-    {
-        if (shutdown.IsStopping) return;
-        shutdown.Track(ObservePreDownloadAsync(info), $"update pre-download {info.Version}");
-    }
-
-    private async Task ObservePreDownloadAsync(UpdateInfo info)
-    {
-        try
-        {
-            await EnsurePreparedAsync(info, shutdown.Token);
-        }
-        catch (Exception ex) when (IsExpectedUpdateException(ex))
-        {
-            log.LogWarning(ex, "Could not pre-download Mesh {Version}", info.Version);
-        }
-    }
-
-    private async Task<PreparedUpdate> EnsurePreparedAsync(UpdateInfo info, CancellationToken cancellationToken)
-    {
-        if (preparedUpdate is not null
-            && string.Equals(preparedTag, info.TagName, StringComparison.Ordinal)
-            && File.Exists(preparedUpdate.InstallerPath))
-            return preparedUpdate;
-
-        Task<PreparedUpdate> task;
-        lock (preparationSync)
-        {
-            if (!preparationTasks.TryGetValue(info.TagName, out task!))
-            {
-                task = PrepareTrackedAsync(info);
-                preparationTasks[info.TagName] = task;
-            }
-        }
-
-        try
-        {
-            return await task.WaitAsync(cancellationToken);
-        }
-        finally
-        {
-            if (task.IsCompleted)
-            {
-                lock (preparationSync)
-                {
-                    if (preparationTasks.TryGetValue(info.TagName, out var current) && ReferenceEquals(current, task))
-                        preparationTasks.Remove(info.TagName);
-                }
-            }
-        }
-    }
-
-    private async Task<PreparedUpdate> PrepareTrackedAsync(UpdateInfo info)
-    {
-        try
-        {
-            var prepared = await PrepareUpdateCoreAsync(info, shutdown.Token);
-            if (string.Equals(Available?.TagName, info.TagName, StringComparison.Ordinal))
-            {
-                preparedUpdate = prepared;
-                preparedTag = info.TagName;
-            }
-            return prepared;
-        }
-        catch (Exception ex) when (IsExpectedUpdateException(ex))
-        {
-            PublishFailure(info, $"Update download failed: {ex.Message}");
-            throw;
-        }
-    }
-
-    private async Task<PreparedUpdate> PrepareUpdateCoreAsync(UpdateInfo info, CancellationToken cancellationToken)
-    {
-        ValidateInfo(info);
-
-        var descriptor = new UpdatePackageDescriptor(info.TagName, info.AssetName, info.DownloadUrl, info.Size);
-        var releaseDirectory = UpdatePackageCache.GetReleaseDirectory(
-            UpdatePackageCache.DefaultBaseDirectory, info.TagName);
-
-        try
-        {
-            var cached = await UpdatePackageCache.TryLoadAsync(releaseDirectory, descriptor, cancellationToken);
-            if (cached is not null)
-            {
-                VerifySignedInstaller(cached.InstallerPath);
-                ReportProgress(info, new UpdateProgress(UpdatePhase.ReadyToApply, 0, 0, "Ready to update"));
-                return cached;
-            }
-        }
-        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
-        {
-            log.LogWarning(ex, "Discarding an invalid cached Mesh update at {Path}", releaseDirectory);
-        }
-
-        ResetReleaseDirectory(releaseDirectory);
-        var stagingDirectory = Path.Combine(releaseDirectory, "staging");
-        Directory.CreateDirectory(stagingDirectory);
-        var isZip = info.AssetName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
-        var downloadPath = Path.Combine(stagingDirectory, isZip ? "installer.zip" : info.AssetName);
-
-        var http = httpFactory.CreateClient("updater");
-        using (var request = new HttpRequestMessage(HttpMethod.Get, info.DownloadUrl))
-        using (var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
-        {
-            response.EnsureSuccessStatusCode();
-            var total = response.Content.Headers.ContentLength ?? (info.Size > 0 ? info.Size : 0);
-            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
-            await using var destination = new FileStream(downloadPath, FileMode.Create, FileAccess.Write, FileShare.None,
-                1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-
-            var buffer = new byte[1024 * 1024];
-            long received = 0;
-            long lastReport = 0;
-            ReportProgress(info, new UpdateProgress(UpdatePhase.Downloading, 0, total, "Starting download"));
-            int read;
-            while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
-            {
-                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-                hasher.AppendData(buffer, 0, read);
-                received += read;
-                if (received - lastReport >= 512 * 1024 || received == total)
-                {
-                    lastReport = received;
-                    ReportProgress(info, new UpdateProgress(UpdatePhase.Downloading, received, total, null));
-                }
-            }
-            await destination.FlushAsync(cancellationToken);
-            if (total > 0 && received != total)
-                throw new InvalidDataException($"The update download was incomplete ({received} of {total} bytes).");
-            if (info.Size > 0 && received != info.Size)
-                throw new InvalidDataException($"The update size did not match its release metadata ({received} of {info.Size} bytes).");
-            var actualDigest = hasher.GetHashAndReset();
-            if (!CryptographicOperations.FixedTimeEquals(
-                    actualDigest, Convert.FromHexString(info.Sha256)))
-                throw new CryptographicException("The installer archive SHA-256 digest is invalid.");
-        }
-
-        string sourceInstaller;
-        if (isZip)
-        {
-            ReportProgress(info, new UpdateProgress(UpdatePhase.Extracting, 0, 0, "Extracting update"));
-            var extractDirectory = Path.Combine(stagingDirectory, "extracted");
-            Directory.CreateDirectory(extractDirectory);
-            sourceInstaller = await ExtractInstallerAsync(
-                downloadPath,
-                extractDirectory,
-                info,
-                new InlineProgress<UpdateProgress>(progress => ReportProgress(info, progress)),
-                cancellationToken);
-        }
-        else
-        {
-            sourceInstaller = downloadPath;
-        }
-
-        var installerName = Path.GetFileName(sourceInstaller);
-        if (!installerName.StartsWith(InstallerPrefix, StringComparison.OrdinalIgnoreCase)
-            || !installerName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("The downloaded update did not contain the Mesh installer.");
-
-        var finalInstallerPath = Path.Combine(releaseDirectory, installerName);
-        File.Copy(sourceInstaller, finalInstallerPath, overwrite: true);
-        ReportProgress(info, new UpdateProgress(UpdatePhase.Preparing, 0, 0, "Verifying downloaded update"));
-        VerifySignedInstaller(finalInstallerPath);
-        var result = await UpdatePackageCache.SaveAsync(
-            releaseDirectory, descriptor, finalInstallerPath, cancellationToken);
-
-        TryDeleteStagingDirectory(stagingDirectory);
-        PruneOldUpdates(releaseDirectory);
-        ReportProgress(info, new UpdateProgress(UpdatePhase.ReadyToApply, 0, 0, "Ready to update"));
-        return result;
-    }
-
-    private void LaunchUpdaterAndExit(PreparedUpdate prepared, UpdateInfo info)
-    {
-        var bundledUpdater = Path.Combine(AppContext.BaseDirectory, UpdaterFileName);
-        if (!File.Exists(bundledUpdater))
-            throw new FileNotFoundException("The bundled Mesh updater is missing.", bundledUpdater);
-
-        var cleanupDirectory = Path.GetDirectoryName(prepared.InstallerPath)
-            ?? throw new InvalidOperationException("The prepared update directory could not be located.");
-        var updatesRoot = Path.GetFullPath(UpdatePackageCache.DefaultBaseDirectory)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var fullCleanupDirectory = Path.GetFullPath(cleanupDirectory)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!fullCleanupDirectory.StartsWith(updatesRoot, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("The prepared update is outside the Mesh update cache.");
-
-        var meshExe = Environment.ProcessPath;
-        if (string.IsNullOrWhiteSpace(meshExe) || !File.Exists(meshExe))
-            throw new FileNotFoundException("The running Mesh executable could not be located.", meshExe);
-
-        var launcherDirectory = Path.Combine(Path.GetTempPath(), "MeshUpdater", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(launcherDirectory);
-        var launcherName = "Mesh.Updater-" + Guid.NewGuid().ToString("N") + ".exe";
-        var launcherPath = Path.Combine(launcherDirectory, launcherName);
-        File.Copy(bundledUpdater, launcherPath, overwrite: false);
-
-        var bundledConfig = bundledUpdater + ".config";
-        if (File.Exists(bundledConfig))
-            File.Copy(bundledConfig, launcherPath + ".config", overwrite: false);
-
-        var quitEventName = @"Local\MeshUpdateQuit-" + Guid.NewGuid().ToString("N");
-        var quitEvent = new EventWaitHandle(false, EventResetMode.ManualReset, quitEventName);
-        Process updater;
-        try
-        {
-            using var currentProcess = Process.GetCurrentProcess();
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = launcherPath,
-                WorkingDirectory = launcherDirectory,
-                UseShellExecute = false
-            };
-            startInfo.ArgumentList.Add("--installer");
-            startInfo.ArgumentList.Add(prepared.InstallerPath);
-            startInfo.ArgumentList.Add("--mesh-exe");
-            startInfo.ArgumentList.Add(meshExe);
-            startInfo.ArgumentList.Add("--cleanup-dir");
-            startInfo.ArgumentList.Add(cleanupDirectory);
-            startInfo.ArgumentList.Add("--sha256");
-            startInfo.ArgumentList.Add(prepared.Sha256);
-            startInfo.ArgumentList.Add("--version");
-            startInfo.ArgumentList.Add(info.Version.ToString(3));
-            startInfo.ArgumentList.Add("--quit-event");
-            startInfo.ArgumentList.Add(quitEventName);
-            startInfo.ArgumentList.Add("--mesh-pid");
-            startInfo.ArgumentList.Add(currentProcess.Id.ToString(CultureInfo.InvariantCulture));
-            startInfo.ArgumentList.Add("--mesh-start-ticks");
-            startInfo.ArgumentList.Add(currentProcess.StartTime.ToUniversalTime().Ticks.ToString(CultureInfo.InvariantCulture));
-
-            updater = Process.Start(startInfo)
-                ?? throw new InvalidOperationException("The Mesh updater could not be started.");
-        }
-        catch (Exception ex) when (IsExpectedUpdateException(ex))
-        {
-            quitEvent.Dispose();
-            TryDeleteLauncherDirectory(launcherDirectory);
-            throw;
-        }
-
-        _ = CoordinateUpdaterShutdownAsync(updater, quitEvent, info);
-    }
-
-    private async Task CoordinateUpdaterShutdownAsync(
-        Process updater,
-        EventWaitHandle quitEvent,
-        UpdateInfo info)
-    {
-        try
-        {
-            var deadline = DateTime.UtcNow.AddMinutes(10);
-            while (!quitEvent.WaitOne(0))
-            {
-                if (updater.HasExited)
-                {
-                    Interlocked.Exchange(ref launchRequested, 0);
-                    PublishFailure(info, $"The Mesh updater closed before installation (code {updater.ExitCode}).");
-                    return;
-                }
-                if (DateTime.UtcNow >= deadline)
-                {
-                    try { updater.Kill(entireProcessTree: true); }
-                    catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
-                    {
-                        log.LogWarning(ex, "Could not stop an unresponsive Mesh updater");
-                    }
-                    Interlocked.Exchange(ref launchRequested, 0);
-                    PublishFailure(info, "The Mesh updater did not request shutdown in time.");
-                    return;
-                }
-                await Task.Delay(TimeSpan.FromMilliseconds(200));
-            }
-
-            try
-            {
-                await appControl.QuitAsync();
-            }
-            catch (Exception ex) when (IsExpectedUpdateException(ex))
-            {
-                log.LogWarning(ex, "Mesh did not quit cleanly after the updater requested shutdown");
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(10));
-            try
-            {
-                Process.GetCurrentProcess().Kill(entireProcessTree: true);
-            }
-            catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
-            {
-                log.LogWarning(ex, "Could not terminate Mesh after the updater requested shutdown");
-                Environment.Exit(0);
-            }
-        }
-        catch (Exception ex) when (IsExpectedUpdateException(ex))
-        {
-            log.LogWarning(ex, "Could not coordinate shutdown with the Mesh updater");
-            Interlocked.Exchange(ref launchRequested, 0);
-            PublishFailure(info, $"The Mesh updater failed before installation: {ex.Message}");
-        }
-        finally
-        {
-            updater.Dispose();
-            quitEvent.Dispose();
-        }
-    }
-    private async Task StopAsync(CancellationToken cancellationToken)
-    {
-        Interlocked.Exchange(ref autoTimer, null)?.Dispose();
-        Task<PreparedUpdate>[] pending;
-        lock (preparationSync)
-            pending = preparationTasks.Values.Where(task => !task.IsCompleted).ToArray();
-        if (pending.Length == 0) return;
-
-        var completions = pending.Select(task => task.ContinueWith(
-            static _ => { },
-            CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default));
-        await Task.WhenAll(completions).WaitAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    private void NotifyChanged()
-    {
-        if (!shutdown.IsStopping)
-            Changed?.Invoke();
-    }
-    private void ReportProgress(UpdateInfo info, UpdateProgress progress)
-    {
-        if (!string.Equals(Available?.TagName, info.TagName, StringComparison.Ordinal)) return;
-        Phase = progress.Phase;
-        CurrentProgress = progress;
-        Error = null;
-        Status = progress.Message ?? progress.Phase switch
-        {
-            UpdatePhase.Downloading => "Downloading update.",
-            UpdatePhase.Extracting => "Extracting update.",
-            UpdatePhase.Preparing => "Preparing update.",
-            UpdatePhase.ReadyToApply => "Ready to update.",
-            _ => Status
-        };
-        NotifyChanged();
-    }
-
-    private void PublishFailure(UpdateInfo? info, string message)
-    {
-        if (info is not null && !string.Equals(Available?.TagName, info.TagName, StringComparison.Ordinal)) return;
-        Phase = UpdatePhase.Failed;
-        CurrentProgress = new UpdateProgress(UpdatePhase.Failed, 0, 0, message);
-        Status = message;
-        Error = message;
-        NotifyChanged();
-    }
-
-    private void SetState(UpdatePhase phase, string? status)
-    {
-        Phase = phase;
-        CurrentProgress = new UpdateProgress(phase, 0, 0, status);
-        Status = status;
-        if (phase != UpdatePhase.Failed) Error = null;
-        NotifyChanged();
-    }
-
-    private static void ResetReleaseDirectory(string releaseDirectory)
-    {
-        if (Directory.Exists(releaseDirectory)) Directory.Delete(releaseDirectory, recursive: true);
-        Directory.CreateDirectory(releaseDirectory);
-    }
-
-    private void TryDeleteStagingDirectory(string stagingDirectory)
-    {
-        try
-        {
-            if (Directory.Exists(stagingDirectory)) Directory.Delete(stagingDirectory, recursive: true);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            log.LogDebug(ex, "Could not remove update staging directory {Path}", stagingDirectory);
-        }
-    }
-
-    private void PruneOldUpdates(string currentReleaseDirectory)
-    {
-        var baseDirectory = UpdatePackageCache.DefaultBaseDirectory;
-        if (!Directory.Exists(baseDirectory)) return;
-        foreach (var directory in Directory.EnumerateDirectories(baseDirectory))
-        {
-            if (string.Equals(Path.GetFullPath(directory), Path.GetFullPath(currentReleaseDirectory),
-                StringComparison.OrdinalIgnoreCase)) continue;
-            try
-            {
-                Directory.Delete(directory, recursive: true);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                log.LogDebug(ex, "Could not remove old update cache {Path}", directory);
-            }
-        }
-    }
-
-    private static string FindInstaller(string extractDirectory)
-    {
-        var matches = Directory.EnumerateFiles(extractDirectory, "*.exe", SearchOption.AllDirectories)
-            .Where(path => Path.GetFileName(path).StartsWith(InstallerPrefix, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        return matches.Length switch
-        {
-            1 => matches[0],
-            0 => throw new InvalidDataException("Downloaded update did not contain an installer."),
-            _ => throw new InvalidDataException("Downloaded update contained more than one installer.")
-        };
-    }
-
-    private void TryDeleteLauncherDirectory(string launcherDirectory)
-    {
-        try
-        {
-            if (Directory.Exists(launcherDirectory)) Directory.Delete(launcherDirectory, recursive: true);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            log.LogDebug(ex, "Could not remove updater launcher {Path}", launcherDirectory);
-        }
-    }
-
-    private void CleanupTemporaryLaunchers()
-    {
-        var launcherRoot = Path.Combine(Path.GetTempPath(), "MeshUpdater");
-        if (!Directory.Exists(launcherRoot)) return;
-        foreach (var directory in Directory.EnumerateDirectories(launcherRoot))
-        {
-            try
-            {
-                Directory.Delete(directory, recursive: true);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                log.LogDebug(ex, "Could not remove old updater launcher {Path}", directory);
-            }
-        }
-
-        try
-        {
-            if (!Directory.EnumerateFileSystemEntries(launcherRoot).Any()) Directory.Delete(launcherRoot);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            log.LogDebug(ex, "Could not remove the empty updater launcher root {Path}", launcherRoot);
-        }
-    }
-
-    private static bool IsExpectedUpdateException(Exception exception)
-        => exception is HttpRequestException
-            or IOException
-            or UnauthorizedAccessException
-            or InvalidDataException
-            or InvalidOperationException
-            or Win32Exception
-            or JsonException
-            or UriFormatException
-            or NotSupportedException;
-
-    private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
-    {
-        public void Report(T value) => report(value);
     }
 
     internal static UpdateCheckResult ParseLatestRelease(JsonElement root, Version currentVersion)
@@ -865,6 +250,136 @@ public sealed class UpdateService : IDisposable
             latest, tag!, expectedAsset, url!, size.Value, sha256,
             ReadString(root, "body"), ReadString(root, "html_url"));
         return new UpdateCheckResult(true, currentVersion, latest, info, null);
+    }
+
+    public async Task<string> DownloadAndPrepareAsync(
+        UpdateInfo info, IProgress<UpdateProgress> progress, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(info);
+        ArgumentNullException.ThrowIfNull(progress);
+        ThrowIfDisposed();
+        if (!IsSupported) throw new PlatformNotSupportedException("Updates are only supported on Windows.");
+
+        await operationGate.WaitAsync(ct).ConfigureAwait(false);
+        string? workDirectory = null;
+        try
+        {
+            ValidateInfo(info);
+            preparedInstallerPath = null;
+            var updateRoot = GetUpdateRoot();
+            DeleteDirectoryBestEffort(updateRoot);
+            Directory.CreateDirectory(updateRoot);
+            workDirectory = Path.Combine(updateRoot, info.TagName);
+            Directory.CreateDirectory(workDirectory);
+            var archivePath = Path.Combine(workDirectory, "installer.zip");
+
+            var http = httpFactory.CreateClient("updater");
+            using var request = new HttpRequestMessage(HttpMethod.Get, info.DownloadUrl);
+            using var response = await http.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength is > MaxArchiveBytes)
+                throw new InvalidDataException("The installer archive is too large.");
+
+            var total = response.Content.Headers.ContentLength ?? info.Size;
+            if (total != info.Size)
+                throw new InvalidDataException("The installer archive size does not match the GitHub release.");
+
+            progress.Report(new UpdateProgress(UpdatePhase.Downloading, 0, total, "Downloading"));
+            await using (var input = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
+            await using (var output = new FileStream(
+                archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, true))
+            using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            {
+                var buffer = new byte[1024 * 1024];
+                long received = 0;
+                long lastReport = 0;
+                while (true)
+                {
+                    var read = await input.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false);
+                    if (read == 0) break;
+                    if (received > MaxArchiveBytes - read)
+                        throw new InvalidDataException("The installer archive is too large.");
+                    received += read;
+                    hasher.AppendData(buffer, 0, read);
+                    await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                    if (received - lastReport >= 512 * 1024 || received == total)
+                    {
+                        lastReport = received;
+                        progress.Report(new UpdateProgress(UpdatePhase.Downloading, received, total, null));
+                    }
+                }
+
+                if (received != info.Size)
+                    throw new InvalidDataException("The installer archive size does not match the GitHub release.");
+                var actualDigest = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
+                if (!CryptographicOperations.FixedTimeEquals(
+                    Convert.FromHexString(actualDigest), Convert.FromHexString(info.Sha256)))
+                    throw new CryptographicException("The installer archive SHA-256 digest is invalid.");
+            }
+
+            progress.Report(new UpdateProgress(UpdatePhase.Extracting, 0, 0, "Extracting"));
+            var installerPath = await ExtractInstallerAsync(archivePath, workDirectory, info, progress, ct)
+                .ConfigureAwait(false);
+            progress.Report(new UpdateProgress(UpdatePhase.Preparing, 0, 0, "Preparing"));
+            VerifySignedInstaller(installerPath);
+            preparedInstallerPath = Path.GetFullPath(installerPath);
+            progress.Report(new UpdateProgress(UpdatePhase.ReadyToApply, 0, 0, "Ready"));
+            return preparedInstallerPath;
+        }
+        catch
+        {
+            preparedInstallerPath = null;
+            if (workDirectory is not null) DeleteDirectoryBestEffort(workDirectory);
+            throw;
+        }
+        finally
+        {
+            operationGate.Release();
+        }
+    }
+
+    public void ApplyAndExit(string installerPath)
+    {
+        ThrowIfDisposed();
+        if (!IsSupported) throw new PlatformNotSupportedException("Updates are only supported on Windows.");
+        if (!operationGate.Wait(0))
+            throw new InvalidOperationException("Another update operation is already running.");
+
+        try
+        {
+            var fullPath = Path.GetFullPath(installerPath);
+            if (preparedInstallerPath is null ||
+                !string.Equals(fullPath, preparedInstallerPath, StringComparison.OrdinalIgnoreCase) ||
+                !File.Exists(fullPath))
+                throw new InvalidOperationException("Only the currently prepared installer can be applied.");
+
+            VerifySignedInstaller(fullPath);
+            var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = fullPath,
+                UseShellExecute = true,
+                WorkingDirectory = Path.GetDirectoryName(fullPath)!
+            });
+            if (process is null)
+                throw new InvalidOperationException("Failed to launch the update installer.");
+
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                try { appControl.Quit(); } catch { }
+            });
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                try { Process.GetCurrentProcess().Kill(); }
+                catch { Environment.Exit(0); }
+            });
+        }
+        catch
+        {
+            operationGate.Release();
+            throw;
+        }
     }
 
     internal static async Task<string> ExtractInstallerAsync(

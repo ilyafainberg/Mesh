@@ -781,7 +781,8 @@ public sealed partial class AppState
                 thread.LastActivityAt,
                 thread.IsPinned,
                 thread.ExecutionAt,
-                thread.ExecutionRunId
+                thread.ExecutionRunId,
+                ExecutionTriggerLineId = ExecutionTriggerLineId(thread)
             }, ReplicationJson);
             items.Add(new ReplicationPayloadCodec.DomainEnvelope(
                 ReplicationOpKinds.Topic,

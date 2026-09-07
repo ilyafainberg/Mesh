@@ -7,7 +7,6 @@
 @inject UpdateService Updater
 @inject MemoryService Memories
 @inject MobileOverlayState MobileOverlays
-@inject AppShutdownCoordinator Shutdown
 @implements IDisposable
 
 <div class="m-shell @ModeClass @(MobileOverlays.IsOpen ? "mobile-overlay-open" : "")">
@@ -39,8 +38,8 @@
         {
             <div class="global-banner update">
                 <i class="bi bi-arrow-up-circle-fill"></i>
-                <span class="gb-text">@Updater.BannerText</span>
-                <button type="button" class="gb-link" @onclick="StartUpdate" disabled="@Updater.IsLaunchRequested">@Updater.ActionText</button>
+                <span class="gb-text">Mesh @Updater.Available.Version.ToString(3) is available.</span>
+                <a class="gb-link" href="settings">Update</a>
                 <button class="gb-close" @onclick="Updater.DismissBanner" title="Dismiss" aria-label="Dismiss"><i class="bi bi-x-lg"></i></button>
             </div>
         }
@@ -134,7 +133,6 @@
     enum Tab { None, Me, Messages, Contacts, Search }
 
     bool moreOpen;
-    bool disposed;
 
     int MessagesBadge => State.UnreadHandles.Count + State.Profile.Approvals.Count;
     int ContactsBadge => State.Profile.Requests.Count;
@@ -167,8 +165,6 @@
 
     void ToggleMore() => moreOpen = !moreOpen;
 
-    async Task StartUpdate() => await Updater.StartUpdateAsync();
-
     void CloseMore() => moreOpen = false;
 
     protected override void OnInitialized()
@@ -184,14 +180,7 @@
 
     private void OnLocationChanged(object? sender, LocationChangedEventArgs e) => Refresh();
 
-    private void Refresh()
-    {
-        if (disposed || Shutdown.IsStopping) return;
-        Shutdown.Track(InvokeAsync(() =>
-        {
-            if (!disposed && !Shutdown.IsStopping) StateHasChanged();
-        }), "mobile shell refresh");
-    }
+    private void Refresh() => InvokeAsync(StateHasChanged);
 
     private void UndoMemoryNotice()
     {
@@ -209,7 +198,6 @@
 
     public void Dispose()
     {
-        disposed = true;
         State.Changed -= Refresh;
         Mesh.StateChanged -= Refresh;
         Setup.Changed -= Refresh;

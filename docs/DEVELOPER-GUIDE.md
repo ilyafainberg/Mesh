@@ -33,9 +33,9 @@ Mesh is a system for handle-addressed, end-to-end-encrypted messaging and servic
 |-----------|---------|---------|----------------|-----------------|
 | **Mesh.Relay** | ASP.NET Core minimal-API + SignalR relay server. Routes envelopes, registers handles, brokers connectors and a hosted model, serves the capability directory. | AGPL-3.0 | `MeshRelayAI/Relay` | Yes (full) |
 | **Mesh.Shared** | Wire contracts (envelope, kinds, request/response records, protocol helpers) plus the `MeshCrypto` library. | Apache-2.0 | `MeshRelayAI/Shared`, also vendored into `MeshRelayAI/Relay` | Yes (full) |
-| **Mesh.App** | The reference client. Closed-source. Links Mesh.Shared. | PolyForm Noncommercial | (not published) | No (existence only) |
+| **Mesh.App** | The reference client. Links Mesh.Shared. | GPL-3.0 | `ilyafainberg/Mesh` | Yes |
 
-Mesh.App exists and is the reference client. It is closed-source under PolyForm Noncommercial and links Mesh.Shared. Its internals are out of scope for this guide; only the open protocol surface is documented here so that anyone can build an interoperable client.
+Mesh.App is the GPL-3.0 reference client and links Mesh.Shared. This guide emphasizes the open protocol surface so that anyone can build an interoperable client.
 
 ### 1.2 Why the license split
 

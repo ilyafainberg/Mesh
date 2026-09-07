@@ -73,6 +73,140 @@ public sealed class Protocol9RunReconciliationWiringTests
         Assert.AreEqual(command.Draft.TriggerLineId, correlation.TriggerLineId);
     }
 
+    [DataTestMethod]
+    [DataRow(DevicePlatforms.Android)]
+    [DataRow(DevicePlatforms.Windows)]
+    public async Task SiblingLocalCompletion_RemovesThinkingAndStopForMobileAndDesktopOwners(
+        string ownerPlatform)
+    {
+        var at = DateTimeOffset.Parse("2026-08-26T00:10:00Z");
+        var (state, secrets) = CreateState(at);
+        const string runId = "run-sibling-local";
+        const string triggerLineId = "line-sibling-local";
+        const string ownerDeviceId = "owner-device";
+        var active = new ReplicationDomainMaterializer.TopicBody(
+            "thread",
+            "Sibling local completion",
+            at,
+            0,
+            ownerDeviceId,
+            "Owner device",
+            ownerPlatform,
+            at,
+            false,
+            at,
+            runId,
+            ExecutionTriggerLineId: triggerLineId);
+        var trigger = new ChatLine
+        {
+            Id = triggerLineId,
+            Role = "user",
+            Text = "run locally",
+            At = at
+        };
+        var answer = new ChatLine
+        {
+            Id = "answer-sibling-local",
+            Role = "assistant",
+            Text = "done",
+            ReplyToLineId = triggerLineId,
+            At = at.AddSeconds(1)
+        };
+
+        await ApplyProductionBatchAsync(
+            state,
+            secrets,
+            [
+                Envelope(ReplicationPayloadCodec.DomainAction.Upsert, "thread", active),
+                Envelope(ReplicationPayloadCodec.DomainAction.AppendLine, "thread", trigger),
+                Envelope(ReplicationPayloadCodec.DomainAction.AppendLine, "thread", answer)
+            ]);
+
+        var thread = state.Profile.OwnThreads.Single();
+        Assert.IsNull(thread.ExecutionRunId);
+        Assert.IsNull(state.GetRemoteRunProjection(thread.Id));
+        Assert.IsFalse(RemoteRunActivity.IsBusy(
+            thread,
+            localTurnActive: false,
+            projection: null,
+            remoteBound: true,
+            at.AddSeconds(2),
+            authoritativeState: true));
+        Assert.IsFalse(TopicComposerPresentation.ShowStop(
+            topicBusy: false,
+            hasSendableDraft: false));
+        Assert.IsFalse(TopicTranscriptPresentation.Compose(
+                thread.Lines,
+                _ => false,
+                activeRunKey: thread.ExecutionRunId)
+            .Any(item => item.IsActiveRun));
+        using var verificationDb = OpenStateDb(state, secrets);
+        var correlation = verificationDb.GetTopicRunCorrelation(runId);
+        Assert.AreEqual(triggerLineId, correlation?.TriggerLineId);
+        Assert.IsNotNull(correlation?.TerminalAt);
+    }
+
+    [TestMethod]
+    public async Task ReplicatedTerminalControl_ClearsWithoutAnswerAndFencesDuplicateAndLateState()
+    {
+        var at = DateTimeOffset.Parse("2026-08-26T00:20:00Z");
+        var (state, secrets) = CreateState(at);
+        var thread = state.Profile.OwnThreads.Single();
+        thread.ExecutionDeviceId = "owner-device";
+        thread.ExecutionDeviceName = "Owner device";
+        thread.ExecutionDevicePlatform = DevicePlatforms.Android;
+        thread.ExecutionAt = at;
+        thread.ExecutionRunId = "run-terminal-only";
+        thread.LastActivityAt = at;
+        using (var db = OpenStateDb(state, secrets))
+            db.SetOwnThreadExecution(
+                thread.Id,
+                thread.ExecutionDeviceId,
+                at,
+                thread.ExecutionRunId,
+                thread.ExecutionDeviceName,
+                thread.ExecutionDevicePlatform);
+
+        var terminal = new ReplicationDomainMaterializer.TopicBody(
+            thread.Id,
+            thread.Title,
+            thread.CreatedAt,
+            0,
+            thread.ExecutionDeviceId,
+            thread.ExecutionDeviceName,
+            thread.ExecutionDevicePlatform,
+            at.AddSeconds(1),
+            false,
+            at,
+            ExecutionRunId: null,
+            TerminalUpdate: new TopicRunUpdatePayload(
+                "run-terminal-only",
+                thread.Id,
+                TopicRunPhase.Cancelled,
+                "Cancelled",
+                Timestamp: at.AddSeconds(1),
+                TriggerLineId: "line-terminal-only"));
+        var terminalEnvelope = Envelope(
+            ReplicationPayloadCodec.DomainAction.Upsert,
+            thread.Id,
+            terminal);
+
+        await ApplyProductionBatchAsync(state, secrets, [terminalEnvelope, terminalEnvelope]);
+
+        Assert.IsNull(thread.ExecutionRunId);
+        Assert.IsFalse(RemoteRunActivity.IsBusy(
+            thread,
+            localTurnActive: false,
+            projection: null,
+            remoteBound: true,
+            at.AddSeconds(2),
+            authoritativeState: true));
+        using var verificationDb = OpenStateDb(state, secrets);
+        var correlation = verificationDb.GetTopicRunCorrelation("run-terminal-only");
+        Assert.AreEqual("line-terminal-only", correlation?.TriggerLineId);
+        Assert.IsNotNull(correlation?.TerminalAt);
+    }
+
     [TestMethod]
     public void ProductionStartup_ReconcilesDurableAnswerWithoutTestCallingPostCommitHook()
     {
