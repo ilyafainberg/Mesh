@@ -127,6 +127,156 @@ public sealed class NotificationCoordinatorTests
         Assert.AreEqual(1, state.ListPendingCalls);
     }
 
+    [TestMethod]
+    public async Task IosResume_RecordsCatchUpWithoutBannersOrLosingUnreadAttention()
+    {
+        var resumedAt = DateTimeOffset.UtcNow;
+        var state = new RecordingState();
+        var notifier = new RecordingNotifier();
+        var lifecycle = new TestLifecycle { IsForeground = true, ForegroundedAt = resumedAt };
+        var views = new NotificationViewState(lifecycle, suppressForegroundCatchUp: true);
+        var coordinator = Create(state, notifier, views);
+
+        for (var index = 0; index < 300; index++)
+        {
+            var activity = Activity($"message:{index}", NotificationKind.Message, "alice", "alice") with
+            {
+                CreatedAt = resumedAt.AddMinutes(-1)
+            };
+            await coordinator.OnCommittedActivityAsync(activity);
+        }
+        await coordinator.RecoverPendingAsync();
+
+        Assert.AreEqual(0, notifier.Shown.Count);
+        Assert.AreEqual(300, state.Suppressed.Count);
+        Assert.AreEqual(300, state.GetUnreadNotificationCount());
+        Assert.AreEqual(NotificationRoutes.Messages("alice"), state.GetHighestPriorityNotificationRoute());
+        Assert.AreEqual(300, notifier.Badges.Last());
+    }
+
+    [TestMethod]
+    public async Task IosResume_RecoversPendingActivitiesWithoutReplayingBanners()
+    {
+        var resumedAt = DateTimeOffset.UtcNow;
+        var state = new RecordingState();
+        var notifier = new RecordingNotifier();
+        for (var index = 0; index < 300; index++)
+            state.TryRecordNotificationActivity(
+                Activity($"message:{index}", NotificationKind.Message, "alice", "alice") with
+                {
+                    CreatedAt = resumedAt.AddMinutes(-1)
+                });
+        var views = new NotificationViewState(
+            new TestLifecycle { IsForeground = true, ForegroundedAt = resumedAt },
+            suppressForegroundCatchUp: true);
+        var coordinator = Create(state, notifier, views);
+
+        await coordinator.RecoverPendingAsync();
+
+        Assert.AreEqual(0, notifier.Shown.Count);
+        Assert.AreEqual(300, state.Suppressed.Count);
+        Assert.AreEqual(300, state.GetUnreadNotificationCount());
+        Assert.AreEqual(3, state.ListPendingCalls);
+    }
+
+    [TestMethod]
+    public async Task IosResume_KeepsNewLiveNotificationsAndBackgroundDelivery()
+    {
+        var resumedAt = DateTimeOffset.UtcNow;
+        var state = new RecordingState();
+        var notifier = new RecordingNotifier();
+        var lifecycle = new TestLifecycle { IsForeground = true, ForegroundedAt = resumedAt };
+        var coordinator = Create(
+            state, notifier, new NotificationViewState(lifecycle, suppressForegroundCatchUp: true));
+        var activity = Activity("message:live", NotificationKind.Message, "alice", "alice") with
+        {
+            CreatedAt = resumedAt.AddSeconds(1)
+        };
+
+        await coordinator.OnCommittedActivityAsync(activity);
+        lifecycle.IsForeground = false;
+        await coordinator.OnCommittedActivityAsync(activity with
+        {
+            StableId = "message:background",
+            CreatedAt = resumedAt.AddMinutes(-1)
+        });
+
+        Assert.AreEqual(2, notifier.Shown.Count);
+        Assert.AreEqual(2, state.GetUnreadNotificationCount());
+    }
+
+    [TestMethod]
+    public async Task CatchUpSuppression_DoesNotChangeOtherPlatforms()
+    {
+        var resumedAt = DateTimeOffset.UtcNow;
+        var state = new RecordingState();
+        var notifier = new RecordingNotifier();
+        var views = new NotificationViewState(
+            new TestLifecycle { IsForeground = true, ForegroundedAt = resumedAt },
+            suppressForegroundCatchUp: false);
+        var coordinator = Create(state, notifier, views);
+
+        await coordinator.OnCommittedActivityAsync(
+            Activity("message:desktop", NotificationKind.Message, "alice", "alice") with
+            {
+                CreatedAt = resumedAt.AddMinutes(-1)
+            });
+
+        Assert.AreEqual(1, notifier.Shown.Count);
+    }
+
+    [TestMethod]
+    public async Task IosResume_RechecksCatchUpPolicyDuringAnActiveRecovery()
+    {
+        var resumedAt = DateTimeOffset.UtcNow;
+        var state = new RecordingState();
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var notifier = new RecordingNotifier { ShowEntered = entered, ReleaseShow = release };
+        var lifecycle = new TestLifecycle { IsForeground = false };
+        for (var index = 0; index < 3; index++)
+            state.TryRecordNotificationActivity(
+                Activity($"message:{index}", NotificationKind.Message, "alice", "alice") with
+                {
+                    CreatedAt = resumedAt.AddMinutes(-1)
+                });
+        var coordinator = Create(
+            state, notifier, new NotificationViewState(lifecycle, suppressForegroundCatchUp: true));
+
+        var recovery = coordinator.RecoverPendingAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        lifecycle.ForegroundedAt = resumedAt;
+        lifecycle.IsForeground = true;
+        release.TrySetResult(true);
+        await recovery.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.AreEqual(1, notifier.Shown.Count);
+        Assert.AreEqual(2, state.Suppressed.Count);
+        Assert.AreEqual(3, state.GetUnreadNotificationCount());
+    }
+
+    [TestMethod]
+    public async Task Recovery_CancellationStopsDeliveryAndLeavesAttentionPending()
+    {
+        var state = new RecordingState();
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var notifier = new RecordingNotifier { ShowEntered = entered, ReleaseShow = release };
+        var coordinator = Create(state, notifier, foreground: false);
+        var activity = Activity("message:cancelled", NotificationKind.Message, "alice", "alice");
+        state.TryRecordNotificationActivity(activity);
+        using var cancellation = new CancellationTokenSource();
+
+        var recovery = coordinator.RecoverPendingAsync(cancellation.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => recovery);
+
+        Assert.IsNotNull(state.GetPendingNotificationActivity(activity.StableId));
+        Assert.AreEqual(1, state.GetUnreadNotificationCount());
+        Assert.AreEqual(0, state.Suppressed.Count);
+    }
+
     private static NotificationCoordinator Create(
         RecordingState state,
         RecordingNotifier notifier,
@@ -165,7 +315,8 @@ public sealed class NotificationCoordinatorTests
 
     private sealed class TestLifecycle : IAppLifecycleState
     {
-        public bool IsForeground { get; init; }
+        public bool IsForeground { get; set; }
+        public DateTimeOffset? ForegroundedAt { get; set; }
         public event Action<bool>? ForegroundChanged { add { } remove { } }
     }
 

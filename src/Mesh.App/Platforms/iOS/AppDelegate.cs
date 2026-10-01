@@ -5,7 +5,9 @@ using Mesh.App.Platforms.iOS;
 using Mesh.App.Services;
 using Mesh.Shared;
 using Microsoft.Identity.Client;
+using Microsoft.Maui.ApplicationModel;
 using ObjCRuntime;
+using System.Globalization;
 using System.Text;
 using UIKit;
 using UserNotifications;
@@ -76,6 +78,7 @@ public class AppDelegate : MauiUIApplicationDelegate
 
     public override void WillEnterForeground(UIApplication application)
     {
+        AppLifecycleState.SetForeground(true);
         RuntimeDiagnostics.Current?.MarkLifecycle("foreground");
         base.WillEnterForeground(application);
     }
@@ -86,37 +89,51 @@ public class AppDelegate : MauiUIApplicationDelegate
         NSDictionary userInfo,
         Action<UIBackgroundFetchResult> completionHandler)
     {
+        var completion = new NotificationCallbackCompletion(MainThread.BeginInvokeOnMainThread);
         if (!TryGetMeshSyncNotification(userInfo, out var wakeId, out var hasVisibleAlert))
         {
-            completionHandler(UIBackgroundFetchResult.NoData);
+            completion.Complete(() => completionHandler(UIBackgroundFetchResult.NoData));
             return;
         }
         var visibleRemoteAlert = RemoteWakeNotificationPolicy.ShouldShowGenericAlert(
             hasVisibleAlert, application.ApplicationState == UIApplicationState.Active);
-        _ = CompleteRemoteNotificationSyncAsync(wakeId, visibleRemoteAlert, completionHandler);
+        _ = Task.Run(() => CompleteRemoteNotificationSyncAsync(
+            wakeId, visibleRemoteAlert, completion, completionHandler));
     }
 
     private static async Task CompleteRemoteNotificationSyncAsync(
         string? wakeId,
         bool visibleRemoteAlert,
+        NotificationCallbackCompletion completion,
         Action<UIBackgroundFetchResult> completionHandler)
     {
         using var wakeSession = NotificationWakeSessionBridge.Begin(wakeId, visibleRemoteAlert);
+        using var deadline = new CancellationTokenSource(OnlineReplicationWakeCoordinator.DefaultBudget);
+        var completionResult = UIBackgroundFetchResult.Failed;
         try
         {
-            var result = await OnlineReplicationWakeBridge.SynchronizePendingAsync().ConfigureAwait(false);
-            await NotificationCoordinatorBridge.RecoverPendingAsync().ConfigureAwait(false);
-            completionHandler(result.Outcome switch
+            var result = await OnlineReplicationWakeBridge.SynchronizePendingAsync(
+                    ct: deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false);
+            await NotificationCoordinatorBridge.RecoverPendingAsync(deadline.Token)
+                .WaitAsync(deadline.Token).ConfigureAwait(false);
+            completionResult = result.Outcome switch
             {
                 OnlineReplicationWakeOutcome.NewData => UIBackgroundFetchResult.NewData,
                 OnlineReplicationWakeOutcome.NoData => UIBackgroundFetchResult.NoData,
                 _ => UIBackgroundFetchResult.Failed
-            });
+            };
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            RuntimeDiagnostics.Current?.RecordEvent("background-push-sync", "callback deadline reached");
         }
         catch (Exception ex)
         {
             RuntimeDiagnostics.Current?.RecordException("background-push-sync", ex);
-            completionHandler(UIBackgroundFetchResult.Failed);
+        }
+        finally
+        {
+            completion.Complete(() => completionHandler(completionResult));
         }
     }
 
@@ -401,7 +418,7 @@ public sealed class MeshMetricManagerSubscriber(RuntimeDiagnostics diagnostics)
     }
 }
 
-// Suppresses contentless sync alerts in the foreground; committed local notifications are presented.
+// Suppresses contentless sync alerts and catch-up banners in the foreground.
 public sealed class MeshNotificationCenterDelegate : UNUserNotificationCenterDelegate
 {
     public override void WillPresentNotification(
@@ -409,38 +426,50 @@ public sealed class MeshNotificationCenterDelegate : UNUserNotificationCenterDel
         UNNotification notification,
         Action<UNNotificationPresentationOptions> completionHandler)
     {
+        var completion = new NotificationCallbackCompletion(MainThread.BeginInvokeOnMainThread);
         if (AppDelegate.TryGetMeshSyncNotification(
                 notification.Request.Content.UserInfo,
                 out _,
                 out _))
         {
-            completionHandler(UNNotificationPresentationOptions.None);
+            completion.Complete(() => completionHandler(UNNotificationPresentationOptions.None));
             return;
         }
 
-        completionHandler(
+        using var createdAtKey = new NSString(AppleNotifier.CreatedAtKey);
+        var rawCreatedAt = notification.Request.Content.UserInfo[createdAtKey]?.ToString();
+        if (DateTimeOffset.TryParse(
+                rawCreatedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var createdAt)
+            && NotificationForegroundPolicy.IsCatchUp(
+                createdAt, AppLifecycleState.IsProcessForeground, AppLifecycleState.ProcessForegroundedAt))
+        {
+            completion.Complete(() => completionHandler(UNNotificationPresentationOptions.None));
+            return;
+        }
+
+        completion.Complete(() => completionHandler(
             UNNotificationPresentationOptions.Banner
             | UNNotificationPresentationOptions.Sound
-            | UNNotificationPresentationOptions.Badge);
+            | UNNotificationPresentationOptions.Badge));
     }
 
     public override void DidReceiveNotificationResponse(
         UNUserNotificationCenter center,
         UNNotificationResponse response,
         Action completionHandler)
-        => _ = CompleteActivationAsync(response, completionHandler);
-
-    private static async Task CompleteActivationAsync(
-        UNNotificationResponse response,
-        Action completionHandler)
     {
+        var completion = new NotificationCallbackCompletion(MainThread.BeginInvokeOnMainThread);
         try
         {
             var userInfo = response.Notification.Request.Content.UserInfo;
             if (AppDelegate.TryGetMeshSyncNotification(userInfo, out _, out _))
-                await NotificationNavigationBridge.OpenHighestPriorityAfterSyncAsync().ConfigureAwait(false);
-            else if (userInfo[new NSString(AppleNotifier.RouteKey)]?.ToString() is { Length: > 0 } route)
-                DeepLinkDispatch.Dispatch(route);
+                OpenAfterSync();
+            else
+            {
+                using var routeKey = new NSString(AppleNotifier.RouteKey);
+                if (userInfo[routeKey]?.ToString() is { Length: > 0 } route)
+                    DeepLinkDispatch.Dispatch(route);
+            }
         }
         catch (Exception ex)
         {
@@ -448,7 +477,18 @@ public sealed class MeshNotificationCenterDelegate : UNUserNotificationCenterDel
         }
         finally
         {
-            completionHandler();
+            completion.Complete(completionHandler);
         }
+    }
+
+    private static void OpenAfterSync()
+    {
+        _ = Task.Run(() => NotificationNavigationBridge.OpenHighestPriorityAfterSyncAsync())
+            .ContinueWith(
+                static completed => RuntimeDiagnostics.Current?.RecordException(
+                    "notification-activation", completed.Exception!.GetBaseException()),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
     }
 }

@@ -2644,6 +2644,7 @@ public sealed class RelayLiveFaultRuntimeIntegrationTests
     private sealed class ForegroundLifecycle : IAppLifecycleState
     {
         public bool IsForeground => true;
+        public DateTimeOffset? ForegroundedAt => null;
         public event Action<bool>? ForegroundChanged
         {
             add { }

@@ -55,7 +55,8 @@ public sealed record LocalNotification(
     string Title,
     string Body,
     string Route,
-    bool PlaySound);
+    bool PlaySound,
+    DateTimeOffset CreatedAt);
 
 public interface INotificationCoordinator
 {

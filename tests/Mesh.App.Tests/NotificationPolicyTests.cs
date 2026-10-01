@@ -62,6 +62,28 @@ public sealed class NotificationPolicyTests
     }
 
     [TestMethod]
+    public void ForegroundPolicy_SuppressesOnlyActivityFromBeforeTheCurrentResume()
+    {
+        var resumedAt = DateTimeOffset.UtcNow;
+        Assert.IsTrue(NotificationForegroundPolicy.IsCatchUp(resumedAt.AddSeconds(-1), true, resumedAt));
+        Assert.IsTrue(NotificationForegroundPolicy.IsCatchUp(resumedAt, true, resumedAt));
+        Assert.IsFalse(NotificationForegroundPolicy.IsCatchUp(resumedAt.AddSeconds(1), true, resumedAt));
+        Assert.IsFalse(NotificationForegroundPolicy.IsCatchUp(resumedAt.AddSeconds(-1), false, resumedAt));
+        Assert.IsFalse(NotificationForegroundPolicy.IsCatchUp(resumedAt.AddSeconds(-1), true, null));
+        Assert.IsFalse(NotificationDecisionPolicy.ShouldShowBanner(
+            Activity(NotificationKind.Message, "body"), false, false, false, foregroundCatchUp: true));
+    }
+
+    [TestMethod]
+    public void ContentPolicy_PreservesActivityTimeForNativePresentationRaces()
+    {
+        var activity = Activity(NotificationKind.Message, "body");
+        var notification = NotificationContentPolicy.Build(activity, true);
+
+        Assert.AreEqual(activity.CreatedAt, notification.CreatedAt);
+    }
+
+    [TestMethod]
     public void WakeSession_ReferenceCountsSameWakeLeases()
     {
         var sessions = new NotificationWakeSession();
@@ -124,6 +146,45 @@ public sealed class NotificationPolicyTests
 
         Assert.IsTrue(elapsed.ElapsedMilliseconds < 100);
         await operation;
+    }
+
+    [TestMethod]
+    public async Task NativeCompletion_FromWorkerQueuesCallbackForMainThread()
+    {
+        var callbacks = new System.Collections.Concurrent.ConcurrentQueue<Action>();
+        var completion = new NotificationCallbackCompletion(callbacks.Enqueue);
+        var nativeCalls = 0;
+        var dispatched = false;
+
+        await Task.Run(() => completion.Complete(() =>
+        {
+            Assert.IsTrue(dispatched, "The native callback must execute through the UI dispatcher.");
+            nativeCalls++;
+        }));
+
+        Assert.AreEqual(0, nativeCalls);
+        Assert.IsTrue(callbacks.TryDequeue(out var callback));
+        dispatched = true;
+        callback();
+        Assert.AreEqual(1, nativeCalls);
+        Assert.IsTrue(callbacks.IsEmpty);
+    }
+
+    [TestMethod]
+    public async Task NativeCompletion_ConcurrentSuccessAndTimeoutDispatchOnlyOnce()
+    {
+        var callbacks = new System.Collections.Concurrent.ConcurrentQueue<Action>();
+        var completion = new NotificationCallbackCompletion(callbacks.Enqueue);
+        var nativeCalls = 0;
+
+        await Task.WhenAll(Enumerable.Range(0, 32).Select(_ =>
+            Task.Run(() => completion.Complete(() => nativeCalls++))));
+
+        Assert.AreEqual(1, callbacks.Count);
+        Assert.AreEqual(0, nativeCalls);
+        Assert.IsTrue(callbacks.TryDequeue(out var callback));
+        callback();
+        Assert.AreEqual(1, nativeCalls);
     }
 
     [TestMethod]

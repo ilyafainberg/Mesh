@@ -17,7 +17,8 @@ internal static class NotificationContentPolicy
             activity.Title,
             NormalizeBody(activity.Body),
             activity.Route,
-            playSound);
+            playSound,
+            activity.CreatedAt);
     }
 
     private static string NormalizeBody(string value)
@@ -34,12 +35,23 @@ internal static class NotificationDecisionPolicy
         CommittedActivity activity,
         bool doNotDisturb,
         bool muted,
-        bool entityVisible)
+        bool entityVisible,
+        bool foregroundCatchUp = false)
         => activity.NotifyRequested
            && !activity.IsHistorical
            && !doNotDisturb
            && !muted
-           && !entityVisible;
+           && !entityVisible
+           && !foregroundCatchUp;
+}
+
+internal static class NotificationForegroundPolicy
+{
+    public static bool IsCatchUp(
+        DateTimeOffset createdAt,
+        bool isForeground,
+        DateTimeOffset? foregroundedAt)
+        => isForeground && foregroundedAt is { } resumedAt && createdAt <= resumedAt;
 }
 
 internal static class RemoteWakeNotificationPolicy
@@ -89,12 +101,19 @@ internal sealed class NotificationWakeDeduplicator(TimeSpan retention, int capac
 }
 
 /// <summary>Tracks the entities currently visible in the foreground across desktop and mobile pages.</summary>
-public sealed class NotificationViewState(IAppLifecycleState lifecycle)
+public sealed class NotificationViewState(
+    IAppLifecycleState lifecycle,
+    bool? suppressForegroundCatchUp = null)
 {
+    private readonly bool suppressCatchUp = suppressForegroundCatchUp ?? OperatingSystem.IsIOS();
     private readonly object gate = new();
     private readonly Dictionary<string, HashSet<string>> scopes = new(StringComparer.Ordinal);
 
     public bool IsForeground => lifecycle.IsForeground;
+
+    public bool ShouldSuppressCatchUp(DateTimeOffset createdAt)
+        => suppressCatchUp && NotificationForegroundPolicy.IsCatchUp(
+            createdAt, lifecycle.IsForeground, lifecycle.ForegroundedAt);
 
     public void SetVisibleEntities(string scope, IEnumerable<string> entityIds)
     {
@@ -167,6 +186,19 @@ public sealed class NotificationWakeSession
         }
     }
 }
+/// <summary>Completes a native notification callback once through its required thread dispatcher.</summary>
+internal sealed class NotificationCallbackCompletion(Action<Action> dispatch)
+{
+    private int completed;
+
+    public void Complete(Action callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        if (Interlocked.CompareExchange(ref completed, 1, 0) == 0)
+            dispatch(callback);
+    }
+}
+
 internal sealed class NotificationOperationGate
 {
     private readonly SemaphoreSlim gate = new(1, 1);

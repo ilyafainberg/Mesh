@@ -3405,6 +3405,7 @@ public sealed class MobileMeLifecycleComponentTests
     private sealed class TestLifecycle : IAppLifecycleState
     {
         public bool IsForeground => true;
+        public DateTimeOffset? ForegroundedAt => null;
         public event Action<bool>? ForegroundChanged
         {
             add { }

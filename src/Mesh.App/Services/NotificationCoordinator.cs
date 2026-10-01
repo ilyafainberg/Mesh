@@ -81,15 +81,17 @@ public sealed class NotificationCoordinator(
                 activity,
                 state.DoNotDisturb,
                 muted,
-                entityVisible: false))
+                entityVisible: false,
+                foregroundCatchUp: views.ShouldSuppressCatchUp(activity.CreatedAt)))
         {
             state.MarkNotificationSuppressed(activity.StableId);
             logger.LogDebug(
-                "notification policy suppressed banner: kind={Kind} historical={Historical} dnd={Dnd} muted={Muted}",
+                "notification policy suppressed banner: kind={Kind} historical={Historical} dnd={Dnd} muted={Muted} catchUp={CatchUp}",
                 activity.Kind,
                 activity.IsHistorical,
                 state.DoNotDisturb,
-                muted);
+                muted,
+                views.ShouldSuppressCatchUp(activity.CreatedAt));
             return;
         }
 
@@ -116,7 +118,7 @@ public sealed class NotificationCoordinator(
         {
             if (recoveryTask.IsCompleted)
                 recoveryTask = operationGate.RunAsync(
-                    RecoverPendingCoreAsync, CancellationToken.None);
+                    RecoverPendingCoreAsync, ct);
             current = recoveryTask;
         }
         return ct.CanBeCanceled ? current.WaitAsync(ct) : current;
